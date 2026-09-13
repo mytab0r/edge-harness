@@ -885,6 +885,37 @@ def stuck_gate_fact_line(item: dict) -> str:
 # отпечатке), поэтому ловит и любой БУДУЩИЙ регресс того же класса, не
 # только повтор буквально этого бага.
 
+def runs_of(runs_payload: object, workflow: str) -> list[dict]:
+    """Единая точка разбора формы ответа «список прогонов» GitHub Actions
+    (issue #1096, F3) — в границах repo_invariants.py: потребители
+    `pulse_guard.recent_runs` в pulse_guard/scheduler/review_labels остаются
+    до отдельного прохода F3 (тот не умещается в одну пачку, файлы вне
+    repo_invariants.py). Форма не по контракту — не dict, нет ключа
+    workflow_runs, значение под ключом не список — RuntimeError с текстом,
+    называющим факт (живой класс #120A: ответ вторичного рейт-лимита
+    `{"message": ...}` без ключа раньше молча читался как «прогонов нет»),
+    не молчаливый []. Выбор третьего исхода (ok/violation/unknown) остаётся
+    за вызывающей стороной: эта функция не знает, наблюдатель ли это с
+    третьим состоянием или фоновый сборщик, которому громкое падение
+    честнее unknown()."""
+    if not isinstance(runs_payload, dict) or "workflow_runs" not in runs_payload:
+        raise RuntimeError(
+            f"ответ истории прогонов {workflow} неожиданной формы (не dict "
+            f"с ключом workflow_runs — живой класс F3, issue #1096/#1109): "
+            f"{runs_payload!r}")
+    runs = runs_payload.get("workflow_runs")
+    # Ключ ПРИСУТСТВУЕТ, но значение под ним не список (None/dict/строка) —
+    # проверка только на наличие ключа пропустила бы `{"workflow_runs": None}`
+    # с ложным «форма подтверждена». isinstance(list) — тот же приём, что
+    # запись dependabot в pagination-гвардии (не-list — громкий сигнал, не
+    # молчаливое усечение).
+    if not isinstance(runs, list):
+        raise RuntimeError(
+            f"ответ истории прогонов {workflow}: ключ workflow_runs есть, "
+            f"но значение не список (не по контракту): {runs!r}")
+    return runs
+
+
 def ai_review_runs_after(repo: str, pr: int, since: str, gh_func) -> list[dict]:
     """Прогоны `ai-review.yml` для PR #pr, СТАРТОВАВШИЕ ПОСЛЕ `since` (ISO,
     момент публикации вердикта) — признак «этот прогон про PR N» тот же, что
@@ -899,24 +930,15 @@ def ai_review_runs_after(repo: str, pr: int, since: str, gh_func) -> list[dict]:
     if isinstance(chunk, dict) else []` молча читал ЛЮБУЮ форму ответа не по
     контракту (не dict, нет ключа, значение под ключом не список) как «прогонов
     после вердикта нет» — то же самое 💚, что и настоящее отсутствие растраты.
-    Теперь форма проверяется явно и RuntimeError поднимается вызывающей
+    Теперь форма проверяется явно (runs_of — единая точка разбора формы в
+    этом модуле, не вторая копия) и RuntimeError поднимается вызывающей
     стороне (check_wasted_ai_review_runs) — та решает третий исход, эта
     функция сама не молчит о нарушении контракта."""
     since_dt = pulse_guard.parse_time(since)
     chunk = gh_func(
         f"repos/{repo}/actions/workflows/{review_labels.AI_REVIEW_WORKFLOW_FILE}/runs"
         f"?per_page=100")
-    if not isinstance(chunk, dict) or "workflow_runs" not in chunk:
-        raise RuntimeError(
-            f"ответ истории прогонов {review_labels.AI_REVIEW_WORKFLOW_FILE} "
-            f"неожиданной формы (не dict с ключом workflow_runs — живой класс "
-            f"F3/F7, issue #1096/#1109): {chunk!r}")
-    runs = chunk.get("workflow_runs")
-    if not isinstance(runs, list):
-        raise RuntimeError(
-            f"ответ истории прогонов {review_labels.AI_REVIEW_WORKFLOW_FILE}: "
-            f"ключ workflow_runs есть, но значение не список (не по "
-            f"контракту): {runs!r}")
+    runs = runs_of(chunk, review_labels.AI_REVIEW_WORKFLOW_FILE)
     target = review_labels.ai_review_run_name(pr)
     found = []
     for run in runs:
@@ -972,16 +994,23 @@ def check_wasted_ai_review_runs(repo: str, open_pulls: list[dict]) -> check_resu
     при каждом вызове), не берут его параметром со значением по умолчанию."""
     ai_final = {review_labels.AI_OK, review_labels.AI_CHANGES}
     violations = []
-    unchecked = 0
+    # Неопределённость — ФАКТ на PR/шаг/ошибку, не счётчик с перечнем гипотез
+    # (находка ai-review PR #1140, чеклист: знаменатель — только PR с
+    # финальным ai-вердиктом, а не все открытые; упавший шаг называет сам
+    # текст RuntimeError — повторять все три варианта в причине значило бы
+    # гадать там, где данные уже есть).
+    unchecked: list[dict] = []
+    ai_final_total = 0
     for pull in open_pulls:
         number = pull["number"]
         labels = {label["name"] for label in pull["labels"]}
         if not (labels & ai_final):
             continue
+        ai_final_total += 1
         try:
             comment = review_labels.latest_ai_comment(repo, number, gh)
-        except RuntimeError:
-            unchecked += 1
+        except RuntimeError as error:
+            unchecked.append({"pr": number, "step": "комментарий-вердикт", "error": str(error)})
             continue
         if comment is None:
             continue
@@ -993,15 +1022,15 @@ def check_wasted_ai_review_runs(repo: str, open_pulls: list[dict]) -> check_resu
         try:
             files = review_labels.list_pr_files(repo, number, gh)
             current_fp = review_labels.diff_fingerprint(files)
-        except RuntimeError:
-            unchecked += 1
+        except RuntimeError as error:
+            unchecked.append({"pr": number, "step": "файлы PR", "error": str(error)})
             continue
         if not review_labels.diff_unchanged(stored_fp, current_fp):
             continue
         try:
             wasted_runs = ai_review_runs_after(repo, number, comment_at, gh)
-        except RuntimeError:
-            unchecked += 1
+        except RuntimeError as error:
+            unchecked.append({"pr": number, "step": "история прогонов", "error": str(error)})
             continue
         if wasted_runs:
             violations.append({
@@ -1013,11 +1042,13 @@ def check_wasted_ai_review_runs(repo: str, open_pulls: list[dict]) -> check_resu
     if violations:
         return check_result.violation(violations)
     if unchecked:
+        detail = "; ".join(
+            f"#{item['pr']} ({item['step']}): {item['error']}" for item in unchecked)
         return check_result.unknown(
-            f"{unchecked} из {len(open_pulls)} PR с финальным ai:*-вердиктом "
-            "не удалось проверить на растрату дорогого прогона ai-review "
-            "(сеть/квота на комментариях/файлах/истории прогонов) — нарушений "
-            "среди проверенных нет, но статус непроверенных неизвестен")
+            f"{len(unchecked)} из {ai_final_total} PR с финальным ai:*-вердиктом "
+            f"не удалось проверить на растрату дорогого прогона ai-review — "
+            f"{detail} — нарушений среди проверенных нет, но статус "
+            "непроверенных неизвестен")
     return check_result.ok()
 
 
@@ -1653,22 +1684,37 @@ def check_recurring_worker_failure(repo: str) -> check_result.CheckResult:
     первый же прогон не упал (обычный случай), функция возвращает ok() без
     единого запроса лога/job'а.
 
-    Три исхода, не два (issue #1096/#1109): список прогонов
-    RECURRING_FAILURE_WORKFLOW недоступен целиком (транспорт/квота/форма
-    ответа не по контракту, pulse_guard.recent_runs) раньше молча читался как
-    «серии нет» — то же самое 💚, что и настоящее здоровое состояние.
-    Теперь — check_result.unknown(): не удалось посмотреть вовсе, не «нет
-    нарушения». Частичная деградация ВНУТРИ уже полученного списка (лог
-    конкретного job'а недоступен посреди скана — см. `except RuntimeError:
-    break` ниже) НЕ считается этим же классом и остаётся списком/break, не
-    unknown(): списки прогонов уже получены (транспорт в целом жив), и
-    честнее оборвать скан на неклассифицированном прогоне, чем гадать о его
-    причине — тот же принцип, что last_failure_error/last_error_log_line
-    (отсутствие ОДНОЙ детали не должно топить весь инвариант, у которого и
-    так нет действия ЖЁСТЧЕ наблюдения); ЛЮБОЙ уже накопленный streak_runs
-    длиной ≥ порога всё равно превращается в настоящую violation()."""
+    Три исхода, не два (issue #1096/#1109):
+
+    - Список прогонов RECURRING_FAILURE_WORKFLOW недоступен целиком
+      (транспорт/квота) ИЛИ его форма не по контракту — check_result.
+      unknown(): не удалось посмотреть вовсе, не «нет нарушения». Форму
+      разбирает runs_of() (единая точка этого модуля): раньше
+      `pulse_guard.recent_runs` молча схлопывал ответ без ключа
+      workflow_runs (живой класс #120A — вторичный рейт-лимит) в [] и
+      инвариант отвечал тем же 💚, что и здоровое состояние (F3 из issue
+      #1096; находка ai-review PR #1140 — докстринг обещал unknown(),
+      а код через recent_runs давал ok()).
+    - Недосмотренная серия ВНУТРИ уже полученного списка: job'ы конкретного
+      упавшего прогона недоступны посреди скана (`pulse_guard.failing_jobs`
+      кидает RuntimeError — по запросу НА прогон, а скан ходит до 20
+      прогонов, так что вторичная квота/503 на середине списка — обычный
+      путь). Находка ai-review PR #1140: раньше `except RuntimeError: break`
+      с пустым streak_runs возвращал ok() — то же 💚 при «классифицировать
+      не удалось вовсе», ровно класс #1096. Теперь обрыв по RuntimeError
+      при streak ниже порога — check_result.unknown() с именем прогона и
+      текстом ошибки (что НЕ досмотрено — фактом, не гипотезой об их
+      причине). Обрыв по ДАННЫМ, а не транспорту — success, смена
+      отпечатка, «нет упавших job'ов», пустая строка лога — остаётся
+      честным ok(): это прочитанный факт о прогоне, не недоступность
+      (last_error_log_line best-effort по контракту и не различает «лог
+      недоступен» от «строки нет», там ok() честнее unknown).
+      ЛЮБОЙ уже накопленный streak_runs длиной ≥ порога всё равно
+      превращается в настоящую violation()."""
     try:
-        runs = pulse_guard.recent_runs(repo, RECURRING_FAILURE_WORKFLOW, per_page=RECURRING_FAILURE_RUNS_TO_SCAN)
+        runs_payload = pulse_guard.gh(
+            f"repos/{repo}/actions/workflows/{RECURRING_FAILURE_WORKFLOW}/runs?per_page={RECURRING_FAILURE_RUNS_TO_SCAN}")
+        runs = runs_of(runs_payload, RECURRING_FAILURE_WORKFLOW)
     except RuntimeError as error:
         return check_result.unknown(
             f"история прогонов {RECURRING_FAILURE_WORKFLOW} недоступна: {error}")
@@ -1679,6 +1725,10 @@ def check_recurring_worker_failure(repo: str) -> check_result.CheckResult:
     streak_error_text: str | None = None
     streak_runs: list[dict] = []
     pending_seen = False
+    # Факт «скан оборван транспортом на неклассифицируемом прогоне» — не
+    # silent-break: при streak ниже порога превращается в unknown() ниже,
+    # не в 💚 (находка ai-review PR #1140).
+    scan_interrupted: str | None = None
     for run in runs:
         conclusion = run.get("conclusion")
         if conclusion is None:
@@ -1688,8 +1738,16 @@ def check_recurring_worker_failure(repo: str) -> check_result.CheckResult:
             break  # success — серия обрывается здесь, старше уже не в счёт
         try:
             bad_jobs = pulse_guard.failing_jobs(repo, run, pulse_guard.FAILURE_CONCLUSIONS)
-        except RuntimeError:
-            break  # деталь недоступна — честнее оборвать серию, чем гадать
+        except RuntimeError as error:
+            # Транспорт отказал на середине скана — причина прогонов СТАРШЕ
+            # этого не классифицировать вовсе. Фиксируем факт (какой прогон,
+            # какая ошибка) и решаем после цикла: streak ниже порога —
+            # unknown(), накопленный streak ≥ порога — violation() (нарушение
+            # среди доказанного важнее неопределённости по остатку).
+            scan_interrupted = (
+                f"job'ы прогона {run.get('id')} (created_at "
+                f"{run.get('created_at')}) недоступны: {error}")
+            break  # деталь недоступна — дальше вглубь смысла нет
         if not bad_jobs:
             break
         job = bad_jobs[0]
@@ -1708,6 +1766,13 @@ def check_recurring_worker_failure(repo: str) -> check_result.CheckResult:
         streak_runs.append(run)
 
     if len(streak_runs) < RECURRING_FAILURE_STREAK_THRESHOLD:
+        if scan_interrupted is not None:
+            return check_result.unknown(
+                f"серию провалов {RECURRING_FAILURE_WORKFLOW} не удалось "
+                f"досмотреть: {scan_interrupted} — досмотренная часть "
+                f"({len(streak_runs)} из {len(runs)} прогонов) серии порога "
+                f"({RECURRING_FAILURE_STREAK_THRESHOLD}) не даёт, но статус "
+                "недосмотренных прогонов неизвестен, не «нарушений нет»")
         return check_result.ok()
     return check_result.violation([{
         "workflow": RECURRING_FAILURE_WORKFLOW,
@@ -1883,15 +1948,16 @@ def check_conveyor_gate_phantom_pause(repo: str, now: datetime) -> check_result.
     голый `[]` НЕРАЗЛИЧИМО и на «прогонов правда нет», и на «ответ странной
     формы». Раньше `not runs` здесь читался как ok() в обоих случаях — та же
     слепота, ради которой эта функция и переписана, протекала сквозь границу
-    recent_runs. Правка запрашивает `runs` НАПРЯМУЮ (минуя recent_runs) и
-    валидирует форму САМА — не вторая копия recent_runs целиком (эта функция
-    ничего не знает про `event=`, которого здесь и не было), а точечный
-    байпас ради формы; recent_runs остаётся нетронутым для остальных 6
-    потребителей (issue #1109, шаг 2, F3 — общий `runs_of()` на все места
-    разом)."""
+    recent_runs. Правка запрашивает `runs` НАПРЯМУЮ (минуя recent_runs — эта
+    функция ничего не знает про `event=`, которого здесь и не было) и
+    валидирует форму через runs_of() — единая точка разбора формы в этом
+    модуле (доводка ai-review PR #1140: вторая инлайн-копия сведена туда же);
+    recent_runs остаётся нетронутым для потребителей в других файлах (issue
+    #1109, шаг 2, F3 — общий хелпер на все места разом, отдельный проход)."""
     try:
-        runs_payload = pulse_guard.gh(
-            f"repos/{repo}/actions/workflows/{pulse_guard.WORKER_WORKFLOW}/runs?per_page=10")
+        runs = runs_of(pulse_guard.gh(
+            f"repos/{repo}/actions/workflows/{pulse_guard.WORKER_WORKFLOW}/runs?per_page=10"),
+            pulse_guard.WORKER_WORKFLOW)
         all_markers = pulse_guard.issue_markers_any(
             repo, pulse_guard.WATCHDOG_ISSUE,
             (pulse_guard.PAUSE_MARKER, pulse_guard.RESUME_MARKER))
@@ -1899,23 +1965,6 @@ def check_conveyor_gate_phantom_pause(repo: str, now: datetime) -> check_result.
         return check_result.unknown(
             f"история прогонов {pulse_guard.WORKER_WORKFLOW} или маркеры "
             f"#{pulse_guard.WATCHDOG_ISSUE} недоступны: {error}")
-    if not isinstance(runs_payload, dict) or "workflow_runs" not in runs_payload:
-        return check_result.unknown(
-            f"ответ истории прогонов {pulse_guard.WORKER_WORKFLOW} неожиданной "
-            f"формы (не dict с ключом workflow_runs — живой класс F3/#120A, "
-            f"issue #1096/#1109): {runs_payload!r}")
-    runs = runs_payload.get("workflow_runs")
-    # Находка ai-review PR #1110 (доводка 2): ключ ПРИСУТСТВУЕТ, но значение
-    # под ним не список (None/dict/строка) — предыдущая проверка смотрела
-    # только на наличие ключа, `{"workflow_runs": None}` проходил бы её и
-    # давал ok() с ложным «форма подтверждена». isinstance(list) — тот же
-    # приём, что запись dependabot в pagination-гвардии (не-list — громкий
-    # сигнал, не молчаливое усечение).
-    if not isinstance(runs, list):
-        return check_result.unknown(
-            f"ответ истории прогонов {pulse_guard.WORKER_WORKFLOW}: ключ "
-            f"workflow_runs есть, но значение не список (не по контракту): "
-            f"{runs!r}")
     if not runs:
         return check_result.ok()  # форма подтверждена, история просто пуста
 
