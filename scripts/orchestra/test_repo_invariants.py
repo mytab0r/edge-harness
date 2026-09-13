@@ -2281,6 +2281,14 @@ def test_phantom_pause_not_in_ci_gating():
     assert 13 not in ri.CI_GATING
 
 
+def test_phantom_pause_not_escalating():
+    # issue #1096, ai-review PR #1110, некритичное замечание 2: 13 несёт
+    # CheckResult — findings[13] коллапсирует unknown() в [], эскалация по
+    # findings не должна на него полагаться, пока нет отдельного канала.
+    assert 13 not in ri.ESCALATING_INVARIANTS
+    assert 13 in ri.CHECK_RESULT_MIGRATED_INVARIANTS
+
+
 def test_build_report_wires_invariant_13(monkeypatch):
     """Проводка build_report: фантомная пауза видна строкой [13] с фактом
     (не гипотезой) — числом реальных провалов и порогом."""
@@ -2468,6 +2476,30 @@ def test_worker_false_success_comment_not_in_ci_gating():
     # Наблюдательный: доступность стороннего Search API не должна красить
     # обязательную проверку `test` (см. докстринг check_worker_false_success_comment).
     assert 14 not in ri.CI_GATING
+
+
+def test_worker_false_success_comment_not_escalating():
+    # issue #1096, ai-review PR #1110, некритичное замечание 2: то же, что у
+    # инварианта 13 — CheckResult не должен гейтить/эскалировать по findings.
+    assert 14 not in ri.ESCALATING_INVARIANTS
+    assert 14 in ri.CHECK_RESULT_MIGRATED_INVARIANTS
+
+
+def test_assert_check_result_invariants_not_gated_or_escalated_passes_on_real_constants():
+    # Регресс-доказательство на ЖИВЫХ константах модуля — не только на
+    # синтетике ниже: сегодняшние CI_GATING/ESCALATING_INVARIANTS обязаны
+    # проходить эту проверку молча.
+    ri.assert_check_result_invariants_not_gated_or_escalated(ri.CI_GATING, ri.ESCALATING_INVARIANTS)
+
+
+def test_assert_check_result_invariants_raises_if_migrated_invariant_added_to_ci_gating():
+    with pytest.raises(RuntimeError, match="13"):
+        ri.assert_check_result_invariants_not_gated_or_escalated(frozenset({7, 11, 13}), ())
+
+
+def test_assert_check_result_invariants_raises_if_migrated_invariant_added_to_escalating():
+    with pytest.raises(RuntimeError, match="14"):
+        ri.assert_check_result_invariants_not_gated_or_escalated(frozenset(), (1, 3, 14))
 
 
 # ══════════════════════════════════════════════════════════════════════════

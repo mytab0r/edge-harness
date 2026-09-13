@@ -145,6 +145,15 @@ ALLOWED_SINGLE_PAGE_CALLS = {
         "scheduler.worker_runs_active/stalled_worker_run выше (#955): вопрос "
         "«есть ли ХОТЯ БЫ ОДИН прогон на этот head_sha», не список, серверный "
         "фильтр `head_sha=` уже сужает выборку до прогонов одного коммита.",
+    ("scripts/orchestra/repo_invariants.py", "check_conveyor_gate_phantom_pause"):
+        "issue #1096, ai-review PR #1110: тот же контракт, что "
+        "pulse_guard.recent_runs выше (голова списка + серия в её пределах, "
+        "хвост по природе не читается) — вызов вынесен из-под recent_runs "
+        "точечным байпасом, чтобы САМОСТОЯТЕЛЬНО проверить форму ответа "
+        "(recent_runs молча глотает не-list/не-dict форму, F3 из issue "
+        "#1096, чинится в #1109 разом на 7 мест) до появления общего "
+        "runs_of(). Пагинация здесь исказила бы семантику «голова списка», "
+        "которую инвариант и судит.",
     ("scripts/measure/pipeline_health.py", "search_merged_prs"):
         "окно атрибуции короткое (часы, не сутки — issue #967, "
         "merge_health_watch.py::fetch_suspects), второй страницы на практике "

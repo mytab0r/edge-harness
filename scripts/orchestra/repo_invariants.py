@@ -1836,7 +1836,18 @@ def check_conveyor_gate_phantom_pause(repo: str, now: datetime) -> check_result.
             f"ответ истории прогонов {pulse_guard.WORKER_WORKFLOW} неожиданной "
             f"формы (не dict с ключом workflow_runs — живой класс F3/#120A, "
             f"issue #1096/#1109): {runs_payload!r}")
-    runs = runs_payload.get("workflow_runs") or []
+    runs = runs_payload.get("workflow_runs")
+    # Находка ai-review PR #1110 (доводка 2): ключ ПРИСУТСТВУЕТ, но значение
+    # под ним не список (None/dict/строка) — предыдущая проверка смотрела
+    # только на наличие ключа, `{"workflow_runs": None}` проходил бы её и
+    # давал ok() с ложным «форма подтверждена». isinstance(list) — тот же
+    # приём, что запись dependabot в pagination-гвардии (не-list — громкий
+    # сигнал, не молчаливое усечение).
+    if not isinstance(runs, list):
+        return check_result.unknown(
+            f"ответ истории прогонов {pulse_guard.WORKER_WORKFLOW}: ключ "
+            f"workflow_runs есть, но значение не список (не по контракту): "
+            f"{runs!r}")
     if not runs:
         return check_result.ok()  # форма подтверждена, история просто пуста
 
@@ -1956,7 +1967,14 @@ def check_worker_false_success_comment(repo: str) -> check_result.CheckResult:
         return check_result.unknown(
             f"ответ GitHub Search неожиданной формы (не dict с ключом items "
             f"— живой класс F3, issue #1096/#1109): {result!r}")
-    items = result.get("items") or []
+    items = result.get("items")
+    # Находка ai-review PR #1110 (доводка 2, тот же класс, что у инварианта
+    # 13 выше): ключ ПРИСУТСТВУЕТ, но значение не список — предыдущая
+    # проверка смотрела только на наличие ключа.
+    if not isinstance(items, list):
+        return check_result.unknown(
+            f"ответ GitHub Search: ключ items есть, но значение не список "
+            f"(не по контракту): {items!r}")
     violations = []
     unchecked = 0
     for item in items:
@@ -2482,6 +2500,38 @@ def build_report(repo: str, now: datetime,
     return lines, findings
 
 
+# Инварианты, чей v_N — check_result.CheckResult, не голый список (issue
+# #1096): findings[N] = v_N.violations коллапсирует STATUS_UNKNOWN в тот же
+# пустой список, что и STATUS_OK — CI_GATING/ESCALATING_INVARIANTS читают
+# findings по факту истинности списка, и ❓ молча стал бы 💚 ещё одним слоем
+# ниже отчёта, ровно тот класс, который эта задача закрывает (находка
+# ai-review PR #1110, некритичное замечание 2). Сегодня 13/14 не гейтят и не
+# эскалируют — этот реестр и проверка ниже (assert_check_result_invariants_
+# not_gated_or_escalated) делают невозможным молчаливый регресс, если кто-то
+# добавит один из них в CI_GATING/ESCALATING_INVARIANTS ДО того, как появится
+# отдельный канал для unknown (issue #1109, шаг 2).
+CHECK_RESULT_MIGRATED_INVARIANTS = frozenset({13, 14})
+
+
+def assert_check_result_invariants_not_gated_or_escalated(
+        ci_gating: frozenset[int], escalating_invariants: tuple[int, ...]) -> None:
+    """Падает громко, если инвариант, несущий CheckResult (issue #1096),
+    попал в CI_GATING или ESCALATING_INVARIANTS — оба читают `findings[N]`
+    по факту истинности списка, и unknown() там неотличим от «нарушений
+    нет». Вызывается из main() тем же приёмом, что и проверка `missing_gas`
+    рядом (AGENTS.md «Тормоз без газа не принимается» — падать ДО того, как
+    непроверенное состояние покрасит main, а не после)."""
+    collision = (ci_gating | set(escalating_invariants)) & CHECK_RESULT_MIGRATED_INVARIANTS
+    if collision:
+        raise RuntimeError(
+            f"инварианты {sorted(collision)} несут check_result.CheckResult "
+            "(issue #1096) и не могут гейтить/эскалировать по findings — "
+            "unknown() коллапсирует в findings[N]=[] неотличимо от ok() (см. "
+            "ai-review PR #1110); нужен отдельный канал для unknown ДО "
+            "добавления в CI_GATING/ESCALATING_INVARIANTS"
+        )
+
+
 def summary(lines: list[str]) -> None:
     text = "\n".join(lines) + "\n"
     print(text)
@@ -2606,6 +2656,11 @@ def main() -> int:
              "с правом administration (GITHUB_TOKEN его структурно не имеет, "
              "запускать вручную с admin-токеном владельца, не из CI)")
     args = parser.parse_args()
+
+    # Статическая проверка констант — не нужны ни repo, ни сеть (issue #1096,
+    # ai-review PR #1110, некритичное замечание 2): падаем громко ДО отчёта,
+    # если инвариант с CheckResult попал в CI_GATING/ESCALATING_INVARIANTS.
+    assert_check_result_invariants_not_gated_or_escalated(CI_GATING, ESCALATING_INVARIANTS)
 
     repo = os.environ["GITHUB_REPOSITORY"]
     now = datetime.now(timezone.utc)
