@@ -1,8 +1,11 @@
-# Tasks: quota-continuous-watch (#605)
+# Tasks: quota-continuous-watch (#605, #1100)
 
 Работа реализована в PR #607 (ветка `agent/605-quota-continuous-watch`);
 пункты отмечены по факту состояния кода на момент составления — каждый
-несёт свой критерий приёмки.
+несёт свой критерий приёмки. Раздел «Тренд и третье состояние» добавлен
+PR #1112 (#1100) — живой инцидент 2026-09-13 показал, что дедуп по
+переходу структурно не может предупредить о РОСТЕ, и что дедуп состояния
+был структурно мёртв (см. дельта-спеку, раздел MODIFIED).
 
 ## Каденция и стоимость
 
@@ -128,6 +131,51 @@
 - [x] Этот change: proposal + дельта-спека + tasks. Критерий: каталог
       существует, пункты выше отражают состояние кода.
 
+## Тренд и третье состояние (#1100, PR #1112)
+
+- [x] Корень дедупа: `pulse_guard.all_issue_comments(max_pages=N)` читал
+      буквальную `page=1..N` как «свежие страницы» — у эндпоинта GitHub
+      «List issue comments» нет `sort`/`direction`, страница 1 растущей
+      истории #120 ВСЕГДА самая старая (проверено живьём: `page=1` при 952
+      комментариях вернул комментарий от 2026-08-31). Фикс: метаданные
+      issue (число комментариев, один вызов) → настоящая последняя
+      страница. Критерий:
+      `test_pulse_guard.py::test_all_issue_comments_without_max_pages_
+      ignores_issue_metadata`,
+      `test_quota_watch.py::test_all_issue_comments_max_pages_bounds_
+      traversal`, `test_quota_alert.py::test_last_state_reads_only_fresh_
+      page_of_watchdog_history` (мутационно: возврат к чтению с начала
+      красит все три).
+- [x] Третье состояние `STATE_APPROACHING` (`quota_alert.classify_state`)
+      — по тренду (`last_reading`/`record_reading`), не только по текущему
+      pct. Горизонт 45 мин (3×`CHECK_INTERVAL_MINUTES`, синхронность держит
+      `test_quota_watch.py::test_trend_horizon_matches_check_interval`).
+      Approaching эскалирует без автозадачи; переход approaching→ok несёт
+      текст, отличный от breach→ok (не заявляет ложного пересечения
+      порога). Критерий: `test_quota_alert.py::test_approaching_*`,
+      `test_classify_state_*`, `test_recovery_from_approaching_does_not_
+      claim_threshold_was_crossed`, `test_recovery_from_breach_still_
+      mentions_the_task`.
+- [x] Числовой носитель тренда — редактируется на месте
+      (`pulse_guard.edit_issue_comment`), не растёт с частотой тиков.
+      Честная деградация («съезжает за страницу по мере роста #120,
+      теряет 1 сэмпл, самоисцеляется следующим тиком») названа в
+      докстринге `record_reading` и закреплена тестом
+      `test_reading_carrier_falling_off_fresh_page_self_heals_next_tick`.
+- [x] Собственная каденция для GitHub REST/GraphQL rate limit — новый шаг
+      workflow `github-rate-limit`, без CF-гейта (чтение `rate_limit`
+      бесплатно, проверено живьём), с независимым троттлингом
+      (`RATE_LIMIT_MIN_INTERVAL_MINUTES`). Стоимость измерена, не угадана
+      (см. докстринг константы в `quota_watch.py`): 4 REST-вызова на
+      троттлинг-тик, 10 на замер-тик без перехода (было 14 до передачи
+      уже прочитанного показания в `check_and_alert` через `prev_reading=`
+      — found: ревью PR #1112), 12 на первое наблюдение (было 16).
+      Критерий: `test_quota_watch.py::test_github_rate_limit_main_*`.
+- [x] Воспроизведение: `test_quota_alert.py::test_reproduction_1100_
+      trend_fires_before_exhaustion` — на исторических точках issue #1100
+      сигнал срабатывает в 07:33, за 53 минуты до исчерпания (08:26) и за
+      46 минут до первого реального отказа оркестратора (08:19).
+
 ## Приёмка (пост-мерж, до этого change не завершён)
 
 - [ ] Пост-мерж проверка видимого результата (не «CI зелёный»): первый
@@ -137,3 +185,8 @@
       данные Cloudflare; след дедупа (маркер состояния ресурса) появился
       в #120 после первого тика с замером. До этого пункта изменение
       считается незавершённым независимо от слияния PR.
+- [ ] Пост-мерж проверка видимого результата тренда (#1100): первый
+      прод-прогон `github-rate-limit` записал числовой носитель
+      (`[quota: замер gh_rest_rate_limit_hour = N% at …]`) в #120, и
+      второй прогон (15+ минут спустя) отредактировал ЕГО ЖЕ (не завёл
+      новый) — счётчик комментариев #120 от этого шага не растёт.

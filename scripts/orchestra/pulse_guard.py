@@ -1288,18 +1288,71 @@ def all_issue_comments(repo: str, issue_number: int, max_pages: int | None = Non
     подчёркивания), потому что читается и вне пары «предохранитель/пульс» —
     scheduler.resume_series_by_merge ищет в задачах след аренды (#220).
 
-    Обход — review_labels.list_pages (одно место правды на пагинацию и на
-    fail loud при неожиданной форме ответа, класс #308/дефект A #120: см.
-    комментарий у импорта review_labels выше — эта функция раньше несла
-    свою копию того же цикла с тем же силент-дефектом).
+    Обход БЕЗ `max_pages` (вся история) — review_labels.list_pages (одно
+    место правды на пагинацию и на fail loud при неожиданной форме ответа,
+    класс #308/дефект A #120: см. комментарий у импорта review_labels выше —
+    эта функция раньше несла свою копию того же цикла с тем же
+    силент-дефектом).
 
-    `max_pages` — ограничить обход первыми N СВЕЖИМИ страницами (None — как
-    раньше, вся история); проброшен в `list_pages` (#607: гейт сторожа квот
-    тикает на каждое PR-событие и по cron, а #120 копит сотни комментариев;
-    стоимость одного тика не должна расти с историей задачи)."""
-    return review_labels.list_pages(
-        f"repos/{repo}/issues/{issue_number}/comments?per_page=100", gh, max_pages=max_pages,
-    )
+    `max_pages` — ограничить обход первыми N СВЕЖИМИ страницами (найдено
+    #1100, находка F4 прочёса #1096: эндпоинт GitHub «List issue comments»
+    (`GET /repos/{owner}/{repo}/issues/{issue}/comments`) НЕ поддерживает
+    `sort`/`direction` — проверено живьём 2026-09-13: `page=1` issue #120
+    (952 комментария) вернул комментарий от 2026-08-31, и добавление
+    `&direction=desc&sort=created` к тому же запросу результат НЕ изменило
+    (параметры молча игнорируются). До этой правки `max_pages=N` буквально
+    листал страницы С НАЧАЛА (`page=1..N`), считая их «N свежих» — на самом
+    деле это N САМЫХ СТАРЫХ страниц: маркер, дописанный в конец растущей
+    истории, никогда не попадал в них, и любой вызывающий с `max_pages`
+    (quota_alert.last_state, quota_watch stale-маркеры простоя) читал
+    «состояние неизвестно» на каждом тике — ровно корень #1100 (114 копий
+    «первое наблюдение» в #120 вместо одной записи и одного перехода).
+
+    Фикс: вместо страниц с начала — метаданные issue (`GET
+    /repos/{owner}/{repo}/issues/{issue}`, поле `comments`, ОДИН дешёвый
+    вызов без пагинации) дают точное число комментариев, отсюда — номер
+    ПОСЛЕДНЕЙ страницы (`per_page=100`), и читаются последние `max_pages`
+    страниц НАПРЯМУЮ (без обхода с начала). Стоимость: `max_pages` вызовов
+    страниц + 1 вызов метаданных — на 1 вызов дороже прежнего (ошибочного)
+    поведения при max_pages=1, но теперь честно свежая. Цена гонки (комментарий
+    добавлен МЕЖДУ вызовом метаданных и вызовом страницы): новый комментарий
+    может лечь на страницу `last_page+1`, которую этот вызов не запросит —
+    тот же самозаживляющийся класс деградации, что и у остальных `max_pages`-
+    потребителей этого файла (следующий тик увидит его на пересчитанной
+    последней странице)."""
+    if max_pages is None:
+        return review_labels.list_pages(
+            f"repos/{repo}/issues/{issue_number}/comments?per_page=100", gh, max_pages=None,
+        )
+    try:
+        issue = gh(f"repos/{repo}/issues/{issue_number}")
+    except RuntimeError as error:
+        raise RuntimeError(
+            f"all_issue_comments: метаданные issue #{issue_number} недоступны "
+            f"(нужно число комментариев, чтобы вычислить свежую страницу): {error}"
+        ) from error
+    total = (issue or {}).get("comments")
+    if not isinstance(total, int):
+        raise RuntimeError(
+            f"all_issue_comments: issue #{issue_number} не несёт числового поля "
+            f"'comments' в ответе метаданных ({str(issue)[:200]!r}) — свежую "
+            "страницу вычислить нельзя"
+        )
+    if total == 0:
+        return []
+    last_page = (total + 99) // 100  # per_page=100, целочисленный потолок
+    first_page = max(1, last_page - max_pages + 1)
+    items: list[dict] = []
+    for page in range(first_page, last_page + 1):
+        chunk = gh(f"repos/{repo}/issues/{issue_number}/comments?per_page=100&page={page}")
+        if not isinstance(chunk, list):
+            raise RuntimeError(
+                f"all_issue_comments: неожиданный ответ на странице {page} для issue "
+                f"#{issue_number} — ожидался list, получено {type(chunk).__name__} "
+                f"({str(chunk)[:200]!r})"
+            )
+        items.extend(chunk)
+    return items
 
 
 def _marker_present(marker: str, body: str) -> bool:
@@ -1380,6 +1433,19 @@ def issue_markers_any(
 
 def post_issue_comment(repo: str, issue_number: int, text: str) -> None:
     gh("-X", "POST", f"repos/{repo}/issues/{issue_number}/comments", "-f", "body=" + text)
+
+
+def edit_issue_comment(repo: str, comment_id: int, text: str) -> None:
+    """PATCH — правит УЖЕ существующий комментарий на месте, не создаёт новый
+    (#1100, quota_alert.record_reading): числовые показания квоты для
+    расчёта тренда нужно копить между тиками, но НЕ ценой роста истории #120
+    (тот же класс, что и сам инцидент #1100 — 114 дублей одного маркера).
+    Редактирование одного и того же комментария держит счётчик комментариев
+    issue постоянным независимо от частоты тиков — растёт не число
+    комментариев, а история РЕДАКТИРОВАНИЯ одного, которую GitHub не
+    учитывает как новую активность и не показывает в списке `.../comments`
+    отдельной записью."""
+    gh("-X", "PATCH", f"repos/{repo}/issues/comments/{comment_id}", "-f", "body=" + text)
 
 
 def send_telegram(text: str, as_html: bool = False, reply_markup: dict | None = None) -> bool:
