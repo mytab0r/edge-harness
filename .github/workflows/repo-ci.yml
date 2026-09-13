@@ -89,25 +89,10 @@ jobs:
           python -m pytest scripts/lib/test_task_deps.py -q
 
       # Гвардия класса #179/#526: программное заведение issue пула (POST
-      # repos/{repo}/issues) обязано идти через ЕДИНУЮ точку
-      # scripts/lib/pool_issue.py::create_pool_issue — она физически не даёт
-      # создать issue без метки `task` (RuntimeError до сетевого вызова).
-      # Живой случай, который это закрывает: до #526 три места
-      # (file_tasks.py/scheduler.py/stall_detector.py) собирали
-      # `-f labels[]=task` каждое само по себе — расхождение было лишь
-      # вопросом времени для следующего добавленного места (upstream_drift.py
-      # оказалось четвёртым при сплошном прочёсе, тоже мигрировано). Сырой
-      # POST на этот эндпоинт вне pool_issue.py — рецидив, красит CI.
-      - name: Заведение issue пула — только через pool_issue.create_pool_issue (класс #179/#526)
-        run: |
-          if grep -rn 'repos/{repo}/issues"' scripts/orchestra/ scripts/lib/ scripts/review/ --include=*.py | grep -v 'scripts/lib/pool_issue.py'; then
-            echo "::error::сырой POST repos/{repo}/issues вне pool_issue.py (класс #179/#526) — используй pool_issue.create_pool_issue, иначе task можно забыть"
-            exit 1
-          fi
-          echo "orchestra+lib+review: заведение issue пула только через pool_issue.create_pool_issue"
-
-      # Единственная точка правды create_pool_issue, которую гвардия выше
-      # защищает статическим грепом, сама осталась без юнит-теста в CI
+      # Единственная точка правды create_pool_issue, которую защищает
+      # каталог-гвардия scripts/ci/guards/pool-issue-create-guard.sh
+      # (статический греп; мигрирована из рукописного шага job `test` —
+      # #1069, ревью PR #1117), сама осталась без юнит-теста в CI
       # (находка канарейки осиротевших тестов, #583): test_pool_issue.py
       # доказывает мутацией, что RuntimeError бросается ДО сетевого вызова gh.
       - name: Тесты create_pool_issue — отказ до сетевого вызова при отсутствии task
@@ -137,20 +122,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python scripts/lib/declared_deps.py wire "$GITHUB_REPOSITORY"
-
-      # Гвардия класса #124: keyword body= внутри gh-обёртки (gh(*args)) не
-      # принимается и роняет ВЕСЬ прогон оркестратора — 2026-08-31 мержи стояли,
-      # пока краш не заметил человек. Правильная форма: значение "-f", "body=…".
-      # scripts/lib включён с появления claim_task (#121): там свой gh-обёрточный
-      # скрипт — класс закрывается во всех точках входа, а не только в orchestra.
-      # scripts/review — с появления gh-обёрток ai_review/file_tasks (#18).
-      - name: Оркестрация без keyword-аргументов gh()
-        run: |
-          if grep -rnE ',\s*body=' scripts/orchestra/ scripts/lib/ scripts/review/; then
-            echo "::error::keyword body= в вызове gh() — роняет прогон оркестратора (класс #124)"
-            exit 1
-          fi
-          echo "orchestra+lib+review: keyword-аргументов нет"
 
       # Гвардия «дерево == задача» (#332): .githooks/pre-commit отклоняет коммит
       # в agent/<N>-* не из своего рабочего дерева — прогоняет РЕАЛЬНЫЙ файл

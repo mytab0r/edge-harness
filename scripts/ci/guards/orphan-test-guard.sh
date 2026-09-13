@@ -5,4 +5,6 @@
 # ребейзе, без содержательной правки run: — исходный комментарий шага
 # (если был) приведён ниже дословно.
 set -euo pipefail
-python scripts/lib/orphan_test_guard.py
+# Тело вынесено в носитель scripts/lib/test/orphan-test.guard.sh (#1069,
+# ревью PR #1117, находка 2) — см. exec-bit-guard.sh.
+bash scripts/lib/test/orphan-test.guard.sh

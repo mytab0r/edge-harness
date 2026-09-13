@@ -9,4 +9,7 @@
 # литерале, красная с ожидаемым сообщением на переименованном (это и
 # есть симуляция апстримного релиза, убившего кнопку создания).
 set -euo pipefail
-node --test dsh-edge/verify-provider-namespace.test.mjs
+# Тело вынесено в носитель scripts/lib/test/verify-provider-namespace.guard.sh
+# (#1069, ревью PR #1117, находка 2): `.test.mjs` в `dsh-edge/` канарейка
+# не видит — файл-носитель в `test/` делает удаление обёртки красным.
+bash scripts/lib/test/verify-provider-namespace.guard.sh

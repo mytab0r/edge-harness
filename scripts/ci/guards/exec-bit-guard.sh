@@ -5,4 +5,8 @@
 # ребейзе, без содержательной правки run: — исходный комментарий шага
 # (если был) приведён ниже дословно.
 set -euo pipefail
-python scripts/lib/exec_bit_guard.py
+# Тело вынесено в носитель scripts/lib/test/exec-bit.guard.sh (#1069,
+# ревью PR #1117, находка 2): канарейка осиротевших тестов видит файл
+# в `test/` и красит удаление этой обёртки — прямой python-вызов
+# `scripts/lib/exec_bit_guard.py` для её логики покрытия невидим.
+bash scripts/lib/test/exec-bit.guard.sh

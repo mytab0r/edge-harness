@@ -13,4 +13,7 @@
 # бамп на 0.1.5 в этом же PR). Проверяет и сам каталог репозитория, и
 # мутацию (просочившийся литерал красит гвардию).
 set -euo pipefail
-node --test dsh-edge/verify-catalog-namespace-literal.test.mjs
+# Тело вынесено в носитель
+# scripts/lib/test/verify-catalog-namespace-literal.guard.sh (#1069,
+# ревью PR #1117, находка 2) — см. verify-provider-namespace-guard.sh.
+bash scripts/lib/test/verify-catalog-namespace-literal.guard.sh

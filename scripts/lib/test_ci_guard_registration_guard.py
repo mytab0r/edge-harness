@@ -341,6 +341,7 @@ def test_check_message_advises_deletion_when_step_invokes_catalog_file(tmp_path)
     problems = crg.check_no_undeclared_step(
         path, frozenset({"Тесты X"}), catalog_dir=catalog_dir,
         job_state_exempt=frozenset(), infra_exempt=frozenset(), debt=frozenset(),
+        presence=frozenset(),
     )
     assert len(problems) == 1, problems
     assert "УЖЕ зарегистрирована" in problems[0]
@@ -375,6 +376,7 @@ def test_check_message_advises_deletion_when_catalog_already_runs_target(tmp_pat
     problems = crg.check_no_undeclared_step(
         path, frozenset({"Тесты X"}), catalog_dir=catalog_dir,
         job_state_exempt=frozenset(), infra_exempt=frozenset(), debt=frozenset(),
+        presence=frozenset(),
     )
     # Content-форма видна ДВУМ независимым сверкам (overlap по содержимому
     # и ветка газа «уже зарегистрирована») — обе в отчёте, ОБЕ советуют
@@ -498,14 +500,16 @@ def test_allowlist_job_state_exempt_entry_is_not_flagged(tmp_path):
 # python scripts/orchestra/repo_invariants.py) не виден НИЧЕМУ: ни детекции,
 # ни ALLOWLIST (туда и не попадал) — рукописная гвардия появлялась мимо всего
 # механизма (issue #1069, находка ревью PR #1117; живые жертвы — шесть
-# dsh-edge-проверок job `test`, учтённые теперь BARE_INVOCATION_MIGRATION_DEBT).
+# dsh-edge-проверок job `test`, учтённые теперь GUARD_MIGRATION_DEBT;
+# второй круг ревью расширил множество до ЛЮБЫХ форм рукописных гвардий
+# (grep-инварианты, compileall, bash -n, heredoc) — GUARD_MIGRATION_DEBT).
 #
 # Мутации, доказывающие гвардию:
 #   (1) вырезать вызов check_bare_invocations_are_accounted из
 #       check_no_undeclared_step → краснеет
 #       test_unaccounted_bare_step_is_flagged_through_check (witness проводки
 #       сверки в CI-гейт, а не только в тест);
-#   (2) убрать имя из BARE_INVOCATION_MIGRATION_DEBT (или из
+#   (2) убрать имя из GUARD_MIGRATION_DEBT (или из
 #       ALLOWLIST_JOB_STATE_EXEMPT) → краснеет
 #       test_live_repo_ci_bare_steps_are_all_accounted;
 #   (3) удалить/переименовать шаг «Инварианты состояния репозитория…» в
@@ -616,14 +620,14 @@ def test_stale_exemption_is_flagged(tmp_path):
     assert len(problems) == 3
     assert any("ALLOWLIST_JOB_STATE_EXEMPT" in p and "Мёртвая квота" in p for p in problems)
     assert any("INFRA_EXEMPT_STEP_NAMES" in p and "Мёртвый актёр" in p for p in problems)
-    assert any("BARE_INVOCATION_MIGRATION_DEBT" in p and "Мёртвый долг" in p for p in problems)
+    assert any("GUARD_MIGRATION_DEBT" in p and "Мёртвый долг" in p for p in problems)
 
 
 def test_debt_ratchet_flags_growth(tmp_path):
     """Рэтчет долга — «только вниз», тот же приём, что ALLOWLIST_RATCHET_MAX:
     без потолка текст отказа предлагал бы дописать имя в множество вместо
     переноса гвардии в каталог."""
-    debt = frozenset({f"Долг {i}" for i in range(crg.BARE_INVOCATION_MIGRATION_DEBT_MAX + 1)})
+    debt = frozenset({f"Долг {i}" for i in range(crg.GUARD_MIGRATION_DEBT_MAX + 1)})
     doc = {"jobs": {"test": {"steps": [
         {"name": name, "run": "node dsh-edge/x.mjs"} for name in sorted(debt)
     ]}}}
@@ -636,7 +640,7 @@ def test_debt_ratchet_flags_growth(tmp_path):
         debt=debt, allowlist=frozenset(),
     )
     assert len(problems) == 1
-    assert "BARE_INVOCATION_MIGRATION_DEBT_MAX" in problems[0]
+    assert "GUARD_MIGRATION_DEBT_MAX" in problems[0]
 
 
 def test_allowlist_bare_form_is_not_double_reported(tmp_path):
@@ -670,9 +674,9 @@ def test_live_repo_ci_bare_steps_are_all_accounted():
 
 
 def test_live_debt_is_within_ratchet_ceiling():
-    assert len(crg.BARE_INVOCATION_MIGRATION_DEBT) <= crg.BARE_INVOCATION_MIGRATION_DEBT_MAX, (
-        f"BARE_INVOCATION_MIGRATION_DEBT ({len(crg.BARE_INVOCATION_MIGRATION_DEBT)}) "
-        f"превысил потолок ({crg.BARE_INVOCATION_MIGRATION_DEBT_MAX}) — долг "
+    assert len(crg.GUARD_MIGRATION_DEBT) <= crg.GUARD_MIGRATION_DEBT_MAX, (
+        f"GUARD_MIGRATION_DEBT ({len(crg.GUARD_MIGRATION_DEBT)}) "
+        f"превысил потолок ({crg.GUARD_MIGRATION_DEBT_MAX}) — долг "
         "гвардий-к-миграции обязан убывать, не расти"
     )
 
@@ -745,3 +749,57 @@ def test_step_with_mixed_bare_invocations_reports_only_uncovered(tmp_path):
     assert head == "['dsh-edge/uncovered.mjs']"
     # Мутация: переведи носитель обратно на «первое попадание» — краснеет
     # («Полностью покрытый шаг» и mixed-шаг становятся чистыми мимо сверки).
+
+
+# ── GUARD_CATALOG_PRESENCE: обёртки, невидимые канарейке (ревью, находка 2) ──
+
+def test_guard_catalog_presence_flags_missing_wrapper(tmp_path):
+    """Файл GUARD_CATALOG_PRESENCE обязан лежать в каталоге: его удаление
+    канарейка осиротевших тестов не видит (носитель provider-default
+    покрыт ещё и из provider-latency-bench.yml) — membership защищает
+    только именованное множество."""
+    catalog_dir = tmp_path / "guards"
+    catalog_dir.mkdir()
+    (catalog_dir / "другая-гвардия.sh").write_text("echo hi\n", encoding="utf-8")
+    problems = crg.check_guard_catalog_presence(
+        catalog_dir, presence=frozenset({"provider-default-guard.sh"})
+    )
+    assert len(problems) == 1
+    assert "provider-default-guard.sh" in problems[0]
+
+
+def test_stale_presence_entry_is_flagged(tmp_path):
+    """Мёртвая запись presence-множества красит так же, как мёртвая
+    ALLOWLIST-запись: имя есть в множестве — файла в каталоге нет."""
+    catalog_dir = tmp_path / "guards"
+    catalog_dir.mkdir()
+    problems = crg.check_guard_catalog_presence(
+        catalog_dir, presence=frozenset({"снесённая-обёртка-guard.sh"})
+    )
+    assert len(problems) == 1
+    assert "снесённая-обёртка-guard.sh" in problems[0]
+
+
+def test_live_guard_catalog_presence_is_satisfied():
+    assert crg.check_guard_catalog_presence() == [], (
+        "обёртки GUARD_CATALOG_PRESENCE исчезли из scripts/ci/guards/ — "
+        "их удаление канарейка не увидела бы, локальный прогон молча "
+        "потерял бы гвардии"
+    )
+
+
+def test_live_debt_names_are_present_as_steps():
+    """Каждая запись GUARD_MIGRATION_DEBT — живое имя шага job `test`
+    (парсенная yaml-форма, включая усечённые «… (класс») — иначе учёт
+    вел бы в никуда."""
+    import yaml as _yaml
+    doc = _yaml.safe_load(
+        (REPO_ROOT / ".github" / "workflows" / "repo-ci.yml").read_text(encoding="utf-8")
+    )
+    names = {
+        (s.get("name") or "(без имени)") for s in doc["jobs"]["test"]["steps"]
+    }
+    missing = sorted(crg.GUARD_MIGRATION_DEBT - names)
+    assert missing == [], (
+        f"GUARD_MIGRATION_DEBT называет шаги, которых нет в repo-ci.yml: {missing}"
+    )
