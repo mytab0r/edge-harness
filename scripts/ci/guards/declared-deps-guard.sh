@@ -21,4 +21,11 @@
 set -euo pipefail
 pip install --quiet pytest
 python -m pytest scripts/lib/test_declared_deps.py -q
+# В CI $GITHUB_REPOSITORY дефолтна (окружение раннера), локально — нет:
+# при `set -u` незаданная переменная роняла бы гвардию на старте («unbound
+# variable») ДО самой проверки — эквивалентность локального run_guards.sh
+# и CI вывернулась бы наоборот (находка ревью PR #1117). Дефолт здесь —
+# единственный репозиторий конвейера; сеть и токен для GraphQL даёт
+# gh-аутентификация (в CI — GH_TOKEN шага-перебора, локально — gh auth).
+GITHUB_REPOSITORY="${GITHUB_REPOSITORY:-mytab0r/edge-harness}"
 python scripts/lib/declared_deps.py check "$GITHUB_REPOSITORY"

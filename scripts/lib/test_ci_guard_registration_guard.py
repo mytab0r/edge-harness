@@ -259,13 +259,19 @@ def test_check_clean_when_in_sync(tmp_path):
     # даже если found == allowlist.
     allowlist = frozenset({"Тесты X", "Smoke Y"})
     path = _write_repo_ci(tmp_path, ["Тесты X", "Smoke Y", "checkout"])
-    assert crg.check_no_undeclared_step(path, allowlist) == []
+    assert crg.check_no_undeclared_step(
+        path, allowlist,
+        job_state_exempt=frozenset(), infra_exempt=frozenset(), debt=frozenset(),
+    ) == []
 
 
 def test_check_reports_both_directions_at_once(tmp_path):
     allowlist = frozenset({"Тесты старая", "Тесты X"})
     path = _write_repo_ci(tmp_path, ["Тесты X", "Гвардия новая"])
-    problems = crg.check_no_undeclared_step(path, allowlist)
+    problems = crg.check_no_undeclared_step(
+        path, allowlist,
+        job_state_exempt=frozenset(), infra_exempt=frozenset(), debt=frozenset(),
+    )
     assert len(problems) == 2
     joined = " ".join(problems)
     assert "Гвардия новая" in joined
@@ -287,7 +293,10 @@ def test_check_message_names_exact_guard_filename_when_derivable(tmp_path):
             "run": "pip install --quiet pytest\npython -m pytest scripts/lib/test_scratch_thing.py -q\n",
         },
     ])
-    problems = crg.check_no_undeclared_step(path, frozenset({"Тесты X"}))
+    problems = crg.check_no_undeclared_step(
+        path, frozenset({"Тесты X"}),
+        job_state_exempt=frozenset(), infra_exempt=frozenset(), debt=frozenset(),
+    )
     assert len(problems) == 1
     assert "scripts/ci/guards/scratch-thing-guard.sh" in problems[0]
     assert "set -euo pipefail" in problems[0]
@@ -303,7 +312,10 @@ def test_check_message_falls_back_to_generic_rule_when_target_not_extractable(tm
         {"name": "Тесты X", "run": "echo hi"},
         {"name": "Гвардия новая инлайн-проверка", "run": "grep -rn foo scripts/ || exit 1"},
     ])
-    problems = crg.check_no_undeclared_step(path, frozenset({"Тесты X"}))
+    problems = crg.check_no_undeclared_step(
+        path, frozenset({"Тесты X"}),
+        job_state_exempt=frozenset(), infra_exempt=frozenset(), debt=frozenset(),
+    )
     assert len(problems) == 1
     assert "scripts/ci/guards/<имя>-guard.sh" in problems[0]
     assert "test_foo.py" in problems[0]  # правило именования объяснено примером
@@ -326,7 +338,10 @@ def test_check_message_advises_deletion_when_step_invokes_catalog_file(tmp_path)
         {"name": "Тесты X", "run": "echo hi"},
         {"name": "Проверка окружения", "run": "bash scripts/ci/guards/ci-guard-registration.sh"},
     ])
-    problems = crg.check_no_undeclared_step(path, frozenset({"Тесты X"}), catalog_dir=catalog_dir)
+    problems = crg.check_no_undeclared_step(
+        path, frozenset({"Тесты X"}), catalog_dir=catalog_dir,
+        job_state_exempt=frozenset(), infra_exempt=frozenset(), debt=frozenset(),
+    )
     assert len(problems) == 1, problems
     assert "УЖЕ зарегистрирована" in problems[0]
     assert "ci-guard-registration.sh" in problems[0]
@@ -357,7 +372,10 @@ def test_check_message_advises_deletion_when_catalog_already_runs_target(tmp_pat
         {"name": "Тесты X", "run": "echo hi"},
         {"name": "Гвардия регистрации CI-гвардий", "run": "python scripts/lib/ci_guard_registration_guard.py"},
     ])
-    problems = crg.check_no_undeclared_step(path, frozenset({"Тесты X"}), catalog_dir=catalog_dir)
+    problems = crg.check_no_undeclared_step(
+        path, frozenset({"Тесты X"}), catalog_dir=catalog_dir,
+        job_state_exempt=frozenset(), infra_exempt=frozenset(), debt=frozenset(),
+    )
     # Content-форма видна ДВУМ независимым сверкам (overlap по содержимому
     # и ветка газа «уже зарегистрирована») — обе в отчёте, ОБЕ советуют
     # удалить рукописный шаг; недопустимо только противоречие «создай».
@@ -470,3 +488,222 @@ def test_allowlist_job_state_exempt_entry_is_not_flagged(tmp_path):
     assert crg.check_allowlist_entries_are_migratable(
         path, allowlist, job_state_exempt=allowlist
     ) == []
+
+
+# ── check_bare_invocations_are_accounted: слепое пятно детекции ─────────────
+#
+# Пункты 1–4 модуля видят шаг по имени (Тест/Гвардия/Smoke/Юнит-тест) или по
+# «тестовому» содержимому run: (pytest/node --test/тестовый файл). Шаг под
+# НЕЙТРАЛЬНЫМ именем с «голым» вызовом файла (node dsh-edge/manifest.mjs,
+# python scripts/orchestra/repo_invariants.py) не виден НИЧЕМУ: ни детекции,
+# ни ALLOWLIST (туда и не попадал) — рукописная гвардия появлялась мимо всего
+# механизма (issue #1069, находка ревью PR #1117; живые жертвы — шесть
+# dsh-edge-проверок job `test`, учтённые теперь BARE_INVOCATION_MIGRATION_DEBT).
+#
+# Мутации, доказывающие гвардию:
+#   (1) вырезать вызов check_bare_invocations_are_accounted из
+#       check_no_undeclared_step → краснеет
+#       test_unaccounted_bare_step_is_flagged_through_check (witness проводки
+#       сверки в CI-гейт, а не только в тест);
+#   (2) убрать имя из BARE_INVOCATION_MIGRATION_DEBT (или из
+#       ALLOWLIST_JOB_STATE_EXEMPT) → краснеет
+#       test_live_repo_ci_bare_steps_are_all_accounted;
+#   (3) удалить/переименовать шаг «Инварианты состояния репозитория…» в
+#       repo-ci.yml → краснеет и presence-тест пары ниже, и та же live-сверка
+#       (мёртвое исключение).
+
+def test_unaccounted_bare_step_is_flagged(tmp_path):
+    """Шаг под нейтральным именем с «голым» вызовом, не учтённый ни одним
+    именованным множеством и не покрытый каталогом, обязан красить."""
+    doc = {"jobs": {"test": {"steps": [
+        {"name": "Канарейка окружения", "run": "node dsh-edge/manifest.mjs"},
+    ]}}}
+    path = tmp_path / "repo-ci.yml"
+    path.write_text(yaml.safe_dump(doc, allow_unicode=True), encoding="utf-8")
+    problems = crg.check_bare_invocations_are_accounted(
+        path,
+        catalog_dir=tmp_path / "нет-такого-каталога",
+        job_state_exempt=frozenset(),
+        infra_exempt=frozenset(),
+        debt=frozenset(),
+        allowlist=frozenset(),
+    )
+    assert len(problems) == 1
+    assert "Канарейка окружения" in problems[0]
+    assert "manifest.mjs" in problems[0]
+
+
+def test_unaccounted_bare_step_is_flagged_through_check(tmp_path):
+    """Мутация (1): та же находка обязана проходить и через CI-вход
+    check_no_undeclared_step — вырезание вызова сверки из него красит этот
+    тест (fixture: имя нейтральное, run: не pytest/node --test — шага не
+    видит ни детекция имени, ни содержимого, ни ALLOWLIST-сверка)."""
+    doc = {"jobs": {"test": {"steps": [
+        {"name": "Канарейка окружения", "run": "node dsh-edge/manifest.mjs"},
+    ]}}}
+    path = tmp_path / "repo-ci.yml"
+    path.write_text(yaml.safe_dump(doc, allow_unicode=True), encoding="utf-8")
+    problems = crg.check_no_undeclared_step(
+        path, frozenset(), catalog_dir=tmp_path / "нет-такого-каталога",
+        job_state_exempt=frozenset(), infra_exempt=frozenset(), debt=frozenset(),
+    )
+    assert problems != []
+    assert any("manifest.mjs" in p for p in problems)
+
+
+def test_bare_step_covered_by_catalog_is_accounted(tmp_path):
+    """«Голое» попадание, цель которого уже исполняет файл каталога, —
+    учтённое: локальный run_guards.sh её покрывает (а рукописный дубль
+    отдельно красит overlap-сверка — делие труда проверяется тут же)."""
+    doc = {"jobs": {"test": {"steps": [
+        {"name": "Канарейка окружения", "run": "node dsh-edge/manifest.mjs"},
+    ]}}}
+    path = tmp_path / "repo-ci.yml"
+    path.write_text(yaml.safe_dump(doc, allow_unicode=True), encoding="utf-8")
+    catalog_dir = tmp_path / "guards"
+    catalog_dir.mkdir()
+    (catalog_dir / "manifest-guard.sh").write_text(
+        "#!/usr/bin/env bash\nnode dsh-edge/manifest.mjs\n", encoding="utf-8"
+    )
+    assert crg.check_bare_invocations_are_accounted(
+        path, catalog_dir=catalog_dir,
+        job_state_exempt=frozenset(), infra_exempt=frozenset(),
+        debt=frozenset(), allowlist=frozenset(),
+    ) == []
+    assert crg.check_catalog_handwritten_overlap(path, catalog_dir) != []
+
+
+def test_bare_steps_in_named_exempts_are_accounted(tmp_path):
+    """Три именованных множества — три НАЗВАННЫЕ причины остаться
+    рукописным шагом (job-state / актёр / долг-к-миграции); шаг из любого
+    из них сверка не красит — иначе именованное исключение красило бы CI на
+    каждом прогоне без возможности его снять."""
+    steps = [
+        {"name": "Квота X", "run": "python scripts/lib/rate_guard.py --job x"},
+        {"name": "Инварианты X", "run": "python scripts/orchestra/x.py"},
+        {"name": "Автоперенос X", "run": "python scripts/lib/x.py wire repo"},
+        {"name": "Долг X", "run": "node dsh-edge/x.mjs"},
+    ]
+    doc = {"jobs": {"test": {"steps": steps}}}
+    path = tmp_path / "repo-ci.yml"
+    path.write_text(yaml.safe_dump(doc, allow_unicode=True), encoding="utf-8")
+    assert crg.check_bare_invocations_are_accounted(
+        path,
+        catalog_dir=tmp_path / "нет-такого-каталога",
+        job_state_exempt=frozenset({"Квота X", "Инварианты X"}),
+        infra_exempt=frozenset({"Автоперенос X"}),
+        debt=frozenset({"Долг X"}),
+        allowlist=frozenset(),
+    ) == []
+
+
+def test_stale_exemption_is_flagged(tmp_path):
+    """Мёртвое исключение красит так же, как мёртвая ALLOWLIST-запись:
+    имя есть в множестве, шага в job `test` больше нет."""
+    doc = {"jobs": {"test": {"steps": [
+        {"name": "Живой шаг", "run": "echo hi"},
+    ]}}}
+    path = tmp_path / "repo-ci.yml"
+    path.write_text(yaml.safe_dump(doc, allow_unicode=True), encoding="utf-8")
+    problems = crg.check_bare_invocations_are_accounted(
+        path,
+        catalog_dir=tmp_path / "нет-такого-каталога",
+        job_state_exempt=frozenset({"Мёртвая квота"}),
+        infra_exempt=frozenset({"Мёртвый актёр"}),
+        debt=frozenset({"Мёртвый долг"}),
+        allowlist=frozenset(),
+    )
+    assert len(problems) == 3
+    assert any("ALLOWLIST_JOB_STATE_EXEMPT" in p and "Мёртвая квота" in p for p in problems)
+    assert any("INFRA_EXEMPT_STEP_NAMES" in p and "Мёртвый актёр" in p for p in problems)
+    assert any("BARE_INVOCATION_MIGRATION_DEBT" in p and "Мёртвый долг" in p for p in problems)
+
+
+def test_debt_ratchet_flags_growth(tmp_path):
+    """Рэтчет долга — «только вниз», тот же приём, что ALLOWLIST_RATCHET_MAX:
+    без потолка текст отказа предлагал бы дописать имя в множество вместо
+    переноса гвардии в каталог."""
+    debt = frozenset({f"Долг {i}" for i in range(crg.BARE_INVOCATION_MIGRATION_DEBT_MAX + 1)})
+    doc = {"jobs": {"test": {"steps": [
+        {"name": name, "run": "node dsh-edge/x.mjs"} for name in sorted(debt)
+    ]}}}
+    path = tmp_path / "repo-ci.yml"
+    path.write_text(yaml.safe_dump(doc, allow_unicode=True), encoding="utf-8")
+    problems = crg.check_bare_invocations_are_accounted(
+        path,
+        catalog_dir=tmp_path / "нет-такого-каталога",
+        job_state_exempt=frozenset(), infra_exempt=frozenset(),
+        debt=debt, allowlist=frozenset(),
+    )
+    assert len(problems) == 1
+    assert "BARE_INVOCATION_MIGRATION_DEBT_MAX" in problems[0]
+
+
+def test_allowlist_bare_form_is_not_double_reported(tmp_path):
+    """ALLOWLIST-запись с «голой» формой называется
+    check_allowlist_entries_are_migratable (своё сообщение с критерием
+    #1069) — сверка по всем шагам её пропускает, двойной находки нет."""
+    allowlist = frozenset({"Канарейка X"})
+    doc = {"jobs": {"test": {"steps": [
+        {"name": "Канарейка X", "run": "node dsh-edge/x.mjs"},
+    ]}}}
+    path = tmp_path / "repo-ci.yml"
+    path.write_text(yaml.safe_dump(doc, allow_unicode=True), encoding="utf-8")
+    assert crg.check_bare_invocations_are_accounted(
+        path,
+        catalog_dir=tmp_path / "нет-такого-каталога",
+        job_state_exempt=frozenset(), infra_exempt=frozenset(),
+        debt=frozenset(), allowlist=allowlist,
+    ) == []
+    assert len(crg.check_allowlist_entries_are_migratable(path, allowlist)) == 1
+
+
+# ── живой репозиторий: учёт полон, пара quota/invariants на месте ────────────
+
+def test_live_repo_ci_bare_steps_are_all_accounted():
+    problems = crg.check_bare_invocations_are_accounted()
+    assert problems == [], (
+        "в job `test` .github/workflows/repo-ci.yml есть «голые» вызовы файлов "
+        f"(живые снимки/гвардии), не учтённые ни каталогом, ни именованными "
+        f"множествами: {problems}"
+    )
+
+
+def test_live_debt_is_within_ratchet_ceiling():
+    assert len(crg.BARE_INVOCATION_MIGRATION_DEBT) <= crg.BARE_INVOCATION_MIGRATION_DEBT_MAX, (
+        f"BARE_INVOCATION_MIGRATION_DEBT ({len(crg.BARE_INVOCATION_MIGRATION_DEBT)}) "
+        f"превысил потолок ({crg.BARE_INVOCATION_MIGRATION_DEBT_MAX}) — долг "
+        "гвардий-к-миграции обязан убывать, не расти"
+    )
+
+
+def test_quota_invariants_job_state_pair_is_present_in_repo_ci():
+    """Presence-тест пары ALLOWLIST_JOB_STATE_EXEMPT (#1069, ревью PR #1117):
+    квота несёт `id: quota`, шаг инвариантов читает её `outputs.skip` своим
+    `if:`. Удаление/переименование любого из двух шагов или обрыв проводки
+    `if:` → `id:` красит тест — исключение держится данными repo-ci.yml, а
+    не комментарием (тот же приём, что
+    test_catalog_perebor_step_itself_is_present_in_repo_ci)."""
+    doc = yaml.safe_load(
+        (REPO_ROOT / ".github" / "workflows" / "repo-ci.yml").read_text(encoding="utf-8")
+    )
+    steps = doc["jobs"]["test"]["steps"]
+    quota = [s for s in steps if s.get("name") == "Квота GitHub API — ранняя проверка (инварианты)"]
+    invariants = [
+        s for s in steps
+        if s.get("name") == "Инварианты состояния репозитория — живой снимок (7 — required)"
+    ]
+    assert len(quota) == 1 and quota[0].get("id") == "quota", (
+        "шаг «Квота GitHub API — ранняя проверка (инварианты)» с id: quota "
+        "исчез или потерял id — пара ALLOWLIST_JOB_STATE_EXEMPT мертва, "
+        "сними запись из множества или верни шаг"
+    )
+    assert len(invariants) == 1, (
+        "шаг «Инварианты состояния репозитория — живой снимок (7 — required)» "
+        "исчез или переименован — запись ALLOWLIST_JOB_STATE_EXEMPT мертва"
+    )
+    assert invariants[0].get("if") == "steps.quota.outputs.skip != 'true'", (
+        "шаг инвариантов не читает steps.quota.outputs.skip своим if: — "
+        "межшаговая зависимость пары ALLOWLIST_JOB_STATE_EXEMPT оборвана, "
+        "основание исключения больше не действует"
+    )
