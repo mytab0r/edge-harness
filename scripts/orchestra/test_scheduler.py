@@ -5585,6 +5585,20 @@ def test_session_progress_tip_empty_events_is_unavailable(monkeypatch):
     assert "пусты" in error
 
 
+def test_session_progress_tip_missing_events_field_names_actual_response_shape(monkeypatch):
+    # Некритичное замечание ai-review PR #1089: «нет поля events вовсе»
+    # (морда сменила форму ответа) — ДРУГОЙ факт, чем «events реально пуст»
+    # (сессия правда молчит). Схлопывать их в одну причину значило бы
+    # утверждать «события пока пусты», не проверив это (алерт не гадает).
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
+    monkeypatch.setattr(sch, "_morde_rpc", lambda opener, method, payload, **kw: {"hasMore": False})
+    seq, error = sch._session_progress_tip("harness-1085")
+    assert seq is None
+    assert "без поля events" in error and "hasMore" in error
+
+
 def test_worker_silence_reason_first_observation_posts_baseline_marker(monkeypatch):
     monkeypatch.setattr(sch, "_session_progress_tip", lambda session_id: (10, None))
     fake = FakeGh({

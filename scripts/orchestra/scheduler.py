@@ -2644,7 +2644,14 @@ def _session_progress_tip(session_id: str) -> tuple[int | None, str | None]:
         )
     except (RuntimeError, OSError, urllib.error.URLError, ValueError) as error:
         return None, str(error)
-    events = value.get("events") if isinstance(value, dict) else None
+    # Некритичное замечание ai-review PR #1089: «нет поля events» и «events
+    # реально пуст» — разные факты (морда сменила форму ответа vs сессия
+    # правда молчит), схлопывать их в одну причину значило бы врать о форме
+    # ответа при следующем несовпадении контракта (AGENTS.md, «алерт не
+    # гадает»). Различаем явно, а не общим `.get("events") or []`.
+    if not isinstance(value, dict) or "events" not in value:
+        return None, f"ответ session.history без поля events: {str(value)[:200]!r}"
+    events = value.get("events")
     seqs = []
     for item in (events or []):
         event = item.get("event") if isinstance(item, dict) else None
