@@ -142,7 +142,12 @@ jobs:
       # тяжёлых шагов выше (пагинированный список слитых PR + compare API
       # на кандидата); continue-on-error — тот же приём, что у гвардий ниже:
       # красный шаг виден (fail loud), но не гасит зелёный статус job'а,
-      # который читает пульс (heartbeat_check, #120).
+      # который читает пульс (heartbeat_check, #120). DSH_EDGE_URL — находка
+      # ai-review PR #1046 (круг 4): compute_evidence переиспользует
+      # scheduler.deploy_evidence для deploy-категории улики, а та без этой
+      # переменной бросает RuntimeError («DSH_EDGE_URL не задан») — не сбой
+      # проверки, а недонастройка шага, каждый deploy-кандидат навсегда уходил
+      # бы в 🚨-эскалацию. `/api/health` публичный — ключ доступа не нужен.
       - name: Приёмка по ссылке — чужие задачи слитого PR (#1042)
         if: steps.quota.outputs.skip != 'true'
         continue-on-error: true
@@ -152,6 +157,7 @@ jobs:
           # pulse_guard.escalate всегда вернёт «НЕ доставлен» (нет токена/чата).
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DSH_EDGE_URL: ${{ vars.DSH_EDGE_URL }}
         run: python scripts/orchestra/reference_closure.py
 
       # Гвардия «протухшей» метки blocked (#334): чисто читающий шаг, ничего

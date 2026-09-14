@@ -364,6 +364,23 @@ _PR_841_FRAGMENT = (
     "`--body-file` у `gh secret set`.\n"
 )
 
+# Живые ложные срабатывания прошедшего времени (находка ai-review PR #1046,
+# круг 4, живой пул 323 слитых PR) — дословно из тел уже слитых PR #576 и
+# #358 (проверено `gh pr view <N> --json body`, 2026-09-14).
+_PR_576_PAST_TENSE_FRAGMENT = (
+    "дедуп следа доверяет телу чужого комментария** — `notify_head_moved` "
+    "ищет marker в любом комментарии PR, включая посторонние — это тот же "
+    "класс, что закрыла #294 («доверять телу комментария можно только "
+    "после проверки автора»)"
+)
+
+_PR_358_PAST_TENSE_FRAGMENT = (
+    "Три места класса «действие раньше проверки предусловия» (гвардия "
+    "срабатывает постфактум вместо проверки на входе), живой случай — "
+    "приёмка закрыла #320, пока по нему был открыт второй PR #325 (упал "
+    "на contract):"
+)
+
 
 def test_also_closes_targets_real_pr_986_declares_issue_507():
     assert task_ref.also_closes_targets(_PR_986_FRAGMENT) == [507]
@@ -384,6 +401,36 @@ def test_also_closes_targets_rejects_noun_form():
     # корень `закры[а-я]*` (первая попытка регэкспа) матчил бы оба фрагмента
     # неразличимо; список конкретных форм отклоняет именно этот.
     assert task_ref.also_closes_targets(_PR_986_FALSE_POSITIVE_FRAGMENT) == []
+
+
+def test_also_closes_targets_rejects_past_tense_narrative():
+    # Находка ai-review PR #1046 (круг 4, живой пул 323 слитых PR): форма
+    # ПРОШЕДШЕГО времени («закрыла»/«закрыли») ловит повествование о ЧУЖОМ
+    # прошлом действии («приёмка закрыла #320», «тот же класс, что закрыла
+    # #294»), не заявление ЭТОГО PR о себе — ни один из живых НАСТОЯЩИХ
+    # случаев (#986/#952/#841) прошедшего времени не использует (см.
+    # докстринг _ALSO_CLOSES_RE). Список форм урезан до настоящего времени и
+    # причастия текущего состояния — оба живых фрагмента больше не матчат.
+    assert task_ref.also_closes_targets(_PR_576_PAST_TENSE_FRAGMENT) == []
+    assert task_ref.also_closes_targets(_PR_358_PAST_TENSE_FRAGMENT) == []
+
+
+def test_also_closes_targets_mutation_past_tense_regresses_on_live_pr_576_358():
+    # Мутация: верни форму прошедшего времени в список (состояние ДО находки
+    # ai-review PR #1046, круг 4) — воспроизводим её здесь напрямую, не
+    # полагаясь на то, что кто-то повторит ту же правку в исходнике.
+    import re
+    past_tense_re = re.compile(
+        r"(?i)\b(?:закрывает|закрываю|закрыл[аио]?|закрыт[аоы]?)\b"
+        r"(?:\s+(?:issue|класс))?\s*#(\d+)"
+    )
+    assert [int(m.group(1)) for m in past_tense_re.finditer(_PR_576_PAST_TENSE_FRAGMENT)] == [294], \
+        "мутация (прошедшее время в списке) обязана воспроизводить ложное срабатывание на #294"
+    assert [int(m.group(1)) for m in past_tense_re.finditer(_PR_358_PAST_TENSE_FRAGMENT)] == [320], \
+        "мутация (прошедшее время в списке) обязана воспроизводить ложное срабатывание на #320"
+    # А актуальный код (без прошедшего времени) — нет:
+    assert task_ref.also_closes_targets(_PR_576_PAST_TENSE_FRAGMENT) == []
+    assert task_ref.also_closes_targets(_PR_358_PAST_TENSE_FRAGMENT) == []
 
 
 def test_also_closes_targets_ignores_number_before_verb():

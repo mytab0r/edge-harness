@@ -417,6 +417,85 @@ def test_run_reports_no_candidates_line_when_nothing_found(monkeypatch):
     assert len(lines) == 1 and lines[0].startswith("💗")
 
 
+# ── Находка ai-review PR #1046 (круг 4, живой прогон на 323 слитых PR): ──────
+# структурные и ОКОНЧАТЕЛЬНЫЕ пропуски (номер — не issue вовсе, 404) не
+# обязаны краснить шаг каждый прогон — тихий ⏭️, не ⚠️ (AGENTS.md, «тормоз
+# без газа не принимается»). Живой триггер: кандидат #294 из тела PR #576.
+
+
+class _Fake404Gh:
+    """gh(), у которого GET issues/<number> отвечает 404 — тот же класс
+    ошибки, что и «номер вообще не issue репозитория» (не транзиентный сбой)."""
+
+    def __call__(self, *args):
+        url = args[0]
+        if url.startswith("repos/") and "/issues/" in url:
+            raise RuntimeError(f"gh api {url}: HTTP 404: Not Found (https://api.github.com/{url})")
+        raise AssertionError(f"неожиданный вызов gh в этом тесте: {args}")
+
+
+def test_run_treats_404_issue_read_as_quiet_final_skip_not_loud_warning(monkeypatch):
+    # Живой триггер (находка): кандидат #294 из тела PR #576 — issue не
+    # существует под этим номером репозитория. Не транзиентный сбой,
+    # следующий прогон даст тот же результат — тихий ⏭️, exit_code 0.
+    monkeypatch.setattr(rc, "gh", _Fake404Gh())
+    monkeypatch.setattr(rc.scheduler, "all_merged_pulls", lambda repo: [_PR_986])
+    monkeypatch.setattr(rc.scheduler, "open_pulls", lambda repo: [])
+
+    lines = rc.run("mytab0r/edge-harness")
+
+    assert any(line.startswith("⏭️") and "404" in line for line in lines)
+    assert not any(line.startswith("⚠️") for line in lines)
+    assert rc.exit_code(lines) == 0
+
+
+class _FakeTransientErrorGh:
+    """gh(), у которого GET issues/<number> падает НЕ 404 (рейт-лимит/сеть,
+    класс #454) — транзиентный сбой, следующий прогон может дать другой
+    результат, поэтому остаётся громким ⚠️."""
+
+    def __call__(self, *args):
+        url = args[0]
+        if url.startswith("repos/") and "/issues/" in url:
+            raise RuntimeError(f"gh api {url}: HTTP 403: API rate limit exceeded")
+        raise AssertionError(f"неожиданный вызов gh в этом тесте: {args}")
+
+
+def test_run_treats_non_404_issue_read_failure_as_loud_transient_warning(monkeypatch):
+    monkeypatch.setattr(rc, "gh", _FakeTransientErrorGh())
+    monkeypatch.setattr(rc.scheduler, "all_merged_pulls", lambda repo: [_PR_986])
+    monkeypatch.setattr(rc.scheduler, "open_pulls", lambda repo: [])
+
+    lines = rc.run("mytab0r/edge-harness")
+
+    assert any(line.startswith("⚠️") and "не удалось прочитать issue" in line for line in lines)
+    assert rc.exit_code(lines) == 1
+
+
+class _FakePullRequestIssueGh:
+    """gh(), у которого GET issues/<number> отвечает объектом PR (несёт ключ
+    pull_request) — номер существует, но это PR, не задача. Структурный и
+    окончательный исход, не изменится на следующем прогоне."""
+
+    def __call__(self, *args):
+        url = args[0]
+        if url.startswith("repos/") and "/issues/" in url:
+            return {"number": 507, "pull_request": {"url": "..."}}
+        raise AssertionError(f"неожиданный вызов gh в этом тесте: {args}")
+
+
+def test_run_treats_pull_request_number_as_quiet_final_skip_not_loud_warning(monkeypatch):
+    monkeypatch.setattr(rc, "gh", _FakePullRequestIssueGh())
+    monkeypatch.setattr(rc.scheduler, "all_merged_pulls", lambda repo: [_PR_986])
+    monkeypatch.setattr(rc.scheduler, "open_pulls", lambda repo: [])
+
+    lines = rc.run("mytab0r/edge-harness")
+
+    assert any(line.startswith("⏭️") and "не issue задачи" in line for line in lines)
+    assert not any(line.startswith("⚠️") for line in lines)
+    assert rc.exit_code(lines) == 0
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # merge_commit_on_main — «проверка сломана» не маскируется под «не предок»
 # (находка ревью PR #1046, чеклист) — AGENTS.md, «Алерт не гадает»
@@ -661,6 +740,27 @@ def test_pipeline_wiring_orchestra_yml_calls_reference_closure():
     assert "python scripts/orchestra/reference_closure.py" in yml, (
         "шаг «Приёмка по ссылке» удалён из orchestra.yml — модуль снова "
         "мёртвый код: класс #507/#661/#786 возвращается к ручной ревизии")
+
+
+def test_pipeline_wiring_reference_closure_step_has_dsh_edge_url():
+    # Находка ai-review PR #1046 (круг 4): compute_evidence переиспользует
+    # scheduler.deploy_evidence для deploy-категории улики — без DSH_EDGE_URL
+    # тот кидает RuntimeError («не задан»), каждый deploy-кандидат навсегда
+    # уходил бы в 🚨-эскалацию с неверной формулировкой «не смогла проверить
+    # улику» (недонастройка шага, не сбой проверки). Проверяем именно БЛОК
+    # этого шага (между его именем и следующим `- name:`), не файл целиком —
+    # DSH_EDGE_URL стоит и у соседнего шага «Обход пула», найти его там не
+    # значит, что он передан ЭТОМУ шагу.
+    yml_path = _DIR.parent.parent / ".github" / "workflows" / "orchestra.yml"
+    yml = yml_path.read_text(encoding="utf-8")
+    start = yml.index("Приёмка по ссылке — чужие задачи слитого PR (#1042)")
+    rest = yml[start:]
+    next_step = rest.find("\n      - name:", 1)
+    step_block = rest if next_step == -1 else rest[:next_step]
+    assert "DSH_EDGE_URL" in step_block, (
+        "шаг «Приёмка по ссылке» не передаёт DSH_EDGE_URL — deploy-категория "
+        "улики (compute_evidence → scheduler.deploy_evidence) упадёт "
+        "RuntimeError'ом на каждом deploy-кандидате")
 
 
 # ══════════════════════════════════════════════════════════════════════════
