@@ -16,6 +16,11 @@
   докстринге модуля.
 - `OPEN_PR_1209` — дословно урезанный `gh api
   repos/mytab0r/edge-harness/pulls/1209` (2026-09-14).
+- Маркеры в фикстурах-комментариях авторства `github-actions[bot]` — это
+  ПРОД-форма: workflow пишет под `github.token`, а чтение маркеров в модуле
+  фильтрует автора `trusted_login=EVENT_ACTOR_LOGIN` (находка ревью PR
+  #1212, #1027) — комментарий чужого автора маркер-дедуп не создаёт и
+  проверяется отдельным тестом ниже.
 
 Запуск: python -m pytest scripts/orchestra/test_zombie_run_watch.py -q
 """
@@ -50,6 +55,20 @@ def patch_gh(monkeypatch, fake):
     же fake (тот же приём, что test_dependabot_alert_watch.py::patch_gh)."""
     monkeypatch.setattr(zrw, "gh", fake)
     monkeypatch.setattr(pg, "gh", fake)
+
+
+def patch_escalate(monkeypatch, result="Telegram: доставлен; след в #120: оставлен"):
+    """Подмена канала эскалации с записью вызовов: возвращает (calls,
+    result) — result по умолчанию «оба канала живы», чтобы предикат
+    escalation_channel_failed не красил прогон."""
+    calls: list[tuple[str, int, str]] = []
+
+    def fake(repo, issue_number, text, options=None):
+        calls.append((repo, issue_number, text))
+        return result
+
+    monkeypatch.setattr(zrw, "escalate", fake)
+    return calls
 
 
 def utc(*args):
@@ -231,6 +250,8 @@ def test_stale_but_not_zombie_run_no_action(monkeypatch):
         "actions/runs?event=pull_request&status=queued": {"workflow_runs": [ZOMBIE_RUN_ORCHESTRA]},
         "pulls?state=open": [OPEN_PR_1088_MATCHING],
         f"issues/1088/comments": [],
+        # запасной носитель маркера (#120) читается, когда в PR маркера нет
+        f"issues/{pg.WATCHDOG_ISSUE}/comments": [],
         "actions/runs/34748469966/jobs": {"total_count": 3, "jobs": [{}]},
     })
     patch_gh(monkeypatch, fake)
@@ -243,6 +264,7 @@ def test_confirmed_zombie_on_open_pr_triggers_reopen(monkeypatch):
         "actions/runs?event=pull_request&status=queued": {"workflow_runs": [ZOMBIE_RUN_ORCHESTRA]},
         "pulls?state=open": [OPEN_PR_1088_MATCHING],
         "issues/1088/comments": [],
+        f"issues/{pg.WATCHDOG_ISSUE}/comments": [],
         "actions/runs/34748469966/jobs": ZOMBIE_JOBS_EMPTY,
         "-X POST": None,
         "-X PATCH": None,
@@ -255,6 +277,14 @@ def test_confirmed_zombie_on_open_pr_triggers_reopen(monkeypatch):
     assert any("state=open" in c for c in patch_calls)
     comment_calls = [c for c in fake.calls if "-X POST" in c and "issues/1088/comments" in c]
     assert len(comment_calls) == 1
+    # Порядок действия (находка ревью PR #1212): close→reopen ПЕРВЫМИ,
+    # маркер-отчёт — только после успеха. Мутация (вернуть порядок
+    # «комментарий → действие») красит этот тест: комментарий с маркером,
+    # записанный до действия, при отказе посередине навсегда глушит газ.
+    closed_idx = fake.calls.index(next(c for c in fake.calls if "state=closed" in c))
+    opened_idx = fake.calls.index(next(c for c in fake.calls if "state=open" in c))
+    post_idx = fake.calls.index(comment_calls[0])
+    assert closed_idx < post_idx and opened_idx < post_idx
 
 
 def test_zombie_matching_stale_head_is_not_touched(monkeypatch):
@@ -281,9 +311,59 @@ def test_permanent_zombie_after_reopen_is_not_reescalated(monkeypatch):
         "actions/runs?event=pull_request&status=queued": {"workflow_runs": [ZOMBIE_RUN_ORCHESTRA]},
         "pulls?state=open": [OPEN_PR_1088_MATCHING],
         "issues/1088/comments": [
-            {"created_at": "2026-09-13T09:00:00Z", "body": reopened_marker, "user": {"login": "x"}},
+            {"created_at": "2026-09-13T09:00:00Z", "body": reopened_marker,
+             "user": {"login": "github-actions[bot]"}},
         ],
         "actions/runs/34748469966/jobs": AssertionError("не должен вызываться — старый permanent-зомби"),
+    })
+    patch_gh(monkeypatch, fake)
+    observations, actions = zrw.zombie_run_watch(REPO, NOW)
+    assert actions == []
+    assert any("известный старый зомби-прогон" in o for o in observations)
+
+
+def test_marker_from_other_author_is_not_dedup(monkeypatch):
+    """Мутация-гвардия trusted_login (находка ревью PR #1212, #1027):
+    маркер в комментарии ЧУЖОГО автора (цитата, пересказ) дедупом не
+    является — сторож обязан выполнить газ, а не молча сослаться на чужой
+    текст. Снятие фильтра в модуле красит этот тест: чужой комментарий
+    заблокировал бы действие."""
+    reopened_marker = "[zombie-run-watch: переэмиссия 9a75c414]"
+    fake = FakeGh({
+        "actions/runs?event=pull_request&status=queued": {"workflow_runs": [ZOMBIE_RUN_ORCHESTRA]},
+        "pulls?state=open": [OPEN_PR_1088_MATCHING],
+        "issues/1088/comments": [
+            {"created_at": "2026-09-13T09:00:00Z",
+             "body": f"Цитата чужого отчёта: {reopened_marker}",
+             "user": {"login": "some-human"}},
+        ],
+        f"issues/{pg.WATCHDOG_ISSUE}/comments": [],
+        "actions/runs/34748469966/jobs": ZOMBIE_JOBS_EMPTY,
+        "-X POST": None,
+        "-X PATCH": None,
+    })
+    patch_gh(monkeypatch, fake)
+    observations, actions = zrw.zombie_run_watch(REPO, NOW)
+    assert any("переоткрыт" in a for a in actions)
+
+
+def test_fallback_dedup_anchor_in_watchdog_issue_blocks_repeat_gas(monkeypatch):
+    """Случай (в) докстринга — «газ применён, отчёт в PR не записан»:
+    эскалация унесла маркер переэмиссии в #120, следующий пульс, не найдя
+    маркера в PR, читает его из #120 и ПОВТОРНОЙ переэмиссии не делает
+    (контракт «одна попытка на head_sha» держится на обоих носителях)."""
+    reopened_marker = "[zombie-run-watch: переэмиссия 9a75c414]"
+    fake = FakeGh({
+        "actions/runs?event=pull_request&status=queued": {"workflow_runs": [ZOMBIE_RUN_ORCHESTRA]},
+        "pulls?state=open": [OPEN_PR_1088_MATCHING],
+        "issues/1088/comments": [],
+        f"issues/{pg.WATCHDOG_ISSUE}/comments": [
+            {"created_at": "2026-09-13T09:00:05Z",
+             "body": f"[zombie-run-watch: отчёт-не-записан PR#1088@9a75c414] "
+                     f"Переэмиссия ВЫПОЛНЕНА, отчёт не записан ({reopened_marker})",
+             "user": {"login": "github-actions[bot]"}},
+        ],
+        "actions/runs/34748469966/jobs": AssertionError("не должен вызываться — дедуп по запасному носителю"),
     })
     patch_gh(monkeypatch, fake)
     observations, actions = zrw.zombie_run_watch(REPO, NOW)
@@ -302,7 +382,8 @@ def test_genuine_recurrence_after_reopen_escalates_once(monkeypatch):
         "actions/runs?event=pull_request&status=queued": {"workflow_runs": [new_zombie_run]},
         "pulls?state=open": [OPEN_PR_1088_MATCHING],
         "issues/1088/comments": [
-            {"created_at": "2026-09-13T09:00:00Z", "body": reopened_marker, "user": {"login": "x"}},
+            {"created_at": "2026-09-13T09:00:00Z", "body": reopened_marker,
+             "user": {"login": "github-actions[bot]"}},
         ],
         "actions/runs/999999/jobs": ZOMBIE_JOBS_EMPTY,
         f"issues/{pg.WATCHDOG_ISSUE}/comments": [],
@@ -324,11 +405,13 @@ def test_escalation_not_repeated_once_already_marked(monkeypatch):
         "actions/runs?event=pull_request&status=queued": {"workflow_runs": [new_zombie_run]},
         "pulls?state=open": [OPEN_PR_1088_MATCHING],
         "issues/1088/comments": [
-            {"created_at": "2026-09-13T09:00:00Z", "body": reopened_marker, "user": {"login": "x"}},
+            {"created_at": "2026-09-13T09:00:00Z", "body": reopened_marker,
+             "user": {"login": "github-actions[bot]"}},
         ],
         "actions/runs/999999/jobs": ZOMBIE_JOBS_EMPTY,
         f"issues/{pg.WATCHDOG_ISSUE}/comments": [
-            {"created_at": "2026-09-13T10:05:00Z", "body": escalation_marker, "user": {"login": "x"}},
+            {"created_at": "2026-09-13T10:05:00Z", "body": escalation_marker,
+             "user": {"login": "github-actions[bot]"}},
         ],
     })
     patch_gh(monkeypatch, fake)
@@ -337,6 +420,116 @@ def test_escalation_not_repeated_once_already_marked(monkeypatch):
     observations, actions = zrw.zombie_run_watch(REPO, NOW)
     assert actions == []
     assert any("рецидив уже эскалирован" in o for o in observations)
+
+
+def test_close_failure_does_not_write_marker_comment(monkeypatch):
+    """Форма (а) находки ревью PR #1212: close не прошёл — состояние PR не
+    менялось, газа не было, маркер-комментарий НЕ пишется (иначе следующий
+    пульс принял бы «переэмиссия уже была» и навсегда заглушил бы газ,
+    потратив попытку впустую). Мутация (комментарий до действия) красит
+    этот тест."""
+    fake = FakeGh({
+        "actions/runs?event=pull_request&status=queued": {"workflow_runs": [ZOMBIE_RUN_ORCHESTRA]},
+        "pulls?state=open": [OPEN_PR_1088_MATCHING],
+        "issues/1088/comments": [],
+        f"issues/{pg.WATCHDOG_ISSUE}/comments": [],
+        "actions/runs/34748469966/jobs": ZOMBIE_JOBS_EMPTY,
+        "state=closed": RuntimeError("secondary rate limit"),
+        "state=open": AssertionError("reopen не должен вызываться — close не прошёл"),
+        "-X POST": AssertionError("комментарий-маркер при непрошедшем действии не пишется"),
+    })
+    patch_gh(monkeypatch, fake)
+    observations, actions = zrw.zombie_run_watch(REPO, NOW)
+    assert actions == []
+    assert any("закрытие не выполнено" in o for o in observations)
+    assert not any("-X POST" in c for c in fake.calls)
+
+
+def test_reopen_failure_after_close_escalates_and_reports_closed_pr(monkeypatch):
+    """Форма (б): close прошёл, reopen не прошёл — PR ОСТАЛСЯ ЗАКРЫТЫМ,
+    сторож смотрит только открытые PR и сам к нему не вернётся, поэтому
+    эскалация немедленно, а не в ⚠️ observations. Комментарий-маркер в PR
+    не пишется (переэмиссия не состоялась)."""
+    calls = patch_escalate(monkeypatch)
+    fake = FakeGh({
+        "actions/runs?event=pull_request&status=queued": {"workflow_runs": [ZOMBIE_RUN_ORCHESTRA]},
+        "pulls?state=open": [OPEN_PR_1088_MATCHING],
+        "issues/1088/comments": [],
+        f"issues/{pg.WATCHDOG_ISSUE}/comments": [],
+        "actions/runs/34748469966/jobs": ZOMBIE_JOBS_EMPTY,
+        "state=closed": None,
+        "state=open": RuntimeError("422 reopen rejected"),
+        "-X POST": AssertionError("маркер-комментарий не пишется — переэмиссия не состоялась"),
+    })
+    patch_gh(monkeypatch, fake)
+    observations, actions = zrw.zombie_run_watch(REPO, NOW)
+    assert len(calls) == 1
+    assert "ОСТАЛСЯ ЗАКРЫТЫМ" in calls[0][2]
+    assert "1088" in calls[0][2]
+    assert any("ЗАКРЫТ без переоткрытия" in a for a in actions)
+
+
+def test_reopen_failure_with_dead_channels_reddens_pulse(monkeypatch):
+    """Форма (б) + отказ самой эскалации (оба канала молчат) — молча
+    оставить закрытый PR нельзя: прогон краснеет (fail loud)."""
+    patch_escalate(monkeypatch, result="Telegram: НЕ доставлен; след в #120: НЕ оставлен")
+    fake = FakeGh({
+        "actions/runs?event=pull_request&status=queued": {"workflow_runs": [ZOMBIE_RUN_ORCHESTRA]},
+        "pulls?state=open": [OPEN_PR_1088_MATCHING],
+        "issues/1088/comments": [],
+        f"issues/{pg.WATCHDOG_ISSUE}/comments": [],
+        "actions/runs/34748469966/jobs": ZOMBIE_JOBS_EMPTY,
+        "state=closed": None,
+        "state=open": RuntimeError("422 reopen rejected"),
+        "-X POST": AssertionError("маркер-комментарий не пишется — переэмиссия не состоялась"),
+    })
+    patch_gh(monkeypatch, fake)
+    with pytest.raises(RuntimeError, match="остался ЗАКРЫТЫМ"):
+        zrw.zombie_run_watch(REPO, NOW)
+
+
+def test_report_comment_failure_escalates_with_reopened_marker(monkeypatch):
+    """Форма (в): газ ПРИМЕНЁН (close и reopen прошли), отчёт-маркер в PR
+    не записан — эскалация в #120 обязана нести САМ маркер переэмиссии
+    (он становится запасным носителем дедупа, проверен соседним тестом
+    test_fallback_dedup_anchor_in_watchdog_issue_blocks_repeat_gas)."""
+    calls = patch_escalate(monkeypatch)
+    fake = FakeGh({
+        "actions/runs?event=pull_request&status=queued": {"workflow_runs": [ZOMBIE_RUN_ORCHESTRA]},
+        "pulls?state=open": [OPEN_PR_1088_MATCHING],
+        # POST (запись отчёта в PR) падает, GET-чтения комментариев идут в свои маршруты
+        "-X POST": RuntimeError("502 comment post failed"),
+        "issues/1088/comments": [],
+        f"issues/{pg.WATCHDOG_ISSUE}/comments": [],
+        "actions/runs/34748469966/jobs": ZOMBIE_JOBS_EMPTY,
+        "-X PATCH": None,
+    })
+    patch_gh(monkeypatch, fake)
+    observations, actions = zrw.zombie_run_watch(REPO, NOW)
+    assert len(calls) == 1
+    assert zrw.REOPENED_MARKER_PREFIX + "9a75c414]" in calls[0][2]
+    assert any("переэмиссия ПРИМЕНЕНА" in a for a in actions)
+    patch_calls = [c for c in fake.calls if "-X PATCH" in c and "pulls/1088" in c]
+    assert any("state=closed" in c for c in patch_calls)
+    assert any("state=open" in c for c in patch_calls)
+
+
+def test_report_failure_with_dead_channels_reddens_pulse(monkeypatch):
+    """Форма (в) + отказ самой эскалации: без записи дедупа следующий пульс
+    повторил бы переэмиссию, не зная о этой, — молча нельзя, прогон краснеет."""
+    patch_escalate(monkeypatch, result="Telegram: НЕ доставлен; след в #120: НЕ оставлен")
+    fake = FakeGh({
+        "actions/runs?event=pull_request&status=queued": {"workflow_runs": [ZOMBIE_RUN_ORCHESTRA]},
+        "pulls?state=open": [OPEN_PR_1088_MATCHING],
+        "-X POST": RuntimeError("502 comment post failed"),
+        "issues/1088/comments": [],
+        f"issues/{pg.WATCHDOG_ISSUE}/comments": [],
+        "actions/runs/34748469966/jobs": ZOMBIE_JOBS_EMPTY,
+        "-X PATCH": None,
+    })
+    patch_gh(monkeypatch, fake)
+    with pytest.raises(RuntimeError, match="переэмиссия применена"):
+        zrw.zombie_run_watch(REPO, NOW)
 
 
 def test_candidate_cap_truncates_and_warns(monkeypatch):
@@ -352,6 +545,38 @@ def test_candidate_cap_truncates_and_warns(monkeypatch):
     patch_gh(monkeypatch, fake)
     observations, actions = zrw.zombie_run_watch(REPO, NOW)
     assert any("потолок цены API" in o for o in observations)
+
+
+def test_candidate_cap_keeps_oldest_not_newest(monkeypatch):
+    """Мутация-гвардия чеклист-находки ревью PR #1212: `/actions/runs`
+    отдаёт от свежих к старым (замер 2026-09-14), поэтому усечение обязано
+    брать ХВОСТ списка — старейшие. Open PR соответствует только САМОМУ
+    старому прогону из 25 — при усечении с головы (новейшие) он вытеснялся
+    бы и газ никогда не дошёл бы до самого критичного зомби."""
+    many = [
+        {**HEALTHY_RUN, "id": 100 + i,
+         # свежие ПЕРВЫМИ (прод-порядок API): i=0 — новейший, i=24 — старейший
+         "created_at": f"2026-09-13T00:{59 - i:02d}:00Z",
+         "head_branch": f"branch-{i}", "head_sha": f"{i:064d}"}
+        for i in range(25)
+    ]
+    oldest_pr = {
+        "number": 1300, "state": "open",
+        "head": {"ref": "branch-24", "sha": f"{24:064d}"},
+    }
+    fake = FakeGh({
+        "actions/runs?event=pull_request&status=queued": {"workflow_runs": many},
+        "pulls?state=open": [oldest_pr],
+        "issues/1300/comments": [],
+        f"issues/{pg.WATCHDOG_ISSUE}/comments": [],
+        "actions/runs/124/jobs": ZOMBIE_JOBS_EMPTY,
+        "-X POST": None,
+        "-X PATCH": None,
+    })
+    patch_gh(monkeypatch, fake)
+    observations, actions = zrw.zombie_run_watch(REPO, NOW)
+    assert any("потолок цены API" in o for o in observations)
+    assert any("переоткрыт" in a for a in actions)
 
 
 if __name__ == "__main__":

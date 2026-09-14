@@ -49,6 +49,31 @@ head SHA не меняется, все обязательные workflow пол�
 газа не принимается»: автоматический газ пробуется один раз, дальше решение
 переходит человеку явной эскалацией).
 
+Порядок действия (находка ревью PR #1212): сначала close→reopen, маркер-отчёт —
+ТОЛЬКО после успеха (он и есть честный отчёт о сделанном). Маркер, записанный
+до действия, при отказе посередине навсегда глушит газ: следующий пульс читает
+маркер, решает «переэмиссия уже была» и больше не пытается — попытка
+потрачена, действия не было. Формы отказа различимы и обрабатываются по-разному:
+
+- close не прошёл — состояние PR не менялось, газа не было, маркер не
+  пишется: следующий пульс повторит попытку (⚠️ в observations);
+- close прошёл, reopen не прошёл — PR ОСТАЛСЯ ЗАКРЫТЫМ, состояние хуже
+  исходного: сторож смотрит только открытые PR и сам к нему не вернётся —
+  эскалация в #120 немедленно, БЕЗ дедупа (каждый такой случай — новый
+  инцидент, оставивший PR закрытым; повторное «уже эскалировано» утаило бы
+  его от человека); если эскалация не доставлена ни одним каналом —
+  красный прогон;
+- газ применён, отчёт не записан — дедуп-якоря в PR нет, поэтому тот же
+  маркер переэмиссии дублируется эскалацией в #120 (запасной носитель):
+  следующий пульс, не найдя маркера в PR, читает его из #120 и повторной
+  переэмиссии на этом head не делает — контракт «одна попытка на head_sha»
+  держится на обоих носителях.
+
+Чтение маркеров фильтрует автора (`trusted_login=EVENT_ACTOR_LOGIN`,
+#1027): маркеры пишет только job под `github.token` (вне Actions запись
+закрыта гейтом #1074), поэтому частичная цитата маркера в чужом ответе
+(человек, агент, пересказ) дедуп не создаёт.
+
 ## Рецидив после действия — не путать со старым permanent-зомби
 
 Живой факт выше («старые зомби остаются queued навсегда») означает, что ПОСЛЕ
@@ -65,12 +90,28 @@ head SHA не меняется, все обязательные workflow пол�
 ## Цена
 
 Steady state (нет queued PR-прогонов старше порога) — 1 вызов `gh api` за
-пульс (список queued PR-прогонов). Кандидаты появляются — ещё 1 вызов
-(список открытых PR) и до `MAX_ZOMBIE_CANDIDATES_PER_PULSE` вызовов на
-число job'ов (по одному на подтверждение, с коротким замыканием: одного
-подтверждённого зомби на PR достаточно, дальше по этому PR не проверяем).
-Верхняя граница на один пульс — `2 + MAX_ZOMBIE_CANDIDATES_PER_PULSE`
-вызовов `gh api`, независимо от того, сколько PR реально открыто.
+пульс (список queued PR-прогонов). Кандидаты появляются — сверх того:
+
+- +1 вызов: список открытых PR;
+- до `MAX_ZOMBIE_CANDIDATES_PER_PULSE` вызовов числа job'ов (по одному на
+  проверяемый прогон, с коротким замыканием: одного подтверждённого зомби
+  на PR достаточно). Проверяются СТАРЕЙШИЕ кандидаты: `/actions/runs`
+  отдаёт список от свежих к старым (замер 2026-09-14: `created_at`
+  убывает с первой записи), усечение берёт хвост списка — при затяжном
+  сбое (>20 кандидатов пульс за пульсом) старейшие, самые критичные
+  зомби обслуживаются первыми, а не вытесняются свежими;
+- +1 вызов чтения маркеров в комментариях КАЖДОГО PR-кандидата (одна
+  страница комментариев целиком; на длинной истории — несколько);
+- +1 вызов чтения маркеров в #120 на каждый PR-кандидат, чей собственный
+  носитель маркера пуст (запасной носитель случая «отчёт не записан»);
+- только в путях рецидива/отказа: ещё чтение маркера эскалации в #120 и
+  запись эскалации (комментарий в #120 + Telegram).
+
+Верхняя граница обычного пульса с кандидатами — около
+`2 + MAX_ZOMBIE_CANDIDATES_PER_PULSE + 2·<число PR-кандидатов>` вызовов
+`gh api` (находка ревью PR #1212: первая версия считала только
+`2 + MAX_ZOMBIE_CANDIDATES_PER_PULSE` и не включала чтения маркеров),
+независимо от того, сколько PR реально открыто.
 
 Запуск: python scripts/orchestra/zombie_run_watch.py run
 Тесты:  python -m pytest scripts/orchestra/test_zombie_run_watch.py -q
@@ -94,8 +135,10 @@ from datetime import datetime, timezone
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # pulse_guard сосед
 
 from pulse_guard import (  # noqa: E402
+    EVENT_ACTOR_LOGIN,
     WATCHDOG_ISSUE,
     escalate,
+    escalation_channel_failed,
     gh,
     issue_marker_times,
     minutes_between,
@@ -116,6 +159,8 @@ MAX_ZOMBIE_CANDIDATES_PER_PULSE = 20
 
 REOPENED_MARKER_PREFIX = "[zombie-run-watch: переэмиссия "
 ESCALATION_MARKER_PREFIX = "[zombie-run-watch: эскалация "
+REOPEN_FAILED_MARKER_PREFIX = "[zombie-run-watch: reopen-не-удался "
+REPORT_FAILED_MARKER_PREFIX = "[zombie-run-watch: отчёт-не-записан "
 
 
 # ── Чистая логика (тестируется без сети) ────────────────────────────────────
@@ -195,6 +240,35 @@ def escalation_text(pr_number: int, run_ids: list[int], sha8: str, marker: str) 
     )
 
 
+def reopen_failed_text(pr_number: int, run_ids: list[int], sha8: str,
+                       marker: str, error: str) -> str:
+    """Случай «close прошёл, reopen не прошёл» (находка ревью PR #1212):
+    PR остался закрыт — факт, а не гипотеза, текст называет его прямо."""
+    ids_text = ", ".join(str(i) for i in run_ids)
+    return (
+        f"🚨 edge-harness: {marker} Сторож зомби-прогонов (#1106) закрыл PR #{pr_number} "
+        f"для переэмиссии событий (run {ids_text}, head `{sha8}`), но переоткрыть не "
+        f"удалось: {error}. PR ОСТАЛСЯ ЗАКРЫТЫМ — сторож смотрит только открытые PR и "
+        "сам к нему не вернётся. Нужен человек: переоткрыть PR и разобрать причину "
+        "отказа reopen."
+    )
+
+
+def report_failed_text(pr_number: int, run_ids: list[int], sha8: str,
+                       reopened_marker: str, marker: str, error: str) -> str:
+    """Случай «газ применён, отчёт не записан»: текст несёт САМ маркер
+    переэмиссии — этот комментарий в #120 становится запасным носителем
+    дедупа, который следующий пульс читает, когда в PR маркера нет."""
+    ids_text = ", ".join(str(i) for i in run_ids)
+    return (
+        f"🚨 edge-harness: {marker} Переэмиссия событий PR #{pr_number} (close→reopen, "
+        f"#1106, {reopened_marker}) ВЫПОЛНЕНА, но комментарий-отчёт с этим дедуп-маркером "
+        f"в PR записать не удалось: {error}. Дедуп «одна попытка на head_sha» живёт "
+        "только здесь — последующие пульсы читают маркер из #120 и повторной "
+        f"переэмиссии на этом head (`{sha8}`) не делают. run {ids_text}."
+    )
+
+
 # ── I/O ─────────────────────────────────────────────────────────────────
 
 
@@ -230,11 +304,13 @@ def is_zombie(repo: str, run: dict) -> bool:
     return jobs_total_count(repo, run["id"]) == 0
 
 
-def close_reopen_pr(repo: str, number: int) -> None:
-    """Единственный проверенный живым случаем газ (issue #1106, PR #1088):
-    close→reopen переэмиттит `pull_request`-события без изменения head SHA."""
-    gh("-X", "PATCH", f"repos/{repo}/pulls/{number}", "-f", "state=closed")
-    gh("-X", "PATCH", f"repos/{repo}/pulls/{number}", "-f", "state=open")
+def set_pr_state(repo: str, number: int, state: str) -> None:
+    """Примитив газа (issue #1106, PR #1088): close и reopen выполняются
+    РАЗДЕЛЬНЫМИ вызовами не зря — отказ reopen после успешного close
+    оставляет PR закрытым, и вызывающий обязан различить эти два отказа
+    (находка ревью PR #1212: один catch-all над парой склеивал их в
+    «переэмиссия не выполнена»)."""
+    gh("-X", "PATCH", f"repos/{repo}/pulls/{number}", "-f", f"state={state}")
 
 
 def zombie_run_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
@@ -255,9 +331,10 @@ def zombie_run_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
 
     if len(candidates) > MAX_ZOMBIE_CANDIDATES_PER_PULSE:
         observations.append(
-            f"⚠️ zombie-run-watch: кандидатов {len(candidates)}, проверяются первые "
-            f"{MAX_ZOMBIE_CANDIDATES_PER_PULSE} (потолок цены API за один пульс)")
-        candidates = candidates[:MAX_ZOMBIE_CANDIDATES_PER_PULSE]
+            f"⚠️ zombie-run-watch: кандидатов {len(candidates)}, проверяются старейшие "
+            f"{MAX_ZOMBIE_CANDIDATES_PER_PULSE} (потолок цены API за один пульс; "
+            "API отдаёт от свежих к старым — берём хвост)")
+        candidates = candidates[-MAX_ZOMBIE_CANDIDATES_PER_PULSE:]
 
     prs = review_labels.list_pages(f"repos/{repo}/pulls?state=open&per_page=100", gh)
     prs_by_branch = open_prs_by_branch(prs)
@@ -278,12 +355,27 @@ def zombie_run_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
         escalation_marker = f"{ESCALATION_MARKER_PREFIX}PR#{pr_number}@{sha8}]"
 
         try:
-            reopen_times = issue_marker_times(repo, pr_number, reopened_marker)
+            reopen_times = issue_marker_times(repo, pr_number, reopened_marker,
+                                              trusted_login=EVENT_ACTOR_LOGIN)
         except RuntimeError as error:
             observations.append(
                 f"⚠️ zombie-run-watch: PR #{pr_number} — маркеры не прочитаны ({error}), "
                 "действие в этом пульсе пропущено (не гадаем, применялось ли оно уже)")
             continue
+
+        if not reopen_times:
+            # PR-носитель пуст — проверить запасной носитель в #120 (случай
+            # «газ применён, отчёт в PR не записан», см. докстринг модуля:
+            # эскалация report_failed_text несёт тот же маркер переэмиссии).
+            try:
+                reopen_times = issue_marker_times(repo, WATCHDOG_ISSUE, reopened_marker,
+                                                  trusted_login=EVENT_ACTOR_LOGIN)
+            except RuntimeError as error:
+                observations.append(
+                    f"⚠️ zombie-run-watch: PR #{pr_number} — запасные маркеры "
+                    f"#{WATCHDOG_ISSUE} не прочитаны ({error}), действие в этом "
+                    "пульсе пропущено")
+                continue
 
         if reopen_times:
             last_reopen_at = max(reopen_times)
@@ -311,19 +403,71 @@ def zombie_run_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
         run_ids = [zombie_run["id"]]
 
         if not reopen_times:
-            body = reopen_comment_body(run_ids, sha8, reopened_marker)
+            # Находка ревью PR #1212: действие ПЕРВЫМ, маркер-отчёт — только
+            # после успеха (он и есть честный отчёт о сделанном). Три формы
+            # отказа различимы и обрабатываются по-разному (докстринг
+            # модуля, «Порядок действия»).
             try:
-                post_issue_comment(repo, pr_number, body)
-                close_reopen_pr(repo, pr_number)
+                set_pr_state(repo, pr_number, "closed")
             except RuntimeError as error:
+                # (а) close не прошёл — состояние PR не менялось, газа не
+                # было, маркер не пишется: следующий пульс повторит попытку.
                 observations.append(
-                    f"⚠️ zombie-run-watch: PR #{pr_number} — переэмиссия не выполнена ({error})")
+                    f"⚠️ zombie-run-watch: PR #{pr_number} — закрытие не выполнено "
+                    f"({error}), маркер не пишется, попытка повторится в следующем пульсе")
+                continue
+            try:
+                set_pr_state(repo, pr_number, "open")
+            except RuntimeError as error:
+                # (б) close прошёл, reopen не прошёл — PR ОСТАЛСЯ ЗАКРЫТЫМ,
+                # состояние хуже исходного: сторож смотрит только открытые
+                # PR и сам к нему не вернётся. Эскалация немедленно и БЕЗ
+                # дедупа: каждый такой случай — новый инцидент, оставивший
+                # PR закрытым, «уже эскалировано» утаило бы его от человека.
+                marker = f"{REOPEN_FAILED_MARKER_PREFIX}PR#{pr_number}@{sha8}]"
+                text = reopen_failed_text(pr_number, run_ids, sha8, marker, error)
+                esc_result = escalate(repo, WATCHDOG_ISSUE, text)
+                actions.append(
+                    f"🚨 zombie-run-watch: PR #{pr_number} ЗАКРЫТ без переоткрытия "
+                    f"(run {run_ids[0]}, head {sha8}) — эскалация #{WATCHDOG_ISSUE}: "
+                    f"{esc_result}")
+                if escalation_channel_failed(esc_result):
+                    raise RuntimeError(
+                        f"zombie-run-watch: PR #{pr_number} остался ЗАКРЫТЫМ (close "
+                        f"прошёл, reopen не прошёл: {error}), эскалация не доставлена "
+                        "ни одним каналом — красный прогон вместо молчаливого закрытого PR")
+                continue
+            try:
+                post_issue_comment(repo, pr_number,
+                                   reopen_comment_body(run_ids, sha8, reopened_marker))
+            except RuntimeError as error:
+                # (в) газ ПРИМЕНЁН, отчёт и дедуп-якорь в PR не записаны.
+                # Повтор газа вслепую — нарушение контракта «одна попытка на
+                # head_sha», поэтому тот же маркер переэмиссии уходит
+                # эскалацией в #120: он становится запасным носителем дедупа,
+                # который следующий пульс читает (см. ветку выше).
+                marker = f"{REPORT_FAILED_MARKER_PREFIX}PR#{pr_number}@{sha8}]"
+                text = report_failed_text(pr_number, run_ids, sha8,
+                                          reopened_marker, marker, error)
+                esc_result = escalate(repo, WATCHDOG_ISSUE, text)
+                actions.append(
+                    f"⚠️🔁 zombie-run-watch: PR #{pr_number} переэмиссия ПРИМЕНЕНА "
+                    f"(run {run_ids[0]}, head {sha8}), отчёт в PR не записан — "
+                    f"дедуп-якорь в #{WATCHDOG_ISSUE}: {esc_result}")
+                if escalation_channel_failed(esc_result):
+                    raise RuntimeError(
+                        f"zombie-run-watch: PR #{pr_number} переэмиссия применена, "
+                        f"но отчёт-дедуп не записан ни в PR ({error}), ни в "
+                        f"#{WATCHDOG_ISSUE} — следующий пульс может повторить "
+                        "переэмиссию, не зная о этой (красный прогон вместо повтора газа)")
                 continue
             actions.append(
                 f"🔁 zombie-run-watch: PR #{pr_number} переоткрыт (run {run_ids[0]}, head {sha8})")
         else:
             try:
-                already_escalated = bool(issue_marker_times(repo, WATCHDOG_ISSUE, escalation_marker))
+                already_escalated = bool(issue_marker_times(
+                    repo, WATCHDOG_ISSUE, escalation_marker,
+                    trusted_login=EVENT_ACTOR_LOGIN))
             except RuntimeError as error:
                 observations.append(
                     f"⚠️ zombie-run-watch: PR #{pr_number} — маркеры {WATCHDOG_ISSUE} не "
