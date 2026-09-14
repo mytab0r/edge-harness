@@ -208,6 +208,9 @@ from pulse_guard import (
     AI_REWORK_ESCALATION_MARKER,
     AI_REWORK_MARKER,
     AI_REWORK_MAX_ATTEMPTS,
+    AI_REWORK_REBUTTAL_MARKER,
+    AI_REWORK_SECOND_CHANCE_MARKER,
+    AI_REWORK_UNATTRIBUTED_RETRY_MARKER,
     ALLOW_PROD_WRITES_ENV,
     CONFLICT_BUDGET_RESET_MARKER,
     CONFLICT_ESCALATION_MARKER,
@@ -215,6 +218,7 @@ from pulse_guard import (
     CONFLICT_REWORK_MAX_ATTEMPTS,
     EVENT_ACTOR_LOGIN,
     FAILURE_CONCLUSIONS,
+    LAST_RUN_LOOKUP_PAGES,
     READY_STALL_MARKER,
     RESUME_MARKER,
     UNHEALTHY_PR_AFTER_MINUTES,
@@ -231,6 +235,7 @@ from pulse_guard import (
     heartbeat_check,
     independent_pulse_check,
     issue_marker_times,
+    issue_markers_any,
     merge_telegram_text,
     minutes_between,
     parse_time,
@@ -1135,28 +1140,40 @@ def dispatch_ai_review_rework(
     (ai_rework_attempts), не лифтайм на PR: изменившийся отпечаток — это
     новая, ещё не пробованная задача (агент реально что-то поменял), сгоревшая
     попытка на СТАРОМ отпечатке не должна её блокировать. Исчерпание бюджета
-    на текущем отпечатке — ЧЕТЫРЕ исхода, не один (#1027, живой случай PR
-    #1020, 2026-09-11/12; четвёртый — находка ревью PR #1260,
-    эскалация-до-итога-прогона): (1) последний прогон worker.yml по этой
-    задаче сам завершился FAILURE_CONCLUSIONS (rc≠0/нет ответившего
-    провайдера/нет новых коммитов, см. scripts/lib/dsh-ci.sh::
-    dsh_worker_run_is_success) — попытка нечестная, budget не в счёт, диспатч
-    повторяется автоматически БЕЗ эскалации; (2) прогон реально отработал
-    (conclusion=='success') или атрибуции нет вовсе — законная эскалация
-    владельцу; (3) PR уже закрыт/слит между снимком `pulls` и перепроверкой —
-    эскалация не нужна, предмет исчез сам; (4) прогон атрибутирован, но ещё
-    не завершился (status != "completed" — ПЕРВАЯ версия проверяла белый
-    список неконечных статусов ("in_progress", "queued"), но у GitHub Actions
-    их больше ("requested", "waiting", "pending", …); conclusion пока не
-    заполнен GitHub ни для одного неконечного статуса — тот же None, что у
-    «атрибуции нет вовсе» в исходе (2), но ДРУГОЙ факт) — эскалация
-    откладывается до известного исхода, не занятостью воркера вообще
-    (busy-гейт снят этим же PR намеренно), а именно ожиданием исхода СВОЕГО
-    последнего прогона. Раньше `last_worker_run_conclusion` читался только
-    для ТЕКСТА эскалации —
-    решение эскалировать не зависело от него, хотя conclusion уже нёс факт
-    «инфраструктурный отказ vs находки»; после #1260 решение читает ещё и
-    `status` того же прогона (`last_worker_run`), не только `conclusion`.
+    на текущем отпечатке разбирает несколько исходов, не один (#1027, живой
+    случай PR #1020, 2026-09-11/12; #1260 добавил четвёртый — эскалация-до-
+    итога-прогона; #1274 добавил бесплатные бонус-заходы для двух ветвей,
+    которые раньше эскалировали одинаково с первого раза): (1) последний
+    прогон worker.yml по этой задаче сам завершился FAILURE_CONCLUSIONS
+    (rc≠0/нет ответившего провайдера/нет новых коммитов, см. scripts/lib/
+    dsh-ci.sh::dsh_worker_run_is_success) — попытка нечестная, budget не в
+    счёт, диспатч повторяется автоматически БЕЗ эскалации; (2) прогон реально
+    отработал (conclusion=='success'), но отпечаток диффа не изменился —
+    ОДИН бесплатный доп. заход с явным контрактом «исправь или возрази»
+    (AI_REWORK_SECOND_CHANCE_MARKER), законная эскалация только на ВТОРОМ
+    подряд таком совпадении (issue #1274, живой случай PR #1120, 2026-09-13);
+    (3) атрибуции нет вовсе даже в расширенном окне поиска
+    (`last_worker_run(since=...)`) — тот же приём, ОДИН бесплатный повтор
+    (AI_REWORK_UNATTRIBUTED_RETRY_MARKER), эскалация только на втором подряд
+    отсутствии следа, текст называет дефект атрибуции, а не находки ai-review
+    (issue #1274, живой случай PR #804/задача #720, 2026-09-12→14); (4) PR
+    уже закрыт/слит между снимком `pulls` и перепроверкой — эскалация не
+    нужна, предмет исчез сам; (5) прогон атрибутирован, но ещё не завершился
+    (status != "completed" — ПЕРВАЯ версия проверяла белый список неконечных
+    статусов ("in_progress", "queued"), но у GitHub Actions их больше
+    ("requested", "waiting", "pending", …); conclusion пока не заполнен
+    GitHub ни для одного неконечного статуса — тот же None, что у «атрибуции
+    нет вовсе» в исходе (3), но ДРУГОЙ факт) — эскалация откладывается до
+    известного исхода, не занятостью воркера вообще (busy-гейт снят этим же
+    PR намеренно), а именно ожиданием исхода СВОЕГО последнего прогона.
+    Атрибутированный прогон с conclusion вне FAILURE_CONCLUSIONS и не
+    'success' (timed_out/startup_failure) — не входит в список бесплатных
+    исходов #1274, эскалирует с первого раза, как раньше.
+
+    Ни один из бесплатных исходов (1)/(2)/(3) не эскалирует владельцу при
+    ПЕРВОМ обнаружении (AGENTS.md, «Воркеру нужны четыре исхода, не два») —
+    все три дают действие (автоповтор/доп. заход), эскалация остаётся
+    последним, а не первым исходом.
 
     Дедуп «тот же head, тот же отпечаток находок» — ai_rework_dispatched_at:
     неизменный отпечаток при уже висящем маркере не даёт второй, дублирующий
@@ -1202,6 +1219,8 @@ def dispatch_ai_review_rework(
     ordered_pulls = unscheduled + schedulable + [p for p in pulls if p["number"] not in ai_numbers]
     for pull in ordered_pulls:
         infra_retry = False  # Исход 1: этот диспатч — повтор после инфра-отказа, бюджет не тратит
+        unattributed_retry = False  # Исход 3: бесплатный повтор — атрибуции не нашлось даже в расширенном окне
+        second_chance = False  # Исход 2: бесплатный доп. заход — успех, но отпечаток не сдвинулся
         labels = {label["name"] for label in pull["labels"]}
         if review_labels.AI_CHANGES not in labels:
             continue
@@ -1228,7 +1247,25 @@ def dispatch_ai_review_rework(
         except RuntimeError as error:
             observations.append(f"⚠️ PR #{number}: не удалось сверить бюджет авто-доводки: {error}")
             continue
-        if attempts >= AI_REWORK_MAX_ATTEMPTS:
+        # Бонусный повтор Исхода 3 (issue #1274) по конструкции НЕ оставляет
+        # git-шага (genuinely unattributed — attempts им не считается), а
+        # ai_rework_attempts считает только git-шаг: без этой проверки
+        # `attempts` навсегда остаётся 0 после бонусного повтора, гейт ниже
+        # никогда не срабатывает повторно, и функция диспатчила бы третий,
+        # четвёртый... заход бесконечно, никогда не долистывая до эскалации
+        # (тормоз без газа наоборот — газ без тормоза). Маркер уже стоит на
+        # этом отпечатке — значит решение по этому PR уже требуется, вне
+        # зависимости от attempts.
+        pending_unattributed_retry = False
+        if attempts < AI_REWORK_MAX_ATTEMPTS:
+            retry_marker_probe = f"{AI_REWORK_UNATTRIBUTED_RETRY_MARKER} fp:{fingerprint}"
+            try:
+                pending_unattributed_retry = bool(issue_marker_times(repo, number, retry_marker_probe))
+            except RuntimeError as error:
+                observations.append(
+                    f"⚠️ PR #{number}: не удалось сверить висящий бонусный повтор: {error}")
+                continue
+        if attempts >= AI_REWORK_MAX_ATTEMPTS or pending_unattributed_retry:
             # Решение об эскалации НЕ гейтится занятостью воркера (issue
             # #1253): в отличие от диспатча worker.yml несколькими строками
             # ниже, эскалация не трогает воркер — это комментарий в PR/#120 +
@@ -1276,7 +1313,11 @@ def dispatch_ai_review_rework(
             # факт (scripts/lib/dsh-ci.sh::dsh_worker_run_is_success решает
             # ЕГО conclusion по rc/провайдеру/новым коммитам — не второй
             # классификатор, тот же факт, уже вычисленный воркером).
-            run = last_worker_run(repo, task_number)
+            # `since` (issue #1274) — расширяет окно поиска атрибуции за
+            # фиксированные 10 прогонов (см. last_worker_run) якорем
+            # последнего диспатча на этом отпечатке.
+            dispatch_anchor = ai_rework_dispatched_at(repo, number, fingerprint)
+            run = last_worker_run(repo, task_number, since=dispatch_anchor)
             run_conclusion = run.get("conclusion") if run else None
             if run is not None and run.get("status") != "completed":
                 # Находка ревью PR #1260, ВТОРОЙ круг (эскалация-до-итога-
@@ -1328,47 +1369,146 @@ def dispatch_ai_review_rework(
                     "прогона, не незакрытые находки ai-review) — автоматический повтор, "
                     "без эскалации владельцу"
                 )
-            else:
-                # Исход 2 (законная эскалация): либо прогон реально отработал
-                # (conclusion=='success'), либо атрибуции нет вовсе (аренда
-                # сгорела до следа воркера) — ни один из двух не наш
-                # инфра-отказ, дальше без человека не разобраться.
-                if run_conclusion == "success":
-                    # «Алерт не гадает» (#472, находка ai-review PR #1030,
-                    # второй круг): «ai-review снова нашёл нарушения на этом
-                    # коммите» недостижимо честно на этой ветке. Бюджет
-                    # считается ПО ОТПЕЧАТКУ (ai_rework_attempts), и смена
-                    # отпечатка его обнуляет — эскалация на текущем отпечатке
-                    # возможна только если success-прогон НЕ поменял отпечаток
-                    # диффа (иначе следующий пульс уже считал бы по новому
-                    # отпечатку с attempts=0). А при неизменном отпечатке
-                    # should_run_ai_review отдаёт go=False (keep-path) — сам
-                    # ai-review на этот коммит не запускался, «снова нашёл»
-                    # было бы утверждением о событии, которого не было.
-                    reason = (
-                        "worker.yml отработал успешно, но отпечаток диффа не изменился: "
-                        "повторный прогон ai-review на этом отпечатке не выполнялся "
-                        "(keep-path) — стоят находки прежнего ревью того же диффа"
-                    )
-                elif run_conclusion is None:
-                    reason = (
-                        "прогон worker.yml по этой задаче не атрибутирован (аренда сгорела "
-                        "до следа?) — см. лог worker.yml вручную"
+            elif run_conclusion is None:
+                # Исход 3 (issue #1274, живой случай PR #804/задача #720,
+                # 2026-09-12→14): расширенное окно `last_worker_run(since=)`
+                # уже накрывает измеренную задержку эскалации — если
+                # атрибуции ВСЁ РАВНО нет, честно неизвестно, работал ли
+                # кто-то вообще, а не «находки не закрыты». Как и Исход 1,
+                # ОДИН бесплатный повтор на отпечаток ПЕРЕД эскалацией
+                # (маркер ниже — если уже стоит, второе подряд отсутствие
+                # следа не случайность, а систематический дефект атрибуции;
+                # текст называет ИМЕННО его, не находки ai-review).
+                retry_marker = f"{AI_REWORK_UNATTRIBUTED_RETRY_MARKER} fp:{fingerprint}"
+                try:
+                    retried_already = issue_marker_times(repo, number, retry_marker)
+                except RuntimeError as error:
+                    observations.append(
+                        f"⚠️ PR #{number}: не удалось сверить повтор атрибуции: {error}")
+                    continue
+                if not retried_already:
+                    unattributed_retry = True
+                    observations.append(
+                        f"🔁 PR #{number}: авто-доводка ({attempts}/{AI_REWORK_MAX_ATTEMPTS} "
+                        "на этом отпечатке) не в счёт эскалации — прогон worker.yml по этой "
+                        "задаче не атрибутирован даже в расширенном окне поиска (аренда "
+                        "сгорела до следа или дефект атрибуции) — один бесплатный повтор, "
+                        "без эскалации владельцу"
                     )
                 else:
-                    # Атрибутированный прогон с conclusion ВНЕ FAILURE_CONCLUSIONS
-                    # — timed_out (worker.yml несёт timeout-minutes: 340, #1067, висяк
-                    # даёт именно его) или startup_failure. «Алерт не гадает»
-                    # (#472, находка ai-review PR #1030): факт уже в руках —
-                    # называем conclusion как есть; прежний текст подменял его
-                    # неверным утверждением про атрибуцию («не атрибутирован»).
-                    # Решение не менялось (эскалация — это не наш класс
-                    # инфра-отказа), врал только текст.
-                    reason = (
-                        f"последний прогон worker.yml по этой задаче завершился с "
-                        f"conclusion={run_conclusion!r} — не success и не известный "
-                        "инфра-отказ, см. лог worker.yml вручную"
+                    text = (
+                        f"🚨 edge-harness: {marker}\n"
+                        f"PR #{number} (задача #{task_number}) остаётся с ai:changes-requested "
+                        f"на том же отпечатке диффа после {attempts} авто-попытки доводки — "
+                        "ДВА прогона worker.yml подряд не оставили следа аренды даже в "
+                        "расширенном окне поиска. Это дефект атрибуции (аренда сгорает раньше, "
+                        "чем worker.yml успевает отметиться git-шагом, либо прогон не стартует "
+                        "вовсе), не непрочитанные находки ai-review — проверь вручную, шёл ли "
+                        f"вообще прогон worker.yml по задаче #{task_number} за это время и "
+                        "почему он не оставил следа."
                     )
+                    escalation = escalate(repo, WATCHDOG_ISSUE, text)
+                    actions.append(
+                        f"🚨 PR #{number}: авто-доводка исчерпана ({attempts}/"
+                        f"{AI_REWORK_MAX_ATTEMPTS} на этом отпечатке) — два прогона подряд без "
+                        f"следа аренды, дефект атрибуции — эскалация владельцу ({escalation})"
+                    )
+                    continue
+            elif run_conclusion == "success":
+                # Исход 2 (issue #1274, живой случай PR #1120, 2026-09-13):
+                # агент реально отработал, но не закрыл находки —
+                # generic-инструкция «прочитай комментарии PR» не
+                # донесла/не убедила. Повтор с ТЕМ ЖЕ заданием бессмыслен —
+                # ОДИН дополнительный заход с ЯВНО другим контрактом (маркер
+                # ниже прямо требует исправить или возразить; task.sh уже
+                # велит агенту читать ВСЕ комментарии PR — текст дойдёт без
+                # правки task.sh/worker.yml). Второе подряд success с тем же
+                # отпечатком — законная эскалация, несущая возражение агента,
+                # если оно было (AGENTS.md: «тогда это возражение и есть
+                # результат, его надо донести до ревью, а не потерять»).
+                #
+                # «Алерт не гадает» (#472, находка ai-review PR #1030, второй
+                # круг): «ai-review снова нашёл нарушения на этом коммите»
+                # недостижимо честно на этой ветке. Бюджет считается ПО
+                # ОТПЕЧАТКУ (ai_rework_attempts), и смена отпечатка его
+                # обнуляет — эскалация на текущем отпечатке возможна только
+                # если success-прогон НЕ поменял отпечаток диффа (иначе
+                # следующий пульс уже считал бы по новому отпечатку с
+                # attempts=0). А при неизменном отпечатке should_run_ai_review
+                # отдаёт go=False (keep-path) — сам ai-review на этот коммит
+                # не запускался, «снова нашёл» было бы утверждением о
+                # событии, которого не было.
+                second_chance_marker = f"{AI_REWORK_SECOND_CHANCE_MARKER} fp:{fingerprint}"
+                try:
+                    second_chance_used = issue_marker_times(repo, number, second_chance_marker)
+                except RuntimeError as error:
+                    observations.append(
+                        f"⚠️ PR #{number}: не удалось сверить второй заход доводки: {error}")
+                    continue
+                if not second_chance_used:
+                    second_chance = True
+                    observations.append(
+                        f"🔁 PR #{number}: авто-доводка ({attempts}/{AI_REWORK_MAX_ATTEMPTS} "
+                        "на этом отпечатке) не в счёт эскалации — worker.yml отработал "
+                        "успешно, но отпечаток диффа не изменился; второй заход с явным "
+                        "требованием исправить или возразить, без эскалации владельцу"
+                    )
+                else:
+                    try:
+                        rebuttal_hits = issue_markers_any(repo, number, (AI_REWORK_REBUTTAL_MARKER,))
+                    except RuntimeError as error:
+                        rebuttal_hits = []
+                        observations.append(
+                            f"⚠️ PR #{number}: не удалось прочитать возражение агента: {error}")
+                    second_chance_since = issue_marker_times(repo, number, second_chance_marker)
+                    anchor2 = max(second_chance_since) if second_chance_since else None
+                    # Собственный комментарий-дисПатч (contract_note ниже) сам
+                    # УПОМИНАЕТ маркер возражения прозой («… маркера
+                    # AI_REWORK_REBUTTAL_MARKER, …») — без фильтра он бы сам
+                    # себя засчитывал как «возражение». Комментарии
+                    # оркестратора всегда несут AI_REWORK_MARKER, настоящее
+                    # возражение агента — никогда (агент пишет отдельный
+                    # комментарий, не переиспользует маркер дисПатча).
+                    rebuttal_text = next(
+                        (body for ts, body in sorted(rebuttal_hits)
+                         if (anchor2 is None or ts >= anchor2) and AI_REWORK_MARKER not in body),
+                        None,
+                    )
+                    reason = (
+                        "worker.yml отработал успешно ВТОРОЙ раз подряд на этом отпечатке "
+                        "(второй заход нёс явное требование исправить находку или возразить), "
+                        "отпечаток диффа снова не изменился"
+                        + (f" — агент возразил: {rebuttal_text[:400]!r}" if rebuttal_text
+                           else " — без объяснения (агент не оставил возражения)")
+                    )
+                    text = (
+                        f"🚨 edge-harness: {marker}\n"
+                        f"PR #{number} (задача #{task_number}) остаётся с ai:changes-requested "
+                        f"на том же отпечатке диффа после {attempts} авто-попытки доводки "
+                        f"worker.yml — {reason}. Нужно решение владельца: посмотреть находки "
+                        "ai-review (gh pr view --comments) и разобраться руками."
+                    )
+                    escalation = escalate(repo, WATCHDOG_ISSUE, text)
+                    actions.append(
+                        f"🚨 PR #{number}: авто-доводка по находкам ai-review исчерпана "
+                        f"({attempts}/{AI_REWORK_MAX_ATTEMPTS} на этом отпечатке, второй заход "
+                        f"тоже не помог) — эскалация владельцу ({escalation})"
+                    )
+                    continue
+            else:
+                # Атрибутированный прогон с conclusion ВНЕ FAILURE_CONCLUSIONS
+                # — timed_out (worker.yml несёт timeout-minutes: 340, #1067, висяк
+                # даёт именно его) или startup_failure. «Алерт не гадает»
+                # (#472, находка ai-review PR #1030): факт уже в руках —
+                # называем conclusion как есть; прежний текст подменял его
+                # неверным утверждением про атрибуцию («не атрибутирован»).
+                # Не один из трёх новых исходов (#1274) — вне их списка,
+                # эскалация с первого раза остаётся законной, как раньше.
+                reason = (
+                    f"последний прогон worker.yml по этой задаче завершился с "
+                    f"conclusion={run_conclusion!r} — не success и не известный "
+                    "инфра-отказ, см. лог worker.yml вручную"
+                )
                 text = (
                     f"🚨 edge-harness: {marker}\n"
                     f"PR #{number} (задача #{task_number}) остаётся с ai:changes-requested "
@@ -1412,18 +1552,48 @@ def dispatch_ai_review_rework(
         # Повтор после инфра-отказа (Исход 1) падает сюда с attempts уже
         # равным AI_REWORK_MAX_ATTEMPTS — «попытка {attempts+1}/{max}» печатало
         # бы несуществующее «2/1» (некритичная находка ai-review PR #1030,
-        # чеклист): эта попытка бюджет НЕ расходует, дробь здесь врёт.
+        # чеклист): эта попытка бюджет НЕ расходует, дробь здесь врёт. Те же
+        # правила — для бесплатных заходов Исходов 2/3 (issue #1274).
         attempt_note = (
             "повтор после инфра-отказа прогона "
             f"(исчерпанные {attempts}/{AI_REWORK_MAX_ATTEMPTS} на этом отпечатке не в счёт)"
             if infra_retry
+            else "повтор — прошлый прогон не оставил следа аренды даже в расширенном окне "
+                 f"поиска (исчерпанные {attempts}/{AI_REWORK_MAX_ATTEMPTS} на этом отпечатке "
+                 "не в счёт)"
+            if unattributed_retry
+            else "второй заход с явными находками ai-review — исправь или явно возрази "
+                 f"(маркер {AI_REWORK_REBUTTAL_MARKER}), молчание не годится"
+            if second_chance
             else f"попытка {attempts + 1}/{AI_REWORK_MAX_ATTEMPTS} на этом отпечатке диффа"
+        )
+        # Бонусные маркеры (issue #1274) — по одному на исход, дают ровно
+        # ОДИН бесплатный заход на отпечаток: их присутствие в комментариях
+        # PR — то, что ветки выше проверяют перед эскалацией второй раз.
+        bonus_marker = (
+            f" {AI_REWORK_SECOND_CHANCE_MARKER} fp:{fingerprint}" if second_chance
+            else f" {AI_REWORK_UNATTRIBUTED_RETRY_MARKER} fp:{fingerprint}" if unattributed_retry
+            else ""
+        )
+        # Контракт второго захода (Исход 2) — единственное место, где
+        # задание РЕАЛЬНО отличается от первого: task.sh (режим доводки)
+        # велит агенту прочитать ВСЕ комментарии PR, значит этот текст
+        # дойдёт до него без правки task.sh/worker.yml.
+        contract_note = (
+            " Прошлая попытка отработала успешно, но отпечаток диффа не изменился — правка "
+            "не применена или находка признана неверной без объяснения. Прочитай последний "
+            "вердикт ai-review (комментарий «AI-ревью — второй гейт конвейера», reviewer: "
+            "rework/failed) и весь тред PR: согласен — исправь и запушь новый коммит; НЕ "
+            f"согласен — оставь явный комментарий, начинающийся с маркера "
+            f"{AI_REWORK_REBUTTAL_MARKER}, с причиной. Молчание при несогласии не годится — "
+            "конвейер обязан увидеть причину."
+            if second_chance else ""
         )
         post_issue_comment(
             repo, number,
-            f"🤖 {AI_REWORK_MARKER} fp:{fingerprint} Оркестратор снял назначение с задачи "
-            f"#{task_number} и запустил worker.yml адресно ({attempt_note}) на доводку по находкам "
-            "ai-review — см. gh pr view --comments.",
+            f"🤖 {AI_REWORK_MARKER} fp:{fingerprint}{bonus_marker} Оркестратор снял назначение "
+            f"с задачи #{task_number} и запустил worker.yml адресно ({attempt_note}) на "
+            f"доводку по находкам ai-review — см. gh pr view --comments.{contract_note}",
         )
         actions.append(
             f"🔧 PR #{number} с ai:changes-requested — задача #{task_number} освобождена "
@@ -2163,7 +2333,7 @@ def run_claimed_task(repo: str, task_number: int, run_id: int | str) -> bool:
     )
 
 
-def last_worker_run(repo: str, task_number: int) -> dict | None:
+def last_worker_run(repo: str, task_number: int, *, since: datetime | None = None) -> dict | None:
     """Последний прогон worker.yml, атрибутированный задаче (run_claimed_task
     ищет след аренды среди свежих прогонов, новее→старше) — сырой объект
     GitHub Actions API целиком (несёт и `status`, и `conclusion` — конечный
@@ -2171,10 +2341,38 @@ def last_worker_run(repo: str, task_number: int) -> dict | None:
     (аренда сгорела до следа/прогон ещё не отметился). Единственное место,
     где прогон и задача сопоставлены по следу аренды — `last_worker_run_
     conclusion` ниже и находка ревью PR #1260 (эскалация-до-итога-прогона в
-    dispatch_ai_review_rework) читают отсюда, не заводят вторую выборку."""
-    for run in recent_runs(repo, WORKER_WORKFLOW, per_page=10):
-        if run_claimed_task(repo, task_number, run.get("id")):
-            return run
+    dispatch_ai_review_rework) читают отсюда, не заводят вторую выборку.
+
+    `since` (issue #1274, живой случай PR #804/задача #720, 2026-09-12→14) —
+    нижняя граница окна поиска (обычно момент диспатча авто-доводки,
+    ai_rework_dispatched_at). Без него — старое поведение (последние 10
+    прогонов, обратная совместимость для вызовов без анкера: resume_series_
+    by_merge и dispatch_conflict_rework через last_worker_run_conclusion). С
+    анкером окно расширяется до pulse_guard.LAST_RUN_LOOKUP_PAGES страниц по
+    100 прогонов, обход останавливается, как только целая страница старше
+    since — дальше только старее, атрибуции там уже не будет.
+
+    Живой дефект: фиксированные последние 10 прогонов — окно короче реальной
+    задержки эскалации (двое суток, 43 прогона worker.yml по ДРУГИМ задачам
+    между диспатчем и перепроверкой — слот сериализован, AGENTS.md).
+    Атрибутированный прогон (conclusion='failure', честный инфра-отказ) ушёл
+    за окно — dispatch_ai_review_rework классифицировал его как «атрибуции
+    нет вовсе» вместо бесплатного автоповтора Исхода 1."""
+    if since is None:
+        for run in recent_runs(repo, WORKER_WORKFLOW, per_page=10):
+            if run_claimed_task(repo, task_number, run.get("id")):
+                return run
+        return None
+    for page in range(1, LAST_RUN_LOOKUP_PAGES + 1):
+        runs = recent_runs(repo, WORKER_WORKFLOW, per_page=100, page=page)
+        if not runs:
+            break
+        for run in runs:
+            if run_claimed_task(repo, task_number, run.get("id")):
+                return run
+        oldest_created_at = runs[-1].get("created_at")
+        if oldest_created_at and parse_time(oldest_created_at) < since:
+            break  # страница целиком старше since — дальше только старее
     return None
 
 
