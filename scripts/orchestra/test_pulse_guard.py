@@ -1787,6 +1787,26 @@ def test_resume_alert_text_carries_marker_evidence():
     ("dsh: RATE_LIMIT: Rate limit reached for requests", "infra"),
     ("dial tcp: lookup api.github.com: no such host", "infra"),
     ("gh: 502 Bad Gateway", "infra"),
+    # Прод-форма issue #1115: дословно из job `review` (job id 103700060977,
+    # run 34748262115, PR #1099, 2026-09-13 08:40 UTC) — исчерпание квоты
+    # installation-токена уронило четыре чека подряд (contract/review/watch/
+    # test), ни один не нашёл дефекта в коде.
+    (
+        "##[error]review: gh api repos/mytab0r/edge-harness/pulls/1099/files"
+        "?per_page=100&page=1: gh: API rate limit exceeded for installation. "
+        "If you reach out to GitHub Support for help, please include the "
+        "request ID 5C82:6FB4A:1519C87:44D7C64:6AA66176 and timestamp "
+        "2026-09-13 08:40:22 UTC. For more on scraping GitHub and how it may "
+        "affect your rights, please review our Terms of Service "
+        "(https://docs.github.com/en/site-policy/github-terms/github-terms-of-service) "
+        "(HTTP 403)",
+        "infra",
+    ),
+    # Прод-форма issue #1115: дословно из job `review` (job id 103701285000,
+    # run 34748740141, PR #1089, 2026-09-13 08:58 UTC) — gh CLI оборачивает
+    # 502 от GitHub API своей формулировкой "Server Error (HTTP 502)", без
+    # слов "bad gateway" — старой сигнатуры это не ловило.
+    ("##[error]review: gh api -X: gh: Server Error (HTTP 502)", "infra"),
     ("ОШИБКА: main уехал вперёд (оркестратор слил PR-ы) — base протух.", "stale_base"),
     # Находка ревью PR #488: "protected branch hook declined" — НЕ признак
     # протухшей базы (это отказ серверного хука по другой причине, обычно
@@ -1796,6 +1816,14 @@ def test_resume_alert_text_carries_marker_evidence():
     ("scripts/worker/task.sh: line 375: .../infra_digest.sh: No such file or directory", "defect"),
     ("AssertionError: expected 3 got 2", "defect"),
     ("что угодно нераспознанное", "defect"),  # fail loud: непонятное — дефект, не прощаем молча
+    # Граница (#1115, пункт 4): текст реального дефекта, который сам
+    # УПОМИНАЕТ "HTTP 403"/"502" как часть содержания (тест печатает код,
+    # который проверяет), не должен ложно классифицироваться как infra, если
+    # он не совпадает буквально с сигнатурой. Сигнатуры — узкие фразы целиком
+    # ("api rate limit exceeded for installation", "server error (http 502)"),
+    # не голые коды "403"/"502" — assert с кодом в тексте их не задевает.
+    ("AssertionError: expected status 403, got 200 (permission check)", "defect"),
+    ("test_provider_returns_502: response.status_code == 502", "defect"),
 ])
 def test_classify_failure_cause(text, expected):
     assert pg.classify_failure_cause(text) == expected

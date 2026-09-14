@@ -394,6 +394,18 @@ INFRA_ERROR_SIGNATURES = (
     "abuse-rate-limit",
     "quota_exhausted",
     "rate_limit_retry_budget_exceeded",
+    # Исчерпание квоты GitHub App installation-токена (issue #1115) — текст
+    # gh CLI, ОТЛИЧНЫЙ от "rate limit reached"/"secondary rate limit" выше
+    # (другая формулировка GitHub API на исчерпание общего лимита installation,
+    # не per-user/secondary). Дословно из живых прогонов PR #1099, 2026-09-13:
+    # job `review` (job id 103700060977, run 34748262115): "gh api
+    # repos/mytab0r/edge-harness/pulls/1099/files?per_page=100&page=1: gh: API
+    # rate limit exceeded for installation. ..."; тот же текст на job
+    # `contract` (run 34748262106) и job `orchestra`/`repo_invariants` семи
+    # прогонов orchestra.yml того же окна (08:40–09:10 UTC) — обратный прогон
+    # классификатора по реальным логам подтверждает 10 совпадений за сутки
+    # 2026-09-13 (см. отчёт PR).
+    "api rate limit exceeded for installation",
     "dial tcp",
     "could not resolve host",
     "connection reset",
@@ -402,6 +414,12 @@ INFRA_ERROR_SIGNATURES = (
     "etimedout",
     "econnreset",
     "502 bad gateway",
+    # gh CLI оборачивает ответ GitHub API "502 Bad Gateway" СВОЕЙ формулировкой
+    # "Server Error (HTTP 502)", без слов "bad gateway" — сигнатура выше её не
+    # ловит. Дословно из живого прогона PR #1089, 2026-09-13: job `review`
+    # (job id 103701285000, run 34748740141): "##[error]review: gh api -X: gh:
+    # Server Error (HTTP 502)".
+    "server error (http 502)",
     "503 service unavailable",
     "504 gateway",
     "temporarily unavailable",
