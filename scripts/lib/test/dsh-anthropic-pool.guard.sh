@@ -394,7 +394,11 @@ write_fixture_package() {
   # index.js — ensureProvider() и окружающий forward()/401-403-ветка —
   # ТОЧНАЯ копия dsh-anthropic-oauth-pool-0.1.0.tgz (релиз
   # dsh-plugins-suite-v1), инспектирована живьём при разборе #1097/#1130.
+  # Строка import — тоже точная копия верхушки реального lib/index.js
+  # (#1192: PATCH_IMPORT_CLASSIFY трогает именно её).
   cat >"$dir/lib/index.js" <<'INDEX_JS'
+import { createRefreshCoordinator, selectAccount, updateQuotaFromHeaders, available } from './pool.js'
+
 const name = "dsh-anthropic-oauth-pool"
 
 function apply(ctx) {
@@ -700,5 +704,195 @@ BEHAVIOR_MJS
   cat "$BEHAVIOR_LOG"
 ) || fail "14) патч превентивного рефреша долгоживущих токенов не подтверждён поведенчески"
 echo "GUARD(anthropic-pool): 14) патченный pool.js — без expiresAt рефреша нет, с expiresAt в прошлом рефреш есть, короткоживущие токены не задеты — ок (#1130)"
+
+# ── 15) #1192: 4-й патч (classifyPoolUnavailable/reason/accounts) применился
+#       к прод-форме фикстуры — расширение секции 11a теми же приёмами:
+#       живой вызов classifyPoolUnavailable в else-ветке, обновлённый import
+#       из pool.js, экспортированная функция в pool.js. ────────────────────
+(
+  FIXTURE_DIR="$(mktemp -d)"
+  write_fixture_package "$FIXTURE_DIR"
+  grep -q "import { createRefreshCoordinator, selectAccount, updateQuotaFromHeaders, available } from './pool.js'" "$FIXTURE_DIR/lib/index.js" || { echo "::error::15) фикстура index.js сама не содержит ожидаемую строку import — тест сломан до патча" >&2; exit 1; }
+  if ! python3 "$REPO/scripts/lib/patch_anthropic_pool_plugin.py" "$FIXTURE_DIR" >"$FIXTURE_DIR/patch.log" 2>&1; then
+    echo "::error::15) патч не применился к прод-форме фикстуры: $(cat "$FIXTURE_DIR/patch.log")" >&2; exit 1
+  fi
+  grep -q "available, classifyPoolUnavailable } from './pool.js'" "$FIXTURE_DIR/lib/index.js" || { echo "::error::15) import classifyPoolUnavailable не добавлен в index.js" >&2; exit 1; }
+  grep -q "const { reason, accounts } = classifyPoolUnavailable(\[...runtime.values()\])" "$FIXTURE_DIR/lib/index.js" || { echo "::error::15) else-ветка pool_unavailable не зовёт classifyPoolUnavailable" >&2; exit 1; }
+  grep -q "retryAt: next?.cooldownUntil || null, reason, accounts } }))" "$FIXTURE_DIR/lib/index.js" || { echo "::error::15) reason/accounts не попали в JSON-тело pool_unavailable" >&2; exit 1; }
+  grep -q "^export function classifyPoolUnavailable(accounts) {" "$FIXTURE_DIR/lib/pool.js" || { echo "::error::15) pool.js не содержит экспортированную classifyPoolUnavailable" >&2; exit 1; }
+) || fail "15) патч 4 (reason/accounts у pool_unavailable) не применился к прод-форме"
+echo "GUARD(anthropic-pool): 15) патч 4 (classifyPoolUnavailable/reason/accounts) применился к прод-форме — ок (#1192)"
+
+# ── 16) #1192 (мутация): форма else-ветки pool_unavailable изменилась (как
+#       если бы апстрим переписал плагин) — точное совпадение обязано
+#       провалиться громко, а НЕ применить патч частично. Проверяем
+#       атомарность: ни index.js, ни pool.js не изменились (все 6
+#       _replace_required идут на content-буферах ДО первой записи файла). ──
+(
+  FIXTURE_DIR="$(mktemp -d)"
+  write_fixture_package "$FIXTURE_DIR"
+  python3 -c "
+import sys
+path = sys.argv[1]
+with open(path, encoding='utf-8') as f:
+    content = f.read()
+marker = \"type: 'pool_unavailable', message: lastError?.message || 'No Anthropic account is available', retryAt: next?.cooldownUntil || null\"
+assert marker in content, 'fixture setup broken'
+content = content.replace(marker, \"type: 'pool_unavailable', reason_message: lastError?.message || 'No Anthropic account is available', retryAt: next?.cooldownUntil || null\")
+with open(path, 'w', encoding='utf-8') as f:
+    f.write(content)
+" "$FIXTURE_DIR/lib/index.js"
+  ORIGINAL_INDEX_JS="$(cat "$FIXTURE_DIR/lib/index.js")"
+  ORIGINAL_POOL_JS="$(cat "$FIXTURE_DIR/lib/pool.js")"
+  if python3 "$REPO/scripts/lib/patch_anthropic_pool_plugin.py" "$FIXTURE_DIR" >"$FIXTURE_DIR/patch.log" 2>&1; then
+    echo "::error::16) патч ОБЯЗАН был отказать на изменённой форме else-ветки pool_unavailable, но применился молча" >&2; exit 1
+  fi
+  grep -qi "PATCH_MARKER_NOT_FOUND\[pool_unavailable_reason\]" "$FIXTURE_DIR/patch.log" || { echo "::error::16) отказ патча не назвал причину PATCH_MARKER_NOT_FOUND[pool_unavailable_reason]: $(cat "$FIXTURE_DIR/patch.log")" >&2; exit 1; }
+  [ "$(cat "$FIXTURE_DIR/lib/index.js")" = "$ORIGINAL_INDEX_JS" ] || { echo "::error::16) index.js изменился, хотя патч должен был отказать ДО записи любого файла" >&2; exit 1; }
+  [ "$(cat "$FIXTURE_DIR/lib/pool.js")" = "$ORIGINAL_POOL_JS" ] || { echo "::error::16) pool.js изменился, хотя патч 4-й (pool_unavailable_reason) не совпал первым в index.js — атомарность нарушена (pool_classify_export не должен был примениться)" >&2; exit 1; }
+) || fail "16) патч не падает громко на изменённой форме else-ветки pool_unavailable (мутация #1192)"
+echo "GUARD(anthropic-pool): 16) мутация формы pool_unavailable -> патч отказывает громко (PATCH_MARKER_NOT_FOUND), ОБА файла не тронуты (атомарность) — ок (#1192)"
+
+# ── 17) #1192: ПОВЕДЕНЧЕСКОЕ доказательство classifyPoolUnavailable — не
+#       текстовый grep (уже сделан в 15), а РЕАЛЬНЫЙ вызов патченной функции
+#       в node с синтетическими аккаунтами. Доказывает: 401/403 ->
+#       auth_rejected; 429 (без auth_rejected рядом) -> rate_limited;
+#       исключение без HTTP-ответа -> network_error; ничего не пробовалось
+#       -> unknown; auth_rejected ИМЕЕТ ПРИОРИТЕТ над rate_limited, когда оба
+#       класса присутствуют одновременно (владелец не должен быть пропущен
+#       только потому, что ДРУГОЙ аккаунт всего лишь упёрся в лимit). ───────
+(
+  FIXTURE_ROOT="$(mktemp -d)"
+  EXTRACT_DIR="$FIXTURE_ROOT/anthropic-oauth-pool-extracted/package"
+  write_fixture_package "$EXTRACT_DIR"
+  export DSH_ANTHROPIC_POOL_ACTIVE=1
+  export DSH_ANTHROPIC_POOL_EXTRACTED="$EXTRACT_DIR"
+  export DSH_ANTHROPIC_POOL_PKG="$FIXTURE_ROOT/original.tgz"
+  : >"$DSH_ANTHROPIC_POOL_PKG"
+  dsh_patch_anthropic_pool_plugin || { echo "::error::17) dsh_patch_anthropic_pool_plugin отказала на валидной фикстуре" >&2; exit 1; }
+
+  cat >"$EXTRACT_DIR/lib/classify-check.mjs" <<'CLASSIFY_MJS'
+import { classifyPoolUnavailable } from './pool.js'
+
+const authOnly = classifyPoolUnavailable([{ id: 'a1', lastStatus: 401 }, { id: 'a2', lastStatus: 403 }])
+const rateOnly = classifyPoolUnavailable([{ id: 'a1', lastStatus: 429 }])
+const networkOnly = classifyPoolUnavailable([{ id: 'a1', lastError: 'fetch failed: ECONNRESET' }])
+const nothing = classifyPoolUnavailable([{ id: 'a1' }])
+const mixedAuthWins = classifyPoolUnavailable([{ id: 'a1', lastStatus: 429 }, { id: 'a2', lastStatus: 401 }])
+
+const checks = [
+  ['authOnly.reason', authOnly.reason, 'auth_rejected'],
+  ['authOnly.accounts[0].class', authOnly.accounts[0].class, 'auth_rejected'],
+  ['authOnly.accounts[1].class', authOnly.accounts[1].class, 'auth_rejected'],
+  ['rateOnly.reason', rateOnly.reason, 'rate_limited'],
+  ['networkOnly.reason', networkOnly.reason, 'network_error'],
+  ['nothing.reason', nothing.reason, 'unknown'],
+  ['mixedAuthWins.reason', mixedAuthWins.reason, 'auth_rejected'],
+]
+let failed = false
+for (const [label, got, want] of checks) {
+  const ok = got === want
+  console.log(`${ok ? 'OK' : 'FAIL'}: ${label}=${got} (want ${want})`)
+  if (!ok) failed = true
+}
+if (failed) process.exit(1)
+console.log('OK: classifyPoolUnavailable — все шесть классов различены верно, auth_rejected приоритетнее rate_limited')
+CLASSIFY_MJS
+  CLASSIFY_LOG="$FIXTURE_ROOT/classify.log"
+  if ! node "$EXTRACT_DIR/lib/classify-check.mjs" >"$CLASSIFY_LOG" 2>&1; then
+    { echo "::error::17) поведенческая проверка classifyPoolUnavailable провалилась:"; cat "$CLASSIFY_LOG"; } >&2
+    exit 1
+  fi
+  cat "$CLASSIFY_LOG"
+) || fail "17) classifyPoolUnavailable не подтверждена поведенчески"
+echo "GUARD(anthropic-pool): 17) classifyPoolUnavailable — auth_rejected/rate_limited/network_error/unknown различены, auth_rejected приоритетнее — ок (#1192)"
+
+# ── 18) #1192: dsh_pool_unavailable_owner_note — прод-форма stderr (реальный
+#       вид «dsh: SERVER: 503 {...}» из живого прогона worker.yml 34792555573,
+#       дополненный полем reason нашим же патчем). Пять исходов, каждый —
+#       РАЗНЫЙ факт, не гадание: auth_rejected называет "владелец нужен",
+#       rate_limited — "владелец НЕ нужен" (два сообщения обязаны различаться
+#       буквально, не одним и тем же текстом с другой меткой). Мутация:
+#       поле reason отсутствует (форма до патча/апстрим сменился) -> честный
+#       пробел «не классифицирована», а не подстановка одной из гипотез. ────
+(
+  WORK18="$(mktemp -d)"
+  cat >"$WORK18/err_auth.txt" <<'EOF'
+dsh: SERVER: 503 {"type":"error","error":{"type":"pool_unavailable","message":"No Anthropic account is available","retryAt":1789345764948,"reason":"auth_rejected","accounts":[{"id":"anthropic-1","class":"auth_rejected","lastStatus":401,"cooldownUntil":1789345764948},{"id":"anthropic-2","class":"auth_rejected","lastStatus":403,"cooldownUntil":1789345764948}]}}
+EOF
+  cat >"$WORK18/err_rate.txt" <<'EOF'
+dsh: SERVER: 503 {"type":"error","error":{"type":"pool_unavailable","message":"No Anthropic account is available","retryAt":1789345764948,"reason":"rate_limited","accounts":[{"id":"anthropic-1","class":"rate_limited","lastStatus":429,"cooldownUntil":1789345764948}]}}
+EOF
+  cat >"$WORK18/err_network.txt" <<'EOF'
+dsh: SERVER: 503 {"type":"error","error":{"type":"pool_unavailable","message":"fetch failed: ECONNRESET","retryAt":null,"reason":"network_error","accounts":[{"id":"anthropic-1","class":"network_error","lastStatus":null,"cooldownUntil":1789345764948}]}}
+EOF
+  cat >"$WORK18/err_unknown.txt" <<'EOF'
+dsh: SERVER: 503 {"type":"error","error":{"type":"pool_unavailable","message":"No Anthropic account is available","retryAt":null,"reason":"unknown","accounts":[]}}
+EOF
+  # Прод-форма ДО патча #1192 (живой прогон 34792555573 — ровно этот текст) —
+  # поле reason отсутствует физически, не пустая строка.
+  cat >"$WORK18/err_no_reason.txt" <<'EOF'
+dsh: SERVER: 503 {"type":"error","error":{"type":"pool_unavailable","message":"No Anthropic account is available","retryAt":1789345764948}}
+EOF
+
+  note_auth=$(dsh_pool_unavailable_owner_note "$WORK18/err_auth.txt")
+  note_rate=$(dsh_pool_unavailable_owner_note "$WORK18/err_rate.txt")
+  note_network=$(dsh_pool_unavailable_owner_note "$WORK18/err_network.txt")
+  note_unknown=$(dsh_pool_unavailable_owner_note "$WORK18/err_unknown.txt")
+  note_no_reason=$(dsh_pool_unavailable_owner_note "$WORK18/err_no_reason.txt")
+
+  echo "18) auth_rejected: $note_auth"
+  echo "18) rate_limited:  $note_rate"
+  echo "18) network_error: $note_network"
+  echo "18) unknown:       $note_unknown"
+  echo "18) без reason:    $note_no_reason"
+
+  [[ "$note_auth" == *"владелец нужен"* ]] || { echo "::error::18) auth_rejected обязан назвать «владелец нужен»: $note_auth" >&2; exit 1; }
+  [[ "$note_auth" == *"ANTHROPIC_OAUTH_1"* && "$note_auth" == *"ANTHROPIC_OAUTH_2"* ]] || { echo "::error::18) auth_rejected обязан назвать имена секретов на перевыпуск: $note_auth" >&2; exit 1; }
+  [[ "$note_rate" == *"владелец НЕ нужен"* ]] || { echo "::error::18) rate_limited обязан назвать «владелец НЕ нужен»: $note_rate" >&2; exit 1; }
+  [[ "$note_rate" == *"2026-09-14"* ]] || { echo "::error::18) rate_limited обязан назвать ретрай, вычисленный из retryAt (эпоха 1789345764948мс): $note_rate" >&2; exit 1; }
+  [ "$note_auth" != "$note_rate" ] || { echo "::error::18) auth_rejected и rate_limited дали ОДИНАКОВЫЙ текст — ровно та проблема, ради которой заведена задача #1192" >&2; exit 1; }
+  [[ "$note_network" == *"не подтверждено"* ]] || { echo "::error::18) network_error обязан честно назвать «не подтверждено»: $note_network" >&2; exit 1; }
+  [[ "$note_unknown" == *"не подтверждено"* ]] || { echo "::error::18) unknown (плагин сам не смог классифицировать) обязан назвать «не подтверждено»: $note_unknown" >&2; exit 1; }
+  # Мутация класса «алерт не гадает»: без поля reason сообщение обязано
+  # признать пробел, а НЕ выбрать одну из гипотез (auth_rejected/rate_limited)
+  # наугад.
+  [[ "$note_no_reason" == *"не классифицирована"* ]] || { echo "::error::18) без поля reason (прод-форма ДО патча) сообщение обязано признать пробел, не угадывать: $note_no_reason" >&2; exit 1; }
+  [[ "$note_no_reason" != *"владелец нужен"* && "$note_no_reason" != *"владелец НЕ нужен"* ]] || { echo "::error::18) без поля reason сообщение НЕ должно утверждать о владельце ни в одну сторону (это и есть гадание) — $note_no_reason" >&2; exit 1; }
+) || fail "18) dsh_pool_unavailable_owner_note не различает исходы либо гадает при отсутствии reason"
+echo "GUARD(anthropic-pool): 18) dsh_pool_unavailable_owner_note — пять исходов различены буквально, без reason — честный пробел, не гадание — ок (#1192)"
+
+# ── 19) #1192 (сквозной): dsh_run_with_pool_then_chain печатает ОБА факта
+#       (текст отказа + причину «владелец нужен/не нужен») И честно
+#       откатывается на цепочку — рабочая деградация (класс #1067/#838) не
+#       сломана добавлением reason. Мок пула отвечает прод-формой ответа
+#       ПОСЛЕ патча #1192 (с полем reason), мок цепочки отвечает успехом. ───
+(
+  export DSH_ANTHROPIC_POOL_ACTIVE=1
+  export SMOKE_MODE_primary_model=ok
+  rm -f "$CHAIN_CALLED_MARK"; : >"$ANSWER"; : >"$ERR"
+  dsh() {
+    case "${1:-}" in
+      --profile)
+        if grep -q 'provider: anthropic-pool' "$HOME/.dsh/profiles/headless/cordis.patch.yml" 2>/dev/null; then
+          echo 'dsh: SERVER: 503 {"type":"error","error":{"type":"pool_unavailable","message":"No Anthropic account is available","retryAt":1789345764948,"reason":"auth_rejected","accounts":[{"id":"anthropic-1","class":"auth_rejected","lastStatus":401,"cooldownUntil":1789345764948}]}}' >&2
+          return 1
+        else
+          touch "$CHAIN_CALLED_MARK"; echo "smoke: ответ от $DEEPSEEK_MODEL"; return 0
+        fi ;;
+      *) echo "::error::SMOKE(19): dsh-заглушка не знает вызов: $*" >&2; return 99 ;;
+    esac
+  }
+  export -f dsh
+  POOL_LOG19="$WORK/pool-warning-19.txt"
+  dsh_run_with_pool_then_chain "$ANSWER" "$ERR" "промпт smoke" >"$POOL_LOG19" 2>&1
+  [ "$DSH_RUN_RC" = "0" ] || { echo "::error::19) ожидался успех после отката на цепочку, получено rc=$DSH_RUN_RC: $(cat "$POOL_LOG19")" >&2; exit 1; }
+  [ "$DSH_CHAIN_PROVIDER" = "PRIMARY" ] || { echo "::error::19) DSH_CHAIN_PROVIDER='$DSH_CHAIN_PROVIDER', ожидался PRIMARY (деградация на цепочку сломана)" >&2; exit 1; }
+  [ -f "$CHAIN_CALLED_MARK" ] || { echo "::error::19) цепочка обязана была запуститься после отказа пула" >&2; exit 1; }
+  grep -q "pool_unavailable" "$POOL_LOG19" || { echo "::error::19) предупреждение потеряло исходный текст отказа (регресс #1067): $(cat "$POOL_LOG19")" >&2; exit 1; }
+  grep -q "владелец нужен" "$POOL_LOG19" || { echo "::error::19) предупреждение не назвало «владелец нужен» для auth_rejected: $(cat "$POOL_LOG19")" >&2; exit 1; }
+  grep -q "перевыпуск секретов ANTHROPIC_OAUTH_1 ANTHROPIC_OAUTH_2" "$POOL_LOG19" || { echo "::error::19) предупреждение не назвало конкретные секреты на перевыпуск: $(cat "$POOL_LOG19")" >&2; exit 1; }
+) || fail "19) сквозной путь: reason виден в предупреждении, откат на цепочку не сломан"
+echo "GUARD(anthropic-pool): 19) dsh_run_with_pool_then_chain — reason виден владельцу, откат на цепочку честный (класс #1067/#838 не сломан) — ок (#1192)"
 
 echo "GUARD(anthropic-pool): быстрый провайдер Claude (#838), инвариант #860 «пул только в worker/hands» — гвардия зелёная"

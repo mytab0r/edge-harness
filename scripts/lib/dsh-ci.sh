@@ -1561,9 +1561,61 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
 # (DSH_RUN_RC/DSH_RUN_FAILURE_REASON/DSH_CHAIN_PROVIDER/DSH_CHAIN_TRIED/
 # DSH_CHAIN_RESET_HINT) — вызывающие (worker/hands/ai-review) читают ровно те
 # же переменные, что и раньше, независимо от того, ответил пул или цепочка.
+# ── Причина pool_unavailable — различить, нужен ли владелец (#1192) ─────────
+#
+# «pool_unavailable» сам по себе — агрегат «ни один аккаунт не доступен», он
+# НЕ говорит, почему: 401/403 (креды отвергнуты Anthropic, нужен перевыпуск
+# секретов ВЛАДЕЛЬЦЕМ) и 429 (лимит Anthropic, само пройдёт) выглядели
+# снаружи одинаковым текстом. Патч плагина (classifyPoolUnavailable,
+# lib/pool.js, scripts/lib/patch_anthropic_pool_plugin.py) кладёт
+# машиночитаемое поле `reason` прямо в JSON-тело ответа — читаем его отсюда,
+# не гадаем по тексту (AGENTS.md, «Алерт не гадает»). Поле извлекается
+# регэкспом по СЫРОМУ stderr (не через jq на всю строку) — префикс "dsh:
+# SERVER: 503 " и то, что JSON лежит внутри чужого текстового сообщения, не
+# гарантируют валидный самостоятельный JSON-объект при наивной вырезке
+# подстроки.
+#
+# Четыре исхода, каждый — ФАКТ, не гипотеза:
+#   auth_rejected  — аккаунт(ы) отвергнуты Anthropic (401/403), владелец нужен;
+#   rate_limited   — аккаунт(ы) исчерпали лимит (429), само пройдёт;
+#   network_error  — исключение при попытке (не HTTP-ответ), не подтверждено;
+#   reason=unknown/поле отсутствует — плагин сам не смог классифицировать,
+#     либо патч не применился/апстрим сменил форму — так и сказано, без
+#     подстановки одной из трёх гипотез выше вместо честного пробела.
+dsh_pool_unavailable_owner_note() { # err_file
+  local err_file=$1 pool_reason pool_retry_at retry_note note
+  pool_reason=$(grep -oE '"reason":"[a-z_]+"' "$err_file" 2>/dev/null | head -1 | sed -E 's/.*"reason":"([a-z_]+)".*/\1/') || pool_reason=""
+  case "$pool_reason" in
+    auth_rejected)
+      note="ПРИЧИНА: аккаунт(ы) пула отвергнуты Anthropic (401/403) — нужен перевыпуск секретов ${ANTHROPIC_OAUTH_ACCOUNT_SECRETS[*]}, владелец нужен"
+      ;;
+    rate_limited)
+      pool_retry_at=$(grep -oE '"retryAt":[0-9]+' "$err_file" 2>/dev/null | head -1 | grep -oE '[0-9]+') || pool_retry_at=""
+      retry_note=""
+      if [ -n "$pool_retry_at" ]; then
+        retry_note=", ретрай ~$(jq -nr --argjson ms "$pool_retry_at" '($ms/1000)|gmtime|strftime("%Y-%m-%d %H:%M:%SZ")' 2>/dev/null || printf '%s' "$pool_retry_at")"
+      fi
+      note="ПРИЧИНА: аккаунт(ы) пула исчерпали лимит Anthropic (429)${retry_note}, само пройдёт, владелец НЕ нужен"
+      ;;
+    network_error)
+      note="ПРИЧИНА: сетевая ошибка при обращении к Anthropic (не 401/403/429) — владелец, вероятно, не нужен, но не подтверждено (проверь сеть/таймауты)"
+      ;;
+    unknown)
+      note="причина не установлена: ни один аккаунт пула не получил ответ от Anthropic в этом процессе (не подтверждено, нужен ли владелец)"
+      ;;
+    "")
+      note="причина не классифицирована — поле reason отсутствует в ответе пула (патч classifyPoolUnavailable не применился либо форма pool_unavailable изменилась), не подтверждено, нужен ли владелец"
+      ;;
+    *)
+      note="причина не распознана (reason='$pool_reason', неизвестный класс) — не подтверждено, нужен ли владелец"
+      ;;
+  esac
+  printf '%s' "$note"
+}
+
 dsh_run_with_pool_then_chain() { # answer_file err_file prompt_text
   local answer_file=$1 err_file=$2 prompt_text=$3
-  local pool_rl_used=0 pool_err_note
+  local pool_rl_used=0 pool_err_note pool_reason_note
   if [ "${DSH_ANTHROPIC_POOL_ACTIVE:-0}" = "1" ]; then
     echo "быстрый провайдер: пробую Anthropic OAuth Pool (failover между аккаунтами — внутри одного вызова, lib/index.js плагина)"
     _dsh_patch_profile_anthropic_pool headless
@@ -1591,7 +1643,10 @@ dsh_run_with_pool_then_chain() { # answer_file err_file prompt_text
     # применяет к провайдерам цепочки (200 символов, redact).
     pool_err_note=$(tr '\n' ' ' <"$err_file" | cut -c1-200 | redact)
     [ -n "$pool_err_note" ] || pool_err_note="stderr пуст — диагностику дать не может"
-    echo "::warning::быстрый провайдер Claude (anthropic-oauth-pool) отказал (rc=$DSH_RUN_RC), причина: $pool_err_note — пробую цепочку vars.DSH_PROVIDER_CHAIN/манифеста использования (#838)"
+    # #1192: reason читаем ДО той же перезаписи err_file, которой посвящён
+    # комментарий #1067 выше — тем же приёмом («здесь, до перезаписи»).
+    pool_reason_note=$(dsh_pool_unavailable_owner_note "$err_file")
+    echo "::warning::быстрый провайдер Claude (anthropic-oauth-pool) отказал (rc=$DSH_RUN_RC), причина: $pool_err_note — $pool_reason_note — пробую цепочку vars.DSH_PROVIDER_CHAIN/манифеста использования (#838)"
   fi
   dsh_run_with_provider_chain "$answer_file" "$err_file" "$prompt_text" "$pool_rl_used"
   if [ "${DSH_ANTHROPIC_POOL_ACTIVE:-0}" = "1" ]; then
