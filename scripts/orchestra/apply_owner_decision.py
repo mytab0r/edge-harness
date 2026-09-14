@@ -13,6 +13,50 @@ workflow'а (github.token).
 следующем пульсе orchestra. Второй путь применения здесь НЕ заводится,
 переиспользован post_issue_comment из pulse_guard.py без изменений.
 
+Подпись client_payload (issue #1251, разбор от 2026-09-14): repository_dispatch
+не проверяет, каким токеном его вызвали, только scope — любой держатель
+токена с правом Actions-write на этот репозиторий (это есть у каждого
+агента) вызывает `POST /repos/{owner}/{repo}/dispatches` напрямую с
+произвольным client_payload и получает ОТ ЭТОГО job'а тот же артефакт
+«РЕШЕНИЕ: N», что и настоящее нажатие кнопки. Заслон — HMAC-SHA256 над
+`{issue_number}:{option}` секретом TELEGRAM_WEBHOOK_SECRET (существующий
+секрет, уже аутентифицирующий бота вебхука на стороне морды,
+#ownerChatAuthorized/#telegramWebhookAuthorized в cf-worker/src/harness.ts;
+новый секрет не заводим); тот же секрет уже лежит в GitHub Actions
+repository secrets тем же именем (deploy-worker.yml/telegram-webhook.yml
+читают его как `secrets.TELEGRAM_WEBHOOK_SECRET`). `verify_signature` даёт
+ТРИ РАЗНЫХ отказа, ни один не пишет комментарий (класс #1096, носитель
+третьего состояния scripts/lib/check_result.py — здесь применена та же
+дисциплина «не схлопывать разные причины в одно НЕТ», без прямого импорта
+модуля: тот заточен под проверки инвариантов репозитория, эта — под
+верификацию подписи одного payload'а):
+  1. TELEGRAM_WEBHOOK_SECRET не настроен в этом job'е — подпись НЕЧЕМ
+     проверить (`GithubSecretMissing`);
+  2. client_payload не несёт подписи вовсе (пустая строка — воркер её
+     отправляет уже сейчас всегда, см. #dispatchOwnerDecision, пустая может
+     прийти либо от воркера без TELEGRAM_WEBHOOK_SECRET, либо от воркера
+     старше этого мержа, см. «переходный режим» ниже) (`SignatureMissing`);
+  3. подпись есть, но не совпала с ожидаемой — подделка или испорченный
+     payload (`SignatureMismatch`).
+Повтор ТОГО ЖЕ (issue, option) сознательно НЕ гвардируется нонсом здесь:
+повтор валидной подписи произвёл бы тот же самый текст «РЕШЕНИЕ: N» (не
+другое решение), а риск «протухшей кнопки другого раунда» — отдельный,
+существовавший ДО этой правки пробел, закрытый ниже `issue_still_waiting`
+(другая пара issue/option значит другое в новом раунде — эта проверка не
+про подпись).
+
+Переходный режим (issue #1251, критерий 4): PR правит воркер и workflow
+ОДНИМ коммитом на `cf-worker/**`, поэтому один push на main запускает
+`deploy-worker.yml` (path-фильтр `cf-worker/**`) — окно, где
+`owner-decision.yml` уже проверяет подпись, а Cloudflare-воркер ещё старой
+версии (не подписывает), существует РОВНО длительность прогона
+`deploy-worker.yml` (минуты) и закрывается САМ, без ручного шага: как
+только деплой заканчивается, воркер уже шлёт подпись всегда. Внутри этого
+окна нажатие кнопки красит job (SignatureMissing) — это видимый, громкий,
+самостоятельно устраняющийся сбой, не тихая дыра: постоянного «мягкого»
+режима, принимающего пустую подпись бессрочно, здесь нет и не будет —
+именно бессрочный обход и был дырой issue #1251.
+
 Проверка «задача всё ещё ждёт» (находка ревью PR #486, четвёртый заход):
 клавиатуры прошлых эскалаций ничем не удаляются (кнопки снимает только
 `editMessageText` по нажатию), а гвардия шлёт НОВОЕ кнопочное сообщение
@@ -38,10 +82,20 @@ _console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_u
 # --- конец console_utf8 bootstrap ---
 
 import argparse
+import hashlib
+import hmac
+import os
 import sys
 
 from pulse_guard import DECISION_COMMENT_PREFIX, gh, post_issue_comment
 from waiting_owner_guard import WAITING_OWNER_LABEL
+
+# Имя переменной окружения, несущей секрет подписи (#1251) — ОДНО место
+# правды и здесь, и в .github/workflows/owner-decision.yml (env: с тем же
+# именем из secrets.TELEGRAM_WEBHOOK_SECRET), и в cf-worker/src/harness.ts
+# (env.TELEGRAM_WEBHOOK_SECRET) — три файла читают/пишут один секрет по
+# одному имени, расхождение имени сделало бы подпись непроверяемой молча.
+SIGNATURE_SECRET_ENV_VAR = "TELEGRAM_WEBHOOK_SECRET"
 
 
 def decision_comment(option: int) -> str:
@@ -49,6 +103,43 @@ def decision_comment(option: int) -> str:
         f"{DECISION_COMMENT_PREFIX}: {option}\n\n"
         "Источник: нажатие инлайн-кнопки в Telegram (#254)."
     )
+
+
+def compute_signature(secret: str, issue_number: int, option: int) -> str:
+    """HMAC-SHA256(secret, "issue_number:option") — тот же формат, что
+    #dispatchOwnerDecision считает в cf-worker/src/harness.ts (#hmac над
+    `${issueNumber}:${option}`, вторым аргументом TELEGRAM_WEBHOOK_SECRET).
+    Изменение формата ОБЯЗАНО меняться синхронно в обоих местах — иначе
+    подпись живого воркера перестаёт проверяться этим job'ом."""
+    message = f"{issue_number}:{option}".encode("utf-8")
+    return hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
+
+
+def verify_signature(secret: str | None, issue_number: int, option: int, signature: str | None) -> None:
+    """Три РАЗНЫХ отказа (issue #1251, класс #1096 — не схлопывать причины в
+    одно НЕТ), ни один не должен привести к post_issue_comment: секрет не
+    настроен в этом job'е, подписи нет в client_payload, подпись не
+    совпала. См. докстринг модуля, раздел «Подпись client_payload», за
+    объяснением каждой причины и переходного режима."""
+    if not secret:
+        raise RuntimeError(
+            f"секрет {SIGNATURE_SECRET_ENV_VAR} не настроен в этом job'е (GitHub Actions "
+            "repository secret) — подпись НЕЧЕМ проверить, решение НЕ записано"
+        )
+    if not signature:
+        raise RuntimeError(
+            "client_payload не несёт подписи (signature пусто) — dispatch либо от "
+            "воркера без TELEGRAM_WEBHOOK_SECRET/старее правки #1251 (переходное окно "
+            "деплоя, самоустраняется), либо вызван напрямую в обход кнопки Telegram; "
+            "решение НЕ записано"
+        )
+    expected = compute_signature(secret, issue_number, option)
+    if not hmac.compare_digest(expected, signature):
+        raise RuntimeError(
+            f"#{issue_number}: подпись client_payload не совпадает с ожидаемой для "
+            f"варианта {option} — подделка, испорченный payload или подпись от другой "
+            "пары issue/option; решение НЕ записано"
+        )
 
 
 def issue_still_waiting(repo: str, issue_number: int) -> bool:
@@ -67,7 +158,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", required=True, help="owner/repo")
     parser.add_argument("--issue", required=True, type=int, help="номер задачи (issue), не PR")
     parser.add_argument("--option", required=True, type=int, help="номер выбранного варианта (с 1)")
+    parser.add_argument(
+        "--signature", default="",
+        help="HMAC-подпись client_payload (#1251) из github.event.client_payload.signature; "
+             "пусто — трактуется как «подписи нет» в verify_signature",
+    )
     args = parser.parse_args(argv)
+
+    verify_signature(os.environ.get(SIGNATURE_SECRET_ENV_VAR), args.issue, args.option, args.signature or None)
 
     if not issue_still_waiting(args.repo, args.issue):
         raise RuntimeError(

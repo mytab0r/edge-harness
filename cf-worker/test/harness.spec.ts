@@ -86,6 +86,19 @@ function isGitHubDispatchCall(input: string | URL | Request): boolean {
   }
 }
 
+// Подпись client_payload решения владельца (#1251) — HMAC-SHA256(secret,
+// "issue:option"), тот же формат, что worker считает в #dispatchOwnerDecision
+// (#hmac) и apply_owner_decision.py проверяет на стороне job'а. Отдельная
+// реализация в тесте, не импорт приватного метода класса — приватные методы
+// (#hmac) недоступны снаружи класса, а публичный экспорт ради теста завёл бы
+// лишнюю поверхность API только для проверки.
+async function expectedOwnerDecisionSignature(secret: string, issueNumber: number, option: number): Promise<string> {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const mac = await crypto.subtle.sign("HMAC", key, encoder.encode(`${issueNumber}:${option}`));
+  return [...new Uint8Array(mac)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 function telegramApiMethod(input: string | URL | Request): string | null {
   try {
     const url = new URL(String(input));
@@ -2291,7 +2304,14 @@ describe("Telegram: кнопки решения владельца (#254)", () =
 
       expect(dispatchCalls).toHaveLength(1);
       expect(dispatchCalls[0].event_type).toBe("owner-decision");
-      expect(dispatchCalls[0].client_payload).toEqual({ issue_number: 471, option: 2 });
+      const payload = dispatchCalls[0].client_payload as { issue_number: number; option: number; signature: string };
+      expect(payload.issue_number).toBe(471);
+      expect(payload.option).toBe(2);
+      // Подпись (#1251) — HMAC-SHA256(TELEGRAM_WEBHOOK_SECRET, "issue:option"),
+      // тот же секрет, что открывает вебхук выше ("test-webhook-secret",
+      // vitest.config.ts). Считаем её здесь заново, не хардкодим хеш — иначе
+      // тест ловил бы только "изменился ли вывод", не "правильный ли ключ/формат".
+      expect(payload.signature).toBe(await expectedOwnerDecisionSignature("test-webhook-secret", 471, 2));
 
       const answer = telegramCalls.find((c) => c.method === "answerCallbackQuery");
       expect(answer).toBeDefined();
@@ -2308,6 +2328,54 @@ describe("Telegram: кнопки решения владельца (#254)", () =
       env.GH_DISPATCH_TOKEN = "";
       env.TELEGRAM_BOT_TOKEN = "";
     }
+  });
+
+  // #1251: подпись client_payload — единственный заслон между нажатием
+  // кнопки и прямым вызовом repository_dispatch тем же токеном, что есть у
+  // каждого агента (сам дизайн защиты, не пересказ). Три свойства подписи
+  // проверяются отдельно от happy path выше.
+  describe("подпись client_payload решения владельца (#1251)", () => {
+    it("подпись меняется вместе с issue_number ИЛИ option — переносить её на другую пару нельзя", async () => {
+      const sigA = await expectedOwnerDecisionSignature("test-webhook-secret", 471, 1);
+      const sigB = await expectedOwnerDecisionSignature("test-webhook-secret", 471, 2);
+      const sigC = await expectedOwnerDecisionSignature("test-webhook-secret", 999, 1);
+      expect(sigA).not.toBe(sigB);
+      expect(sigA).not.toBe(sigC);
+    });
+
+    it("без TELEGRAM_WEBHOOK_SECRET в воркере — signature уходит пустой строкой, полем не пропадает (стабильный контракт client_payload)", async () => {
+      const saved = env.TELEGRAM_WEBHOOK_SECRET;
+      env.TELEGRAM_WEBHOOK_SECRET = "";
+      const realFetch = globalThis.fetch;
+      env.GH_DISPATCH_TOKEN = "test-dispatch-token";
+      env.TELEGRAM_BOT_TOKEN = "test-bot-token";
+      const dispatchCalls: Record<string, unknown>[] = [];
+      vi.stubGlobal("fetch", (async (input: string | URL | Request, init?: RequestInit) => {
+        if (isGitHubDispatchCall(input)) {
+          dispatchCalls.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+          return new Response(null, { status: 204 });
+        }
+        if (telegramApiMethod(input)) return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        return realFetch(input as RequestInfo, init);
+      }) as typeof fetch);
+      try {
+        // Путь через вебхук требует TELEGRAM_WEBHOOK_SECRET для самой
+        // аутентификации бота — обходим его здесь Bearer'ом (вызывающий по
+        // Bearer уже доверен, viaTelegramWebhook=false, chat_id не сверяется,
+        // см. докстринг #postMessageIngest), чтобы изолированно проверить
+        // именно «нет секрета для подписи», не «нет секрета для вебхука».
+        const res = await postJson("/api/messages/ingest", callbackUpdate({ data: "wo:471:1" }));
+        expect(res.status).toBe(200);
+        expect(dispatchCalls).toHaveLength(1);
+        const payload = dispatchCalls[0].client_payload as { signature: string };
+        expect(payload.signature).toBe("");
+      } finally {
+        vi.unstubAllGlobals();
+        env.GH_DISPATCH_TOKEN = "";
+        env.TELEGRAM_BOT_TOKEN = "";
+        env.TELEGRAM_WEBHOOK_SECRET = saved;
+      }
+    });
   });
 
   it("повторная доставка того же update_id (ретрай Telegram) не дублирует dispatch, но снова отвечает владельцу", async () => {
