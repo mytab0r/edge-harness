@@ -2623,29 +2623,27 @@ def fetch_recently_closed_ci_failure_issues(
 ) -> list[dict]:
     """Закрытые issues с меткой pulse_guard.FAILURE_WATCH_LABEL, чей
     closed_at не старше window_hours — сырой вход для
-    check_ci_failure_closed_but_main_red. Листает страницы (класс #308) —
-    тот же приём, что открытые обходы Issues этого файла (без него молча
-    занижали бы охват после первой сотни закрытых ci-failure задач за всё
-    время)."""
+    check_ci_failure_closed_but_main_red.
+
+    `review_labels.list_pages` — одно место правды и на обход страниц
+    (класс #308: сырая первая страница молча теряла бы хвост после первой
+    сотни закрытых ci-failure задач за всё время), и на fail loud при
+    неожиданной форме ответа (дефект #120A: dict/None от вторичного
+    рейт-лимита не читается как «страниц больше нет»). `label_query_value`
+    (issue #938) — метка с `-` не несёт `:`, но гвардия
+    test_label_query_encoding_guard.py требует кодирования КАЖДОЙ
+    подстановки `labels=`, не только тех, что сейчас содержат опасный
+    символ, — второе место, забывшее это сделать, находит именно она."""
     cutoff = now - timedelta(hours=window_hours)
-    page = 1
-    result: list[dict] = []
-    while True:
-        chunk = gh(
-            f"repos/{repo}/issues?state=closed&labels={pulse_guard.FAILURE_WATCH_LABEL}"
-            f"&per_page=100&page={page}"
-        ) or []
-        if not isinstance(chunk, list) or not chunk:
-            break
-        for issue in chunk:
-            if "pull_request" in issue or not issue.get("closed_at"):
-                continue
-            if parse_time(issue["closed_at"]) >= cutoff:
-                result.append(issue)
-        if len(chunk) < 100:
-            break
-        page += 1
-    return result
+    issues = review_labels.list_pages(
+        f"repos/{repo}/issues?state=closed"
+        f"&labels={review_labels.label_query_value(pulse_guard.FAILURE_WATCH_LABEL)}"
+        f"&per_page=100", gh)
+    return [
+        issue for issue in issues
+        if "pull_request" not in issue and issue.get("closed_at")
+        and parse_time(issue["closed_at"]) >= cutoff
+    ]
 
 
 def fetch_runs_by_workflow(repo: str, workflows: set[str], per_page: int = 100) -> dict[str, list[dict]]:
