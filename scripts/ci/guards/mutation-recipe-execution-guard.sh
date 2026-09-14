@@ -25,6 +25,12 @@ if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
   git fetch --unshallow origin main
 fi
 
+# Контракт каталога (докстринг run_guards.sh): каждая гвардия несёт свои
+# pip install/pytest сама, не полагается на алфавитный сосед по циклу
+# (issue #1208, чеклист ревью — без этой строки гвардия проходила только
+# потому, что ai-review-gate-guard.sh/ci-guard-registration.sh уже
+# поставили pytest раньше в том же job'е run_guards.sh).
+pip install --quiet pytest
 python3 -m pytest scripts/lib/test_mutation_recipe_guard.py -q
 
 # scan_and_verify() до этой правки не вызывалась нигде, кроме собственных
@@ -45,8 +51,22 @@ python3 -m pytest scripts/lib/test_mutation_recipe_guard.py -q
 # `mutation_recipe_guard.py` (докстринг-пример формата) исключения не
 # требует — его плейсхолдерный `ref` содержит пробел и отсеивается
 # `_looks_like_template_ref` внутри самого парсера.
-if hits="$(git grep -lI MUTATION-PROOF -- . ':!scripts/lib/test_mutation_recipe_guard.py' 2>/dev/null)"; then
+#
+# rc=0 — есть совпадения, rc=1 — совпадений нет (штатный, самый частый
+# случай), любой другой код (128 — не репозиторий/битый index, 2 — отказ
+# pathspec) — реальный отказ git grep, а не «ноль файлов» (issue #1208,
+# третий круг ai-review): `if hits=$(...); then ... else ...; fi` этого не
+# различал — ЛЮБОЙ ненулевой rc уходил в ветку «0 файлов», молча подменяя
+# несостоявшийся скан здоровым нулём.
+set +e
+hits="$(git grep -lI MUTATION-PROOF -- . ':!scripts/lib/test_mutation_recipe_guard.py' 2>/dev/null)"
+grep_rc=$?
+set -e
+if [ "$grep_rc" -eq 0 ]; then
   echo "$hits" | xargs -r python3 scripts/lib/mutation_recipe_guard.py
-else
+elif [ "$grep_rc" -eq 1 ]; then
   echo "mutation-recipe-guard: 0 файлов с маркером MUTATION-PROOF в дереве"
+else
+  echo "::error::git grep отказал (rc=$grep_rc) — скан не состоялся" >&2
+  exit 1
 fi

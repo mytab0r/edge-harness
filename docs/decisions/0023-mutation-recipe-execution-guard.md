@@ -119,10 +119,12 @@ $ node scripts/lib/test/ingest-mutation-scenario.mjs <патч на HEAD (пос
 RESULT batch1.appended=2 batch2Error=null batch3Error=null disposeCalls=0
 ```
 
-Ложных срабатываний на 20 слитых PR из замера выше — 0 (все их файлы
-проверены `test_scan_of_last_20_merged_pr_test_files_finds_zero_blocks_and_
-zero_violations`: 0 блоков `MUTATION-PROOF` найдено, поэтому 0 проверок и 0
-возможных ложных находок — opt-in формат не задевает существующую прозу).
+Ложных срабатываний на 20 слитых PR из замера выше — 0: выборка из 8
+тест-файлов, затронутых этими PR (`test_scan_of_last_20_merged_pr_test_
+files_finds_zero_blocks_and_zero_violations` — не все файлы 20 PR
+поштучно, а репрезентативная выборка их тест-файлов), даёт 0 блоков
+`MUTATION-PROOF`, поэтому 0 проверок и 0 возможных ложных находок — opt-in
+формат не задевает существующую прозу.
 
 ## Мутация собственного механизма (доказательство, не описание)
 

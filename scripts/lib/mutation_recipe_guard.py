@@ -47,6 +47,14 @@ safety.test.mjs` заявил «одно освобождение дескрип
 свободный shell (её содержимое доверяется автору блока: та же модель
 доверия, что уже несёт любой шаг CI/гвардия каталога `scripts/ci/guards/`).
 
+`ref` обязана быть достижима из `origin/main` в CI (исторический SHA main,
+`origin/main` сама) — гвардия каталога (`mutation-recipe-execution-guard.sh`)
+дотягивает полную историю ТОЛЬКО main (`git fetch --unshallow origin main`).
+`ref: HEAD~1` на многокоммитной PR-ветке или SHA только внутри чужого PR
+локально может пройти, а в CI даст `unknown()` — это не отказ транспорта,
+а ref, недостижимый из истории, которую CI себе дотягивает (issue #1208,
+чеклист ревью).
+
 Запуск тестов: python -m pytest scripts/lib/test_mutation_recipe_guard.py -q
 """
 
