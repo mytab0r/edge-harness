@@ -3934,3 +3934,125 @@ def test_run_escalations_invariant_18_key_stays_compact(monkeypatch):
     ri.run_escalations("mytab0r/edge-harness", {18: many_plus_one})
     assert len(seen_markers) == 2
     assert seen_markers[0] != seen_markers[1]  # новый состав — новая эскалация
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Инвариант 19 (issue #1253): «доводку не звали ни разу» отдельно от
+# «доводка звалась и не помогла» — check_stuck_review_gate (инвариант 3)
+# структурно не видит PR с уже вынесенным ai:changes-requested.
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def timeline_with_ai_changes(when: str):
+    return [{"event": "labeled", "label": {"name": ri.review_labels.AI_CHANGES}, "created_at": when}]
+
+
+def ai_rework_marker_comment(when: str):
+    return {"created_at": when, "body": f"🤖 {ri.scheduler.AI_REWORK_MARKER} fp:abc123 текст"}
+
+
+def test_ai_rework_never_dispatched_flags_after_threshold_without_marker(monkeypatch):
+    # Живой случай (issue #1253, замер 2026-09-14): PR #261 несёт
+    # ai:changes-requested с 2026-09-06T09:13:49Z (~8.3 сут на момент замера)
+    # и ни разу не получал маркер авто-доводки — голодание очереди по
+    # возрасту (dispatch_ai_review_rework перебирал сырой порядок open_pulls,
+    # новые PR первыми, до фикса этим же PR).
+    pull = open_pr(261, labels=[ri.review_labels.AI_CHANGES])
+    fake = FakeGh({
+        "issues/261/timeline": timeline_with_ai_changes("2026-09-06T09:13:49Z"),
+        "issues/261/comments": [],
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 14, 15, 33)
+    violations = ri.check_ai_rework_never_dispatched("mytab0r/edge-harness", now, [pull])
+    assert len(violations) == 1
+    assert violations[0]["pr"] == 261
+    assert violations[0]["age_minutes"] > ri.AI_REWORK_NEVER_DISPATCHED_AFTER_MINUTES
+
+
+def test_ai_rework_never_dispatched_silent_within_threshold(monkeypatch):
+    # Свежепомеченный PR — формирующийся бэклог сразу после дисптача,
+    # НЕ находка (тот же класс «тормоз без газа», от которого уже
+    # отказались для 1/4/5/9): очередь из N PR разгребается сама за часы.
+    pull = open_pr(1254, labels=[ri.review_labels.AI_CHANGES])
+    fake = FakeGh({
+        "issues/1254/timeline": timeline_with_ai_changes("2026-09-14T15:33:15Z"),
+        "issues/1254/comments": [],
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 14, 15, 34)
+    assert ri.check_ai_rework_never_dispatched("mytab0r/edge-harness", now, [pull]) == []
+
+
+def test_ai_rework_never_dispatched_silent_when_marker_present(monkeypatch):
+    # «Доводка звалась и не помогла» — ДРУГОЕ состояние: бюджет
+    # dispatch_ai_review_rework (AI_REWORK_MAX_ATTEMPTS + эскалация) уже
+    # отвечает за него, второй тормоз здесь не заводится.
+    #
+    # Мутация: убери ветку `if ever_dispatched: continue` в
+    # check_ai_rework_never_dispatched — этот тест покраснеет (PR #804,
+    # 7.5 суток с меткой, стал бы ложной находкой несмотря на маркер доводки).
+    pull = open_pr(804, labels=[ri.review_labels.AI_CHANGES])
+    fake = FakeGh({
+        "issues/804/timeline": timeline_with_ai_changes("2026-09-09T09:35:51Z"),
+        "issues/804/comments": [ai_rework_marker_comment("2026-09-12T13:00:00Z")],
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 14, 15, 33)  # ~7.5 суток с простановки метки
+    assert ri.check_ai_rework_never_dispatched("mytab0r/edge-harness", now, [pull]) == []
+
+
+def test_ai_rework_never_dispatched_silent_for_conflict_pr(monkeypatch):
+    # Conflict-PR — своя очередь (dispatch_conflict_rework), этот инвариант
+    # их не трогает вовсе, даже если ai:changes-requested тоже висит.
+    pull = open_pr(560, labels=[ri.review_labels.AI_CHANGES, ri.scheduler.CONFLICT_LABEL])
+    fake = FakeGh({})  # маршрут даже не должен запрашиваться
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 14, 15, 33)
+    assert ri.check_ai_rework_never_dispatched("mytab0r/edge-harness", now, [pull]) == []
+    assert fake.calls == []
+
+
+def test_ai_rework_never_dispatched_silent_when_no_ai_changes_label():
+    pull = open_pr(1, labels=["review:ok"])
+    now = utc(2026, 9, 14, 15, 33)
+    assert ri.check_ai_rework_never_dispatched("mytab0r/edge-harness", now, [pull]) == []
+
+
+def test_ai_rework_never_dispatched_silent_when_label_event_not_found(monkeypatch):
+    # ai_changes_labeled_at вернул None (таймлайн не отдал событие — метка
+    # снята и переставлена мимо API, редкий факт) — не гадаем, не находка.
+    pull = open_pr(1, labels=[ri.review_labels.AI_CHANGES])
+    fake = FakeGh({"issues/1/timeline": []})
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 14, 15, 33)
+    assert ri.check_ai_rework_never_dispatched("mytab0r/edge-harness", now, [pull]) == []
+
+
+def test_ai_rework_never_dispatched_not_in_ci_gating_or_escalating():
+    # Наблюдательный (docstring build_report/CI_GATING): свежедобавленный
+    # инвариант, ноль истории эскалаций — тот же порядок, что у 8/9/10/12/14.
+    assert 19 not in ri.CI_GATING
+    assert 19 not in ri.ESCALATING_INVARIANTS
+
+
+def test_build_report_wires_invariant_19(monkeypatch):
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": [{**open_pr(261, labels=[ri.review_labels.AI_CHANGES]),
+                               "created_at": "2026-09-06T00:00:00Z"}],
+        "graphql": graphql_pool_page(),
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+        "search/issues": {"items": []},
+        "issues/261/timeline": timeline_with_ai_changes("2026-09-06T09:13:49Z"),
+        "issues/261/comments": [],
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    now = utc(2026, 9, 14, 15, 33)
+    lines, findings = ri.build_report("mytab0r/edge-harness", now)
+    assert len(findings[19]) == 1
+    assert findings[19][0]["pr"] == 261
+    assert any("🚨" in line and "[19]" in line for line in lines)
+    assert any("#261" in line for line in lines)

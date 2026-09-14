@@ -709,6 +709,23 @@ def conflict_overlap_hint(repo: str, pull: dict) -> str:
     return ", ".join(sorted(pr_files & main_files))
 
 
+def _label_event_times(repo: str, pr_number: int, label_name: str) -> list[str]:
+    """Сырые ISO `created_at` всех событий `labeled` с указанным именем метки
+    в таймлайне PR — общая часть conflict_labeled_at/conflict_first_labeled_at
+    (issue #588) и ai_changes_labeled_at (issue #1253, симметрия голодания по
+    возрасту очереди доводки ai-review): три места считали один и тот же факт
+    «когда метка появилась» тремя копиями, теперь одна. Пустой список — метки
+    не было НИ РАЗУ (не «неизвестно», вызывающая сторона решает, что это
+    значит — для сортировки это null-возраст, для лифтайм-границы бюджета —
+    «бюджет ещё не открывался»)."""
+    timeline = review_labels.list_timeline(repo, pr_number, gh)
+    return [
+        event["created_at"] for event in timeline
+        if event.get("event") == "labeled"
+        and (event.get("label") or {}).get("name") == label_name
+    ]
+
+
 def conflict_labeled_at(repo: str, pr_number: int) -> datetime | None:
     """Момент последней простановки метки CONFLICT_LABEL (тот же приём, что
     last_gate1_labeled_at: max(), не min() — метка могла сниматься/ставиться
@@ -722,12 +739,7 @@ def conflict_labeled_at(repo: str, pr_number: int) -> datetime | None:
     Только для СОРТИРОВКИ очереди по возрасту — не путать с границей бюджета
     conflict_rework_attempts (conflict_first_labeled_at ниже, min() вместо
     max(): там нужна лифтайм-граница, не сбрасывающаяся по эпизодам)."""
-    timeline = review_labels.list_timeline(repo, pr_number, gh)
-    labeled_at = [
-        event["created_at"] for event in timeline
-        if event.get("event") == "labeled"
-        and (event.get("label") or {}).get("name") == CONFLICT_LABEL
-    ]
+    labeled_at = _label_event_times(repo, pr_number, CONFLICT_LABEL)
     return parse_time(max(labeled_at)) if labeled_at else None
 
 
@@ -748,13 +760,24 @@ def conflict_first_labeled_at(repo: str, pr_number: int) -> datetime | None:
     conflict_rework_attempts) при этом не теряется: даже первая простановка
     метки случается уже ПОСЛЕ того, как PR создан и исходный прогон
     завершился."""
-    timeline = review_labels.list_timeline(repo, pr_number, gh)
-    labeled_at = [
-        event["created_at"] for event in timeline
-        if event.get("event") == "labeled"
-        and (event.get("label") or {}).get("name") == CONFLICT_LABEL
-    ]
+    labeled_at = _label_event_times(repo, pr_number, CONFLICT_LABEL)
     return parse_time(min(labeled_at)) if labeled_at else None
+
+
+def ai_changes_labeled_at(repo: str, pr_number: int) -> datetime | None:
+    """Момент последней простановки review_labels.AI_CHANGES — аналог
+    conflict_labeled_at выше (issue #1253, симметрия #588): очередь
+    dispatch_ai_review_rework перебирала кандидатов в сыром порядке
+    open_pulls (новые PR первыми), из-за чего старые PR с
+    ai:changes-requested голодали бесконечно (замер 2026-09-14: 31 открытый
+    PR с этой меткой, 15 не получили ни одного диспатча доводки никогда).
+    max(), не min(): нас интересует возраст ТЕКУЩЕГО эпизода вердикта, метка
+    могла сниматься/ставиться заново новым прогоном ai-review. Своей
+    лифтайм-границы (аналог conflict_first_labeled_at) здесь не нужно —
+    бюджет авто-доводки уже считается ПО ОТПЕЧАТКУ диффа (ai_rework_attempts,
+    ai_rework_dispatched_at), не по возрасту метки."""
+    labeled_at = _label_event_times(repo, pr_number, review_labels.AI_CHANGES)
+    return parse_time(max(labeled_at)) if labeled_at else None
 
 
 def conflict_rework_attempts(repo: str, pr_number: int, task_number: int) -> int:
@@ -1135,12 +1158,38 @@ def dispatch_ai_review_rework(
     Идемпотентность — worker_runs_active, тот же гейт, что и у
     dispatch_conflict_rework/dispatch_worker: воркер один на репозиторий,
     пока прошлый прогон жив. Третий элемент кортежа (dispatched) — сигнал
-    main() не звать следом dispatch_worker в этом же проходе."""
+    main() не звать следом dispatch_worker в этом же проходе.
+
+    Порядок обхода — от старейшего вердикта ai:changes-requested к новейшему
+    (issue #1253, симметрия #588/dispatch_conflict_rework): сырой порядок
+    `pulls` (`open_pulls()`, `GET /pulls?state=open`) отдаёт новые PR
+    первыми, а диспатч на пульс — один, поэтому раньше всегда доставался
+    самому свежему PR. Замер живого репозитория 2026-09-14: 31 открытый PR
+    с ai:changes-requested, 15 не получили ни одного диспатча доводки
+    НИКОГДА. ai_changes_labeled_at (момент простановки метки ТЕКУЩЕГО
+    эпизода), не created_at PR — тот же довод, что у conflict_labeled_at:
+    PR мог быть открыт неделю назад и получить changes-requested только
+    сегодня. PR без задачи (resolve_pr_task is None) сортировкой не платят —
+    идут первыми как заведомый дешёвый `continue` (тот же приём, что
+    unscheduled в dispatch_conflict_rework)."""
     observations: list[str] = []
     actions: list[str] = []
     dispatched = False
     pool_by_number = {issue["number"]: issue for issue in pool}
-    for pull in pulls:
+    ai_pulls = [
+        p for p in pulls
+        if review_labels.AI_CHANGES in {label["name"] for label in p["labels"]}
+        and CONFLICT_LABEL not in {label["name"] for label in p["labels"]}
+    ]
+    schedulable, unscheduled = [], []
+    for p in ai_pulls:
+        (schedulable if task_ref.resolve_pr_task(p) is not None else unscheduled).append(p)
+    schedulable.sort(
+        key=lambda p: ai_changes_labeled_at(repo, p["number"]) or parse_time(p["created_at"])
+    )
+    ai_numbers = {p["number"] for p in ai_pulls}
+    ordered_pulls = unscheduled + schedulable + [p for p in pulls if p["number"] not in ai_numbers]
+    for pull in ordered_pulls:
         infra_retry = False  # Исход 1: этот диспатч — повтор после инфра-отказа, бюджет не тратит
         labels = {label["name"] for label in pull["labels"]}
         if review_labels.AI_CHANGES not in labels:
@@ -1169,12 +1218,16 @@ def dispatch_ai_review_rework(
             observations.append(f"⚠️ PR #{number}: не удалось сверить бюджет авто-доводки: {error}")
             continue
         if attempts >= AI_REWORK_MAX_ATTEMPTS:
-            if dispatched or worker_runs_active(repo):
-                observations.append(
-                    f"⏸️ PR #{number}: авто-доводка по находкам ai-review ещё идёт "
-                    "(worker.yml активен) — решение об эскалации отложено"
-                )
-                continue
+            # Решение об эскалации НЕ гейтится занятостью воркера (issue
+            # #1253): в отличие от диспатча worker.yml несколькими строками
+            # ниже, эскалация не трогает воркер — это комментарий в PR/#120 +
+            # Telegram. Раньше оба решения жили за одним `if dispatched or
+            # worker_runs_active(repo)`, и живой воркер (занят 3–16-минутными
+            # интервалами почти постоянно) откладывал решение пульс за
+            # пульсом. Живая цена: PR #804/задача #720 — воркер упал честным
+            # инфра-отказом 2026-09-12T13:43, авто-повтор без штрафа бюджета
+            # должен был сработать следующим свободным пульсом, не сработал
+            # почти двое суток.
             marker = f"{AI_REWORK_ESCALATION_MARKER} #{number} fp:{fingerprint[:12]}"
             try:
                 already = issue_marker_times(repo, WATCHDOG_ISSUE, marker)
