@@ -13,7 +13,7 @@
 import importlib.util
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -2961,6 +2961,9 @@ def test_check_wip_gate_false_zero_flags_live_incident_2026_09_11():
         "claimed_count": 0,
         "actual_count": 27,
         "limit": limit,
+        "claimed_closes_gate": False,
+        "actual_closes_gate": True,
+        "literal_false_zero": True,
     }
 
 
@@ -2997,6 +3000,9 @@ def test_check_wip_gate_false_zero_flags_literal_zero_below_limit():
         "claimed_count": 0,
         "actual_count": 1,
         "limit": limit,
+        "claimed_closes_gate": False,
+        "actual_closes_gate": False,
+        "literal_false_zero": True,
     }]
 
 
@@ -3137,6 +3143,9 @@ def test_build_report_flags_wip_gate_false_zero_from_impostor_marker(monkeypatch
         "claimed_count": 0,
         "actual_count": 23,
         "limit": limit,
+        "claimed_closes_gate": False,
+        "actual_closes_gate": True,
+        "literal_false_zero": True,
     }]
     assert any("🚨" in line and "[16]" in line and "23" in line for line in lines)
 
@@ -3172,6 +3181,9 @@ def test_build_report_flags_wip_gate_false_zero_live_incident(monkeypatch):
         "claimed_count": 0,
         "actual_count": 27,
         "limit": limit,
+        "claimed_closes_gate": False,
+        "actual_closes_gate": True,
+        "literal_false_zero": True,
     }]
     assert any("🚨" in line and "[16]" in line and "27" in line for line in lines)
 
@@ -3182,6 +3194,232 @@ def test_wip_gate_false_zero_is_escalating_not_gating():
     # чужой PR за чужое искажение снимка.
     assert 16 not in ri.CI_GATING
     assert 16 in ri.ESCALATING_INVARIANTS
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Дедуп эскалации инварианта 16: «состояние + окно», не «состояние + момент»
+# (issue #1261, живой случай 2026-09-13/14: 36 отдельных эскалаций за ~30
+# часов при неизменном claimed=0 — старый ключ нёс сырой marker_at/
+# actual_count, дрейфующие почти на каждый такт)
+# ══════════════════════════════════════════════════════════════════════════
+
+def _wip_gate_finding(marker_at: datetime, claimed: int, actual: int, limit: int) -> dict:
+    return {
+        "marker_at": marker_at.isoformat(),
+        "claimed_count": claimed,
+        "actual_count": actual,
+        "limit": limit,
+        "claimed_closes_gate": claimed >= limit,
+        "actual_closes_gate": actual >= limit,
+        "literal_false_zero": claimed == 0 and actual > 0,
+    }
+
+
+def _wire_escalation_recorder(monkeypatch):
+    """Тот же приём, что test_run_escalations_pipeline_health_dedupes_by_last_date
+    (инвариант 12), но с НАКАПЛИВАЮЩИМСЯ множеством уже отправленных маркеров
+    (issue_marker_times читает СОСТОЯНИЕ #120, которое растёт с каждым
+    escalate()) — нужно для сценария «несколько тактов подряд»."""
+    already_escalated_markers: set[str] = set()
+    calls: list[str] = []
+
+    def fake_issue_marker_times(repo, issue, marker):
+        return [utc(2026, 9, 1)] if marker in already_escalated_markers else []
+
+    def fake_escalate(repo, issue, text):
+        calls.append(text)
+        already_escalated_markers.add(text.splitlines()[0])  # маркер — первая строка
+        return "отправлено"
+
+    monkeypatch.setattr(ri, "issue_marker_times", fake_issue_marker_times)
+    monkeypatch.setattr(ri, "escalate", fake_escalate)
+    return calls
+
+
+# MUTATION-PROOF
+# ref: 66d12179c62af09e44b2e4d5ddb0755914ae1e95
+# paths: scripts/orchestra/repo_invariants.py
+# run: python -X utf8 -m pytest scripts/orchestra/test_repo_invariants.py::test_run_escalations_wip_gate_dedupes_repeated_ticks_of_same_state -q
+# expect: 1 failed
+def test_run_escalations_wip_gate_dedupes_repeated_ticks_of_same_state(monkeypatch):
+    """Живой случай 2026-09-13/14: то же состояние (claimed=0, actual растёт
+    естественным дрейфом 28→30), маркер republish'ится другим временем — один
+    такт диспатча (orchestra.yml, ~15 мин) позже НЕ должен дать вторую
+    эскалацию, пока окно ESCALATION_REMINDER_WINDOW_MINUTES не истекло.
+
+    Мутация: верни старый ключ (`f"{item['marker_at']}:{item['claimed_count']}:
+    {item['actual_count']}"`) в run_escalations — этот тест покраснеет (calls
+    будет содержать 2 элемента, не 1). Доказано исполнением (issue #1261):
+    вывод red/green зафиксирован в теле PR. MUTATION-PROOF выше даёт CI
+    возможность повторить это исполнение самостоятельно (scripts/lib/
+    mutation_recipe_guard.py, ADR 0023) — `ref` указывает на состояние ДО
+    этого фикса (текущий origin/main на момент задачи #1261)."""
+    calls = _wire_escalation_recorder(monkeypatch)
+    limit = ri.scheduler.WIP_LIMIT
+    first_tick = utc(2026, 9, 13, 10, 6, 48)
+    second_tick = first_tick + timedelta(minutes=9)  # тот же 15-минутный такт диспатча
+
+    ri.run_escalations("mytab0r/edge-harness", {16: [_wip_gate_finding(first_tick, 0, 28, limit)]})
+    assert len(calls) == 1
+
+    ri.run_escalations("mytab0r/edge-harness", {16: [_wip_gate_finding(second_tick, 0, 30, limit)]})
+    assert len(calls) == 1, "то же состояние внутри окна напоминания — не новая эскалация"
+
+
+def test_run_escalations_wip_gate_state_change_escalates_immediately(monkeypatch):
+    """Смена КАЧЕСТВЕННОГО состояния (здесь: literal_false_zero перестаёт
+    выполняться, потому что actual тоже упал в ноль) обязана эскалировать
+    сразу, даже внутри того же окна времени — это не тот же инцидент."""
+    calls = _wire_escalation_recorder(monkeypatch)
+    limit = ri.scheduler.WIP_LIMIT
+    moment = utc(2026, 9, 13, 10, 6, 48)
+
+    ri.run_escalations("mytab0r/edge-harness", {16: [_wip_gate_finding(moment, 0, 28, limit)]})
+    assert len(calls) == 1
+
+    # 5 минут спустя, тот же 6-часовой бакет, но actual_closes_gate теперь
+    # False (было True) — переворот решения допуска другого типа.
+    later = moment + timedelta(minutes=5)
+    ri.run_escalations("mytab0r/edge-harness", {16: [_wip_gate_finding(later, 0, 2, limit)]})
+    assert len(calls) == 2, "смена типа расхождения — новая эскалация, даже в том же окне"
+
+
+def test_run_escalations_wip_gate_recurrence_after_pause_escalates_again(monkeypatch):
+    """Возврат ТОГО ЖЕ состояния после паузы, длиннее окна напоминания,
+    обязан снова эскалировать — иначе рецидив, наступивший днём позже,
+    остался бы немым (ровно риск, названный в задаче #1261: просто выкинуть
+    marker_at схлопнул бы такой рецидив навсегда). Здесь пауза дольше
+    ESCALATION_REMINDER_WINDOW_MINUTES, числа буквально совпадают с первым
+    наблюдением — единственное отличие от «того же такта» выше — время."""
+    calls = _wire_escalation_recorder(monkeypatch)
+    limit = ri.scheduler.WIP_LIMIT
+    first = utc(2026, 9, 13, 10, 6, 48)
+    ri.run_escalations("mytab0r/edge-harness", {16: [_wip_gate_finding(first, 0, 28, limit)]})
+    assert len(calls) == 1
+
+    # Инцидент «разрешился» между тактами (findings.get(16) пуст — здоровые
+    # тики не вызывают escalate_if_new вовсе, ничего дополнительно мокать не
+    # нужно), затем то же состояние возвращается почти через сутки.
+    recurred = first + timedelta(hours=20)
+    ri.run_escalations("mytab0r/edge-harness", {16: [_wip_gate_finding(recurred, 0, 28, limit)]})
+    assert len(calls) == 2, "рецидив после долгой паузы обязан эскалировать снова"
+
+
+def test_escalation_state_key_windowing_matches_reminder_constant():
+    """Мутация: поменяй ESCALATION_REMINDER_WINDOW_MINUTES на 0 (или убери
+    деление на него) — этот тест покраснеет, потому что моменты внутри
+    объявленного окна перестанут давать одинаковый ключ."""
+    limit = ri.scheduler.WIP_LIMIT
+    window = ri.ESCALATION_REMINDER_WINDOW_MINUTES
+    # Начало окна выровнено по той же арифметике, что escalation_state_key
+    # (floor(epoch_minutes / window) * window) — иначе «через window-1 минуту»
+    # от ПРОИЗВОЛЬНОГО момента может уже попасть в следующий бакет.
+    raw = utc(2026, 9, 13, 10, 0)
+    bucket_start_minutes = (int(raw.timestamp() // 60) // window) * window
+    bucket_start = datetime.fromtimestamp(bucket_start_minutes * 60, tz=timezone.utc)
+    finding_a = _wip_gate_finding(bucket_start + timedelta(minutes=1), 0, 28, limit)
+    finding_b = _wip_gate_finding(bucket_start + timedelta(minutes=window - 1), 0, 31, limit)
+    finding_c = _wip_gate_finding(bucket_start + timedelta(minutes=window + 1), 0, 31, limit)
+
+    def key_of(item):
+        sig = f"{item['claimed_closes_gate']}:{item['actual_closes_gate']}:{item['literal_false_zero']}"
+        return ri.escalation_state_key(datetime.fromisoformat(item["marker_at"]), sig)
+
+    assert key_of(finding_a) == key_of(finding_b), "внутри окна — тот же ключ, несмотря на дрейф actual"
+    assert key_of(finding_a) != key_of(finding_c), "за окном — новый ключ (напоминание)"
+
+
+_INV16_ESCALATION_RE = re.compile(r"\[инвариант 16: (.+?):(\d+):(\d+)\]")
+_INV16_LIMIT_RE = re.compile(r"\(лимит (\d+)\)")
+
+
+def _load_issue120_invariant16_history() -> list[tuple[datetime, int, int, int]]:
+    """Прод-форма (issue #1261): комментарии #120 сняты `gh api
+    repos/mytab0r/edge-harness/issues/120/comments?since=2026-09-13T00:00:00Z
+    --paginate` (2026-09-14), фикстура несёт ВСЕ 37 комментариев, содержащих
+    подстроку «инвариант 16» (одна — опровержение постороннего маркера,
+    формату эскалации не соответствует и regex её не берёт — прод-форма,
+    не подчищенный вручную список из ровно 36 нужных строк)."""
+    path = Path(__file__).resolve().parent / "testdata" / "issue120_invariant16_escalations_2026-09-13.json"
+    import json
+    comments = json.loads(path.read_text(encoding="utf-8"))
+    rows = []
+    for c in comments:
+        m = _INV16_ESCALATION_RE.search(c["body"])
+        if not m:
+            continue
+        marker_at = datetime.fromisoformat(m.group(1))
+        claimed, actual = int(m.group(2)), int(m.group(3))
+        limit_m = _INV16_LIMIT_RE.search(c["body"])
+        limit = int(limit_m.group(1)) if limit_m else ri.scheduler.WIP_LIMIT
+        rows.append((marker_at, claimed, actual, limit))
+    rows.sort(key=lambda r: r[0])
+    return rows
+
+
+def test_issue120_fixture_reproduces_36_escalations_with_old_key():
+    """До/после (issue #1261, буквально задаваемое число): старый ключ
+    (`marker_at:claimed_count:actual_count`, все три компонента разные
+    почти на каждой строке фикстуры) даёт ровно 36 эскалаций на реальной
+    сохранённой истории — то же число, что дал живой прогон 2026-09-13/14.
+    Этот тест не про новый код — он подтверждает, что фикстура и разбор
+    воспроизводят замер из задачи ДО того, как считать число «после»."""
+    rows = _load_issue120_invariant16_history()
+    assert len(rows) == 36
+
+    seen = set()
+    for marker_at, claimed, actual, _limit in rows:
+        key = f"{marker_at.isoformat()}:{claimed}:{actual}"
+        seen.add(key)
+    assert len(seen) == 36
+
+
+def test_issue120_fixture_new_key_collapses_36_into_units():
+    """Число «после» (issue #1261): та же история, дедуп-ключ
+    `escalation_state_key` (тот же код, что использует run_escalations) —
+    36 наблюдений схлопываются в единицы, не в одно (см. соседний тест —
+    инцидент длился ~30 часов, окно 6 часов даёт периодическое напоминание,
+    а не одну немую запись на весь инцидент)."""
+    rows = _load_issue120_invariant16_history()
+    seen_in_order = []
+    for marker_at, claimed, actual, limit in rows:
+        signature = f"{claimed >= limit}:{actual >= limit}:{claimed == 0 and actual > 0}"
+        key = ri.escalation_state_key(marker_at, signature)
+        if key not in seen_in_order:
+            seen_in_order.append(key)
+    # Единицы, не десятки (было 36) и не единственная запись на весь
+    # 30-часовой инцидент (что означало бы: не разрешившийся рецидив никогда
+    # не напомнит о себе повторно).
+    assert 1 < len(seen_in_order) < 10, seen_in_order
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Инвариант 18: тот же СИМПТОМ (много эскалаций), другая ПРИЧИНА — не тронут
+# (issue #1261: 18 эскалаций за то же время, но множество violator-id
+# ПРОВЕРЕННО росло на каждой из них — реальные новые подделки, не пересчёт
+# того же состояния; см. докстринг pipeline_status_marker_key)
+# ══════════════════════════════════════════════════════════════════════════
+
+def test_issue120_fixture_invariant18_every_escalation_carries_new_violators():
+    """Подтверждение исполнением, не на глаз: РОВНО у скольких из 18
+    эскалаций счётчик нарушителей строго вырос относительно предыдущей —
+    если бы ключ был волатильным БЕЗ изменения состава (тот же класс
+    дефекта, что у 16), встретились бы повторы одного и того же счётчика.
+    На реальной истории — ни одного повтора: каждая эскалация несёт
+    честно новую подделку, поэтому инвариант 18 НЕ подведён под общий
+    механизм окна (см. докстринг pipeline_status_marker_key)."""
+    path = Path(__file__).resolve().parent / "testdata" / "issue120_invariant18_escalations_2026-09-13.json"
+    import json
+    comments = json.loads(path.read_text(encoding="utf-8"))
+    count_re = re.compile(r"— (\d+) таких комментариев")
+    counts = []
+    for c in comments:
+        m = count_re.search(c["body"])
+        if m:
+            counts.append(int(m.group(1)))
+    assert len(counts) == 18
+    assert counts == sorted(counts), "счётчик нарушителей монотонно растёт — прод-факт, не допущение"
+    assert len(set(counts)) == len(counts), "ни один счётчик не повторился — каждая эскалация несла новые id"
 
 
 # ══════════════════════════════════════════════════════════════════════════
