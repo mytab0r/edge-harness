@@ -2112,7 +2112,15 @@ def resume_series_by_merge(repo: str, pull: dict, task_number: int) -> str | Non
     if not run_claimed_task(repo, task_number, last_red.get("id")):
         return None  # последний красный работал над другой задачей — связи нет
     resume_token = f"{RESUME_MARKER} #{pull['number']}]"
-    if issue_marker_times(repo, WATCHDOG_ISSUE, resume_token):
+    # require_job_token=True (#1242, доводка #1101/#1074): та же проверка, что
+    # conveyor_gate теперь применяет к ЧТЕНИЮ RESUME_MARKER — дедуп «уже
+    # сигналился» и подтверждение «сброс правда встал» обязаны судить по
+    # НАСТОЯЩЕМУ маркеру job'а, не по чужеродной подделке (личный PAT,
+    # устаревший checkout или прямой `gh api` — см. docstring
+    # pulse_guard.issue_marker_times). Без фильтра поддельный маркер здесь
+    # заблокировал бы легитимный сброс НАВСЕГДА (дедуп решил бы «уже было»),
+    # либо ложно подтвердил бы сброс, которого не произошло на самом деле.
+    if issue_marker_times(repo, WATCHDOG_ISSUE, resume_token, require_job_token=True):
         return None  # сброс этим мержем уже сигналился — один сигнал на мерж
     text = resume_alert_text(pull["number"], task_number, last_red)
     status = escalate(repo, WATCHDOG_ISSUE, text)
@@ -2122,7 +2130,7 @@ def resume_series_by_merge(repo: str, pull: dict, task_number: int) -> str | Non
     # переформулировки (тот же класс врущего отчёта, что чинили в пульсе
     # после #318). Гейт видит только #120 — значит сброс для него существует
     # только вместе с маркером там.
-    if not issue_marker_times(repo, WATCHDOG_ISSUE, resume_token):
+    if not issue_marker_times(repo, WATCHDOG_ISSUE, resume_token, require_job_token=True):
         return (f"⚠️ сброс мержем #{pull['number']} не подтверждён маркером в "
                 f"#{WATCHDOG_ISSUE} — серия НЕ снята, возобновление остаётся за "
                 f"пробой (#205); {status}")
