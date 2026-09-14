@@ -1,0 +1,27 @@
+{
+  "id": 5666075953,
+  "issue_url": "https://api.github.com/repos/mytab0r/edge-harness/issues/1212",
+  "user": {
+    "login": "github-actions[bot]",
+    "id": 41898282,
+    "node_id": "MDM6Qm90NDE4OTgyODI=",
+    "avatar_url": "https://avatars.githubusercontent.com/in/15368?v=4",
+    "gravatar_id": "",
+    "url": "https://api.github.com/users/github-actions%5Bbot%5D",
+    "html_url": "https://github.com/apps/github-actions",
+    "followers_url": "https://api.github.com/users/github-actions%5Bbot%5D/followers",
+    "following_url": "https://api.github.com/users/github-actions%5Bbot%5D/following{/other_user}",
+    "gists_url": "https://api.github.com/users/github-actions%5Bbot%5D/gists{/gist_id}",
+    "starred_url": "https://api.github.com/users/github-actions%5Bbot%5D/starred{/owner}{/repo}",
+    "subscriptions_url": "https://api.github.com/users/github-actions%5Bbot%5D/subscriptions",
+    "organizations_url": "https://api.github.com/users/github-actions%5Bbot%5D/orgs",
+    "repos_url": "https://api.github.com/users/github-actions%5Bbot%5D/repos",
+    "events_url": "https://api.github.com/users/github-actions%5Bbot%5D/events{/privacy}",
+    "received_events_url": "https://api.github.com/users/github-actions%5Bbot%5D/received_events",
+    "type": "Bot",
+    "user_view_type": "public",
+    "site_admin": false
+  },
+  "created_at": "2026-09-14T15:04:00Z",
+  "body": "pr: 1212\nhead: 8c08fd12b4516b3370afc61e3d1f7060fefe0f78\nreviewer: rework\ndiff: 5eb0747121b1c1d965514c115dfac5b1d18241467c65ca679553d7fc944bc0b0\nprovider: GLM\nclass: candidate=маркер-позже-действия\n\n🤖 AI-ревью — второй гейт конвейера (#18). Вердикт: rework.\n\nРевью закончил: дифф прочитан целиком, модуль прогнан (48 тестов зелёные, плюс соседние гвардии dispatch-token/pagination/console-utf8), импорты в `pulse_guard` и прод-факты по workflow сверены с репозиторием.\n\nМеханизм в целом собран добротно: дедуп на двух носителях, PAT-гейт в проде до действия, бюджет на дорогих /jobs-вызовах после группировки, честное различение ожидания concurrency-группы по данным, а не порогом. Но в самой сердцевине — ветке рецидива — есть дыра, и она одного класса с той, которую этот же PR чинит в соседней ветке.\n\n1. Рецидив-детекция отсчитывает «до/после переэмиссии» от времени маркера, который пишется ПОСЛЕ действия — `scripts/orchestra/zombie_run_watch.py`, ветка `if reopen_times:` (`runs_to_check = runs_created_after(entry[\"runs\"], last_reopen_at)`). Маркер-комментарий записывается после close+reopen, а прогоны, созданные самим `reopened`-событием, материализуются в окне между действием и записью маркера (по живому замеру #1088 run-строки создаются в секунду события — раньше маркера). Такие прогоны навсегда выпадают из `runs_created_after`, и дальше два ложных исхода: пока новый зомби свеж (<15 мин) — наблюдение «переэмиссия породила N прогон(ов), новых зомби после неё нет — не трогаю», заявленное без единого /jobs-чтения (ветка `produced` непустого); когда он входит в кандидаты — `produced` пуст (cut = max по `entry[\"runs\"]`, куда новый зомби уже входит), и уходит алерт «переэмиссия ВХОЛОСТУЮ, не появилось НИ ОДНОГО нового прогона» — фактическая ложь, реальный рецидив не назван, а дедуп-маркер `переэмиссия-без-прогонов` глушит все следующие пульсы. Модуль сам знает этот класс: докстринг `runs_produced_by_reopen` прямо пишет «сравнение по времени промахнулось бы — маркер пишется ПОСЛЕ действия» и закрывает дыру id-сравнением — но только в ветке холостой переэмиссии, не здесь, хотя «починил класс» требует обоих мест. Поправь: неси id-границу «до переэмиссии» (известна в момент действия) в маркере/отчёте и фильтруй `runs_to_check` по ней, как уже делает `runs_produced_by_reopen`; мутационный тест — фикстурой с прогоном, созданным между reopen и маркером. Текущий `test_genuine_recurrence_after_reopen_escalates_once` ставит новый зомби на ЧАС позже маркера — против собственных прод-фактов модуля, проверена только удобная сторона гонки, поэтому тесты зелёные, а прод-путь лжёт.\n\n\n\nПо размеру: +2590 — это модуль (1007) и тесты к нему (1253) плюс дельта-спека и точечные доки; генерированного, вендоренного и мусорного нет, правки INFRA-GH и обеих гвардий по делу. Объём оправдан содержанием.\n\nРАЗМЕР: оправдан\n\nНекритичные замечания (не блокируют мерж) — в чеклисте тела PR:\n- список queued-прогонов растёт монотонно — полный-страничный отказ станет постоянным\n- при непрочитанной занятости группы наблюдение лжёт «есть in_progress прогон»\n"
+}
