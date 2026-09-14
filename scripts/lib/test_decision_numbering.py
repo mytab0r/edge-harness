@@ -457,7 +457,106 @@ def test_cmd_check_reports_everything_when_branch_unknown(monkeypatch):
     lines, self_name = dn.cmd_check("owner/repo", ["docs/decisions"])
 
     assert len(lines) == 1  # честный дефолт «не знаю → покажи всё», не «не знаю → молчи»
-    assert self_name is None
+
+
+# ── cmd_check: main виновен только за коллизию ВНУТРИ main (issue #1200) ────
+#
+# Живой случай (2026-09-13/14, найден пост-мерж прогоном repo-ci.yml на
+# mytab0r/edge-harness, 12+ красных подряд): push/workflow_dispatch на main
+# резолвит self_name в буквальное "main", а main легитимно держит номер,
+# который НЕЗАВИСИМО занял сторонний, ещё не смёрженный PR (#944 — 0017,
+# #667 — 0018) — старое условие `self_name in involved` считало main
+# виновным просто потому, что main тоже входит в involved этой коллизии.
+
+
+def test_cmd_check_does_not_blame_main_for_a_foreign_open_pr_collision(monkeypatch):
+    refs = {"main": "main", "PR #944": "agent/940-artifact-retention"}
+    sources = {
+        "main": {"0017": ["0017-dsh-edge-pr-smoke-local-worker.md"]},
+        "PR #944": {"0017": ["0017-delayed-branch-deletion-not-delete-on-merge.md"]},
+    }
+    monkeypatch.setattr(dn, "build_refs", lambda repo: refs)
+    monkeypatch.setattr(dn, "collect_sources_from_refs", lambda r, root, width, cwd=None: sources)
+
+    # Прогон push/workflow_dispatch на main: GITHUB_REF_NAME=main, HEAD_REF нет.
+    monkeypatch.delenv("GITHUB_HEAD_REF", raising=False)
+    monkeypatch.setenv("GITHUB_REF_NAME", "main")
+
+    lines, self_name = dn.cmd_check("owner/repo", ["docs/decisions"])
+
+    assert self_name == "main"
+    assert lines == []  # main легитимен, долг — на PR #944, не на main
+
+
+def test_cmd_check_blames_main_for_an_intra_main_duplicate(monkeypatch):
+    refs = {"main": "main"}
+    sources = {
+        "main": {"0017": [
+            "0017-dsh-edge-pr-smoke-local-worker.md",
+            "0017-delayed-branch-deletion-not-delete-on-merge.md",
+        ]},
+    }
+    monkeypatch.setattr(dn, "build_refs", lambda repo: refs)
+    monkeypatch.setattr(dn, "collect_sources_from_refs", lambda r, root, width, cwd=None: sources)
+    monkeypatch.delenv("GITHUB_HEAD_REF", raising=False)
+    monkeypatch.setenv("GITHUB_REF_NAME", "main")
+
+    lines, self_name = dn.cmd_check("owner/repo", ["docs/decisions"])
+
+    assert self_name == "main"
+    assert len(lines) == 1  # настоящий дубль ВНУТРИ main — main обязан покраснеть
+    assert "0017" in lines[0]
+
+
+def build_origin_with_main_vs_foreign_pr_collision(tmp_path) -> Path:
+    """main держит 0017 легитимно; ОДИН сторонний PR независимо занял тот же
+    номер другим именем — ровно живой случай #944 (issue #1200), не синтетика
+    по аналогии: дословные имена файлов и номер из живой находки."""
+    origin = tmp_path / "origin.git"
+    seed = tmp_path / "seed"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(origin)], check=True, capture_output=True)
+    subprocess.run(["git", "clone", str(origin), str(seed)], check=True, capture_output=True)
+    git("config", "user.email", "test@example.com", cwd=seed)
+    git("config", "user.name", "test", cwd=seed)
+    commit_file(
+        seed, "docs/decisions/0017-dsh-edge-pr-smoke-local-worker.md",
+        "# ADR 0017\n", "main: adr 0017",
+    )
+    git("push", "-u", "origin", "main", cwd=seed)
+    base_sha = git("rev-parse", "HEAD", cwd=seed).strip()
+
+    git("checkout", "-b", "agent/940-artifact-retention", base_sha, cwd=seed)
+    commit_file(
+        seed, "docs/decisions/0017-delayed-branch-deletion-not-delete-on-merge.md",
+        "# ADR 0017 (чужой)\n", "agent/940-artifact-retention: add 0017",
+    )
+    git("push", "-u", "origin", "agent/940-artifact-retention", cwd=seed)
+    return origin
+
+
+def test_end_to_end_main_push_is_not_blamed_for_foreign_pr_on_real_git(tmp_path, monkeypatch):
+    """Поведенческое доказательство issue #1200 на настоящем git-дереве, не
+    только на монки-патче сверху: main держит легитимный файл, сторонний PR
+    независимо занял тот же номер — прогон main (self_name == "main") обязан
+    остаться чист, прогон самого PR — обязан покраснеть."""
+    origin = build_origin_with_main_vs_foreign_pr_collision(tmp_path)
+    work = clone_workdir(origin, tmp_path, branch="agent/940-artifact-retention")
+
+    refs = {"main": "main", "PR #944": "agent/940-artifact-retention"}
+    monkeypatch.setattr(dn, "build_refs", lambda repo: refs)
+
+    monkeypatch.delenv("GITHUB_HEAD_REF", raising=False)
+    monkeypatch.setenv("GITHUB_REF_NAME", "main")
+    lines, self_name = dn.cmd_check("owner/repo", ["docs/decisions"], cwd=work)
+    assert self_name == "main"
+    assert lines == []
+
+    monkeypatch.delenv("GITHUB_REF_NAME", raising=False)
+    monkeypatch.setenv("GITHUB_HEAD_REF", "agent/940-artifact-retention")
+    lines, self_name = dn.cmd_check("owner/repo", ["docs/decisions"], cwd=work)
+    assert self_name == "PR #944"
+    assert len(lines) == 1
+    assert "0017" in lines[0]
 
 
 # ── check_decision_doc_number_collisions: обвязка для repo_invariants.py ────

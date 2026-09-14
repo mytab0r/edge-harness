@@ -376,7 +376,7 @@ def cmd_next(repo: str, root: str, cwd=None) -> str:
 
 
 def cmd_check(repo: str, roots: list[str], cwd=None) -> tuple[list[str], str | None]:
-    """Красит только тот прогон, чья ВЕТКА реально участвует в найденной
+    """Красит только тот прогон, чья ВЕТКА реально ВИНОВНА в найденной
     коллизии (self_source_name) — иначе один зависший PR с чужой коллизией
     (живой случай на 2026-09-13: PR #944 занял номер 0017, уже слитый в main
     другим ADR) красил бы CI КАЖДОГО постороннего PR репозитория, а не
@@ -386,6 +386,23 @@ def cmd_check(repo: str, roots: list[str], cwd=None) -> tuple[list[str], str | N
     вне Actions, `current_branch() is None`) — репортит ВСЕ найденные
     коллизии не сужая (честный дефолт «не знаю → покажи всё», не «не знаю →
     молчи»).
+
+    `main` — ОСОБЫЙ случай виновности, не симметричный обычному PR (issue
+    #1200, найдено пост-мерж прогоном repo-ci.yml, 12+ красных `workflow_
+    dispatch`-прогонов подряд 2026-09-13/14): `push`/`workflow_dispatch` на
+    main тоже резолвит `self_name` в буквальное `"main"` (`build_refs` кладёт
+    `{"main": "main", ...}`), и main ОКАЗЫВАЕТСЯ «участником» ЛЮБОЙ коллизии
+    вокруг номера, который main держит легитимно, включая ту, где ВТОРАЯ
+    сторона — сторонний, ещё НЕ смёрженный открытый PR (живой факт: main
+    держит `0017-dsh-edge-pr-smoke-local-worker.md`, PR #944 независимо занял
+    тот же номер другим именем — это долг PR #944, не main, но старое условие
+    `self_name in involved` считало main виновным, потому что main тоже
+    входит в `involved` этой коллизии). main виновен ТОЛЬКО если коллизия
+    ВНУТРИ самого main (`involved == {"main"}` — два файла с одним номером
+    реально слились в main, единственный источник во всей коллизии). Тот же
+    приём независимо выбрал параллельный канал для номеров инвариантов
+    (`scripts/lib/invariant_numbering.py::cmd_check`, issue #904/PR #1201) —
+    сведено к одному решению, не два разных обхода одного класса.
 
     Возвращает `(строки_нарушений, self_name)` — второй элемент нужен ТОЛЬКО
     вызывающему коду (CLI `main`) для честного сообщения об успехе: «коллизий
@@ -402,7 +419,12 @@ def cmd_check(repo: str, roots: list[str], cwd=None) -> tuple[list[str], str | N
         sources = collect_sources_from_refs(refs, root, width, cwd=cwd)
         for violation in find_number_collisions(sources):
             involved = {src for occ in violation["occurrences"] for src in occ["sources"]}
-            if self_name is not None and self_name not in involved:
+            if self_name is None:
+                pass  # честный дефолт: не знаю self — показываю всё, не сужаю
+            elif self_name == "main":
+                if involved != {"main"}:
+                    continue
+            elif self_name not in involved:
                 continue
             lines.append(format_violation(root, violation))
     return lines, self_name
