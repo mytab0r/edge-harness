@@ -104,8 +104,10 @@ Given/When/Then для проверки. Формат текста сообще�
    Когда — тик DO (`alarm()` -> `#processInbox` -> `#processSingleMessage`)
    захватил сообщение и классифицировал его как `chat`. Тогда — НА ТОМ ЖЕ
    тике инициирован HTTP-запрос на
-   `POST /repos/{repo}/actions/workflows/orchestrator.yml/dispatches` (или
-   `repository_dispatch` с отдельным `event_type`), best-effort (сбой
+   `POST /repos/{repo}/actions/workflows/orchestrator-message.yml/dispatches`
+   (или `repository_dispatch` с отдельным `event_type`) — НЕ уже
+   существующий `orchestra.yml` (15-минутный пульс, тот же класс диспатча,
+   но другой workflow, этот change его не трогает), best-effort (сбой
    диспетча не роняет разбор — по образцу `dispatch_worker` в
    `scheduler.py`), а сообщение остаётся в захваченном `processing` и ждёт
    результат джоба (владение окном — требование 4).
@@ -182,7 +184,7 @@ Given/When/Then для проверки. Формат текста сообще�
    инициируется из этого же тика — без второго счётчика.
 
    Сценарий: Дано — диспетч/джоб по сообщению падает стабильно (например,
-   `orchestrator.yml` красный), кап попыток `LIMITS.messageMaxAttempts`
+   `orchestrator-message.yml` красный), кап попыток `LIMITS.messageMaxAttempts`
    достигнут. Когда — `#reclaimStuckMessages` (уже существующая
    гвардия зависших `processing`) видит исчерпанный кап на очередном тике.
    Тогда — сообщение переходит в терминальный `failed` со
