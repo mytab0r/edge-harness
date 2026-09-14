@@ -64,7 +64,11 @@ import x from 'y'
     assert b.expect == "disposeCalls=3"
 
 
-def test_parse_ignores_incomplete_block_missing_expect():
+def test_parse_incomplete_block_excluded_but_reported_not_silently_dropped():
+    """Маркер без всех ключей не становится исполняемым MutationProofBlock
+    (нечем исполнять), НО и не исчезает бесследно — раньше исчезал молча
+    (issue #1208, второй круг ai-review на PR #1208): `parse_incomplete_
+    markers` обязан назвать line_no и недостающий ключ."""
     text = """
 # MUTATION-PROOF
 # ref: abc123
@@ -72,6 +76,80 @@ def test_parse_ignores_incomplete_block_missing_expect():
 # run: pytest -q
 """
     assert mrg.parse_mutation_proof_blocks(text) == []
+    incomplete = mrg.parse_incomplete_markers(text, source_file="f.py")
+    assert len(incomplete) == 1
+    assert incomplete[0].source_file == "f.py"
+    assert incomplete[0].line_no == 2
+    assert incomplete[0].missing_keys == ("expect",)
+
+
+def test_scan_and_verify_reports_incomplete_block_as_violation(tmp_path):
+    """Тот же случай на уровне `scan_and_verify` (реальный путь вызова из
+    `main()`/каталог-гвардии) — неполный маркер обязан красить проверку, а не
+    молча давать 0 результатов."""
+    f = tmp_path / "recipe.py"
+    f.write_text(
+        "# MUTATION-PROOF\n"
+        "# ref: abc123\n"
+        "# paths: some/file.py\n"
+        "# run: pytest -q\n",
+        encoding="utf-8",
+    )
+    results = mrg.scan_and_verify([f], repo_root=tmp_path)
+    assert len(results) == 1
+    block, result = results[0]
+    assert isinstance(block, mrg.IncompleteMutationProofBlock)
+    assert result.status == check_result.STATUS_VIOLATION
+    assert "не хватает ключей" in result.violations[0]
+    assert "expect" in result.violations[0]
+
+
+def test_parse_finds_marker_wrapped_in_html_comment_close():
+    """`<!-- MUTATION-PROOF -->` — естественное чтение markdown-документации
+    ADR/задач, где рецепт живёт внутри html-комментария (issue #1208, второй
+    круг ai-review: эта форма раньше давала 0 блоков)."""
+    text = """
+<!-- MUTATION-PROOF -->
+<!-- ref: abc123 -->
+<!-- paths: some/file.py -->
+<!-- run: pytest -q -->
+<!-- expect: 2 failed -->
+"""
+    blocks = mrg.parse_mutation_proof_blocks(text, source_file="f.md")
+    assert len(blocks) == 1
+    b = blocks[0]
+    assert b.ref == "abc123"
+    assert b.paths == ("some/file.py",)
+    assert b.run == "pytest -q"
+    assert b.expect == "2 failed"
+
+
+def test_parse_finds_marker_wrapped_in_markdown_bold():
+    """`**MUTATION-PROOF**` — вторая форма, найденная тем же кругом ревью."""
+    text = """
+**MUTATION-PROOF**
+ref: abc123
+paths: some/file.py
+run: pytest -q
+expect: 2 failed
+"""
+    blocks = mrg.parse_mutation_proof_blocks(text)
+    assert len(blocks) == 1
+
+
+def test_parse_tolerates_blank_line_between_marker_and_keys():
+    """Пустая строка между маркером и первым ключом (markdown-рендер таблиц/
+    списков иногда её вставляет) раньше обрывала блок молча — issue #1208."""
+    text = """
+# MUTATION-PROOF
+
+# ref: abc123
+# paths: some/file.py
+# run: pytest -q
+# expect: 2 failed
+"""
+    blocks = mrg.parse_mutation_proof_blocks(text)
+    assert len(blocks) == 1
 
 
 def test_parse_finds_multiple_paths_comma_separated():
@@ -88,6 +166,82 @@ def test_parse_finds_multiple_paths_comma_separated():
 
 def test_parse_returns_empty_for_text_without_marker():
     assert mrg.parse_mutation_proof_blocks("обычный текст без блока") == []
+
+
+# --- достижимость на ПРОД-величинах (issue #1208, #1172) ------------------
+
+def test_own_docstring_and_adr_placeholder_examples_are_not_live_blocks():
+    """Доказательство на настоящем содержимом файлов, не на пересказе (issue
+    #1208): буквальная рекомендация ai-review («скани дерево одной строкой»)
+    без фильтра ловит placeholder-пример формата в НАСТОЯЩЕМ докстринге этого
+    же модуля и в НАСТОЯЩЕМ ADR 0023 как валидный блок с ref, который git
+    никогда не примет (пробел внутри) — оба давали бы вечный unknown() и
+    красили каталог-гвардию шумом при каждом прогоне."""
+    guard_src = (REPO_ROOT / "scripts/lib/mutation_recipe_guard.py").read_text(encoding="utf-8")
+    adr = (REPO_ROOT / "docs/decisions/0023-mutation-recipe-execution-guard.md").read_text(encoding="utf-8")
+    for text, name in [(guard_src, "mutation_recipe_guard.py"), (adr, "ADR 0023")]:
+        blocks, incomplete = mrg._scan_blocks(text, name)
+        assert blocks == [], f"{name}: докстринг/ADR-пример формата не должен парситься как живой блок"
+        assert incomplete == [], f"{name}: докстринг/ADR-пример не должен попадать даже в incomplete"
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node недоступен в PATH — фикстурный раннер не исполнить")
+@pytest.mark.skipif(
+    subprocess.run(["git", "cat-file", "-e", "d239e324~1^{commit}"], cwd=REPO_ROOT,
+                    capture_output=True).returncode != 0,
+    reason="история репозитория не несёт d239e324 (мелкий/частичный клон?)")
+def test_block_inside_realistic_pr_comment_body_is_recognized_and_executes():
+    """Формат распознаётся не в синтетической фикстуре парсера, а в теле,
+    какое реально пишет автор PR/комментария — markdown-прозой вокруг, без
+    единого символа комментария (issue #1208, #1172: достижимость на
+    прод-величинах). Блок берётся из реального PR-тела и реально
+    исполняется — не только парсится."""
+    pr_comment_body = f"""
+## Доказательство мутацией
+
+Откатил патч до состояния ДО фикса #1163 и прогнал фикстуру заново.
+
+MUTATION-PROOF
+ref: d239e324~1
+paths: {PATCH_PATH}
+run: node {FIXTURE_RUNNER} {PATCH_PATH}
+expect: disposeCalls=3
+
+Вывод совпал с тем, что описан в ADR 0023.
+"""
+    blocks = mrg.parse_mutation_proof_blocks(pr_comment_body, source_file="pr-comment")
+    assert len(blocks) == 1
+    assert blocks[0].ref == "d239e324~1"
+    result = mrg.verify_block(blocks[0], repo_root=REPO_ROOT)
+    assert result.status == check_result.STATUS_OK, f"ожидался OK, получено {result}"
+
+
+# --- main(): unknown — отдельный счётчик, не «проверено» ------------------
+
+def test_main_reports_unknown_separately_not_as_checked(capsys):
+    """До фикса (issue #1208, второй круг ai-review, находка 2): `main()`
+    считал unknown() в то же «N блок(ов) проверено, 0 расхождений» и
+    возвращал 0 — «не проверен» выглядел как «чисто». Реальный прогон CLI
+    (не пересказ поведения) на несуществующем ref обязан вернуть отдельный
+    ненулевой код и не написать «проверено» про непроверенный блок."""
+    scratch = REPO_ROOT / "scripts" / "lib" / "test" / "_scratch_mutation_proof_main_test.txt"
+    scratch.write_text(
+        "MUTATION-PROOF\n"
+        "ref: 0000000000000000000000000000000000000000\n"
+        "paths: README.md\n"
+        "run: true\n"
+        "expect: whatever\n",
+        encoding="utf-8",
+    )
+    try:
+        rc = mrg.main([str(scratch)])
+    finally:
+        scratch.unlink()
+    out = capsys.readouterr().out
+    assert rc == 2, f"ожидался код 2 (только unknown, без violation), получено {rc}: {out}"
+    assert "не проверено" in out
+    assert "0 блок(ов) проверено, 0 расхождений" not in out
+    assert "1 блок(ов) проверено, 0 расхождений" not in out
 
 
 # --- verify_block: unknown() на несуществующем ref ------------------------

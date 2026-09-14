@@ -76,15 +76,45 @@ _CHR_SPEC.loader.exec_module(check_result)  # type: ignore[union-attr]
 
 MARKER = "MUTATION-PROOF"
 _COMMENT_PREFIX_RE = re.compile(r"^[ \t]*(#|//|\*|<!--)*[ \t]*")
+# Хвостовые обёртки маркера/значения: html-комментарий (`<!-- … -->`) и
+# markdown-выделение (`**MUTATION-PROOF**`) — issue #1208, второй круг
+# ai-review нашёл обе формы молча игнорируемыми.
+_TRAILING_WRAPPER_RE = re.compile(r"[ \t]*(-->|\*\*)[ \t]*$")
 _KV_RE = re.compile(r"^([a-z_]+):[ \t]*(.+?)[ \t]*(-->)?$")
 _KNOWN_KEYS = {"ref", "paths", "run", "expect"}
+# Между строкой маркера и первым ключом markdown-рендер иногда вставляет
+# пустую строку (issue #1208) — терпим ограниченное число пустых строк,
+# не безлимитное (иначе блок без ключей поглотил бы весь остаток файла).
+_MAX_BLANK_LINES_AFTER_MARKER = 3
 
 
 def _strip_comment_prefix(line: str) -> str:
-    """Снимает общий префикс комментария/маркер markdown-конца ('-->'),
-    чтобы один и тот же блок читался одинаково из .py/.mjs/.sh/.md."""
+    """Снимает общий префикс комментария, чтобы один и тот же блок читался
+    одинаково из .py/.mjs/.sh/.md. Хвостовые обёртки (`-->`) для строк-
+    значений по-прежнему добирает `_KV_RE`."""
     stripped = _COMMENT_PREFIX_RE.sub("", line, count=1)
     return stripped.rstrip()
+
+
+def _is_marker_line(line: str) -> bool:
+    """Строка маркера, допускающая обёртки `<!-- MUTATION-PROOF -->` и
+    `**MUTATION-PROOF**` — не только голый `# MUTATION-PROOF`."""
+    stripped = _strip_comment_prefix(line)
+    stripped = _TRAILING_WRAPPER_RE.sub("", stripped).rstrip()
+    return stripped == MARKER
+
+
+def _looks_like_template_ref(ref: str) -> bool:
+    """`ref` документации/докстринга, показывающей ФОРМАТ (не заявляющей
+    факт) — вида `<git-ref состояния ДО фикса>`: несёт пробел, чего НИ ОДИН
+    настоящий git-ref нести не может (git-check-ref-format(1) запрещает
+    пробел в имени ссылки безусловно — это не эвристика по нашим докам, а
+    факт о синтаксисе git). Найдено исполнением (issue #1208, третий пункт
+    находок): буквальный скан дерева по рекомендации ai-review ловит
+    собственный докстринг `mutation_recipe_guard.py` и пример в ADR 0023 как
+    'блок' с этим плейсхолдером — без фильтра оба дают вечный `unknown()` и
+    красят каталог-гвардию шумом, не имеющим отношения к реальным рецептам."""
+    return any(c.isspace() for c in ref)
 
 
 class MutationProofBlock(NamedTuple):
@@ -96,19 +126,30 @@ class MutationProofBlock(NamedTuple):
     expect: str
 
 
-def parse_mutation_proof_blocks(text: str, source_file: str = "<text>") -> list[MutationProofBlock]:
-    """Находит все блоки MUTATION-PROOF в тексте (файл гвардии, PR-тело).
-    Блок без всех четырёх обязательных ключей ИГНОРИРУЕТСЯ (недо-написанный
-    маркер — не полноценный блок, но и не наша забота здесь; забота —
-    вызывающего кода, который может отдельно потребовать полноту)."""
+class IncompleteMutationProofBlock(NamedTuple):
+    """Маркер найден, но не хватает обязательных ключей — раньше исчезал
+    молча (issue #1208), теперь несёт line_no/missing_keys для громкого
+    отчёта вызывающей стороной (см. `scan_and_verify`)."""
+    source_file: str
+    line_no: int
+    missing_keys: tuple[str, ...]
+
+
+def _scan_blocks(text: str, source_file: str) -> tuple[list[MutationProofBlock], list[IncompleteMutationProofBlock]]:
     lines = text.splitlines()
     blocks: list[MutationProofBlock] = []
+    incomplete: list[IncompleteMutationProofBlock] = []
     i = 0
     while i < len(lines):
-        if _strip_comment_prefix(lines[i]) == MARKER:
+        if _is_marker_line(lines[i]):
             marker_line_no = i + 1
-            fields: dict[str, str] = {}
             j = i + 1
+            blanks = 0
+            while (j < len(lines) and not _strip_comment_prefix(lines[j])
+                   and blanks < _MAX_BLANK_LINES_AFTER_MARKER):
+                j += 1
+                blanks += 1
+            fields: dict[str, str] = {}
             while j < len(lines):
                 candidate = _strip_comment_prefix(lines[j])
                 if not candidate:
@@ -118,7 +159,12 @@ def parse_mutation_proof_blocks(text: str, source_file: str = "<text>") -> list[
                     break
                 fields[m.group(1)] = m.group(2)
                 j += 1
-            if _KNOWN_KEYS.issubset(fields.keys()):
+            if "ref" in fields and _looks_like_template_ref(fields["ref"]):
+                # Пример формата в документации ("<git-ref состояния ДО
+                # фикса>"), не заявленный рецепт — не блок вовсе (как если бы
+                # маркер не нашёлся), не unknown()/violation().
+                pass
+            elif _KNOWN_KEYS.issubset(fields.keys()):
                 paths = tuple(p.strip() for p in fields["paths"].split(",") if p.strip())
                 blocks.append(MutationProofBlock(
                     source_file=source_file,
@@ -128,10 +174,30 @@ def parse_mutation_proof_blocks(text: str, source_file: str = "<text>") -> list[
                     run=fields["run"],
                     expect=fields["expect"],
                 ))
+            else:
+                missing = tuple(sorted(_KNOWN_KEYS - fields.keys()))
+                incomplete.append(IncompleteMutationProofBlock(
+                    source_file=source_file, line_no=marker_line_no, missing_keys=missing))
             i = j
         else:
             i += 1
+    return blocks, incomplete
+
+
+def parse_mutation_proof_blocks(text: str, source_file: str = "<text>") -> list[MutationProofBlock]:
+    """Находит все ПОЛНЫЕ блоки MUTATION-PROOF в тексте (файл гвардии,
+    PR-тело). Блок без всех четырёх обязательных ключей сюда не попадает
+    (его нельзя исполнить) — но не исчезает бесследно: `_scan_blocks` отдаёт
+    его отдельным списком `IncompleteMutationProofBlock`, который
+    `scan_and_verify` превращает в громкое нарушение."""
+    blocks, _incomplete = _scan_blocks(text, source_file)
     return blocks
+
+
+def parse_incomplete_markers(text: str, source_file: str = "<text>") -> list[IncompleteMutationProofBlock]:
+    """Маркеры MUTATION-PROOF, найденные без полного набора ключей."""
+    _blocks, incomplete = _scan_blocks(text, source_file)
+    return incomplete
 
 
 def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
@@ -244,8 +310,12 @@ def verify_block(block: MutationProofBlock, repo_root: Path = REPO_ROOT) -> chec
     return check_result.ok()
 
 
-def scan_and_verify(paths: list[Path], repo_root: Path = REPO_ROOT) -> list[tuple[MutationProofBlock, check_result.CheckResult]]:
-    """Сканирует список файлов на блоки MUTATION-PROOF и проверяет каждый."""
+def scan_and_verify(
+    paths: list[Path], repo_root: Path = REPO_ROOT,
+) -> list[tuple[MutationProofBlock | IncompleteMutationProofBlock, check_result.CheckResult]]:
+    """Сканирует список файлов на блоки MUTATION-PROOF и проверяет каждый.
+    Неполный маркер (найден, но без всех ключей) тоже попадает в результат —
+    как `violation()`, не молчаливым пропуском (issue #1208)."""
     results = []
     for path in paths:
         try:
@@ -253,8 +323,15 @@ def scan_and_verify(paths: list[Path], repo_root: Path = REPO_ROOT) -> list[tupl
         except (OSError, UnicodeDecodeError):
             continue
         rel = str(path.relative_to(repo_root)) if path.is_absolute() else str(path)
-        for block in parse_mutation_proof_blocks(text, source_file=rel):
+        blocks, incomplete = _scan_blocks(text, source_file=rel)
+        for block in blocks:
             results.append((block, verify_block(block, repo_root=repo_root)))
+        for inc in incomplete:
+            results.append((inc, check_result.violation([
+                f"MUTATION-PROOF {inc.source_file}:{inc.line_no}: маркер найден, но блок "
+                f"неполон (не хватает ключей: {', '.join(inc.missing_keys)}) — рецепт "
+                f"объявлен, но не выразим для исполнения; допиши недостающие ключи или "
+                f"убери маркер, если это не MUTATION-PROOF-рецепт"])))
     return results
 
 
@@ -268,20 +345,34 @@ def main(argv: list[str] | None = None) -> int:
     if not results:
         print("mutation-recipe-guard: 0 блоков MUTATION-PROOF в переданных файлах (opt-in, не нарушение)")
         return 0
+    ok = 0
+    unknown = 0
     failed = 0
     for block, result in results:
         if result.status == check_result.STATUS_OK:
+            ok += 1
             print(f"MUTATION-PROOF {block.source_file}:{block.line_no}: подтверждён исполнением")
         elif result.status == check_result.STATUS_UNKNOWN:
-            print(f"MUTATION-PROOF {block.source_file}:{block.line_no}: не проверен — {result.reason}")
+            unknown += 1
+            print(f"::warning::MUTATION-PROOF {block.source_file}:{block.line_no}: не проверен — {result.reason}")
         else:
             failed += 1
             for v in result.violations:
                 print(f"::error::{v}")
     if failed:
-        print(f"mutation-recipe-guard: {failed} рецепт(ов) не подтверждён(ы) исполнением")
+        print(
+            f"mutation-recipe-guard: {failed} рецепт(ов) не подтверждён(ы) исполнением, "
+            f"{ok} подтверждено, {unknown} не проверено")
         return 1
-    print(f"mutation-recipe-guard: {len(results)} блок(ов) проверено, 0 расхождений")
+    if unknown:
+        # После фикса истории (unshallow в самой гвардии) недоступный ref —
+        # ошибка автора блока (опечатка), не отказ транспорта: газ — поправить
+        # ref/paths в рецепте. Отдельный код возврата — не путать с violation.
+        print(
+            f"mutation-recipe-guard: {unknown} рецепт(ов) не проверено (ref/путь недоступны) "
+            f"из {len(results)}, {ok} подтверждено, 0 расхождений")
+        return 2
+    print(f"mutation-recipe-guard: {ok} блок(ов) проверено, 0 расхождений")
     return 0
 
 
