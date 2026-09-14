@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Проверка на входе scripts/gh/issue-create (#570, второй слой поверх #566):
 # УЛИКА дефекта в ТЕЛЕ новой issue (путь файла/номер прогона Actions/ссылка
-# #N/дословная цитата из блока ```) сверяется с ОТКРЫТЫМИ И ЗАКРЫТЫМИ
-# задачами пула (scripts/lib/duplicate_guard.py::find_evidence_matches) —
-# похожая находится ДО вызова `gh issue create`.
+# #N/дословная цитата из блока ```) сверяется с уже ОТКРЫТЫМИ задачами пула
+# (критерий готовности #570 — тот же, что у первого слоя, чтобы не
+# наказывать санкционированный паттерн «закрыли → завели узкую related»;
+# scripts/lib/duplicate_guard.py::find_evidence_matches) — похожая находится
+# ДО вызова `gh issue create`.
 #
 # Фикстуры тел — ДОСЛОВНЫЕ тела живых issue (scripts/lib/fixtures_issue_<N>_body.md,
 # `gh issue view --json body -q .body`), не пересказ:
