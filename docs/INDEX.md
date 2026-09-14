@@ -81,6 +81,7 @@
 - [0022. Связывание контекста между каналами: три точечных приёма вместо общего носителя](decisions/0022-cross-channel-context-transfer.md)
 - [0023. Рецепт мутации — исполняемый opt-in формат, не текстовый линт](decisions/0023-mutation-recipe-execution-guard.md)
 - [0024. Триаж застрявшего PR: метод ADR 0021 не покрывал очередь — четыре дефекта и правки](decisions/0024-stalled-pr-triage-method-fix.md)
+- [0025. Классификация классов дефектов — в источнике, не постфактум-кластеризацией](decisions/0025-defect-class-source-classification.md)
 
 ## Операционные процедуры
 
