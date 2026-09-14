@@ -558,9 +558,9 @@ def main(argv: list[str]) -> int:
         if graph_is_empty(issues):
             print(
                 "free_task.py: граф блокировок пуст, ни одна свободная задача "
-                "не помечена area:process и никто не чинит текущий красный CI "
-                "(ci-failure/self-audit) — приоритет сведён к дате создания "
-                "(#361/#224)", file=sys.stderr,
+                "не помечена area:process/impact:system и никто не чинит "
+                "текущий красный CI (ci-failure/self-audit) — приоритет "
+                "сведён к дате создания (#361/#224/#1178)", file=sys.stderr,
             )
         _print_issue_line(candidates[0])
         return 0

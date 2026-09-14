@@ -197,7 +197,7 @@ def test_tier0_propagates_through_multi_step_chain():
 
 def test_ordinary_task_that_blocks_nothing_and_is_not_meta_or_broken_is_tier3():
     # Тир сдвинулся с 2 на 3 задачей #1178 (см. test_priority_reason_names_
-    # meta_label_for_tier2 выше) — порядок между уровнями не изменился.
+    # meta_label_for_tier2 ниже) — порядок между уровнями не изменился.
     plain = issue(50, labels=[])
     meta = issue(60, labels=["area:process"])
     broken = issue(70, labels=["ci-failure"])
@@ -265,7 +265,7 @@ def test_impact_label_tiebreak_by_number_preserved_within_tier():
     assert [i["number"] for i in result] == [50, 90]
 
 
-def test_tier0_urgent_beats_tier2_area_process_mutation_removing_impact_check():
+def test_impact_beats_meta_mutation_removing_impact_check_reverts_order():
     # Доказательство мутацией (AGENTS.md): без учёта IMPACT_LABEL (эквивалент
     # «снять фикс» — вызвать issue_priority_key с несуществующей меткой)
     # порядок ДОЛЖЕН вернуться к старому — старый «хвост чеклиста» (меньший
