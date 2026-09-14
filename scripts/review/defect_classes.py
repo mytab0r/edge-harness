@@ -104,7 +104,6 @@ _console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_u
 
 import json
 import re
-import sys
 from typing import Callable, NamedTuple
 
 SCRIPT_DIR = Path(__file__).resolve().parent
