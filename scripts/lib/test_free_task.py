@@ -378,9 +378,11 @@ def test_broken_labels_mirror_orchestra_literals():
     orchestra = Path(__file__).with_name("..") / "orchestra"
     pulse_guard_src = (orchestra / "pulse_guard.py").resolve().read_text(encoding="utf-8")
     health_audit_src = (orchestra / "health_audit.py").resolve().read_text(encoding="utf-8")
+    digest_src = (orchestra / "soft_failure_digest.py").resolve().read_text(encoding="utf-8")
     assert 'FAILURE_WATCH_LABEL = "ci-failure"' in pulse_guard_src
     assert 'SELF_AUDIT_LABEL = "self-audit"' in health_audit_src
-    assert free_task.BROKEN_LABELS == frozenset({"ci-failure", "self-audit"})
+    assert 'SOFT_FAILURE_LABEL = "soft-failure"' in digest_src
+    assert free_task.BROKEN_LABELS == frozenset({"ci-failure", "self-audit", "soft-failure"})
 
 
 def test_graph_is_empty_true_when_nobody_blocks_and_nobody_is_meta():
@@ -827,3 +829,17 @@ def test_cli_priority_top_rejects_non_integer_n():
     result = run_cli(["priority-top", "owner/repo", "не-число"])
     assert result.returncode == 2
     assert result.stdout == ""
+
+
+
+def test_soft_failure_task_is_tier0_not_tier3():
+    """soft-failure (#1121) — тот же смысл уровня 0, что ci-failure/self-audit:
+    «конвейер деградирует прямо сейчас». Без этого задачи автозаведения
+    дайджеста вставали на уровень 3 (номер issue) среди ~200 открытых —
+    находка AI-ревью PR #1136. Мутация: убери "soft-failure" из
+    BROKEN_LABELS в free_task.py — тест краснеет (задача уедет на уровень 3
+    и в этом списке окажется последней)."""
+    soft = issue(2000, labels=["task", "soft-failure"])
+    plain_process = issue(300, labels=["area:process"], blocking_open=10)
+    result = free_task.prioritized_free([plain_process, soft])
+    assert [i["number"] for i in result] == [2000, 300]

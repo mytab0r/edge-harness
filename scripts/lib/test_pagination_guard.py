@@ -178,6 +178,22 @@ ALLOWED_SINGLE_PAGE_CALLS = {
         "не тихая потеря: вызывающая сторона (`suspects_from_search`) "
         "получает оба числа и обязана предупредить о truncated (см. её "
         "докстринг и `render_report`), не молчаливо теряет хвост.",
+    ("scripts/orchestra/soft_failure_digest.py", "fetch_annotated_check_runs"):
+        "check-runs ОДНОГО прогона (head_sha, отфильтровано по check_suite_id) "
+        "— тот же контракт, что scheduler.script_evidence/review_labels."
+        "status_posted_at выше: фиксированное малое число job'ов ОДНОГО workflow-"
+        "прогона, не растущий пользователем список (замер 2026-09-13: до 12 "
+        "check-runs на sha суммарно по ВСЕМ workflow этого коммита, из них "
+        "этому прогону принадлежат единицы).",
+    ("scripts/orchestra/soft_failure_digest.py", "fetch_annotations"):
+        "аннотации ОДНОГО check-run — число аннотаций одного шага/job'а "
+        "ограничено практикой GitHub Actions (десятки, не сотни за один "
+        "прогон), растущий список был бы признаком отдельной, более крупной "
+        "проблемы job'а, не свойством этого запроса.",
+    ("scripts/orchestra/soft_failure_digest.py", "fetch_jobs"):
+        "jobs ОДНОГО прогона (run_id) — фиксированное малое число job'ов на "
+        "workflow этого репозитория (1-3), не растущий список; тот же контракт, "
+        "что pr_check_runs/script_evidence выше.",
 }
 
 

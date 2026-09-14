@@ -14,6 +14,27 @@ PR проходят ревью, но дольше; воркер продолжа
 ## Метрики и их цена (design.md §1, таблица «источник/уже читается/цена»)
 
   - `merge_throughput`      — PR слито за сутки, `search/issues` (1 запрос).
+
+Семантика «за сутки» (#1121, критерий 5) — ЗАВЕРШЁННЫЕ календарные сутки
+UTC (день перед моментом снимка), не «сегодня»: снимок ставится на
+расписание и берётся первым тиком пульса ПОСЛЕ полуночи (~00:06 UTC) —
+окно «сегодня» меряло бы «слито за первые шесть минут суток» и выдавало
+честный 0 за живой день (живой случай #1121: merge_throughput = 0 за
+2026-09-11..13 при реально слитых 9/15/8 PR; то же — окно DO-метрики
+`do_rows_read_pct` в quotas.collect_cloudflare). Поле `window_day` в
+снимке называет сутки, к которым относятся числа, машинно (не угадывай
+по `date` — это день СНЯТИЯ снимка).
+
+До-фиксовые записи (некритичная находка ревью PR #1136, пятый круг):
+снимки за 2026-09-11..13, снятые ДО этого исправления, поля `window_day`
+не несут вовсе — отличи их по ОТСУТСТВИЮ ключа `window_day`, не по
+значению метрики. Их `merge_throughput`/`do_rows_read_pct` — честные нули
+по окну «сегодня» (первые минуты суток), а не факт отсутствия слияний/
+чтений: `health_regression.py`, сравнивая их с последующими снимками как
+базовую линию, увидел бы ложный скачок с 0 на ненулевое как «регрессию
+наоборот» либо смазал бы порог — потребитель обязан пропускать записи без
+`window_day` при построении базовой линии, не трактовать их как «был 0,
+стало N».
   - `pr_age_p50_hours`/`pr_age_p95_hours` — по уже прочитанному списку
     открытых PR (0 доп. запросов — тот же список, что `scheduler.open_pulls`).
   - `backlog_*`             — по уже прочитанному списку задач пула
@@ -243,6 +264,7 @@ def search_merged_prs(repo: str, gh: GhFn, start: datetime, end: datetime) -> di
 
 def build_snapshot(
     today: date, *,
+    window_day: date,
     merged_search: dict,
     open_pulls: list[dict],
     task_issues: list[dict],
@@ -260,6 +282,9 @@ def build_snapshot(
     cadence = pulse_cadence(tick_runs, now)
     return {
         "date": today.isoformat(),
+        # Сутки, ЗА которые сняты суточные метрики (завершённые сутки перед
+        # моментом снимка), — не путать с `date`, днём снятия снимка.
+        "window_day": window_day.isoformat(),
         "merge_throughput": merge_throughput_from_search(merged_search),
         "pr_age_p50_hours": ages["p50"],
         "pr_age_p95_hours": ages["p95"],
@@ -312,11 +337,18 @@ def should_snapshot(last: date | None, today: date) -> bool:
 # ── I/O: сбор сырых данных (тонкая обёртка, только сеть) ──────────────────
 
 
-def _do_rows_read_pct(account_id: str | None, token: str | None) -> float | None:
+def _do_rows_read_pct(account_id: str | None, token: str | None, now: datetime) -> float | None:
+    """Окно completed_day: тот же класс дефекта, что у merge_throughput выше
+    (#1121, критерий 5) — снимок берётся ~00:06 UTC, окно «сегодня» меряло
+    бы проценты от шести минут. Один параметр collect_cloudflare, дефолт
+    (сегодня) не тронут: он живёт для отчёта квот/quota_watch, который
+    снимается во все часы суток, не только в полночь."""
     if not account_id or not token:
         return None
     try:
-        rows = quotas.collect_cloudflare(account_id, token)
+        window_day = completed_utc_day(now)
+        rows = quotas.collect_cloudflare(
+            account_id, token, rows_read_window=(window_day, window_day))
     except RuntimeError as error:
         print(f"::warning::DO rows_read недоступен для снимка здоровья: {error}", file=sys.stderr)
         return None
@@ -339,13 +371,22 @@ def _gh_rate_remaining_pct(gh: GhFn) -> float | None:
         return None
 
 
+def completed_utc_day(now: datetime) -> str:
+    """ISO-дата ЗАВЕРШЁННЫХ суток UTC относительно now — единственное место
+    правды на окно суточных метрик снимка (#1121, критерий 5)."""
+    return (now.date() - timedelta(days=1)).isoformat()
+
+
 def collect(repo: str, gh: GhFn, now: datetime) -> dict:
     """Собирает сырые данные и строит снимок. Каждый источник — тот же
     вызов/тот же список, что уже читает остальной конвейер (design.md §1) —
     единственный НОВЫЙ сетевой вызов на снимок — `search/issues` (merge
     throughput) и, раз в сутки, GraphQL Cloudflare (DO cost)."""
     today = now.date()
-    day_str = today.isoformat()
+    # Окно — завершённые сутки (критерий 5 #1121): первый тик после полуночи
+    # иначе меряет «слито за первые шесть минут суток». Фикстура-гвардия с
+    # now=00:06 — test_pipeline_health.py, мутация «вернуть сегодня» краснеет.
+    day_str = completed_utc_day(now)
     merged_search = gh(
         f"search/issues?q=repo:{repo}+is:pr+is:merged+merged:{day_str}..{day_str}"
     ) or {}
@@ -360,10 +401,11 @@ def collect(repo: str, gh: GhFn, now: datetime) -> dict:
                                           per_page=WORKER_SUCCESS_WINDOW)
     tick_runs = pulse_guard.orchestra_tick_runs(repo)
     do_pct = _do_rows_read_pct(os.environ.get("CLOUDFLARE_ACCOUNT_ID"),
-                               os.environ.get("CLOUDFLARE_API_TOKEN"))
+                               os.environ.get("CLOUDFLARE_API_TOKEN"), now)
     rate_pct = _gh_rate_remaining_pct(gh)
     return build_snapshot(
-        today, merged_search=merged_search, open_pulls=open_pulls,
+        today, window_day=date.fromisoformat(day_str),
+        merged_search=merged_search, open_pulls=open_pulls,
         task_issues=task_issues, worker_runs=worker_runs, tick_runs=tick_runs,
         do_rows_read_pct=do_pct, gh_rate_remaining_pct=rate_pct, now=now,
     )

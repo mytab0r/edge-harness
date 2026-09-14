@@ -161,10 +161,25 @@ def utc_day_start() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00Z")
 
 
-def collect_cloudflare(account_id: str, token: str) -> list[Row]:
+def collect_cloudflare(
+    account_id: str, token: str,
+    rows_read_window: tuple[str, str] | None = None,
+) -> list[Row]:
+    """rows_read_window — (start_iso, end_iso) окна ДО rows_read/rows_written:
+    дефолт None = сегодня (полночь UTC → сейчас), семантика отчёта квот и
+    quota_watch (снимается во все часы суток — «сколько сегодняшнего лимита
+    выбрано»). Пайплайн снимка здоровья (pipeline_health._do_rows_read_pct)
+    передаёт ЗАВЕРШЁННЫЕ сутки (#1121, критерий 5): его снимок берётся первым
+    тиком после полуночи (~00:06 UTC), и окно «сегодня» меряло бы проценты от
+    шести минут суток — живой случай #1121: 0.0/1.7/0.1 % в снимках при живом
+    пробое 103.2 % накануне. Фильтр date_geq+date_leq — та же форма, проверенная
+    живым прогоном do_rows_read.py::DoRowsReadRange, не новая догадка."""
     source = "Cloudflare GraphQL Analytics"
     reset = "00:00 UTC (следующие сутки)"
     day_start = utc_day_start()
+    if rows_read_window is None:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        rows_read_window = (today, today)
 
     try:
         type_names = cf_type_names(token)
@@ -274,19 +289,23 @@ def collect_cloudflare(account_id: str, token: str) -> list[Row]:
             )
             data = cf_query(
                 token,
-                # $start: Date — не string (находка AI-ревью PR #327, третий
-                # раунд): тот же фильтр date_geq, что и в живом проверенном
-                # do_rows_read.py::DoRowsReadRange (verbatim `$start: Date`),
-                # тип переменной там доказан живым прогоном, здесь — то же
-                # семейство датасетов Durable Objects, не гадаем заново.
-                f"""query($accountTag: string, $start: Date) {{
+                # $start/$end: Date — не string (находка AI-ревью PR #327,
+                # третий раунд): та же пара фильтров date_geq/date_leq, что в
+                # живом проверенном do_rows_read.py::DoRowsReadRange
+                # (verbatim `$start: Date, $end: Date`), форма доказана живым
+                # прогоном, здесь — то же семейство датасетов Durable Objects,
+                # не гадаем заново. Окно — rows_read_window (докстринг выше):
+                # у снимка здоровья это завершённые сутки, у отчёта квот —
+                # сегодня, одно место правды на фильтр — сам запрос.
+                f"""query($accountTag: string, $start: Date, $end: Date) {{
                     viewer {{ accounts(filter: {{accountTag: $accountTag}}) {{
-                        {group_field}(limit: 1000, filter: {{date_geq: $start}}) {{
+                        {group_field}(limit: 1000, filter: {{date_geq: $start, date_leq: $end}}) {{
                             {agg} {{ {field_name} }}
                         }}
                     }} }}
                 }}""",
-                {"accountTag": account_id, "start": datetime.now(timezone.utc).strftime("%Y-%m-%d")},
+                {"accountTag": account_id,
+                 "start": rows_read_window[0], "end": rows_read_window[1]},
             )
             accounts = do_rows_read.require_accounts(data["viewer"]["accounts"])
             items = [item for acc in accounts for item in acc[group_field]]

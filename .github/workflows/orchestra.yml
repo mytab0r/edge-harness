@@ -198,3 +198,33 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: python scripts/orchestra/health_audit.py run
+
+      # Дайджест мягких отказов (#1121): деградация, оформленная как штатная
+      # работа (::warning:: в зелёном прогоне, best-effort continue-on-error,
+      # редкий условный шаг), не видна ничем месяцами — эталон #1097
+      # (NO_ADAPTER на КАЖДОМ прогоне worker.yml полтора месяца при зелёной
+      # системе). Гейт внутри самого скрипта (digest_due, DIGEST_INTERVAL_HOURS)
+      # — полный скан не на каждый тик оркестратора, а раз в несколько часов
+      # (см. докстринг scripts/orchestra/soft_failure_digest.py, «Стоимость по
+      # API»); на тиках без полного скана — пара дешёвых вызовов (гейт
+      # digest_due + независимая проверка застоя escalate_stale_scan) и выход.
+      # `if: steps.quota.outputs.skip != 'true'` — тот же гейт, что у
+      # соседей выше (находка ревью PR #1136, блокер 2): без него самый
+      # дорогой шаг job'а (~700-750 вызовов на полный скан) оставался бы
+      # ЕДИНСТВЕННЫМ, кто не слушает раннюю квоту-проверку #454 — сам стал
+      # бы источником деградации соседей вместо того, чтобы её ловить.
+      # Второй, более строгий порог — ВНУТРИ скрипта (quota_sufficient,
+      # SOFT_FAILURE_QUOTA_THRESHOLD=900): порог `quota`-шага (300)
+      # калиброван под orchestra САМ, не под смету этого скана.
+      # continue-on-error — тот же приём, что у гвардий выше: находка видна в
+      # step summary (fail loud), но не гасит зелёный статус job'а, который
+      # читает пульс (heartbeat_check, #120).
+      - name: Дайджест мягких отказов (#1121)
+        if: steps.quota.outputs.skip != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/orchestra/soft_failure_digest.py
