@@ -523,7 +523,8 @@ else
   # аренды не имеют, снимать нечего.
   if [ -n "$ISSUE_NUMBER" ] && { [ "$HANDS_TASK_FAILURE_REASON" = "quota_exhausted" ] || \
       [ "$HANDS_TASK_FAILURE_REASON" = "rate_limit_retry_budget_exceeded" ] || \
-      [ "$HANDS_TASK_FAILURE_REASON" = "all_providers_exhausted" ]; }; then
+      [ "$HANDS_TASK_FAILURE_REASON" = "all_providers_exhausted" ] || \
+      [ "$HANDS_TASK_FAILURE_REASON" = "chain_budget_exhausted" ]; }; then
     release_out="$(GH_RUN_TOKEN="$LEASE_RELEASE_TOKEN" lease_cli release-full "$ISSUE_NUMBER" 2>&1)" \
       && release_rc=0 || release_rc=$?
     if [ "$release_rc" -eq 0 ]; then
@@ -542,6 +543,12 @@ else
       ;;
     all_providers_exhausted)
       echo "::error::цепочка провайдеров исчерпана целиком (опробованы: ${HANDS_CHAIN_TRIED:-?})${HANDS_CHAIN_RESET_HINT:+, ближайший названный сброс: $HANDS_CHAIN_RESET_HINT} — повтор внутри этого прогона не поможет (docs/runbooks/switch-llm-provider.md, #727)" >&2
+      ;;
+    chain_budget_exhausted)
+      # #1160: суммарный wall-clock бюджет цепочки исчерпан до конца списка —
+      # не зависание (каждая попытка честно ограничена по времени), лизинг
+      # снят выше тем же путём, что и all_providers_exhausted.
+      echo "::error::суммарный бюджет цепочки провайдеров (#1160) исчерпан (опробованы: ${HANDS_CHAIN_TRIED:-?}) прежде, чем список кончился — повтор внутри этого прогона не поможет, но это не зависание" >&2
       ;;
     *)
       echo "::error::dsh завершился с кодом $rc" >&2

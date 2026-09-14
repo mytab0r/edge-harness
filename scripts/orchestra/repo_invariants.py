@@ -311,6 +311,16 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
       вечный долг даёт одну эскалацию (#120 + Telegram), новая подделка
       меняет множество и даёт новую; владелец узнаёт о каждом новом эпизоде
       без спама на каждый пульс.
+  19. check_worker_run_long_running (#1160/#1141, живые прогоны worker.yml
+      34757182001/34801868104, 2026-09-13/14, ~5 часов каждый): текущий
+      in_progress прогон worker.yml старше WORKER_RUN_LONG_RUNNING_MINUTES
+      (200 мин, обоснование — комментарий у константы). Вторая поверхность
+      того же факта, что уже несёт check_recurring_worker_failure (10) —
+      видимость на каждом пульсе, ЗАДОЛГО до внешнего рипера зависших
+      прогонов (scheduler.py::WORKER_STALL_MINUTES=295, вне области этой
+      задачи — правит параллельный канал). Наблюдательный, не в CI_GATING и
+      не ESCALATING_INVARIANTS: read-only факт, ничего не отменяет и не
+      освобождает — носитель действия остаётся у рипера.
   22. check_ai_rework_never_dispatched (issue #1253): PR несёт
       ai:changes-requested дольше AI_REWORK_NEVER_DISPATCHED_AFTER_MINUTES
       с начала текущего эпизода метки (scheduler.ai_changes_labeled_at) и НИ
@@ -1980,6 +1990,81 @@ def check_recurring_worker_failure(repo: str) -> check_result.CheckResult:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# Инвариант 19: единственный слот worker.yml занят одним прогоном дольше
+# разумного (#1160/#1141)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Живые прогоны worker.yml 34757182001/34801868104 (2026-09-13/14) держали
+# ЕДИНСТВЕННЫЙ слот воркера (concurrency: group: worker, worker.yml:26-29)
+# ~5 часов каждый — держится факт, что при этом ничто не сигналило об этом
+# РАНЬШЕ, чем сработает внешний рипер зависших прогонов (scripts/orchestra/
+# scheduler.py::WORKER_STALL_MINUTES=295 мин). Этот инвариант — ВТОРАЯ
+# поверхность того же факта (тот же приём, что check_recurring_worker_failure
+# выше даёт серии провалов, докстринг «даёт этому же факту ВТОРУЮ
+# поверхность, не подверженную маркерному дедупу пульса») — строка в
+# build_report, видимая на КАЖДОМ пульсе (каждые 15 мин, orchestra.yml) и на
+# каждом push/PR (repo-ci.yml), НЕ дублирующая и не заменяющая сам рипер
+# (та же read-only природа, что и check_recurring_worker_failure — этот файл
+# НИЧЕГО не отменяет и не освобождает, только называет факт).
+#
+# Порог обоснован фиксом #1160 (DSH_CHAIN_TOTAL_BUDGET_SECS,
+# scripts/lib/dsh-ci.sh, тот же PR) — новый ожидаемый ЛЕГИТИМНЫЙ максимум
+# одного прогона с реальной работой: пул/GLM (до 7200с) + суммарный бюджет
+# цепочки резервных провайдеров (9000с/150 мин по умолчанию) + оверхед
+# установки/git/отчёта (≤2 мин по замеру, комментарий у WORKER_STALL_MINUTES,
+# scheduler.py) ≈ 152 мин. WORKER_RUN_LONG_RUNNING_MINUTES=200 даёт ~48 мин
+# запаса сверху — заметно МЕНЬШЕ прежнего WORKER_STALL_MINUTES=295 (который
+# остаётся действующим порогом самого рипера, не трогается здесь, см.
+# AGENTS.md-протокол задачи #1160 — эта область принадлежит параллельному
+# каналу), поэтому этот инвариант загорается ЗАДОЛГО до того, как рипер
+# вообще успеет подействовать — ранний сигнал человеку/агенту, читающему
+# отчёт пульса, не завязанный на решение самого рипера.
+WORKER_RUN_LONG_RUNNING_MINUTES = 200
+
+
+def check_worker_run_long_running(repo: str, now: datetime) -> check_result.CheckResult:
+    """Инвариант 19 (#1160/#1141). Нарушение — самый свежий прогон
+    RECURRING_FAILURE_WORKFLOW (worker.yml) в статусе `in_progress` идёт
+    дольше WORKER_RUN_LONG_RUNNING_MINUTES. Наблюдательный факт, не действие:
+    отмену и освобождение аренды делает только scheduler.py::
+    reap_stalled_worker_run (порог WORKER_STALL_MINUTES=295, вне области
+    этой задачи) — здесь только видимость РАНЬШЕ, чем рипер сработает.
+
+    Три исхода (issue #1096), тот же контракт, что check_recurring_worker_
+    failure выше:
+    - список прогонов недоступен целиком (транспорт/квота) — unknown();
+    - список получен, нет прогона in_progress ИЛИ его возраст меньше порога
+      — ok();
+    - есть in_progress прогон старше порога — violation() с фактами (id,
+      url, возраст, порог) — читатель отчёта видит число, не гипотезу."""
+    try:
+        payload = pulse_guard.gh(
+            f"repos/{repo}/actions/workflows/{RECURRING_FAILURE_WORKFLOW}/runs"
+            f"?status=in_progress&per_page=1")
+        runs = runs_of(payload, RECURRING_FAILURE_WORKFLOW)
+    except RuntimeError as error:
+        return check_result.unknown(
+            f"список in_progress прогонов {RECURRING_FAILURE_WORKFLOW} недоступен: {error}")
+    if not runs:
+        return check_result.ok()
+    run = runs[0]
+    started = run.get("run_started_at") or run.get("created_at")
+    if not started:
+        return check_result.unknown(
+            f"прогон {RECURRING_FAILURE_WORKFLOW} #{run.get('id')} числится in_progress, "
+            "но не несёт ни run_started_at, ни created_at — не прод-форма ответа GitHub")
+    age = minutes_between(parse_time(started), now)
+    if age < WORKER_RUN_LONG_RUNNING_MINUTES:
+        return check_result.ok()
+    return check_result.violation([{
+        "run_id": run.get("id"),
+        "url": run.get("html_url"),
+        "age_minutes": round(age),
+        "threshold_minutes": WORKER_RUN_LONG_RUNNING_MINUTES,
+    }])
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # Инвариант 11: манифест использования LLM-провайдеров (#823)
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -3364,6 +3449,23 @@ def build_report(repo: str, now: datetime,
                 f"{AI_REWORK_NEVER_DISPATCHED_AFTER_MINUTES} мин без хотя бы одного "
                 "диспатча авто-доводки"
             )
+    v19 = check_worker_run_long_running(repo, now)
+    findings[19] = v19.violations
+    if v19.status == check_result.STATUS_UNKNOWN:
+        lines.append(f"{check_result.status_emoji(v19.status)} [19] не удалось "
+                      f"проверить длительность текущего {RECURRING_FAILURE_WORKFLOW}: {v19.reason}")
+    elif v19.violations:
+        item = v19.violations[0]
+        lines.append(
+            f"{check_result.status_emoji(check_result.STATUS_VIOLATION)} [19] "
+            f"прогон {RECURRING_FAILURE_WORKFLOW} #{item['run_id']} идёт "
+            f"{item['age_minutes']} мин (порог {item['threshold_minutes']}, #1160/#1141) "
+            f"— держит единственный слот воркера дольше нового ожидаемого легитимного "
+            f"максимума, рипер (WORKER_STALL_MINUTES=295) сработает позже: {item['url']}"
+        )
+    else:
+        lines.append(f"💚 [19] {RECURRING_FAILURE_WORKFLOW} не занимает единственный "
+                      f"слот дольше {WORKER_RUN_LONG_RUNNING_MINUTES} мин (#1160/#1141)")
     return lines, findings
 
 
@@ -3380,7 +3482,7 @@ def build_report(repo: str, now: datetime,
 # (issue #1109, F7 и класс «transport dead -> return []») мигрированы в этой
 # же задаче — оба уже не входят в CI_GATING/ESCALATING_INVARIANTS, коллизии
 # не возникает.
-CHECK_RESULT_MIGRATED_INVARIANTS = frozenset({8, 10, 13, 14})
+CHECK_RESULT_MIGRATED_INVARIANTS = frozenset({8, 10, 13, 14, 19})
 
 
 def assert_check_result_invariants_not_gated_or_escalated(

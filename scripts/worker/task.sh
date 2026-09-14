@@ -878,7 +878,8 @@ fi
 # держать её занятой зря.
 if [ "$WORKER_TASK_FAILURE_REASON" = "quota_exhausted" ] || \
    [ "$WORKER_TASK_FAILURE_REASON" = "rate_limit_retry_budget_exceeded" ] || \
-   [ "$WORKER_TASK_FAILURE_REASON" = "all_providers_exhausted" ]; then
+   [ "$WORKER_TASK_FAILURE_REASON" = "all_providers_exhausted" ] || \
+   [ "$WORKER_TASK_FAILURE_REASON" = "chain_budget_exhausted" ]; then
   case "$WORKER_TASK_FAILURE_REASON" in
     quota_exhausted)
       reason="квота провайдера исчерпана надолго (RATE_LIMIT: Weekly/Monthly Limit Exhausted, код возврата $rc) — повтор внутри этого прогона не поможет, нужно ждать вне CI или сменить провайдера (docs/runbooks/switch-llm-provider.md)" ;;
@@ -892,6 +893,21 @@ if [ "$WORKER_TASK_FAILURE_REASON" = "quota_exhausted" ] || \
       reason="временный RATE_LIMIT провайдера не снялся до исчерпания общего бюджета ожидания на весь прогон (${WORKER_RATE_LIMIT_MAX_WAIT_SECS}с суммарно, #877; код возврата $rc)" ;;
     all_providers_exhausted)
       reason="цепочка провайдеров исчерпана целиком (опробованы: ${WORKER_CHAIN_TRIED:-?})${WORKER_CHAIN_RESET_HINT:+, ближайший названный сброс: $WORKER_CHAIN_RESET_HINT} — повтор внутри этого прогона не поможет (docs/runbooks/switch-llm-provider.md, #727)" ;;
+    chain_budget_exhausted)
+      # #1160/#1141 (живые прогоны worker.yml 34757182001/34801868104,
+      # 2026-09-13/14, ~5 часов каждый): суммарный wall-clock бюджет ВСЕЙ
+      # цепочки (DSH_CHAIN_TOTAL_BUDGET_SECS, dsh_run_with_provider_chain)
+      # исчерпан ДО того, как список провайдеров кончился — НЕ зависание
+      # (каждая попытка убита честным `timeout`'ом, ограниченным остатком
+      # бюджета, лог цепочки уже назвал факт и число опробованных выше),
+      # просто провайдеры отвечали медленнее, чем есть время на весь
+      # список целиком. Лизинг снимается ЭТИМ же прогоном, тем же путём,
+      # что all_providers_exhausted — не дожидаясь ни 24-часового
+      # TTL-сборщика, ни внешнего рипера зависших прогонов
+      # (scripts/orchestra/scheduler.py::WORKER_STALL_MINUTES=295), который
+      # структурно пропускает задачи с уже открытым PR (доводка, #245) —
+      # этот путь такого пробела не несёт.
+      reason="суммарный бюджет цепочки провайдеров (#1160) исчерпан (опробованы: ${WORKER_CHAIN_TRIED:-?}) прежде, чем список провайдеров кончился — повтор внутри этого прогона не поможет, но это не зависание: каждая попытка была честно ограничена по времени" ;;
   esac
   release_out="$(lease_cli release-full "$number" 2>&1)" && release_rc=0 || release_rc=$?
   if [ "$release_rc" -eq 0 ]; then
