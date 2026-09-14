@@ -2,7 +2,9 @@
  * Кодогенератор плагинной композиции dsh-edge: dsh-edge/plugins.json →
  *   1. <clone>/apps/dsh-edge/src/edge-plugins.generated.ts — серверный состав
  *      (литеральные импорты; именно их подхватывает регэксп алиасов,
- *      расширенный патчем 0001, поэтому плагин попадает в бандл воркера);
+ *      расширенный env DSH_EDGE_EXTRA_ALIAS_SCOPES — штатный механизм
+ *      апстрима 0.14.1, снявший патч 0001; скоуп задаёт шаг сборки из
+ *      manifest.mjs::PLUGIN_SCOPE, поэтому плагин попадает в бандл воркера);
  *   2. <clone>/apps/dsh-edge/standalone/edge-plugins.json — клиентский ростер,
  *      который читают патчи 0003 (assemble-standalone-web.mjs +
  *      verify-standalone.mjs).
