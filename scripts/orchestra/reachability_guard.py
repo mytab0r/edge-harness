@@ -31,6 +31,26 @@ PR #1104/задача #1103) НЕ формализован здесь как о�
 перед вызовом, резолвящим наблюдение). Для другой формы гейта тот же баг
 дал бы `gated=None` (probe не нашёл сигнатуру) — «неприменимо», не «ложное
 ОК»: см. `RaceVerdict.status`.
+
+Живая проверка на main (не только исторические фикстуры): подпись 1
+(«гейт+длительность») сегодня НЕ зарегистрирована ни на одной живой паре —
+единственная известная пара этой формы (WORKER_STALL_MINUTES/
+WORKER_SILENCE_MINUTES) существует только в неслитом PR #1089 (задача
+#1085), в main её нет вовсе (см. `test_case1_no_false_positive_on_current_
+worktree_scheduler`, статус `not_applicable`). Другие пары порогов на одну
+величину, встреченные попутно (WORKER_STALL_MINUTES/стена `worker.yml`,
+интервал `alarm()`/`pulseNeedsRecoveryDispatch`, троттлинг quota-watch/
+`MEASUREMENT_STALE_MINUTES`) — РАЗНОЙ формы (простой потолок «А должно
+остаться ниже Б», не «гейт блокирует резолв той же величины») и не
+регистрируются здесь автоматически: `race_verdict(gated=False)` подходит
+для них арифметически, но заявлять их «проверенными» без разбора КАЖДОЙ
+формы гейта означало бы повторить ровно ту ошибку, которую чинит этот файл
+(находка прочёса #1184: ложное срабатывание из-за неограниченного поиска —
+см. `check_stop_signature_in_corpus` ниже). Зарегистрирована ОДНА живая
+пара такой простой формы — `test_worker_stall_minutes_stays_below_worker_
+yml_wall_on_main` (WORKER_STALL_MINUTES < `worker.yml` timeout-minutes),
+уже задокументированная как осознанный запас в комментарии над самой
+константой (scheduler.py:2492 и выше).
 """
 from __future__ import annotations
 
@@ -44,6 +64,14 @@ def extract_constant(source: str, name: str) -> float | None:
     """Значение `NAME = <число>` на уровне модуля — читает из ЖИВОГО текста
     источника (или его вендоренной фикстуры), не дублирует число руками."""
     match = re.search(rf"^{re.escape(name)}\s*=\s*([0-9]+(?:\.[0-9]+)?)", source, re.MULTILINE)
+    return float(match.group(1)) if match is not None else None
+
+
+def extract_yaml_number(source: str, key: str) -> float | None:
+    """Значение `key: <число>` YAML-строкой (например `timeout-minutes: 340`
+    в workflow-файле) — тот же принцип, что `extract_constant`, для формы,
+    где число не Python-присваивание."""
+    match = re.search(rf"^\s*{re.escape(key)}\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*$", source, re.MULTILINE)
     return float(match.group(1)) if match is not None else None
 
 
@@ -77,7 +105,7 @@ def is_gated_by_age_threshold(function_source: str, resolve_call: str, gate_cons
 
 @dataclass(frozen=True)
 class RaceVerdict:
-    status: str  # "not_applicable" | "unreachable" | "reachable"
+    status: str  # "not_applicable" | "degenerate" | "unreachable" | "reachable"
     min_reachable_minutes: float | None
     detail: str
 
@@ -118,7 +146,19 @@ def check_gate_then_duration_pair(
     """Собирает все три факта из ОДНОГО текста источника (файл целиком или
     вендоренная фикстура функции + констант) и считает вердикт. Один вызов —
     один зарегистрированный пары порогов (см. `test_reachability_guard.py`,
-    там же — историческая проверка на реальных коммитах)."""
+    там же — историческая проверка на реальных коммитах).
+
+    `fast_const == slow_const` — вырожденный вызов (по ошибке передана ОДНА
+    константа как обе стороны пары, находка прочёса #1184): арифметика ниже
+    молча дала бы уверенный "unreachable" на `2*X >= X`, хотя это не находка
+    про реальный код, а ошибка КОНФИГУРАЦИИ вызова. Отдельный статус
+    `degenerate`, не `unreachable` — доказывай доказыватель (AGENTS.md)."""
+    if fast_const == slow_const:
+        return RaceVerdict(
+            "degenerate", None,
+            f"fast_const и slow_const совпадают ('{fast_const}') — вырожденный вызов "
+            "(константа передана дважды по ошибке), не находка о реальном коде",
+        )
     fast = extract_constant(source, fast_const)
     slow = extract_constant(source, slow_const)
     func_source = extract_function_source(source, container_func)
@@ -152,14 +192,27 @@ def check_stop_signature_in_corpus(source: str, stop_pattern: str, corpus_text: 
     воспроизводится этим текстом, как на текущем main). Если встречается как
     активная ветка, но не найден в `corpus_text` (реальные цитаты логов) —
     `unconfirmed` (ровно случай 3: недостижимый в проде стоп-класс). Если
-    встречается и в source, и в корпусе — `confirmed`."""
-    stop_line_pattern = re.compile(
-        r"grep\s+-qE\s+'" + re.escape(stop_pattern) + r"'.*\n(?:.*\n)*?\s*return 1",
+    встречается и в source, и в корпусе — `confirmed`.
+
+    Поиск `return 1` ОГРАНИЧЕН телом ЭТОГО `if ...; then ... fi`-блока (до
+    следующей строки, состоящей только из `fi`), а не всем текстом после
+    grep-строки: находка прочёса #1184 — старый неограниченный `(?:.*\\n)*?`
+    дотягивался через закрывающую скобку функции ДО `return 1` СОВСЕМ
+    ДРУГОЙ функции (`dsh_provider_quota_gate_skip`), где `return 1` значит
+    противоположное. Проверено дословно: `STREAM_CLOSED:` на main (реальная
+    сигнатура, восемь `return 0` в `dsh_chain_should_advance`, ни одного
+    `return 1`) до этого фикса давал ложный `unconfirmed`."""
+    block_pattern = re.compile(
+        r"grep\s+-qE\s+'" + re.escape(stop_pattern) + r"'.*\n"
+        r"((?:.*\n)*?)"
+        r"[ \t]*fi[ \t]*\n",
     )
-    if stop_line_pattern.search(source) is None:
+    match = block_pattern.search(source)
+    if match is None or "return 1" not in match.group(1):
         return SignatureVerdict(
             "not_applicable",
-            f"'{stop_pattern}' не встречается как активная стоп-ветка (return 1) в этом тексте",
+            f"'{stop_pattern}' не встречается как активная стоп-ветка (return 1 в СВОЁМ "
+            "if/fi-блоке) в этом тексте",
         )
     if signature_in_corpus(stop_pattern, corpus_text):
         return SignatureVerdict("confirmed", f"'{stop_pattern}' подтверждён реальной цитатой в корпусе")

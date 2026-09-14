@@ -215,5 +215,87 @@ def test_signature_in_corpus_is_case_insensitive_substring():
     assert rg.signature_in_corpus("no_such_signature", "видел RATE_LIMIT: retry\n") is False
 
 
+# ── Регрессия прочёса #1184: ложное срабатывание на РЕАЛЬНО присутствующей
+# на main сигнатуре (STREAM_CLOSED:, восемь return 0, ни одного return 1) ──
+
+def test_case3_stream_closed_present_on_main_is_not_a_stop_class():
+    """STREAM_CLOSED: РЕАЛЬНО встречается в текущем dsh-ci.sh (grep -qE
+    'STREAM_CLOSED:' существует), но её собственный if/fi-блок кончается
+    `return 0` (переключаемый класс, #1084) — единственный `return 1` в
+    файле принадлежит СОВСЕМ ДРУГОЙ функции (dsh_provider_quota_gate_skip,
+    #857), дальше по файлу. Старый неограниченный поиск дотягивался туда и
+    давал ложный `unconfirmed`; проверка обязана сказать `not_applicable`,
+    ровно как для сигнатуры, которой в файле вовсе нет."""
+    live_path = REPO_ROOT / "scripts" / "lib" / "dsh-ci.sh"
+    source = live_path.read_text(encoding="utf-8")
+    assert "grep -qE 'STREAM_CLOSED:'" in source, "фикстура протухла — сигнатура ушла из dsh-ci.sh"
+    assert source.count("return 1") >= 1, "в файле обязан быть хотя бы один return 1 (иначе тест не различает баг)"
+    corpus = read_fixture("real_error_log_corpus.txt")
+    verdict = rg.check_stop_signature_in_corpus(source, "STREAM_CLOSED:", corpus)
+    assert verdict.status == "not_applicable", (
+        f"ложное срабатывание (класс прочёса #1184): {verdict.status} — {verdict.detail}"
+    )
+
+
+def test_case3_mutation_unbounded_search_reintroduces_stream_closed_false_positive():
+    """ДОКАЗАТЕЛЬСТВО МУТАЦИЕЙ (обратное — воспроизводит СТАРЫЙ баг): текст
+    `dsh-ci.sh` не трогаю, мутирую саму функцию проверки на старую,
+    неограниченную форму — она обязана вернуть `unconfirmed` на реальном
+    main (ровно баг, найденный прочёсом), доказывая, что фикс (граница по
+    fi) — не случайность фикстуры."""
+    live_path = REPO_ROOT / "scripts" / "lib" / "dsh-ci.sh"
+    source = live_path.read_text(encoding="utf-8")
+    corpus = read_fixture("real_error_log_corpus.txt")
+
+    def unbounded_check(source: str, stop_pattern: str, corpus_text: str):
+        import re
+        pattern = re.compile(
+            r"grep\s+-qE\s+'" + re.escape(stop_pattern) + r"'.*\n(?:.*\n)*?\s*return 1",
+        )
+        if pattern.search(source) is None:
+            return rg.SignatureVerdict("not_applicable", "старая форма: не найдено")
+        return rg.SignatureVerdict("unconfirmed", "старая форма: return 1 найден где-то дальше")
+
+    mutated_verdict = unbounded_check(source, "STREAM_CLOSED:", corpus)
+    assert mutated_verdict.status == "unconfirmed", (
+        "мутация обязана воспроизвести старый баг (ложный unconfirmed) — если она этого не "
+        "делает, тест выше не доказывает, что фикс закрывает именно этот класс"
+    )
+
+
+# ── Живая проверка простого порядка на main (ответ на находку прочёса #1184,
+# п.2 — «на живом коде подпись 1 не проверяет ничего») ──────────────────────
+
+def test_worker_stall_minutes_stays_below_worker_yml_wall_on_main():
+    """WORKER_STALL_MINUTES (scheduler.py) обязан оставаться НИЖЕ жёсткой
+    стены job'а worker.yml (timeout-minutes) — запас уже задокументирован
+    как осознанное решение в комментарии над самой константой (scheduler.py,
+    #1067: 295 = 270+25, на 45 мин ниже 340-минутной стены). Простая форма
+    (не «гейт+длительность» случая 1, gated=False) — единственная сегодня
+    живая пара, проверяемая этим механизмом на текущем main, а не только на
+    вендоренных исторических фикстурах."""
+    scheduler_source = (REPO_ROOT / "scripts" / "orchestra" / "scheduler.py").read_text(encoding="utf-8")
+    workflow_source = (REPO_ROOT / ".github" / "workflows" / "worker.yml").read_text(encoding="utf-8")
+    stall = rg.extract_constant(scheduler_source, "WORKER_STALL_MINUTES")
+    wall = rg.extract_yaml_number(workflow_source, "timeout-minutes")
+    assert stall is not None and wall is not None, "константы ушли из ожидаемых мест — обнови извлечение"
+    verdict = rg.race_verdict(stall, wall, gated=False)
+    assert verdict.status == "reachable", verdict.detail
+
+
+# ── Вырожденная пара (находка прочёса #1184, п.1): fast_const == slow_const ──
+
+def test_check_gate_then_duration_pair_degenerate_when_same_constant_passed_twice():
+    source = read_fixture("scheduler_before_fix_reap.py.txt")
+    verdict = rg.check_gate_then_duration_pair(
+        source,
+        container_func="reap_stalled_worker_run",
+        resolve_call="_stalled_run_task_number",
+        fast_const="WORKER_SILENCE_MINUTES",
+        slow_const="WORKER_SILENCE_MINUTES",  # по ошибке та же константа дважды
+    )
+    assert verdict.status == "degenerate", verdict.detail
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
