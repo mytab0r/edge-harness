@@ -667,11 +667,9 @@ jobs:
         run: bash scripts/lib/test/dsh-provider-chain.smoke.sh
 
       # Гвардия класса «зависший вызов агента держит единственный слот
-      # воркера часами» (#1160/#1141) — суммарный wall-clock бюджет цепочки
-      # (DSH_CHAIN_TOTAL_BUDGET_SECS) реально обрезает попытку настоящим
-      # `timeout`'ом, не заглушенным (в отличие от соседнего смоука выше).
-      - name: Smoke суммарного бюджета цепочки провайдеров (#1160)
-        run: bash scripts/lib/test/dsh-chain-budget.smoke.sh
+      # воркера часами» (#1160/#1141) — в каталоге гвардий (#749):
+      # scripts/ci/guards/dsh-chain-budget-guard.sh, не рукописный шаг
+      # здесь (та же регистрация данными, что и у соседних гвардий).
 
       # Гвардия критерия успеха воркера (#876) — в каталоге гвардий (#749):
       # scripts/ci/guards/worker-success-gate-guard.sh, не рукописный шаг
