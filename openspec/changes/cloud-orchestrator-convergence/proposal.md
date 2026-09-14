@@ -1,5 +1,7 @@
 # cloud-orchestrator-convergence: оркестратор живёт в облаке, три канала — один вход
 
+Задача: #258.
+
 Дата: 2026-09-03. Спека **C** из трёх параллельных (владелец развёл площади явно):
 A — жизненный цикл задачи (состояния `ready/.../done/dropped`, бюджет реворков) —
 пишется параллельно, change-id на момент написания этого файла не создан, ссылка
@@ -54,7 +56,7 @@ heartbeat — DO) должны быть связаны, а не расходит
 | Канал | Есть/нет | Код | Доказано | Не хватает |
 |---|---|---|---|---|
 | Морда dsh-edge (чат) | частично | сторонний CF-воркер `dsh-edge` (не в этом репо) + `scripts/lib/dsh-edge-session.sh` | Владелец сидит в чате; агент-цикл исполняется внутри чужого DO; job'ы задачи пишут транскрипт хода `harness-<N>` в сессию морды через `POST /api/sessions/:id/ingest` (патч 0004, [runner-sessions-in-dsh-morde](../runner-sessions-in-dsh-morde/proposal.md)) — это ОТВЕТ по конкретной задаче, не диалог общего назначения. Заказ плагина (ADR 0009) — единственный прецедент «сообщение из морды -> пул», узкий: одна выделенная сессия `plugin-orders`, один машиночитаемый формат `[plugin-order:<id>]` | Нет пути «произвольное сообщение владельца в чате морды -> оркестратор». Прямой агент морды не может сам действовать в GitHub — egress `api.github.com` из воркера `dsh-edge` даёт 403 (issue #133, `state: open`, проверено `gh api` 2026-09-03; тело без `message` — похоже на edge-блокировку, не ответ приложения) |
-| Telegram (входящий) | частично, PR #173 смёржен (находка AI-ревью PR #262: прежняя редакция описывала до-мержное состояние) | `cf-worker/src/harness.ts` (`#postMessageIngest`, `#classifyMessage`, `#groupMessages`, `#createIssue`), `cf-worker/src/api-spec.ts` | Релей-эндпоинт принимает плоскую форму или сырой Telegram update в таблицу `messages` DO SQLite (source/source_msg_id/chat_id/sender_id/text/kind/status); идемпотентность `UNIQUE(source, source_msg_id)`; классификация regex'ом `directive/doc_edit/chat/raw`; для `directive` И `doc_edit` — прямой `POST api.github.com/repos/.../issues` (`#processSingleMessage`) **из `cf-worker`, не из `dsh-edge`** — другой воркер, другой egress, НЕ тот же класс, что блок #133 | **(a)** `/api/messages/ingest` — `auth: true`, обычная авторизация (Bearer/кука), но это админский РЕЛЕЙ: прямой публичный вебхук Telegram (без релея, с секретом заголовка) ещё не построен — открытая работа, не открытая дыра (см. design.md, требование 11). **(b)** только `chat` помечается `done` с `result:{note:"classified_for_manual_review"}` — действия нет; `doc_edit` с #173 уже действует (создаёт issue, как `directive`). **(c)** ответа в Telegram нет нигде: `grep -rn "telegram\|sendMessage" cf-worker/src` — ноль совпадений вне словаря кодов ошибок `messages.ts`. |
+| Telegram (входящий) | частично, PR #173 смёржен (находка AI-ревью PR #262: прежняя редакция описывала до-мержное состояние) | `cf-worker/src/harness.ts` (`#postMessageIngest`, `#classifyMessage`, `#groupMessages`, `#dispatchIssueCreation`), `cf-worker/src/api-spec.ts` | Релей-эндпоинт принимает плоскую форму или сырой Telegram update в таблицу `messages` DO SQLite (source/source_msg_id/chat_id/sender_id/text/kind/status); идемпотентность `UNIQUE(source, source_msg_id)`; классификация regex'ом `directive/doc_edit/chat/raw`; для `directive` И `doc_edit` — создание issue РЕПОЗИТОРНЫМ dispatch'ем: `#dispatchIssueCreation` шлёт `POST /repos/{repo}/dispatches` с `event_type: inbox-issue`, issue создаёт job `.github/workflows/inbox-issue.yml` штатным `github.token`, callback `#postIssueCreated` пишет результат в `messages.result` (ADR 0015, заменяет ADR 0011 — прямого `POST api.github.com/.../issues` из DO больше нет) **из `cf-worker`, не из `dsh-edge`** — другой воркер, другой egress, НЕ тот же класс, что блок #133 | **(a)** публичный вебхук Telegram уже подключён (#254, ADR 0014, PR #486): `messagesIngest` принимает гейт `X-Telegram-Bot-Api-Secret-Token` (`TELEGRAM_WEBHOOK_SECRET`, constant-time) + привязку `chat_id` владельца (`#ownerChatAuthorized`, 401 до записи строки), регистрацию делает `.github/workflows/telegram-webhook.yml`; живой статус регистрации у Telegram — «Не подтверждено». **(b)** только `chat` помечается `done` с `result:{note:"classified_for_manual_review"}` — действия нет; `doc_edit` уже действует (создаёт issue через `inbox-issue`, как `directive`). **(c)** ответа в Telegram нет нигде: `grep -rn "telegram\|sendMessage" cf-worker/src` — ноль совпадений вне словаря кодов ошибок `messages.ts`. |
 | Локальная сессия | есть, не облачная | эта сессия | Полный контекст, полное рассуждение | Работает МИМО очереди/журнала: результат — файлы на диске владельца, не событие DO/issue GitHub |
 
 ### 2. Где сегодня принимается решение оркестратора
@@ -66,8 +68,9 @@ heartbeat — DO) должны быть связаны, а не расходит
 
 Решения, требующие ПОНИМАНИЯ СМЫСЛА, сегодня в облаке НЕ принимаются нигде:
 
-- ответ на произвольный вопрос владельца — либо игнор (PR #173,
-  `note: "Requires manual review"`), либо делает локальная сессия руками;
+- ответ на произвольный вопрос владельца — либо парковка (`chat` -> `done`
+  с `note: "classified_for_manual_review"`, `raw` -> `ignored` с
+  `needs_manual_triage`), либо делает локальная сессия руками;
 - превращение сырого текста в осмысленную задачу (заголовок, декомпозиция) —
   либо владелец уже пишет в готовой форме (`/task ...`), либо локальная сессия;
 - дедупликация ПО СМЫСЛУ (не по строке) — issue #243 прямо называет её
@@ -104,7 +107,8 @@ heartbeat — DO) должны быть связаны, а не расходит
   задача» — в JSON-поле `result` той же строки; сама задача — обычный GitHub
   Issue (`task, source:inbox`). Обратной машиночитаемой ссылки «Issue -> id
   сообщения» нет: тело issue содержит человекочитаемый заголовок
-  `## Сообщение владельца (inbox #N)` (`#createIssue`,
+  `## Сообщение владельца (inbox #N)` (заголовок собирается в payload
+  `#dispatchIssueCreation`,
   `cf-worker/src/harness.ts`), это связь ТОЛЬКО в одну сторону и только текстом.
 - Итог: связь GitHub<->DO существует в ДВУХ независимых парах
   (`Issue<->сессия морды`, `Issue<->сообщение DO`), обе однонаправленные и текстовые,
@@ -139,12 +143,16 @@ mytab0r — «у каждого тормоза назван газ»); инва�
   ответить в чат, ИЗ КОТОРОГО пришло сообщение (не обязательно совпадает с
   `TELEGRAM_CHAT_ID`), сегодняшний код не умеет, хотя `chat_id` уже сохранён по
   каждой строке `messages`.
-- Входящий Telegram сегодня — только админский релей `POST /api/messages/ingest`
-  за обычной авторизацией (не публичный вебхук; находка AI-ревью PR #262:
-  прежняя редакция этой строки описывала до-мержное состояние PR #173, где
-  вход действительно был непроверяемым публичным вебхуком). Открытая работа —
-  построить ПУБЛИЧНЫЙ вебхук Telegram (требование 11) сразу с проверкой
-  источника, а не закрыть существующую дыру.
+- Входящий Telegram — публичный вебхук уже подключён (#254, ADR 0014,
+  PR #486): `POST /api/messages/ingest` принимает, кроме обычной
+  Bearer/куки, третий способ — гейт `X-Telegram-Bot-Api-Secret-Token`
+  (`TELEGRAM_WEBHOOK_SECRET`, constant-time, `#telegramWebhookAuthorized`)
+  с привязкой `chat_id` к владельцу (`#ownerChatAuthorized`, 401 до записи
+  строки); регистрацию делает `.github/workflows/telegram-webhook.yml`
+  (#490). Находка AI-ревью PR #262 (пятый раунд): прежняя редакция этой
+  строки называла вебхук «предстоящей работой» — до-мержное состояние.
+  Не подтверждён только живой статус регистрации вебхука у Telegram
+  (секрет заведён, `setWebhook` вызван) — см. «Не подтверждено».
 - Путь «ответить в морду» существует как ПРИМИТИВ, не как готовый механизм для
   диалога: `dsh-edge-session.sh` умеет логиниться кукой владельца и постить
   события в сессию через `ingest`, но сегодня это делают только job'ы КОНКРЕТНОЙ
@@ -152,11 +160,13 @@ mytab0r — «у каждого тормоза назван газ»); инва�
 - Egress `api.github.com` из **`dsh-edge`** (не `cf-worker`!) заблокирован и
   измерен (#133, `state: open`); контрольный факт — тот же PAT из GitHub Actions
   job получает 200 на тот же endpoint. `cf-worker` — другой воркер, другой egress:
-  PR #173 уже делает прямой `POST /issues` из cf-worker (не задеплоено, живьём не
-  подтверждено, см. «Не подтверждено»), а `repository_dispatch`/`workflow_dispatch`
-  из cf-worker доказаны трижды (`cf-worker/src/harness.ts::attemptOrchestraDispatch`/
-  `::#checkDshEdgeUpdate`/`::#postTask` — искать по имени функции, номера
-  строк дрейфуют между ребейзами).
+  `repository_dispatch`/`workflow_dispatch` из cf-worker доказаны
+  (`cf-worker/src/harness.ts::attemptOrchestraDispatch`/
+  `::#checkDshEdgeUpdate`/`::#postTask`/`::#dispatchIssueCreation` — искать
+  по имени функции, номера строк дрейфуют между ребейзами); прямого
+  `POST /issues` из cf-worker по ADR 0015 больше не существует (находка
+  ревью PR #262, пятый раунд — прежняя редакция этой строки описывала
+  смёрженный план PR #173, позже заменённый ADR 0015).
   Не путать эти два egress при проектировании.
 
 ## Границы
@@ -173,7 +183,7 @@ GitHub<->DO без дублирования; честный потолок.
 - формат артефакта на стадии и чеклист приёмки между ролями — спека B;
 - regex-классификация текста (`directive/doc_edit/chat/raw`) — уже в PR #173, не
   переписывается, только получает адресата (оркестратор) для веток, сегодня
-  тупиковых («Requires manual review»);
+  тупиковых (`chat`: `classified_for_manual_review`, `raw`: `needs_manual_triage`);
 - конкретные инварианты `repo_invariants.py` (#244) и реестр меток (#207) — в
   работе владельцем, не дублируются, только называется точка интеграции;
 - починка парсинга `ВЕРДИКТ:` в `ai_review.py` — параллельный change
@@ -216,20 +226,31 @@ GitHub<->DO без дублирования; честный потолок.
   РЕВАЛИДАЦИИ: существенная переработка кода инбокса потребует ревалидации
   таблицы «есть/нет» (находка ревью PR #262 — прежняя редакция описывала
   #173 как не слитый вторым гейтом).
-- Прямой REST `cf-worker -> api.github.com/.../issues` не измерен живым прогоном
-  (PR #173 не задеплоен) — доказаны только `repository_dispatch`/`workflow_dispatch`
-  из того же воркера. Если прямой REST окажется заблокирован так же, как egress
-  `dsh-edge` (#133), создание Issue придётся вести через дополнительный dispatch
-  (job создаёт Issue, не DO напрямую) — архитектура развилки 2 (design.md) это
-  переживает без изменений, ценой одного лишнего шага.
+- Создание issue из DO уже идёт через dispatch (ADR 0015: `#dispatchIssueCreation`
+  -> `repository_dispatch` `inbox-issue` -> job `inbox-issue.yml` штатным
+  `github.token` -> callback `#postIssueCreated`) — «фолбэк» из прежней
+  редакции этого пункта («если прямой REST заблокирован — уйти на dispatch»)
+  и есть сегодняшняя реализация; развилки «прямой REST vs dispatch» не
+  существует (находка ревью PR #262, пятый раунд: прежняя редакция
+  описывала заменённый мир ADR 0011). Вывод «egress `cf-worker` ≠ egress
+  `dsh-edge`» не меняется — доказательство egress cf-worker: сами
+  `repository_dispatch`/`workflow_dispatch` (`attemptOrchestraDispatch`/
+  `#checkDshEdgeUpdate`/`#postTask`/`#dispatchIssueCreation`).
 - Владелец не подтвердил бюджет — если честный потолок (design.md) неприемлем,
   часть решения требует пересмотра варианта архитектуры (развилка 1).
 
 ## Не подтверждено
 
-- Проходит ли прямой `POST api.github.com/.../issues` из `cf-worker` egress так
-  же надёжно, как уже доказанные `repository_dispatch`/`workflow_dispatch` —
-  не измерено живым прогоном.
+- ~~Проходит ли прямой `POST api.github.com/.../issues` из `cf-worker`
+  egress~~ — снято (находка ревью PR #262, пятый раунд): по ADR 0015
+  прямого `POST /issues` из DO не существует, создание issue идёт через
+  `repository_dispatch` `inbox-issue` (см. «Риски»).
+- Зарегистрирован ли вебхук у Telegram ЖИВЫМ вызовом `setWebhook` (секрет
+  `TELEGRAM_WEBHOOK_SECRET` заведён владельцем, `telegram-webhook.yml`
+  отработал) — сам механизм слит (#254, ADR 0014, PR #486, #490), но живой
+  статус регистрации в этой спеке не проверялся. Проверка: ответ
+  `getWebhook` Telegram (pending_update_count, last_error) или живой
+  апдейт, дошедший до `messages`.
 - Точная причина 403 у `dsh-edge` (#133; гипотеза «IP/colo-абьюз-фильтр» не
   подтверждена) — и не проявится ли то же самое у `cf-worker` при росте трафика
   на тот же класс egress.
