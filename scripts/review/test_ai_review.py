@@ -614,8 +614,8 @@ def test_gather_fails_on_missing_placeholder(monkeypatch, tmp_path):
         if path.startswith("repos/o/r/actions/workflows/ai-review.yml/runs"):
             # other_active_ai_review_runs вызывает этот эндпоинт — возвращаем пустой список
             return []
-        if path.startswith(f"repos/o/r/issues/{ai.defect_classes.DEFECT_CLASS_TRACKER_ISSUE}/comments"):
-            # #1237: кандидаты классов дефектов — пустой список, тест не о словаре
+        if path.startswith("repos/o/r/issues/comments"):
+            # #1237/#1255: кандидаты классов дефектов — пустой список, тест не о словаре
             return []
         raise AssertionError(f"unexpected gh call: {path}")
 
@@ -821,11 +821,12 @@ class _FakeCompleted:
 
 def _fake_gh_pull(sha="76913bd001", ref="forge/runner-bridge-v0.1.2"):
     def fake_gh(url: str):
-        # cmd_gather (#1237) читает кандидатов классов дефектов (issue #1238)
-        # ПОСЛЕ основного PR-запроса — только на нормальном пути (диффы
-        # пустого файла возвращаются раньше, до построения промпта, и этот
-        # вызов туда не долетает); пустой список — честный «кандидатов нет».
-        if url.startswith(f"repos/o/r/issues/{ai.defect_classes.DEFECT_CLASS_TRACKER_ISSUE}/comments"):
+        # cmd_gather (#1237/#1255) читает кандидатов классов дефектов
+        # (комментарии всего репозитория) ПОСЛЕ основного PR-запроса — только
+        # на нормальном пути (диффы пустого файла возвращаются раньше, до
+        # построения промпта, и этот вызов туда не долетает); пустой список —
+        # честный «кандидатов нет».
+        if url.startswith("repos/o/r/issues/comments"):
             return []
         assert url == "repos/o/r/pulls/658"
         return {"title": "chore(plugins): обновить runner-bridge до v0.1.2",
@@ -1885,9 +1886,15 @@ def test_cmd_verdict_posts_failure_status_on_rework(monkeypatch, tmp_path):
     assert "state=failure" in " ".join(status_calls[0])
 
 
-# ── Классификация класса дефекта — end-to-end через cmd_verdict (#1237) ──────
+# ── Классификация класса дефекта — end-to-end через cmd_verdict (#1237/#1255) ─
 
-def test_cmd_verdict_records_new_candidate_marker_on_tracker_issue(monkeypatch, tmp_path):
+def test_cmd_verdict_new_candidate_rides_only_in_main_comment_no_separate_write(monkeypatch, tmp_path):
+    # issue #1255: до этой правки cmd_verdict делал ВТОРОЙ POST — маркер на
+    # issue #1238 (issues: write, которого у job'а verdict НЕТ, #939 — падал
+    # 403 вживую, прогон 34857962308/PR #1212). Теперь кандидат едет ТОЛЬКО в
+    # шапке главного комментария (`class: candidate=...`), которая и так
+    # публикуется под pull-requests: write — второй операции записи нет
+    # вовсе, run_gh_calls обязан нести РОВНО один POST на .../issues/294/comments.
     files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
     fake_gh, _ = _fake_gh_verdict("deadbeef", "deadbeef", files, [])
     run_gh_calls: list[tuple] = []
@@ -1900,15 +1907,20 @@ def test_cmd_verdict_records_new_candidate_marker_on_tracker_issue(monkeypatch, 
     rc = ai.cmd_verdict(_verdict_args(tmp_path, answer))
 
     assert rc == 0
-    tracker = f"repos/o/r/issues/{ai.defect_classes.DEFECT_CLASS_TRACKER_ISSUE}/comments"
-    marker_calls = [c for c in run_gh_calls if tracker in c]
-    assert len(marker_calls) == 1, run_gh_calls
-    assert "slug=совсем-новый-класс pr=294" in " ".join(marker_calls[0])
+    comment_calls = [c for c in run_gh_calls if "repos/o/r/issues/294/comments" in c]
+    assert len(comment_calls) == 1, run_gh_calls
+    assert "class: candidate=совсем-новый-класс" in " ".join(comment_calls[0])
+    # Никакой ВТОРОЙ записи — ни на #1238 (закрыта), ни на любую другую issue.
+    other_issue_writes = [c for c in run_gh_calls
+                           if any("issues/" in part and "294" not in part for part in c)]
+    assert other_issue_writes == [], other_issue_writes
 
 
-def test_cmd_verdict_known_class_does_not_touch_tracker_issue():
-    # known-класс (уже в реестре) — не кандидат, маркер не пишется: только
-    # НОВЫЕ slug'и копятся в issue #1238 (см. defect_classes.classify).
+def test_cmd_verdict_known_class_does_not_add_candidate_to_class_line():
+    # known-класс (уже в реестре) — не кандидат: classify() возвращает
+    # candidates=() (см. defect_classes.classify), поэтому build_comment не
+    # добавит его в срез кандидатов даже через новый (репозиторий-широкий)
+    # читатель — тот фильтрует по known_slugs() так же.
     signal = ai.defect_classes.classify(
         "Находка.\nКЛАСС: недостижимый-механизм\nВЕРДИКТ: rework")
     assert signal.state == ai.defect_classes.STATE_KNOWN

@@ -42,7 +42,8 @@ slug'ами, замеченными 1+ раз и ещё не продвинут�
 slug, и придумал бы синоним — ровно то, что сделало #1172 находкой на
 11-м инстансе, а не на третьем.
 
-## Носитель — гибрид: файл (известные) + issue-комментарии (кандидаты)
+## Носитель — файл (известные) + комментарии-вердикты по всему репозиторию
+## (кандидаты) — БЕЗ отдельного маркера, история #1255
 
 Известные классы — `defect_classes.json`, один файл, читается БЕЗ сети
 (cmd_gather уже делает много сетевых вызовов; статический файл — 0
@@ -54,25 +55,83 @@ commit), гонял бы в гонку записи (ai-review идёт ~109 р�
 soft_failure_digest.py) — PR через обычный мерж-конвейер репозитория
 сериализует эти правки тем же механизмом, что и любой другой код.
 
-Кандидаты — НЕ файл (тот же довод про гонку записи, только острее: кандидат
-появляется на КАЖДОМ rework-вердикте, не раз в сутки) — комментарии на
-отдельной issue-носителе (issue #1238, DEFECT_CLASS_TRACKER_ISSUE ниже):
-`POST .../comments` атомарен под конкуренцией, `git commit` — нет. Не
-переиспользуем WATCHDOG_ISSUE (#120): находка ревью PR #1089 (тот самый
-класс #1172, живой пример в этом же файле) — маркер, вытесненный из окна
-чтения штормом чужих комментариев (>100/час на #120), — тот же риск здесь
-дороже нужен НЕ там, где уже документирована теснота.
+Кандидаты — ПЕРВАЯ РЕДАКЦИЯ (PR #1244) писала отдельный маркер-комментарий
+на выделенную issue #1238 (`POST .../issues/1238/comments`, job `verdict`).
+Это СЛОМАНО СТРУКТУРНО, не по недосмотру: `verdict` намеренно лишён
+`issues: write` мандатом владельца 2026-09-11 (#939, эскалация в
+WATCHDOG_ISSUE убрана из ai_review.py целиком — писать в Issues API этому
+job'у стало незачем, право снято). Живая улика (issue #1255): прогон
+34857962308, PR #1212 — модель класс назвала (`class: candidate=
+маркер-позже-действия` в шапке ГЛАВНОГО комментария-вердикта, опубликован
+успешно под `pull-requests: write`), а отдельный POST на #1238 упал `HTTP
+403 Resource not accessible by integration`; issue #1238 осталась пустой
+навсегда — писать в неё было физически нечем.
 
-## Потолок размера — токены прод-промпта не растут без границы
+Фикс (issue #1255) убирает отдельную запись вовсе, а не чинит право: slug
+УЖЕ лежит в шапке главного комментария-вердикта (`class: candidate=...`,
+build_comment) — тот пишется job'ом `verdict` под `pull-requests: write`,
+которое НЕ снималось и работает (иначе не было бы вердикта вообще). Читатель
+(`recent_candidate_stats`) агрегирует кандидатов из УЖЕ опубликованных
+комментариев — репозиторий-широкий эндпоинт `GET /repos/{repo}/issues/
+comments` (не `.../issues/{N}/comments`: он один на весь репозиторий, а не
+на одну issue), доверенный автор (`review_labels._is_trusted_verdict_author`,
+тот же класс проверки, что #294 — публичный репозиторий, тело недоверенного
+автора не парсится как факт) и поле `class` шапки (`review_labels.FACT_RE`,
+общее место правды и для читателя, и для писателя — не вторая копия
+регэкспа). Читает это job `review`/gather, права `issues: read` там были и
+остаются — НИЧЕГО не добавлено. Запись и чтение теперь — ОДНА и та же
+операция POST главного комментария: класс отказа «эмиссия работает, запись
+молча ломается» закрыт по построению — второй операции, которая могла бы
+разойтись с первой, больше нет.
+
+Issue #1238 закрыта (#1255) со ссылкой на этот докстринг и issue #1255 —
+осиротевший носитель, в который больше никто не пишет, не бросается молча
+висеть (AGENTS.md, класс #1172 «механизм недостижим по построению»).
+
+Не переиспользуем WATCHDOG_ISSUE (#120) — довод из первой редакции остаётся
+в силе для ЛЮБОЙ отдельной issue-очереди: находка ревью PR #1089 (класс
+#1172) — маркер, вытесненный из окна чтения штормом чужих комментариев
+(>100/час на #120). Репозиторий-широкий поток (эта редакция) — измеримо
+РЕЖЕ: живой замер issue #1255 (2026-09-14) — 636 комментариев/24ч по всему
+репозиторию (~26/ч), из которых лишь ~15% несут `reviewer:`-факт (доверенный
+вердикт), то есть ниже темпа, который сам #120 уже признал теснотой.
+
+## Потолок размера и честная цена — токены прод-промпта не растут без
+## границы, но окно истории УЖЕ не бесконечное
 
 `MAX_CANDIDATES_SHOWN` ограничивает список кандидатов в промпте (не сам
-носитель — issue #1238 хранит всю историю маркеров, промпт видит только
-срез). `MAX_CANDIDATE_READ_PAGES` ограничивает СТОИМОСТЬ чтения (тот же
-приём, что review_labels.list_pages/pulse_guard.issue_marker_times,
-`max_pages` — стоимость тика не должна расти с историей). Цена в токенах
-текущего словаря (1 известный класс, 0 кандидатов на момент PR) — см.
-`render_prompt_section.__doc__` и число, посчитанное в PR/тестах
-(`test_defect_classes.py::test_render_prompt_section_token_cost_is_small`).
+носитель — история живёт в уже опубликованных PR-комментариях, промпт видит
+только срез). `MAX_CANDIDATE_READ_PAGES` ограничивает СТОИМОСТЬ чтения (тот
+же приём, что review_labels.list_pages/pulse_guard.issue_marker_times,
+`max_pages` — стоимость тика не должна расти с историей): число ВЫЗОВОВ API
+за тик — то же самое (≤5 постранично), что было бы у отдельной issue #1238 в
+рабочем состоянии — `list_pages` ограничивает по числу СТРАНИЦ, не по доле
+полезных записей на странице. Изменилась не цена в запросах, а окно
+ИСТОРИИ: на живом темпе issue #1255 (636 комментариев/24ч) 5 страниц по 100
+= 500 самых свежих комментариев ВСЕГО репозитория покрывают ~19 часов
+(500/636×24ч), а не «всю историю маркеров», как хранила бы выделенная issue.
+Кандидат, не повторившийся в течение ~19 часов, выпадает из среза раньше,
+чем выпал бы из #1238 — цена спрямления носителя, названная явно, а не
+предполагаемая тихо. Цена в токенах текущего словаря (1 известный класс, 0
+кандидатов на момент PR #1244) — см. `render_prompt_section.__doc__` и число,
+посчитанное в тестах (`test_defect_classes.py::
+test_render_prompt_section_token_cost_is_small`).
+
+## Сигнал инертности (issue #1240, требование координатора; issue #1255) —
+## «повторов пока не было» ≠ «контракт не исполняется вовсе»
+
+`recent_candidate_stats` возвращает `CandidateScan`, не голый список: рядом
+со срезом кандидатов — `rework_verdicts_seen`/`rework_with_class_seen`,
+считанные ТОЛЬКО по вердиктам `rework` (у `approve` нет находок, `class:` у
+него законно отсутствует, см. build_comment). Ноль class-строк среди
+НЕНУЛЕВОГО числа rework-вердиктов — это «контракт КЛАСС не исполняется» (то
+же наблюдение, что уже делает cmd_verdict ПОШТУЧНО на каждом PR, issue
+#1237 п.8 — здесь то же самое суммарно, по срезу), отличимое от «rework
+вердиктов в окне не было вовсе» и от «кандидатов 0, потому что все
+находки — известные классы». Ровно тот случай, который #1255 живьём и
+воспроизвёл: issue #1238 была пуста, и ОДНОЙ пустоты было недостаточно,
+чтобы понять, что именно сломалось (запись 403 vs честных «повторов пока
+нет»).
 
 ## Не подтверждено
 
@@ -86,8 +145,11 @@ soft_failure_digest.py) — PR через обычный мерж-конвейе
   промпта, не самой моделью ai-review. Первый настоящий прогон в CI —
   единственное honest-подтверждение; PR явно называет это ограничение,
   не выдаёт симуляцию за факт.
-- Читается ли #1238 без штормов, как #120, при большом числе кандидатов, —
-  не проверено на реальном объёме (issue только что заведена, пуста).
+- Достаточно ли окна ~19ч (при текущем темпе комментариев) для порога
+  повторов, который follow-up #1240 применит при повышении кандидата в
+  известный класс, — не проверено: зависит от того, как часто ai-review в
+  среднем натыкается на один и тот же НОВЫЙ класс, а этого числа пока нет
+  (первый честный прогон нового носителя ещё не случился на момент правки).
 
 Запуск: python -m pytest scripts/review/test_defect_classes.py -q
 """
@@ -104,7 +166,7 @@ _console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_u
 
 import json
 import re
-from typing import Callable, NamedTuple
+from typing import NamedTuple
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -117,15 +179,13 @@ _RL_SPEC.loader.exec_module(review_labels)  # type: ignore[union-attr]
 
 REGISTRY_FILE = SCRIPT_DIR / "defect_classes.json"
 
-# Issue-носитель кандидатов (issue #1238) — НЕ WATCHDOG_ISSUE (#120), см.
-# докстринг модуля «Носитель — гибрид». Хардкод по тому же приёму, что
-# pulse_guard.WATCHDOG_ISSUE = 120 — единственный носитель этого рода, номер
-# не вычисляется, задаётся один раз при заведении issue.
-DEFECT_CLASS_TRACKER_ISSUE = 1238
-
-CANDIDATE_MARKER_PREFIX = "<!-- defect-class-candidate: "
-_CANDIDATE_MARKER_RE = re.compile(
-    r"<!-- defect-class-candidate: slug=(\S+) pr=(\d+) -->")
+# issue #1238 — БЫВШИЙ носитель-реестр кандидатов (PR #1244), закрыта issue
+# #1255: писать было физически нечем (job `verdict` без `issues: write`,
+# #939), носитель заменён на уже публикуемые комментарии-вердикты (см.
+# докстринг модуля). Номер оставлен здесь ТОЛЬКО как исторический якорь для
+# читателя докстрингов/комментариев — в коде НЕ используется (не второй
+# источник правды, просто ссылка на закрытую issue).
+_RETIRED_DEFECT_CLASS_TRACKER_ISSUE = 1238
 
 # Строка контракта промпта (ai_prompt.md, п.1 «Блокирует мерж») — тот же
 # стиль допуска markdown/точки, что VERDICT_RE/SCOPE_RE в ai_review.py, но
@@ -280,28 +340,41 @@ def render_prompt_section_unavailable(reason: str) -> str:
     return "\n".join(lines)
 
 
-# ── Кандидаты: запись маркера (атомарный POST) и чтение среза (issue #1238) ──
+# ── Кандидаты: чтение среза из уже опубликованных комментариев-вердиктов ────
+# (issue #1255) — НЕТ отдельной записи: slug уже лежит в шапке главного
+# комментария (`class:`, build_comment), который job `verdict` и так публикует
+# под `pull-requests: write`. Второй операции записи (которая могла бы
+# разойтись с первой) здесь больше не существует — см. докстринг модуля.
 
-def record_candidate_observation(repo: str, run_gh: Callable[..., None], slug: str, pr: int) -> None:
-    """Один маркер-комментарий на DEFECT_CLASS_TRACKER_ISSUE — `run_gh`
-    принимает ту же сигнатуру, что ai_review.run_gh (variadic args
-    `gh api ...`), не второй копии HTTP-клиента здесь."""
-    body = f"{CANDIDATE_MARKER_PREFIX}slug={slug} pr={pr} -->"
-    run_gh("api", "-X", "POST", f"repos/{repo}/issues/{DEFECT_CLASS_TRACKER_ISSUE}/comments",
-           "-f", f"body={body}")
+class CandidateScan(NamedTuple):
+    """Срез кандидатов + диагностика инертности (issue #1240, issue #1255) —
+    см. докстринг модуля «Сигнал инертности». `rework_verdicts_seen`/
+    `rework_with_class_seen` считают ТОЛЬКО доверенные вердикты `rework`
+    (approve законно не несёт `class:` — у него нет находок); ноль
+    class-строк среди ненулевого `rework_verdicts_seen` — контракт КЛАСС не
+    исполняется, а не «повторов пока не было»."""
+
+    candidates: list[dict]
+    rework_verdicts_seen: int
+    rework_with_class_seen: int
 
 
 def recent_candidate_stats(
     repo: str, gh_func, max_pages: int = MAX_CANDIDATE_READ_PAGES,
     known: set[str] | None = None,
-) -> list[dict]:
-    """Срез кандидатов из последних `max_pages` страниц комментариев
-    DEFECT_CLASS_TRACKER_ISSUE — уже ИЗВЕСТНЫЕ (см. known_slugs()) slug'ы
-    исключены: однажды продвинутый класс не должен маячить кандидатом
-    (историческая метка в issue #1238 не редактируется задним числом, follow-
-    up #1240 читает её честно как «уже известен на момент чтения», не
-    удаляет старые маркеры). Сортировка — по числу РАЗНЫХ PR по убыванию
-    (не по общему числу маркеров: три маркера одного PR — один случай, тот же
+) -> CandidateScan:
+    """Срез кандидатов из последних `max_pages` страниц комментариев ВСЕГО
+    репозитория (`GET /repos/{repo}/issues/comments`, не одной issue — issue
+    #1238 закрыта, см. докстринг модуля «Носитель»). Только доверенные
+    вердикты (`review_labels._is_trusted_verdict_author` — тот же класс
+    проверки, что #294: публичный репозиторий, чужое тело не парсится как
+    факт) с полем `class:` в шапке (`review_labels.header_facts`/`FACT_RE` —
+    одно место правды с писателем, build_comment). Уже ИЗВЕСТНЫЕ (см.
+    known_slugs()) slug'ы исключены: однажды продвинутый класс не должен
+    маячить кандидатом (follow-up #1240 обязан читать срез честно как «уже
+    известен НА МОМЕНТ чтения», старые комментарии задним числом не
+    редактируются). Сортировка — по числу РАЗНЫХ PR по убыванию (не по
+    общему числу упоминаний: три упоминания одного PR — один случай, тот же
     критерий, что follow-up #1240 обязан применить при повышении), обрезка
     по MAX_CANDIDATES_SHOWN.
 
@@ -313,19 +386,36 @@ def recent_candidate_stats(
     известный класс; симуляция состояния «ещё кандидат» требует явного
     known=set())."""
     comments = review_labels.list_pages(
-        f"repos/{repo}/issues/{DEFECT_CLASS_TRACKER_ISSUE}/comments?per_page=100",
+        f"repos/{repo}/issues/comments?per_page=100&sort=created&direction=desc",
         gh_func, max_pages=max_pages)
     known = known if known is not None else known_slugs()
     by_slug: dict[str, dict] = {}
+    rework_seen = 0
+    rework_with_class = 0
     for comment in comments:
-        match = _CANDIDATE_MARKER_RE.search(comment.get("body") or "")
-        if not match:
+        if not review_labels._is_trusted_verdict_author(comment):
             continue
-        slug, pr = match.group(1), int(match.group(2))
-        if slug in known:
+        facts = review_labels.header_facts(comment.get("body") or "")
+        if facts.get("reviewer") != "rework":
             continue
-        entry = by_slug.setdefault(slug, {"slug": slug, "count": 0, "prs": set()})
-        entry["prs"].add(pr)
-        entry["count"] = len(entry["prs"])
+        rework_seen += 1
+        class_fact = facts.get("class")
+        if not class_fact:
+            continue
+        rework_with_class += 1
+        if not class_fact.startswith(f"{STATE_CANDIDATE}="):
+            continue
+        pr_field = facts.get("pr")
+        try:
+            pr = int(pr_field)
+        except (TypeError, ValueError):
+            continue
+        for slug in class_fact[len(STATE_CANDIDATE) + 1:].split(","):
+            slug = slug.strip()
+            if not slug or not is_valid_slug(slug) or slug in known:
+                continue
+            entry = by_slug.setdefault(slug, {"slug": slug, "count": 0, "prs": set()})
+            entry["prs"].add(pr)
+            entry["count"] = len(entry["prs"])
     ranked = sorted(by_slug.values(), key=lambda e: -e["count"])
-    return ranked[:MAX_CANDIDATES_SHOWN]
+    return CandidateScan(ranked[:MAX_CANDIDATES_SHOWN], rework_seen, rework_with_class)

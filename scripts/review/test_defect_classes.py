@@ -161,65 +161,135 @@ def test_render_prompt_section_unavailable_names_reason_not_silent():
     assert "недостижимый-механизм" in section  # известные классы всё равно видны
 
 
-# ── Кандидаты: запись маркера и чтение среза (issue #1238) ───────────────────
+# ── Кандидаты: чтение среза из комментариев-вердиктов всего репозитория ──────
+# (issue #1255 — отдельная запись на issue #1238 убрана: job `verdict` не
+# имеет `issues: write`, #939, POST падал 403 вживую (прогон 34857962308,
+# PR #1212) при исправно опубликованном главном комментарии. Кандидат теперь
+# читается ИЗ него же — `_verdict_comment` ниже строит ту же форму шапки, что
+# реально пишет ai_review.build_comment (см. прод-фикстуру
+# fixtures_pr1212_verdict_comment.json — дословный ответ GitHub API).
 
-def test_record_candidate_observation_posts_expected_marker():
-    calls = []
-
-    def fake_run_gh(*args):
-        calls.append(args)
-
-    dc.record_candidate_observation("o/r", fake_run_gh, "новый-класс", 4242)
-    assert calls == [(
-        "api", "-X", "POST", f"repos/o/r/issues/{dc.DEFECT_CLASS_TRACKER_ISSUE}/comments",
-        "-f", "body=<!-- defect-class-candidate: slug=новый-класс pr=4242 -->",
-    )]
+TRUSTED_LOGIN = "github-actions[bot]"
 
 
-def _fake_gh_comments(bodies):
+def _verdict_comment(pr: int, reviewer: str = "rework", class_field: str | None = None,
+                      trusted: bool = True) -> dict:
+    """Комментарий той же формы, что build_comment пишет и `gh api
+    .../issues/comments` реально отдаёт (см. header_facts/FACT_RE в
+    review_labels.py) — шапка-факты, пустая строка, проза."""
+    lines = [f"pr: {pr}", "head: " + "a" * 40, f"reviewer: {reviewer}"]
+    if class_field:
+        lines.append(f"class: {class_field}")
+    body = "\n".join(lines) + "\n\n🤖 AI-ревью — второй гейт конвейера (#18)."
+    user = ({"login": TRUSTED_LOGIN, "type": "Bot"} if trusted
+            else {"login": "случайный-читатель", "type": "User"})
+    return {"body": body, "user": user}
+
+
+def _fake_gh_comments(comments):
     def fake_gh(url):
-        assert str(dc.DEFECT_CLASS_TRACKER_ISSUE) in url
-        return [{"body": body} for body in bodies]
+        assert "/issues/comments" in url
+        return comments
     return fake_gh
 
 
 def test_recent_candidate_stats_counts_distinct_prs_not_raw_markers():
-    # Три маркера одного PR — один случай, не три (issue #1237 п. «порог
+    # Три упоминания одного PR — один случай, не три (issue #1237 п. «порог
     # считает разные PR» — то же требование, что follow-up #1240 обязан
-    # применить при повышении). Два маркера того же slug на РАЗНЫХ PR — два.
-    bodies = [
-        "<!-- defect-class-candidate: slug=новый-класс pr=1 -->",
-        "<!-- defect-class-candidate: slug=новый-класс pr=1 -->",
-        "<!-- defect-class-candidate: slug=новый-класс pr=2 -->",
+    # применить при повышении). Два упоминания того же slug на РАЗНЫХ PR — два.
+    comments = [
+        _verdict_comment(1, class_field="candidate=новый-класс"),
+        _verdict_comment(1, class_field="candidate=новый-класс"),
+        _verdict_comment(2, class_field="candidate=новый-класс"),
     ]
-    stats = dc.recent_candidate_stats("o/r", _fake_gh_comments(bodies))
-    assert stats == [{"slug": "новый-класс", "count": 2, "prs": {1, 2}}]
+    scan = dc.recent_candidate_stats("o/r", _fake_gh_comments(comments))
+    assert scan.candidates == [{"slug": "новый-класс", "count": 2, "prs": {1, 2}}]
+    assert scan.rework_verdicts_seen == 3
+    assert scan.rework_with_class_seen == 3
 
 
 def test_recent_candidate_stats_excludes_already_known_slugs():
-    bodies = [
-        "<!-- defect-class-candidate: slug=недостижимый-механизм pr=1 -->",
-        "<!-- defect-class-candidate: slug=свежий-кандидат pr=2 -->",
+    comments = [
+        _verdict_comment(1, class_field="candidate=недостижимый-механизм"),
+        _verdict_comment(2, class_field="candidate=свежий-кандидат"),
     ]
-    stats = dc.recent_candidate_stats("o/r", _fake_gh_comments(bodies))
+    stats = dc.recent_candidate_stats("o/r", _fake_gh_comments(comments)).candidates
     assert [s["slug"] for s in stats] == ["свежий-кандидат"]
 
 
-def test_recent_candidate_stats_ignores_unrelated_comments():
-    bodies = ["обычный комментарий человека, не маркер", ""]
-    assert dc.recent_candidate_stats("o/r", _fake_gh_comments(bodies)) == []
+def test_recent_candidate_stats_ignores_unrelated_and_approve_comments():
+    comments = [
+        {"body": "обычный комментарий человека, не вердикт",
+         "user": {"login": "случайный-читатель", "type": "User"}},
+        {"body": "", "user": {"login": TRUSTED_LOGIN, "type": "Bot"}},
+        _verdict_comment(3, reviewer="approve"),  # у approve законно нет class:
+    ]
+    scan = dc.recent_candidate_stats("o/r", _fake_gh_comments(comments))
+    assert scan.candidates == []
+    assert scan.rework_verdicts_seen == 0
+
+
+def test_recent_candidate_stats_rejects_untrusted_author_even_with_class_line():
+    # Публичный репозиторий (тот же класс, что #294): кто угодно может
+    # опубликовать комментарий с точно такой же шапкой — доверять телу можно
+    # только ПОСЛЕ проверки автора, не вместо неё.
+    comments = [_verdict_comment(1, class_field="candidate=подделка-класса", trusted=False)]
+    scan = dc.recent_candidate_stats("o/r", _fake_gh_comments(comments))
+    assert scan.candidates == []
+    assert scan.rework_verdicts_seen == 0
 
 
 def test_recent_candidate_stats_caps_and_ranks_by_distinct_pr_count():
-    bodies = []
-    for i in range(dc.MAX_CANDIDATES_SHOWN + 5):
-        bodies.append(f"<!-- defect-class-candidate: slug=класс-{i} pr={i} -->")
-    # класс-0 замечен в трёх разных PR — должен оказаться первым по ранжиру.
-    bodies += [f"<!-- defect-class-candidate: slug=класс-0 pr={900 + j} -->" for j in range(2)]
-    stats = dc.recent_candidate_stats("o/r", _fake_gh_comments(bodies))
+    # slug — 2-5 групп букв через дефис (SLUG_RE, без цифр) — суффикс через
+    # букву латинского алфавита, не число.
+    import string
+    letters = string.ascii_lowercase
+    comments = [_verdict_comment(i, class_field=f"candidate=класс-{letters[i]}")
+                for i in range(dc.MAX_CANDIDATES_SHOWN + 5)]
+    # класс-a замечен в трёх разных PR — должен оказаться первым по ранжиру.
+    comments += [_verdict_comment(900 + j, class_field="candidate=класс-a") for j in range(2)]
+    stats = dc.recent_candidate_stats("o/r", _fake_gh_comments(comments)).candidates
     assert len(stats) == dc.MAX_CANDIDATES_SHOWN
-    assert stats[0]["slug"] == "класс-0"
+    assert stats[0]["slug"] == "класс-a"
     assert stats[0]["count"] == 3
+
+
+# ── Сигнал инертности (issue #1240/#1255): «повторов пока не было» отличимо
+# от «контракт КЛАСС не исполняется вовсе» — та самая улика #1255 (issue
+# #1238 была пуста, и по одной пустоте нельзя было понять причину). ─────────
+
+def test_recent_candidate_stats_signals_rework_without_any_class_line():
+    comments = [_verdict_comment(1, class_field=None), _verdict_comment(2, class_field=None)]
+    scan = dc.recent_candidate_stats("o/r", _fake_gh_comments(comments))
+    assert scan.rework_verdicts_seen == 2
+    assert scan.rework_with_class_seen == 0  # контракт не исполняется — не "повторов нет"
+    assert scan.candidates == []
+
+
+def test_recent_candidate_stats_all_known_is_distinct_from_class_contract_broken():
+    # Контракт исполняется (class: есть на КАЖДОМ rework), просто находки —
+    # все уже известные классы: candidates=[] здесь ЗАКОНОМЕРНО, не инертность.
+    comments = [_verdict_comment(1, class_field="known=недостижимый-механизм")]
+    scan = dc.recent_candidate_stats("o/r", _fake_gh_comments(comments))
+    assert scan.rework_verdicts_seen == 1
+    assert scan.rework_with_class_seen == 1
+    assert scan.candidates == []
+
+
+# ── Прод-форма (issue #1255): дословный комментарий-вердикт PR #1212 ────────
+# (issue-комментарий id 5666075953, gh api repos/mytab0r/edge-harness/
+# issues/comments/5666075953, снят 2026-09-14) — тот самый прогон 34857962308,
+# что вскрыл HTTP 403 на записи в закрытую issue #1238. Байт-контент, не
+# пересказ формата.
+
+def test_recent_candidate_stats_parses_real_pr1212_verdict_comment():
+    import json
+    fixture = json.loads(
+        Path(__file__).with_name("fixtures_pr1212_verdict_comment.json").read_text(encoding="utf-8"))
+    scan = dc.recent_candidate_stats("mytab0r/edge-harness", _fake_gh_comments([fixture]), known=set())
+    assert scan.candidates == [{"slug": "маркер-позже-действия", "count": 1, "prs": {1212}}]
+    assert scan.rework_verdicts_seen == 1
+    assert scan.rework_with_class_seen == 1
 
 
 # ── Живые тексты #1172: три инстанса, доказательство схождения числом ───────
@@ -284,33 +354,34 @@ def test_three_real_pr1172_findings_each_classify_as_candidate_before_promotion(
 def test_three_real_pr1172_findings_collapse_to_one_slug_by_third_pr():
     """Критерий владельца: механизм обязан поймать класс на 3-4-м, не на
     11-м инстансе. Симуляция: после A1(#1089) и A2(#1104) кандидат уже
-    зафиксирован issue #1238 (2 разных PR); A3(#1114) — ТРЕТИЙ PR того же
-    slug — пересекает порог `DIGEST_REPEAT_THRESHOLD`-стиля 3 (follow-up
-    #1240 обязан завести задачу здесь, не на #1089/#1104/#1114 + восемь
-    последующих, как было исторически с #1172)."""
+    виден в срезе комментариев-вердиктов (2 разных PR); A3(#1114) — ТРЕТИЙ PR
+    того же slug — пересекает порог `DIGEST_REPEAT_THRESHOLD`-стиля 3
+    (follow-up #1240 обязан завести задачу здесь, не на #1089/#1104/#1114 +
+    восемь последующих, как было исторически с #1172)."""
     for pr_number, text in ((1089, _A1_PR1089), (1104, _A2_PR1104)):
         signal = dc.classify(text, known=set())
         assert signal.candidates == ("недостижимый-механизм",)
 
-    marker_bodies_after_two = [
-        f"<!-- defect-class-candidate: slug=недостижимый-механизм pr={pr} -->"
+    comments_after_two = [
+        _verdict_comment(pr, class_field="candidate=недостижимый-механизм")
         for pr in (1089, 1104)
     ]
-    stats_after_two = dc.recent_candidate_stats(
-        "o/r", _fake_gh_comments(marker_bodies_after_two), known=set())
-    assert stats_after_two == [{"slug": "недостижимый-механизм", "count": 2, "prs": {1089, 1104}}]
+    scan_after_two = dc.recent_candidate_stats(
+        "o/r", _fake_gh_comments(comments_after_two), known=set())
+    assert scan_after_two.candidates == [
+        {"slug": "недостижимый-механизм", "count": 2, "prs": {1089, 1104}}]
 
     signal_third = dc.classify(_A3_PR1114, known=set())
     assert signal_third.candidates == ("недостижимый-механизм",)
 
-    marker_bodies_after_three = marker_bodies_after_two + [
-        "<!-- defect-class-candidate: slug=недостижимый-механизм pr=1114 -->"
+    comments_after_three = comments_after_two + [
+        _verdict_comment(1114, class_field="candidate=недостижимый-механизм")
     ]
-    stats_after_three = dc.recent_candidate_stats(
-        "o/r", _fake_gh_comments(marker_bodies_after_three), known=set())
-    assert stats_after_three == [
+    scan_after_three = dc.recent_candidate_stats(
+        "o/r", _fake_gh_comments(comments_after_three), known=set())
+    assert scan_after_three.candidates == [
         {"slug": "недостижимый-механизм", "count": 3, "prs": {1089, 1104, 1114}}
     ]
     # Три РАЗНЫХ PR, один slug — сходимость на третьем инстансе, не на
     # одиннадцатом (живая история #1172).
-    assert stats_after_three[0]["count"] == 3
+    assert scan_after_three.candidates[0]["count"] == 3

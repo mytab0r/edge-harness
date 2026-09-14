@@ -848,19 +848,30 @@ def rules_section() -> str:
 
 def defect_classes_section(repo: str) -> str:
     """$defect_classes_section (#1237) — известные классы + кандидаты
-    (см. defect_classes.py). Чтение кандидатов — сетевой вызов (issue #1238,
-    несколько страниц, defect_classes.MAX_CANDIDATE_READ_PAGES); сбой чтения
-    не должен ронять gather целиком (дифф-ревью важнее словаря-кандидатов) —
-    деградирует на defect_classes.render_prompt_section_unavailable, которая
-    называет причину явно (AGENTS.md, «алерт не гадает»), не молчит «кандидатов
-    нет» вместо настоящего «не прочитано»."""
+    (см. defect_classes.py). Чтение кандидатов — сетевой вызов (комментарии
+    репозитория, несколько страниц, defect_classes.MAX_CANDIDATE_READ_PAGES,
+    issue #1255); сбой чтения не должен ронять gather целиком (дифф-ревью
+    важнее словаря-кандидатов) — деградирует на
+    defect_classes.render_prompt_section_unavailable, которая называет
+    причину явно (AGENTS.md, «алерт не гадает»), не молчит «кандидатов нет»
+    вместо настоящего «не прочитано».
+
+    Сигнал инертности (issue #1240/#1255, см. докстринг defect_classes.py):
+    ненулевое число доверенных rework-вердиктов в срезе без единой
+    class-строки — контракт КЛАСС не исполняется вовсе, не «повторов пока не
+    было»; печатается отдельным ::warning::, не молчит внутри пустого
+    списка кандидатов (те два состояния неразличимы по одной пустоте)."""
     try:
-        candidates = defect_classes.recent_candidate_stats(repo, gh)
+        scan = defect_classes.recent_candidate_stats(repo, gh)
     except RuntimeError as error:
         print(f"::warning::gather: кандидаты классов дефектов не прочитаны ({error}) — "
               "промпт получит только утверждённые классы")
         return defect_classes.render_prompt_section_unavailable(str(error))
-    return defect_classes.render_prompt_section(candidates)
+    if scan.rework_verdicts_seen and not scan.rework_with_class_seen:
+        print(f"::warning::gather: среди {scan.rework_verdicts_seen} последних доверенных "
+              "rework-вердиктов ни один не несёт строку class: — похоже, контракт КЛАСС "
+              "не исполняется (не путать с «повторов пока не было», #1240/#1255)")
+    return defect_classes.render_prompt_section(scan.candidates)
 
 
 def cmd_gather(args: argparse.Namespace) -> int:
@@ -1405,17 +1416,14 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/comments",
            "-f", "body=" + body)
 
-    # Маркер-наблюдение кандидата (#1237, issue #1238) — ПОСЛЕ обоих
-    # head-чеков выше: не пишем наблюдение для вердикта, который уже
-    # отброшен гонкой (head уехал), иначе кандидат накапливал бы шум от
-    # ревью, чей вердикт человек никогда не увидит. Сбой записи — не должен
-    # ронять сам вердикт (словарь — вторичный канал, не критичный путь comment/
-    # label/status выше, уже отправленных к этому моменту).
-    for slug in class_signal.candidates:
-        try:
-            defect_classes.record_candidate_observation(repo, run_gh, slug, args.pr)
-        except RuntimeError as error:
-            print(f"::warning::ai-review: кандидат класса «{slug}» не записан в #{defect_classes.DEFECT_CLASS_TRACKER_ISSUE} ({error})")
+    # Кандидат класса дефекта (#1237) уже лежит в шапке комментария выше
+    # (`class:`, build_comment) — отдельной записи в реестр здесь больше НЕТ
+    # (issue #1255: job `verdict` не имеет `issues: write`, #939, а отдельный
+    # POST на issue #1238 падал 403 при исправно опубликованном главном
+    # комментарии — silent-wrong divergence между эмиссией и записью).
+    # gather (job `review`) агрегирует кандидатов из уже опубликованных
+    # комментариев-вердиктов напрямую (defect_classes.recent_candidate_stats) —
+    # см. докстринг defect_classes.py «Носитель».
 
     if verdict == "error":
         tail = redact("\n".join((answer or "").splitlines()[-12:]))
