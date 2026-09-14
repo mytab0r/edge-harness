@@ -15,8 +15,11 @@ name: zombie-run-watch
 on:
   schedule:
     # 15 минут — тот же порядок величины, что ZOMBIE_AGE_MINUTES в
-    # zombie_run_watch.py: детектор обязан успеть заметить застрявший
-    # прогон в пределах одного-двух тиков после того, как он пересёк порог.
+    # zombie_run_watch.py. ЧЕСТНАЯ оговорка (ревью PR #1212): доставка
+    # schedule в этом репозитории замерена ~7% (docs/research/
+    # 21-github-actions.md, «Замер schedule») — каденс НЕ гарантирован,
+    # застрявший прогон замечается за часы, а не за один-два тика. Это
+    # свойство канала, а не порога: газ от него не зависит.
     - cron: "*/15 * * * *"
   workflow_dispatch:
 
@@ -24,6 +27,12 @@ permissions:
   contents: read
   issues: write
   pull-requests: write
+  # Actions API чтения (находка доводки PR #1212, круг 5): сторож читает
+  # /actions/runs, /actions/workflows/{id}/runs (занятость concurrency-
+  # группы) и Contents API (версия workflow-файла на head). Без `actions:
+  # read` первый же продовый прогон отвечал бы 403 на /actions/runs —
+  # живой прецедент perms: quota-watch.yml (`actions: read`).
+  actions: read
 
 concurrency:
   group: zombie-run-watch
@@ -40,6 +49,7 @@ jobs:
       contents: read
       issues: write
       pull-requests: write
+      actions: read
     steps:
       - uses: actions/checkout@v7
 

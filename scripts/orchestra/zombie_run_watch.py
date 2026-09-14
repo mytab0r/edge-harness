@@ -97,6 +97,55 @@ head SHA не меняется, все обязательные workflow пол�
 закрыта гейтом #1074), поэтому частичная цитата маркера в чужом ответе
 (человек, агент, пересказ) дедуп не создаёт.
 
+## «queued + 0 job'ов» бывает и легитимным — ожидание concurrency-группы
+## (находка ревью PR #1212, круг 4)
+
+Признак «queued ≥15 мин + `total_count: 0`» сам по себе ловит и ЗДОРОВОЕ
+состояние: прогон workflow с workflow-level `concurrency` (cancel-in-progress
+не true) может стоять в очереди группы с 0 job'ов, пока группа занята.
+Живой пример — `quota-watch.yml`: триггер `pull_request` (opened/synchronize/
+reopened/labeled — в этом репозитории срабатывает «практически постоянно»),
+общая группа `quota-watch` вместе со своим же cron'ом `*/15`,
+cancel-in-progress: false, job до 10 минут. Газ по такому прогону —
+close→reopen ЗДОРОВОГО PR (перепрогон всех обязательных чеков — квота) и
+ложный комментарий-отчёт.
+
+Порог возраста это различение НЕ решает: и зомби, и ожидание бывают дольше
+15 минут (живой замер #1106 — зомби стоят трое суток; ожидание quota-watch
+при пачке PR-событий — легко дольше четверти часа). Различение — по данным:
+
+- читается версия workflow-файла НА HEAD_SHA кандидата (Contents API; не
+  версия main — PR-локальные правки workflow исполняются на PR, сверка с
+  main промахнулась бы мимо них) и классифицируется `workflow_queue_gate`:
+  workflow-level `concurrency` без `cancel-in-progress: true` (отсутствие
+  ключа = дефолт GitHub false) → «blocking»;
+- «blocking»-прогон газится только при СВОБОДНОЙ группе того же workflow
+  (`workflow_busy`: нет ни одного in_progress-прогона): занятая группа —
+  легитимное ожидание, газ откладывается до следующего пульса; свободная
+  группа + queued+0 job'ов ≥ порога — зомби (GitHub обязан был
+  материализовать job'ы и не сделал);
+- «none» и «cancelling» (cancel-in-progress: true — новый прогон группы
+  ОТМЕНЯЕТ старый, накопительного ожидания не бывает) газятся напрямую.
+
+Почему не «просто исключить workflow с группами из газа»: среди восьми
+РЕАЛЬНЫХ зомби #1106 два — прогоны workflow именно с группами
+(34748469982 — quota-watch, 34748469975 — dsh-edge-pr-smoke) — полное
+исключение навсегда лишило бы газ треть класса. Проверка занятости по
+`workflow_id` — консервативная аппроксимация занятости группы: статические
+группы этого репозитория уникальны по файлам (замер 2026-09-14: grep
+`^concurrency:` по `.github/workflows/`), кроме параметризованных
+per-PR/per-task (`dsh-edge-pr-smoke-<N>`, `hands-*`, `ai-review` по PR) —
+там чужой in_progress-прогон того же workflow может отложить газ на пульс;
+ложного газа аппроксимация не создаёт. Ведёт ли ожидание JOB-уровневой
+группы к `queued`+0 job'ов — не подтверждено; job-level группы здесь
+(orchestra.yml) стоят на вторых джобах (run уже `in_progress`), а реальный
+зомби 34748469966 — прогон orchestra.yml, поэтому job-level `concurrency`
+классификацией игнорируется. Разбор yml — построчный, без PyYAML (в
+runtime-окружении сторожа он не ставится), консервативно: неразобранная
+форма трактуется как «blocking» (газ откладывается), не наоборот; в CI
+гвардия сверяет построчный разбор с PyYAML на всех реальных workflow
+(test_zombie_run_watch.py).
+
 ## Рецидив после действия — не путать со старым permanent-зомби
 
 Живой факт выше («старые зомби остаются queued навсегда») означает, что ПОСЛЕ
@@ -110,37 +159,45 @@ head SHA не меняется, все обязательные workflow пол�
 самым не участвуют в решении о рецидиве вообще, независимо от того, сколько
 пульсов пройдёт.
 
+Отдельный случай той же ветки (чеклист-находка ревью PR #1212): новых
+QUEUED-прогонов нет, но почему — новые прогоны прошли нормально или
+переэмиссия НЕ ПОРОДИЛА НИ ОДНОГО прогона вовсе (вхолостую)? Второе означает
+вечное «не трогаю» при стоящем PR. Различение — прогоны на том же head
+(`runs_by_head`, любой статус) с id больше существовавших до переэмиссии
+(id монотонны; сравнение по времени промахнулось бы — маркер пишется ПОСЛЕ
+действия). Не породила ничего — эскалация со своим дедуп-маркером
+`[zombie-run-watch: переэмиссия-без-прогонов PR#N@sha8]` (повтор газа
+бессмысленен — «одна попытка на head_sha»), сигнал не записан нигде —
+красный прогон.
+
 ## Цена
 
 Steady state (нет queued PR-прогонов старше порога) — 1 вызов `gh api` за
 пульс (список queued PR-прогонов). Кандидаты появляются — сверх того:
 
-- +1 вызов: список открытых PR (нужен ВСЕГДА, до потолка — находка ревью
-  PR #1212, круг 3: потолок теперь стоит ПОСЛЕ сопоставления кандидатов
-  с открытыми PR, а не до, иначе permanent-зомби закрытых/слитых PR
-  вытесняли из хвоста единственного зомби на открытом PR ещё до того, как
-  список открытых PR вообще был прочитан);
-- до `MAX_ZOMBIE_CANDIDATES_PER_PULSE` вызовов числа job'ов — по одному на
-  PR-кандидата, УЖЕ сопоставленного с открытым PR (с коротким замыканием:
-  одного подтверждённого зомби на PR достаточно). Потолок режет по
-  возрасту САМОГО СТАРОГО прогона внутри группы каждого PR-кандидата —
-  старейшие обслуживаются первыми, свежие не вытесняют более критичные
-  зависшие;
-- +1 вызов чтения маркеров в комментариях КАЖДОГО PR-кандидата (одна
-  страница комментариев целиком; на длинной истории — несколько);
-- +1 вызов чтения маркеров в #120 на каждый PR-кандидат, чей собственный
-  носитель маркера пуст (запасной носитель случая «отчёт не записан»);
-- только в путях рецидива/отказа: ещё чтение маркера эскалации в #120 и
-  запись эскалации (комментарий в #120 + Telegram).
-
-Верхняя граница обычного пульса с кандидатами — около
-`2 + MAX_ZOMBIE_CANDIDATES_PER_PULSE + 2·<число PR-кандидатов>` вызовов
-`gh api` (находка ревью PR #1212: первая версия считала только
-`2 + MAX_ZOMBIE_CANDIDATES_PER_PULSE` и не включала чтения маркеров),
-независимо от того, сколько PR реально открыто. Список открытых PR
-(+1 вызов) больше не входит в счёт «до потолка» — он читается безусловно
-до потолка, поэтому формула верна и при сотнях сырых кандидатов, ни один
-из которых не относится к открытому PR.
+- +1 вызов: список открытых PR (пагинация `list_pages` до короткой
+  страницы — при >100 открытых PR больше одного вызова);
+- +1 вызов Contents API на РАЗЛИЧНЫЙ (workflow-path, head_sha) кандидатов
+  за пульс (кэш в `workflow_text_cache`: повторная встреча того же файла —
+  бесплатно);
+- +1 вызов на workflow с blocking-группой за пульс: список его
+  in_progress-прогонов (кэш по `workflow_id`; список по природе ограничен —
+  serialized-группа не даёт очереди in_progress);
+- до `MAX_JOBS_CHECKS_PER_PULSE` вызовов числа job'ов (бюджет за пульс —
+  потолок держится на дорогих /jobs-запросах уже осмысленных кандидатов,
+  а не на сыром списке; короткое замыкание: одного подтверждённого зомби
+  на PR достаточно; кандидаты проверяются старейшие первыми, при
+  исчерпании бюджета остаток честно переносится на следующий пульс);
+- чтение маркеров — НЕ «+1 вызов»: комментарии КАЖДОГО PR-кандидата и
+  запасной носитель в #120 читаются ЦЕЛИКОМ, вся история (чеклист-находка
+  ревью PR #1212: цена тика растёт с историей #120 — принято сознательно,
+  потолок `max_pages` рисковал бы пропуском дедуп-маркера, то есть
+  повтором close→reopen вслепую);
+- +1 вызов в ветке «известный старый зомби» за пульс: прогоны на head
+  (`runs_by_head`) — различить «переэмиссия породила прогоны» от «газ
+  вхолостую» (чеклист-находка ревью PR #1212);
+- только в путях рецидива/отказа: ещё чтение маркера эскалации в #120
+  (вся история) и запись эскалации (комментарий в #120 + Telegram).
 
 Запуск: python scripts/orchestra/zombie_run_watch.py run
 Тесты:  python -m pytest scripts/orchestra/test_zombie_run_watch.py -q
@@ -157,7 +214,9 @@ _console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_u
 # --- конец console_utf8 bootstrap ---
 
 import argparse
+import base64
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -175,6 +234,7 @@ from pulse_guard import (  # noqa: E402
     minutes_between,
     parse_time,
     post_issue_comment,
+    prod_writes_allowed,
 )
 
 _LIB = Path(__file__).resolve().parents[1] / "lib"
@@ -186,28 +246,76 @@ _RL_SPEC.loader.exec_module(review_labels)  # type: ignore[union-attr]
 # ── Пороги (обоснование — докстринг модуля) ─────────────────────────────────
 
 ZOMBIE_AGE_MINUTES = 15
-MAX_ZOMBIE_CANDIDATES_PER_PULSE = 20
-
-# Находка ревью PR #1212 (круг 3): из восьми workflow с триггером
-# `pull_request` (codeql, dsh-edge-pr-smoke, orchestra, pr-review,
-# quota-watch, repo-ci, secret-scan, worker-ci) ТОЛЬКО `quota-watch.yml`
-# несёт РЕПОЗИТОРНУЮ (не per-PR) concurrency-группу с `cancel-in-progress:
-# false` (`group: quota-watch`, без `${{ github.event.pull_request.number
-# }}`) — прогон одного PR может легитимно стоять `queued` позади прогона
-# ДРУГОГО PR или собственного cron'а того же workflow сколь угодно долго
-# (замер 2026-09-14: живой `queued` run 34748469982 подтверждён как часть
-# ИЗВЕСТНОГО permanent-зомби батча #1088, не пойман случай самой
-# concurrency-очереди — но механизм группы теоретически это допускает, и
-# порог 15 минут его не отличает от настоящего зомби). `dsh-edge-pr-
-# smoke.yml` тоже несёт concurrency, но per-PR (`-${{ ...number }}`) и
-# `cancel-in-progress: true` — конкурирующий прогон ОТМЕНЯЕТСЯ, а не висит
-# `queued`, поэтому не создаёт этот класс отказа и не исключается.
-EXCLUDED_WORKFLOW_PATHS = frozenset({".github/workflows/quota-watch.yml"})
+# Бюджет ДОРОГИХ /jobs-вызовов за один пульс (находка ревью PR #1212,
+# круг 4: потолок держится на уже осмысленных кандидатах после группировки
+# по открытым PR, а не на сыром списке прогонов — permanent-зомби слитых PR
+# остаются queued навсегда и всегда старейшие, потолок до группировки
+# вытеснял бы единственного зомби ОТКРЫТОГО PR).
+MAX_JOBS_CHECKS_PER_PULSE = 20
 
 REOPENED_MARKER_PREFIX = "[zombie-run-watch: переэмиссия "
 ESCALATION_MARKER_PREFIX = "[zombie-run-watch: эскалация "
 REOPEN_FAILED_MARKER_PREFIX = "[zombie-run-watch: reopen-не-удался "
 REPORT_FAILED_MARKER_PREFIX = "[zombie-run-watch: отчёт-не-записан "
+NO_RUNS_MARKER_PREFIX = "[zombie-run-watch: переэмиссия-без-прогонов "
+
+
+# ── Классификация workflow-файла: может ли `queued`+0 job'ов быть легитимным
+# (находка ревью PR #1212, круг 4 — обоснование в докстринге модуля) ─────────
+
+
+QUEUE_GATE_NONE = "none"                # workflow-level concurrency нет
+QUEUE_GATE_CANCELLING = "cancelling"    # workflow-level, cancel-in-progress: true
+QUEUE_GATE_BLOCKING = "blocking"        # workflow-level, cancel-in-progress не true
+
+_TOP_LEVEL_CONCURRENCY_RE = re.compile(r"^concurrency:(.*)$")
+_TOP_LEVEL_KEY_RE = re.compile(r"^\S")
+_CANCEL_IN_PROGRESS_RE = re.compile(r"cancel-in-progress:\s*[\"']?(\w+)")
+
+
+def workflow_queue_gate(text: str) -> str:
+    """Классификация workflow-файла по тому, может ли его прогон легитимно
+    стоять `status=queued` с 0 job'ов (см. докстринг модуля, «"queued +
+    0 job'ов" бывает и легитимным»):
+
+    - `none` — workflow-level `concurrency` нет: queued+0 job'ов дольше
+      порога — только класс зомби #1106;
+    - `cancelling` — workflow-level `concurrency` c
+      `cancel-in-progress: true`: новый прогон группы отменяет старый,
+      накопительного ожидания в очереди не бывает — снова только зомби;
+    - `blocking` — workflow-level `concurrency` без
+      `cancel-in-progress: true` (отсутствие ключа = дефолт false):
+      легитимное ожидание освобождения группы возможно, газ требует
+      проверки занятости группы (`workflow_busy`).
+
+    Job-level `concurrency` не классифицируется: ожидание джобы либо
+    материализует job'ы (run уже не queued/0), либо отменяется — реальный
+    зомби 34748469966 (#1106) — прогон orchestra.yml с job-level группами.
+    Консервативность: неразобранная форма = `blocking` (газ откладывается),
+    не наоборот."""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        match = _TOP_LEVEL_CONCURRENCY_RE.match(line)
+        if match is None:
+            continue
+        inline = match.group(1).strip()
+        if inline and not inline.startswith("#"):
+            # скалярная/flow-форма: `concurrency: имя-группы` или
+            # `concurrency: {group: …, cancel-in-progress: …}`
+            cip = _CANCEL_IN_PROGRESS_RE.search(inline)
+            if cip and cip.group(1).lower() == "true":
+                return QUEUE_GATE_CANCELLING
+            return QUEUE_GATE_BLOCKING
+        # блочная форма: ищем cancel-in-progress до следующего top-level ключа
+        cancelling = False
+        for deeper in lines[i + 1:]:
+            if _TOP_LEVEL_KEY_RE.match(deeper):
+                break
+            cip = _CANCEL_IN_PROGRESS_RE.match(deeper.strip())
+            if cip:
+                cancelling = cip.group(1).lower() == "true"
+        return QUEUE_GATE_CANCELLING if cancelling else QUEUE_GATE_BLOCKING
+    return QUEUE_GATE_NONE
 
 
 # ── Чистая логика (тестируется без сети) ────────────────────────────────────
@@ -217,14 +325,10 @@ def stale_candidates(runs: list[dict], now: datetime,
                      age_minutes: int = ZOMBIE_AGE_MINUTES) -> list[dict]:
     """Прогоны из уже отфильтрованного (`status=queued&event=pull_request`)
     списка, чей возраст по `created_at` >= порога — дорогой запрос числа
-    job'ов делаем только для них. Исключены workflow из
-    `EXCLUDED_WORKFLOW_PATHS` (репозиторная concurrency-группа без
-    per-PR суффикса — легитимный queued-простой неотличим от зомби по
-    одному только возрасту, находка ревью PR #1212, круг 3)."""
+    job'ов делаем только для них."""
     return [
         r for r in runs
         if r.get("status") == "queued"
-        and r.get("path") not in EXCLUDED_WORKFLOW_PATHS
         and minutes_between(parse_time(r["created_at"]), now) >= age_minutes
     ]
 
@@ -267,12 +371,83 @@ def group_candidates_by_pr(candidates: list[dict], prs_by_branch: dict[str, dict
     return grouped
 
 
-def reopen_comment_body(run_ids: list[int], sha8: str, marker: str) -> str:
+def gas_eligible_runs(repo: str, runs: list[dict], head_sha: str,
+                      text_cache: dict, busy_cache: dict,
+                      observations: list[str]) -> list[dict]:
+    """Кандидаты, для которых `queued`+0 job'ов дольше порога может быть
+    ТОЛЬКО зомби #1106 (находка ревью PR #1212, круг 4; см. докстринг
+    модуля, «"queued + 0 job'ов" бывает и легитимным»). Отбраковка:
+
+    - прогон workflow с workflow-level blocking-concurrency газится
+      только при СВОБОДНОЙ группе того же workflow (`workflow_busy`):
+      занятая группа — легитимное ожидание очереди, не зомби;
+    - версия workflow-файла на head не прочитана или занятость группы не
+      прочитана — газ откладывается с ⚠️ в observations (не гадаем);
+    - у прогона нет `path`/`workflow_id` — то же (принадлежность и
+      занятость не установить).
+
+    Порядок выхода — по возрастанию `created_at`: старейшие (самые
+    критичные) зомби проверяются и обслуживаются первыми."""
+    eligible: list[dict] = []
+    for run in sorted(runs, key=lambda r: parse_time(r["created_at"])):
+        path = run.get("path")
+        workflow_id = run.get("workflow_id")
+        if not isinstance(path, str) or not path:
+            observations.append(
+                f"⚠️ zombie-run-watch: run {run.get('id')} без `path` — workflow не "
+                "определить, газ отложен")
+            continue
+        cache_key = (path, head_sha)
+        if cache_key not in text_cache:
+            try:
+                text_cache[cache_key] = workflow_text_at(repo, path, head_sha)
+            except RuntimeError as error:
+                text_cache[cache_key] = None
+                observations.append(
+                    f"⚠️ zombie-run-watch: {path} (head {head_sha[:8]}) не прочитан "
+                    f"({error}) — газ по его прогонам отложен")
+        text = text_cache[cache_key]
+        if text is None:
+            continue  # версия файла не прочитана — газ по этому прогону отложен
+        if workflow_queue_gate(text) != QUEUE_GATE_BLOCKING:
+            eligible.append(run)
+            continue
+        # blocking-группа: легитимное ожидание возможно — газ только при
+        # свободной группе (ни одного in_progress-прогона этого workflow).
+        if not isinstance(workflow_id, int):
+            observations.append(
+                f"⚠️ zombie-run-watch: run {run.get('id')} ({path}) без `workflow_id` — "
+                "занятость concurrency-группы не проверить, газ отложен")
+            continue
+        if workflow_id not in busy_cache:
+            try:
+                busy_cache[workflow_id] = workflow_busy(repo, workflow_id)
+            except RuntimeError as error:
+                busy_cache[workflow_id] = True  # консервативно: считать занятой
+                observations.append(
+                    f"⚠️ zombie-run-watch: занятость группы {path} не прочитана "
+                    f"({error}) — газ отложен")
+        if busy_cache[workflow_id]:
+            observations.append(
+                f"zombie-run-watch: run {run['id']} ({path}) — ожидание "
+                "concurrency-группы (есть in_progress прогон этого workflow), "
+                "легитимное состояние, не зомби — не трогаю")
+            continue
+        eligible.append(run)
+    return eligible
+
+
+def reopen_comment_body(run_ids: list[int], sha8: str, marker: str,
+                        extra_queued: int = 0) -> str:
     ids_text = ", ".join(str(i) for i in run_ids)
+    # Чеклист-находка ревью PR #1212: в живом случае #1088 зомби-прогонов
+    # было ВОСЕМЬ — человек не должен искать остальные сам.
+    extra_text = (f" (и ещё {extra_queued} queued-прогон(ов) этого PR на том же head)"
+                  if extra_queued > 0 else "")
     return (
         f"{marker}\n\n"
         f"Обнаружен зомби-прогон (`queued`, 0 job'ов, старше {ZOMBIE_AGE_MINUTES} мин): "
-        f"run {ids_text} на head `{sha8}`. Класс #1106: `gh run rerun` не работает "
+        f"run {ids_text}{extra_text} на head `{sha8}`. Класс #1106: `gh run rerun` не работает "
         "(«This workflow is already running» — нечего перезапускать), газ — переэмиссия "
         "событий PR (close→reopen, head SHA не меняется) — тем же способом обошли живой "
         "случай #1088.\n\n"
@@ -280,14 +455,32 @@ def reopen_comment_body(run_ids: list[int], sha8: str, marker: str) -> str:
     )
 
 
-def escalation_text(pr_number: int, run_ids: list[int], sha8: str, marker: str) -> str:
+def escalation_text(pr_number: int, run_ids: list[int], sha8: str, marker: str,
+                    extra_queued: int = 0) -> str:
     ids_text = ", ".join(str(i) for i in run_ids)
+    extra_text = (f" (и ещё {extra_queued} queued-прогон(ов) этого PR на том же head)"
+                  if extra_queued > 0 else "")
     return (
         f"🚨 edge-harness: {marker} PR #{pr_number} остаётся зомби (queued, 0 job'ов, "
-        f"run {ids_text}) НА ТОМ ЖЕ head `{sha8}` уже ПОСЛЕ автоматической переэмиссии — "
+        f"run {ids_text}{extra_text}) НА ТОМ ЖЕ head `{sha8}` уже ПОСЛЕ автоматической переэмиссии — "
         "автогаз не сработал (или зомби-состояние повторилось), повторно закрывать/"
         "открывать автоматически не буду (issue #1106: одна попытка на head_sha). "
         "Нужен человек."
+    )
+
+
+def no_runs_after_reopen_text(pr_number: int, sha8: str, marker: str,
+                              reopened_marker: str) -> str:
+    """Случай «переэмиссия прошла вхолостую» (чеклист-находка ревью
+    PR #1212): на head не появилось НИ ОДНОГО нового прогона после
+    close→reopen — повторять газ бессмысленно (одна попытка на head_sha),
+    а молча говорить «не трогаю» при стоящем PR нельзя."""
+    return (
+        f"🚨 edge-harness: {marker} Переэмиссия событий PR #{pr_number} (close→reopen, "
+        f"#1106, {reopened_marker}) ВЫПОЛНЕНА, но на head `{sha8}` не появилось НИ ОДНОГО "
+        "нового прогона (любого статуса, по id старше прогонов до переэмиссии) — газ "
+        "прошёл вхолостую: повторять его бессмысленно (одна попытка на head_sha), а "
+        "обязательные чеки продолжают стоять. Нужен человек."
     )
 
 
@@ -351,6 +544,85 @@ def jobs_total_count(repo: str, run_id: int) -> int:
     return int(payload.get("total_count") or 0)
 
 
+def workflow_text_at(repo: str, path: str, ref: str) -> str:
+    """Текст workflow-файла В ВЕРСИИ head_sha кандидата, не main: для
+    pull_request GitHub исполняет файл из merge-рефа — версия на head та же
+    для неизменённых файлов и авторская для изменённых, сверка с main
+    промахнулась бы мимо PR-локальных правок (класс закрыт целиком, не
+    наполовину). Ответ Contents API — прод-форма `{content: <base64>,
+    encoding: "base64"}`; не она — громкий сбой."""
+    payload = gh(f"repos/{repo}/contents/{path}?ref={ref}")
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            f"contents/{path}?ref={ref[:8]} — не ожидаемая форма ответа "
+            f"({type(payload).__name__})")
+    content = payload.get("content")
+    if not isinstance(content, str) or payload.get("encoding") != "base64":
+        raise RuntimeError(
+            f"contents/{path}?ref={ref[:8]} — в ответе нет base64-содержимого")
+    return base64.b64decode(content).decode("utf-8")
+
+
+def runs_by_head(repo: str, head_sha: str, per_page: int = 100) -> list[dict]:
+    """Все прогоны (ЛЮБОЙ статус) на этом head SHA одним вызовом — нужен
+    только в ветке «известный старый зомби»: отличить «переэмиссия породила
+    новые прогоны» от «газ прошёл вхолостую». На фиксированном head прогонов
+    по природе мало (одна партия на PR-событие); не-list форма и полная
+    страница — громкий сбой (классы #120A/#308, как в `queued_pr_runs`)."""
+    payload = gh(f"repos/{repo}/actions/runs?head_sha={head_sha}&per_page={per_page}")
+    runs = payload.get("workflow_runs") if isinstance(payload, dict) else None
+    if not isinstance(runs, list):
+        raise RuntimeError(
+            f"zombie-run-watch: /actions/runs?head_sha={head_sha[:8]} ответил не ожидаемой "
+            f"формой ({type(payload).__name__}) — не 'прогонов нет', форма ответа неверна")
+    if len(runs) >= per_page:
+        raise RuntimeError(
+            f"zombie-run-watch: /actions/runs?head_sha={head_sha[:8]} вернул полную "
+            f"страницу ({per_page}) — хвост списка этим запросом недочитан (класс #308)")
+    return runs
+
+
+def workflow_busy(repo: str, workflow_id: int, per_page: int = 100) -> bool:
+    """Есть ли у workflow СЕЙЧАС in_progress-прогон — консервативная
+    аппроксимация занятости его concurrency-группы (точная занятость групп
+    API не отдаёт; статические группы репозитория уникальны по файлам —
+    докстринг модуля). `blocking`-прогон при занятой группе — легитимное
+    ожидание очереди; при свободной — зомби. Не-list форма и полная
+    страница — громкий сбой (классы #120A/#308, как в `queued_pr_runs`)."""
+    payload = gh(f"repos/{repo}/actions/workflows/{workflow_id}"
+                 f"/runs?status=in_progress&per_page={per_page}")
+    runs = payload.get("workflow_runs") if isinstance(payload, dict) else None
+    if not isinstance(runs, list):
+        raise RuntimeError(
+            f"zombie-run-watch: /workflows/{workflow_id}/runs?status=in_progress ответил "
+            f"не ожидаемой формой ({type(payload).__name__}) — не 'прогонов нет', "
+            "форма ответа неверна")
+    if len(runs) >= per_page:
+        raise RuntimeError(
+            f"zombie-run-watch: /workflows/{workflow_id}/runs?status=in_progress вернул "
+            f"полную страницу ({per_page}) — хвост списка этим запросом недочитан "
+            "(класс #308)")
+    return bool(runs)
+
+
+def runs_produced_by_reopen(repo: str, head_sha: str, old_runs: list[dict]) -> list[dict]:
+    """Прогоны на этом head, СОЗДАННЫЕ переэмиссией (чеклист-находка ревью
+    PR #1212): id больше максимума id прогонов, существовавших до неё.
+    Сравнение по id, не по времени: маркер-отчёт пишется ПОСЛЕ действия, и
+    временной порог «после маркера» промахнулся бы мимо прогонов, созданных
+    между reopen и записью маркера; id прогонов монотонны. Любой статус:
+    и queued (зомби повторился), и completed (прошли нормально) — «переэмис-
+    сия что-то породила» отличается только от «не породила НИЧЕГО»."""
+    old_ids = [r["id"] for r in old_runs if isinstance(r.get("id"), int)]
+    if not old_ids:
+        raise RuntimeError(
+            "у известных прогонов нет int-id — границу «до/после переэмиссии» "
+            "не построить, решение не гадается")
+    cut = max(old_ids)
+    return [r for r in runs_by_head(repo, head_sha)
+            if isinstance(r.get("id"), int) and r["id"] > cut]
+
+
 def is_zombie(repo: str, run: dict) -> bool:
     return jobs_total_count(repo, run["id"]) == 0
 
@@ -379,6 +651,21 @@ def set_pr_state(repo: str, number: int, state: str) -> None:
     `update_branch`."""
     pat = os.environ.get("GH_PIPELINE_PAT")
     if not pat:
+        if prod_writes_allowed():
+            # Находка ревью PR #1212 (круг 5): в БОЕВОМ прогоне пустой PAT —
+            # не повод для тихого fallback: close→reopen прошли бы успешными
+            # PATCH'ами под GITHUB_TOKEN, не зажигая ни одного прогона,
+            # маркер-отчёт записался бы штатно, и дедуп «одна попытка на
+            # head_sha» запер бы сторож навсегда при сплошь зелёных прогонах.
+            # Честный отказ ДО действия: ветка «закрытие не выполнено» умеет
+            # повторять попытку, не записывая маркер. Вне Actions fallback
+            # остаётся: gh() там всё равно DRY-RUN (#1074).
+            raise RuntimeError(
+                "zombie-run-watch: GH_PIPELINE_PAT отсутствует в боевом прогоне — "
+                "close→reopen под github.token был бы тихим no-op для required-чеков "
+                "(события GITHUB_TOKEN не зажигают новые workflow-прогоны, "
+                "docs/research/21-github-actions.md), газа не будет; проверь секрет "
+                "репозитория GH_PIPELINE_PAT")
         gh("-X", "PATCH", f"repos/{repo}/pulls/{number}", "-f", f"state={state}")
         return
     result = subprocess.run(
@@ -397,7 +684,8 @@ def zombie_run_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
     """Один пульс: найти застрявшие queued-прогоны required-чеков на ТЕКУЩЕМ
     head открытых PR, один раз на head_sha переэмиттить события, на рецидив
     после переэмиссии — эскалация (не повторный retry). См. докстринг модуля
-    целиком за обоснованием порогов и различением от permanent-зомби."""
+    целиком за обоснованием порогов, различением permanent-зомби и
+    легитимного ожидания concurrency-группы."""
     observations: list[str] = []
     actions: list[str] = []
 
@@ -409,36 +697,36 @@ def zombie_run_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
             f"(всего queued PR-прогонов: {len(runs)})")
         return observations, actions
 
-    # Найдено ревью PR #1212 (круг 3): потолок ЗДЕСЬ, до сопоставления с
-    # открытыми PR, резал по возрасту permanent-зомби ЗАКРЫТЫХ/слитых PR
-    # (они всегда старейшие — остаются queued навсегда, см. докстринг
-    # модуля) вперёд единственного зомби на ОТКРЫТОМ PR: тот вытеснялся из
-    # хвоста списка и до дорогой проверки job'ов не доходил вовсе.
-    # Сопоставление с открытыми PR — один дешёвый вызов (`pulls?state=open`)
-    # и чистая группировка в памяти, потолок стоит только на дорогой части
-    # ниже (число job'ов на кандидата).
     prs = review_labels.list_pages(f"repos/{repo}/pulls?state=open&per_page=100", gh)
     prs_by_branch = open_prs_by_branch(prs)
+    # Находка ревью PR #1212 (круг 4): группировка по открытому PR + текущему
+    # head ДО всякого потолка. permanent-зомби слитых/закрытых PR остаются
+    # queued навсегда (восемь штук #1088 живы до сих пор) и потому всегда
+    # старейшие — потолок ДО группировки отсекал бы хвост списка, где живёт
+    # единственный зомби ОТКРЫТОГО PR. Потолок цены остаётся, но там, где
+    # ему место: на дорогих /jobs-вызовах уже осмысленных кандидатов
+    # (jobs_checks_left ниже); список открытых PR — один дешёвый вызов.
     grouped = group_candidates_by_pr(candidates, prs_by_branch)
 
     if not grouped:
         observations.append(
             f"zombie-run-watch: {len(candidates)} застрявших queued-прогон(ов) старше "
             f"{ZOMBIE_AGE_MINUTES} мин, ни один не относится к текущему head открытого PR "
-            "(устарели или PR уже закрыт/слит) — действие не требуется")
+            "(устарели или PR уже закрыт/слит — permanent-зомби) — действие не требуется")
         return observations, actions
 
-    entries = sorted(
-        grouped.items(),
-        key=lambda kv: min(parse_time(r["created_at"]) for r in kv[1]["runs"]))
-    if len(entries) > MAX_ZOMBIE_CANDIDATES_PER_PULSE:
-        observations.append(
-            f"⚠️ zombie-run-watch: PR-кандидатов {len(entries)} (уже сопоставлены с "
-            f"открытыми PR), проверяются старейшие {MAX_ZOMBIE_CANDIDATES_PER_PULSE} "
-            "(потолок цены дорогой проверки job'ов за один пульс)")
-        entries = entries[:MAX_ZOMBIE_CANDIDATES_PER_PULSE]
+    workflow_text_cache: dict = {}
+    busy_cache: dict = {}
+    jobs_checks_left = MAX_JOBS_CHECKS_PER_PULSE
+    budget_exhausted = False
 
-    for pr_number, entry in entries:
+    # Старейшие кандидаты первыми: бюджет может кончиться — самые долгостоя-
+    # щие зомби обязаны обслуживаться в этом пульсе, а не в следующем.
+    ordered = sorted(
+        grouped.items(),
+        key=lambda item: min(parse_time(r["created_at"]) for r in item[1]["runs"]))
+
+    for pr_number, entry in ordered:
         pr = entry["pr"]
         head_sha = (pr.get("head") or {}).get("sha") or ""
         sha8 = head_sha[:8]
@@ -472,24 +760,100 @@ def zombie_run_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
             last_reopen_at = max(reopen_times)
             runs_to_check = runs_created_after(entry["runs"], last_reopen_at)
             if not runs_to_check:
-                observations.append(
-                    f"zombie-run-watch: PR #{pr_number} — известный старый зомби-прогон "
-                    f"(переэмиссия уже была {last_reopen_at.isoformat()}), новых зомби "
-                    "после неё нет — не трогаю")
+                # Чеклист-находка ревью PR #1212: «новых зомби нет» — честный
+                # ответ ТОЛЬКО если переэмиссия вообще что-то породила.
+                # Новых queued-прогонов может не быть по двум причинам:
+                # новые прошли нормально (всё хорошо) или газ прошёл
+                # вхолостую и новых прогонов НЕТ ВООБЩЕ (любого статуса) —
+                # второе означает, что PR стоит навсегда при вечном «не
+                # трогаю». Различение: прогоны на этом head с id больше
+                # существовавших до переэмиссии.
+                try:
+                    produced = runs_produced_by_reopen(repo, head_sha, entry["runs"])
+                except RuntimeError as error:
+                    observations.append(
+                        f"⚠️ zombie-run-watch: PR #{pr_number} — прогоны на head не "
+                        f"прочитаны ({error}), решение отложено до следующего пульса")
+                    continue
+                if produced:
+                    observations.append(
+                        f"zombie-run-watch: PR #{pr_number} — известный старый зомби-прогон "
+                        f"(переэмиссия уже была {last_reopen_at.isoformat()}), она породила "
+                        f"{len(produced)} новых прогон(ов), новых зомби после неё нет — "
+                        "не трогаю")
+                    continue
+                # Переэмиссия вхолостую — эскалация с собственным дедупом
+                # (не каждый пульс): маркер пишет та же эскалация в #120.
+                marker = f"{NO_RUNS_MARKER_PREFIX}PR#{pr_number}@{sha8}]"
+                try:
+                    already = bool(issue_marker_times(
+                        repo, WATCHDOG_ISSUE, marker,
+                        trusted_login=EVENT_ACTOR_LOGIN))
+                except RuntimeError as error:
+                    observations.append(
+                        f"⚠️ zombie-run-watch: PR #{pr_number} — маркеры {WATCHDOG_ISSUE} "
+                        f"не прочитаны ({error}), эскалация в этом пульсе пропущена")
+                    continue
+                if already:
+                    observations.append(
+                        f"zombie-run-watch: PR #{pr_number} — переэмиссия без прогонов "
+                        "уже эскалирована, не повторяю")
+                    continue
+                text = no_runs_after_reopen_text(pr_number, sha8, marker, reopened_marker)
+                esc_result = escalate(repo, WATCHDOG_ISSUE, text)
+                actions.append(
+                    f"🚨 zombie-run-watch: PR #{pr_number} — переэмиссия прошла ВХОЛОСТУЮ "
+                    f"(ни одного нового прогона на head {sha8}), эскалация "
+                    f"#{WATCHDOG_ISSUE}: {esc_result}")
+                # Прогон краснеет, если сигнал не записан нигде: маркер-дедуп
+                # живёт только в #120 — без него следующий пульс повторит
+                # эскалацию каждые 15 минут (форма (в), тот же класс).
+                if escalation_channel_failed(esc_result) or escalation_dedup_carrier_failed(esc_result):
+                    raise RuntimeError(
+                        f"zombie-run-watch: PR #{pr_number} — переэмиссия вхолостую, "
+                        f"эскалация не записана ни в #{WATCHDOG_ISSUE} ({esc_result}) — "
+                        "красный прогон вместо еже-пульсового повтора")
                 continue
         else:
             runs_to_check = entry["runs"]
 
+        # Различение зомби от легитимного ожидания concurrency-группы —
+        # ПОСЛЕ дедуп-фильтра: PR, чьи прогоны известные старые permanent-
+        # зомби, не платит за Contents/занятость-чтения вовсе (их цена
+        # нужна только прогонам, на которых газ возможен).
+        eligible = gas_eligible_runs(repo, runs_to_check, head_sha,
+                                     workflow_text_cache, busy_cache, observations)
+        if not eligible:
+            continue  # всё — легитимное ожидание очереди или непрочитанное
+
+        zombie_run = None
         try:
-            zombie_run = next((r for r in runs_to_check if is_zombie(repo, r)), None)
+            for run in eligible:  # только газ-допустимые, старейшие первыми
+                if jobs_checks_left <= 0:
+                    budget_exhausted = True
+                    break
+                jobs_checks_left -= 1
+                if is_zombie(repo, run):
+                    zombie_run = run
+                    break
         except RuntimeError as error:
             observations.append(
                 f"⚠️ zombie-run-watch: PR #{pr_number} — число job'ов не прочитано "
                 f"({error}), этот PR пропущен в этом пульсе")
             continue
 
+        if zombie_run is None and budget_exhausted:
+            observations.append(
+                f"⚠️ zombie-run-watch: бюджет /jobs-проверок за пульс исчерпан "
+                f"({MAX_JOBS_CHECKS_PER_PULSE}) — оставшиеся кандидаты, если есть, "
+                "в следующем пульсе (старейшие проверены первыми)")
+            break
+
         if zombie_run is None:
-            continue  # прогоны ещё не старше по job'ам — просто медленный старт, не зомби
+            observations.append(
+                f"zombie-run-watch: PR #{pr_number} — у прогон(ов) на текущем head "
+                "есть job'ы (медленный старт, не зомби) — действие не требуется")
+            continue
 
         run_ids = [zombie_run["id"]]
 
@@ -529,8 +893,10 @@ def zombie_run_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
                         "ни одним каналом — красный прогон вместо молчаливого закрытого PR")
                 continue
             try:
-                post_issue_comment(repo, pr_number,
-                                   reopen_comment_body(run_ids, sha8, reopened_marker))
+                post_issue_comment(
+                    repo, pr_number,
+                    reopen_comment_body(run_ids, sha8, reopened_marker,
+                                        extra_queued=max(len(entry["runs"]) - 1, 0)))
             except RuntimeError as error:
                 # (в) газ ПРИМЕНЁН, отчёт и дедуп-якорь в PR не записаны.
                 # Повтор газа вслепую — нарушение контракта «одна попытка на
@@ -575,7 +941,8 @@ def zombie_run_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
                 observations.append(
                     f"zombie-run-watch: PR #{pr_number} — рецидив уже эскалирован, не повторяю")
                 continue
-            text = escalation_text(pr_number, run_ids, sha8, escalation_marker)
+            text = escalation_text(pr_number, run_ids, sha8, escalation_marker,
+                                   extra_queued=max(len(entry["runs"]) - 1, 0))
             esc_result = escalate(repo, WATCHDOG_ISSUE, text)
             actions.append(
                 f"🚨 zombie-run-watch: PR #{pr_number} — рецидив после переэмиссии, "
@@ -591,7 +958,11 @@ def zombie_run_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
                     f"({esc_result}) — красный прогон вместо молчаливого зомби")
 
     if not observations and not actions:
-        observations.append("zombie-run-watch: кандидатов не было")
+        # Страховка: каждая ветка выше обязана оставить своё наблюдение
+        # (чеклист-находка ревью PR #1212: «кандидатов не было» лжёт, когда
+        # кандидат был, проверен и зомби не подтверждён) — сюда попадаем
+        # только если такая ветка появилась.
+        observations.append("zombie-run-watch: действий в этом пульсе нет")
     return observations, actions
 
 
