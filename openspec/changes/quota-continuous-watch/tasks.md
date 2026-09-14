@@ -148,9 +148,14 @@ PR #1112 (#1100) — живой инцидент 2026-09-13 показал, чт
       красит все три).
 - [x] Третье состояние `STATE_APPROACHING` (`quota_alert.classify_state`)
       — по тренду (`last_reading`/`record_reading`), не только по текущему
-      pct. Горизонт 45 мин (3×`CHECK_INTERVAL_MINUTES`, синхронность держит
-      `test_quota_watch.py::test_trend_horizon_matches_check_interval`).
-      Approaching эскалирует без автозадачи; переход approaching→ok несёт
+      pct. Горизонт (`TREND_HORIZON_MINUTES`) 45 мин — ревизия #1184 сняла
+      связку с `CHECK_INTERVAL_MINUTES`/`MEASUREMENT_STALE_MINUTES` (разные
+      вопросы: риск-профиль тренда, не такт триггера) и старую гвардию
+      `test_trend_horizon_matches_check_interval`; число проверено
+      независимо реконструкцией инцидента #1100 —
+      `test_quota_alert.py::test_reproduction_1100_trend_fires_before_
+      exhaustion` и `test_trend_horizon_catches_1100_incident_before_
+      exhaustion`. Approaching эскалирует без автозадачи; переход approaching→ok несёт
       текст, отличный от breach→ok (не заявляет ложного пересечения
       порога). Критерий: `test_quota_alert.py::test_approaching_*`,
       `test_classify_state_*`, `test_recovery_from_approaching_does_not_

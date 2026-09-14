@@ -733,6 +733,29 @@ def test_measurement_stale_minutes_reflects_measured_quota_watch_cadence():
     assert measured_working_cluster_ceiling < qw.MEASUREMENT_STALE_MINUTES < measured_real_quiet_floor
 
 
+def test_scan_max_pages_still_covers_stale_threshold_at_worst_case_density():
+    """Ai-review PR #1185, некритичное замечание 2: `MEASUREMENT_SCAN_MAX_PAGES`
+    пересчитан РУКАМИ «тем же множителем» вслед за поднятием
+    `MEASUREMENT_STALE_MINUTES` с 45 до 90 — ничто механически не мешает
+    следующему поднятию порога (скажем, до 150) без пересчёта страниц:
+    `SCAN_CEILING` снова начал бы маскировать доказанный простой молчанием,
+    тот же класс дефекта, что уже чинили в PR #607 для MAX_PAGES=1. При
+    заявленной худшей плотности шторма ~2 прогона/мин (комментарий у
+    MEASUREMENT_SCAN_MAX_PAGES) MAX_PAGES страниц по PER_PAGE прогонов
+    обязаны покрывать МИНИМУМ MEASUREMENT_STALE_MINUTES минут истории.
+    Мутация: верни MEASUREMENT_SCAN_MAX_PAGES = 3 (старое значение до
+    ревизии #1184) — тест краснеет."""
+    WORST_CASE_RUNS_PER_MINUTE = 2.0
+    covered_minutes = (qw.MEASUREMENT_SCAN_MAX_PAGES * qw.MEASUREMENT_SCAN_PER_PAGE
+                        / WORST_CASE_RUNS_PER_MINUTE)
+    assert covered_minutes >= qw.MEASUREMENT_STALE_MINUTES, (
+        f"{qw.MEASUREMENT_SCAN_MAX_PAGES} страниц по {qw.MEASUREMENT_SCAN_PER_PAGE} "
+        f"покрывают только {covered_minutes} мин при плотности "
+        f"{WORST_CASE_RUNS_PER_MINUTE}/мин — меньше порога простоя "
+        f"{qw.MEASUREMENT_STALE_MINUTES}, SCAN_CEILING замаскирует доказанный простой"
+    )
+
+
 # ── measure_main(): проводка дешёвой/полной проверки (троттлинг решает gate_main) ──
 
 
@@ -941,9 +964,9 @@ def test_gate_main_failure_attempt_throttles_and_fresh_success_closes_episode(mo
 
 def test_gate_main_proceeds_and_closes_episode_when_measured_but_past_throttle_window(monkeypatch, tmp_path):
     """Замер найден (success_age=20 мин), старше окна троттлинга (15 мин), но
-    моложе STALE-порога (45 мин) — гейт пускает следующий замер (proceed=true) И
-    считает систему живой (закрывает эпизод простоя, если он был), а не
-    эскалирует."""
+    моложе STALE-порога (MEASUREMENT_STALE_MINUTES=90, ревизия #1184) — гейт
+    пускает следующий замер (proceed=true) И считает систему живой (закрывает
+    эпизод простоя, если он был), а не эскалирует."""
     output_file = tmp_path / "gh_output"
     monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
