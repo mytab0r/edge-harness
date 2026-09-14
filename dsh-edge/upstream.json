@@ -1,5 +1,5 @@
 {
   "repo": "pawaca/dsh-edge",
-  "sha": "0b2c6cc88cca0cf92e2273b3db2354cf0dc4e7d6",
-  "note": "Пин апстрима для source-build морды. Автоматический бамп (#1138, scripts/orchestra/upstream_drift.py::attempt_auto_bump): sha — тег dsh-edge-v0.14.0 (repos/pawaca/dsh-edge/tags). Патч-серия dsh-edge/patches НЕ перебазирована этим коммитом — применимость доказывает шаг «Патч-серия» deploy-dsh-edge.yml после мержа (dsh-edge/PATCHES.md); красный деплой — честный сигнал, не тихий пропуск версии, дальше заводит задачу пульс отказов деплоя (#477)."
+  "sha": "b164c10552a27ca6d2dae52450063b9dfbd9becf",
+  "note": "Пин апстрима для source-build морды. Автоматический бамп (#1164, scripts/orchestra/upstream_drift.py::attempt_auto_bump): sha — тег dsh-edge-v0.14.1 (repos/pawaca/dsh-edge/tags). Патч-серия dsh-edge/patches перебазирована при доводке PR: 0001 снят по removeWhen — апстрим 0.14.1 принял DSH_EDGE_EXTRA_ALIAS_SCOPES (pawaca/dsh-edge#167), шаг сборки задаёт скоуп из dsh-edge/manifest.mjs::PLUGIN_SCOPE; остаток 0002–0006 наложен git apply подряд на чистом клоне тега без единого хунка мимо (dsh-edge/PATCHES.md)."
 }
