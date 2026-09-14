@@ -3635,14 +3635,28 @@ def test_dispatch_conflict_rework_processes_oldest_conflict_first(monkeypatch):
 
 
 def _ai_rework_base_fixture(pr_number, task_number, run_id, run_conclusion, *, dispatched_since):
-    """Общая часть фикстуры для трёх тестов ниже (#1027): один PR с
+    """Общая часть фикстуры для тестов ниже (#1027): один PR с
     ai:changes-requested, бюджет доводки уже исчерпан (одна ЗАСЧИТАННАЯ
     попытка — WORKER_GIT_STEP_MARKER в комментариях ЗАДАЧИ), последний
-    прогон worker.yml по задаче атрибутирован и несёт `run_conclusion`."""
+    прогон worker.yml по задаче атрибутирован и несёт `run_conclusion`.
+
+    `"status": "completed"` — прод-форма GitHub Actions API: `conclusion`
+    заполнен ТОЛЬКО у завершённых прогонов (класс #1260, второй круг —
+    находка ревью: без явного `status` в фикстуре `run.get("status")`
+    отдаёт `None`, а `!= "completed"` в dispatch_ai_review_rework трактует
+    `None` как «ещё не завершился» — те же 4 теста этого модуля ложно
+    ловили бы «эскалация отложена» вместо ожидаемого исхода, хотя
+    `run_conclusion` здесь ВСЕГДА конечный (failure/success/timed_out)."""
     files = files_payload(["x.py"])
     fingerprint = sch.review_labels.diff_fingerprint(files)
     return fingerprint, {
         "issues/120/comments?per_page=100": [],
+        # ai_changes_labeled_at (issue #1253, сортировка очереди по возрасту)
+        # читает таймлайн КАЖДОГО кандидата ПЕРЕД циклом диспатча — пустая
+        # история метки здесь честна для этих фикстур (они не про сортировку,
+        # см. test_dispatch_ai_review_rework_processes_oldest_ai_changes_first
+        # ниже для сценария с реальными датами): падает на created_at PR.
+        f"issues/{pr_number}/timeline?per_page=100": [],
         f"pulls/{pr_number}/files": files,
         f"issues/{pr_number}/comments": [
             {"created_at": dispatched_since,
@@ -3651,7 +3665,8 @@ def _ai_rework_base_fixture(pr_number, task_number, run_id, run_conclusion, *, d
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
         "workflows/worker.yml/runs?per_page=10": {"workflow_runs": [
-            {"id": run_id, "conclusion": run_conclusion, "created_at": "2026-09-12T11:00:00Z"},
+            {"id": run_id, "status": "completed", "conclusion": run_conclusion,
+             "created_at": "2026-09-12T11:00:00Z"},
         ]},
         f"{REPO}/issues/{task_number}/comments?per_page": [
             {"created_at": "2026-09-12T11:00:30Z",
@@ -3778,6 +3793,62 @@ def test_dispatch_ai_review_rework_escalation_names_attributed_non_success_concl
     assert any("исчерпана" in line and "#1020" in line for line in actions)
 
 
+@pytest.mark.parametrize("run_id, status", [
+    (34600000006, "in_progress"),
+    (34600000007, "queued"),
+    (34600000008, "requested"),
+    (34600000009, "waiting"),
+])
+def test_dispatch_ai_review_rework_defers_escalation_while_own_run_in_flight(monkeypatch, run_id, status):
+    """Находка ревью PR #1260 (класс «эскалация-до-итога-прогона»), ВТОРОЙ
+    круг: последний прогон worker.yml по ЭТОЙ задаче атрибутирован (след
+    аренды найден), но ещё не завершился — GitHub не заполняет `conclusion`
+    ни для одного НЕконечного статуса, поэтому наивное чтение только
+    `conclusion` (None) неотличимо от «атрибуции нет вовсе» и раньше ошибочно
+    эскалировало владельцу прогон, чья попытка доводки ЭТОЙ задачи физически
+    ещё идёт (AGENTS.md, «алерт не гадает» — «атрибуции нет» и «атрибуция
+    есть, исход неизвестен» — разные факты). Это НЕ возврат снятого
+    busy-гейта воркера (тот блокировал занятостью ЛЮБОГО прогона репозитория,
+    см. test_dispatch_ai_review_rework_escalates_while_worker_active выше,
+    где ЧУЖОЙ in_progress прогон эскалации не мешает) — здесь откладываем
+    только пока не известен исход СВОЕГО прогона.
+
+    Параметризация `requested`/`waiting` — ПЕРВАЯ версия фикса проверяла
+    белый список `status in ("in_progress", "queued")`: у GitHub Actions
+    статусов больше, ревьюер исполнил именно эти два сценария и получил
+    ложную эскалацию с текстом «не атрибутирован» — атрибуция БЫЛА, просто
+    белый список её не узнал.
+
+    Мутация: замени условие `run.get("status") != "completed"` обратно на
+    белый список `run.get("status") in ("in_progress", "queued")` — сценарии
+    requested/waiting в этом тесте покраснеют (escalated перестанет быть
+    пустым), in_progress/queued останутся зелёными (класс #1260, второй
+    круг — узкий белый список не покрывает все неконечные статусы)."""
+    task = issue(782, assignees=("mytab0r",))
+    p = pull(1020, labels=[sch.review_labels.AI_CHANGES], ref="agent/782-fix-waiting-owner-relabel-loop")
+    fingerprint, fixture = _ai_rework_base_fixture(
+        1020, 782, run_id, None, dispatched_since="2026-09-12T10:00:00Z")
+    fixture["workflows/worker.yml/runs?per_page=10"] = {
+        "workflow_runs": [workflow_run(run_id, status)]}
+    fake = FakeGh(fixture)
+    patch_gh(monkeypatch, fake)
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("исход СВОЕГО прогона неизвестен — эскалация преждевременна"))
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("бюджет исчерпан, исход не известен — редиспатч тоже преждевременен"))
+    monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("исход не известен — задачу не трогаем"))
+
+    observations, actions, dispatched = sch.dispatch_ai_review_rework(REPO, [p], pool=[task])
+
+    assert dispatched is False
+    assert not any("worker.yml/dispatches" in c for c in fake.calls)
+    assert escalated == []
+    assert any(
+        "эскалация отложена" in line and "#1020" in line and status in line
+        for line in observations
+    )
+    assert task["assignees"] != []  # ни эскалация, ни редиспатч не трогают задачу
+
+
 def test_dispatch_ai_review_rework_skips_escalation_when_pr_already_closed(monkeypatch):
     """Исход 3: PR закрылся/слился между снимком `pulls` и перепроверкой
     (кем-то другим, или accept_merged_tasks этого же прогона) — эскалировать
@@ -3798,6 +3869,100 @@ def test_dispatch_ai_review_rework_skips_escalation_when_pr_already_closed(monke
     assert dispatched is False
     assert fake.mutating_calls() == []
     assert any("закрыт" in line and "эскалация не нужна" in line for line in observations)
+
+
+def test_dispatch_ai_review_rework_escalates_while_worker_active(monkeypatch):
+    """Issue #1253: решение об эскалации (бюджет доводки исчерпан) не должно
+    ждать освобождения воркера — эскалация не трогает воркер, только
+    комментарий/#120/Telegram (pulse_guard.escalate). Живая цена: PR #804/
+    задача #720 — воркер упал честным инфра-отказом 2026-09-12T13:43,
+    авто-повтор без штрафа бюджета должен был сработать следующим свободным
+    пульсом, не сработал почти двое суток, потому что старое решение
+    эскалировать ждало `not worker_runs_active(repo)`.
+
+    Воркер в этой фикстуре ЗАНЯТ прямо сейчас (in_progress run) — эскалация
+    обязана состояться несмотря на это.
+
+    Мутация: верни `if dispatched or worker_runs_active(repo): ...continue`
+    перед эскалацией (см. git-историю функции) — тест покраснеет: escalated
+    останется пустым, потому что busy-гейт молча остановит решение раньше,
+    чем оно дойдёт до marker/pereproverka."""
+    task = issue(782, assignees=("mytab0r",))
+    p = pull(1020, labels=[sch.review_labels.AI_CHANGES], ref="agent/782-fix-waiting-owner-relabel-loop")
+    fingerprint, fixture = _ai_rework_base_fixture(
+        1020, 782, 34600000004, "success", dispatched_since="2026-09-12T10:00:00Z")
+    fixture["workflows/worker.yml/runs?status=in_progress"] = {
+        "workflow_runs": [workflow_run(34600000005, "in_progress")]}
+    fake = FakeGh(fixture)
+    patch_gh(monkeypatch, fake)
+    assume_worker_not_stalled(monkeypatch)
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("эскалация — не обычный комментарий в PR"))
+    monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("эскалация не трогает задачу"))
+
+    observations, actions, dispatched = sch.dispatch_ai_review_rework(REPO, [p], pool=[task])
+
+    assert dispatched is False
+    assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
+    assert any("исчерпана" in line and "#1020" in line for line in actions)
+    assert task["assignees"] != []  # эскалация не трогает задачу
+
+
+def test_dispatch_ai_review_rework_processes_oldest_ai_changes_first(monkeypatch):
+    """Issue #1253 (симметрия #588/dispatch_conflict_rework): сырой порядок
+    `pulls` (open_pulls(), `GET /pulls?state=open`) отдаёт НОВЫЕ PR первыми —
+    без сортировки один workflow_dispatch за проход всегда доставался бы
+    самому свежему PR с ai:changes-requested. Замер живого репозитория
+    2026-09-14: 31 открытый PR с этой меткой, 15 не получили ни одного
+    диспатча доводки НИКОГДА. Вход НАРОЧНО в порядке "новый первым" — дождаться
+    должен СТАРЕЙШИЙ по ai_changes_labeled_at, не первый по списку.
+
+    Мутация: убери сортировку ai_pulls в dispatch_ai_review_rework (верни
+    `for pull in pulls:` без переупорядочивания) — этот тест покраснеет
+    (inputs[task]=475, ветка p_new, вместо ожидаемого 474)."""
+    task_new = issue(475, assignees=("mytab0r",))
+    task_old = issue(474, assignees=("mytab0r",))
+    p_new = pull(561, labels=[sch.review_labels.AI_CHANGES], ref="agent/475-y")
+    p_old = pull(560, labels=[sch.review_labels.AI_CHANGES], ref="agent/474-x")
+    files_new = files_payload(["y.py"])
+    files_old = files_payload(["x.py"])
+    fake = FakeGh({
+        # Метка на p_new проставлена НЕДАВНО, на p_old — почти четверо суток
+        # назад: p_old обязан получить единственный слот этого прохода.
+        "issues/561/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": sch.review_labels.AI_CHANGES},
+             "created_at": "2026-09-06T20:00:00Z"},
+        ],
+        "issues/560/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": sch.review_labels.AI_CHANGES},
+             "created_at": "2026-09-03T00:00:00Z"},
+        ],
+        "pulls/561/files": files_new,
+        "pulls/560/files": files_old,
+        f"issues/560/comments": [],
+        f"issues/561/comments": [],
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        f"{REPO}/issues/474/comments?per_page": [],
+        f"{REPO}/issues/475/comments?per_page": [],
+        "issues/474/assignees": None,
+        "workflows/worker.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: "ok")
+
+    # Вход НАРОЧНО в порядке "новый первым" — тот же порядок, что отдаёт
+    # open_pulls() на живом репозитории.
+    observations, actions, dispatched = sch.dispatch_ai_review_rework(
+        REPO, [p_new, p_old], pool=[task_new, task_old])
+
+    assert dispatched is True
+    dispatch_calls = [c for c in fake.calls if "worker.yml/dispatches" in c]
+    assert len(dispatch_calls) == 1
+    assert "inputs[task]=474" in dispatch_calls[0]  # старейший вердикт, не первый по списку
+    assert task_new["assignees"] != []  # свежий PR этим проходом не тронут
 
 
 def test_conflict_labeled_at_returns_most_recent_labeling_episode(monkeypatch):
@@ -3846,6 +4011,34 @@ def test_conflict_first_labeled_at_none_when_never_labeled(monkeypatch):
     fake = FakeGh({"issues/560/timeline?per_page=100": []})
     patch_gh(monkeypatch, fake)
     assert sch.conflict_first_labeled_at(REPO, 560) is None
+
+
+def test_ai_changes_labeled_at_returns_most_recent_labeling_episode(monkeypatch):
+    # Issue #1253: аналог conflict_labeled_at (max(), не min() — вердикт мог
+    # сниматься/ставиться заново несколькими прогонами ai-review, нас
+    # интересует начало ТЕКУЩЕГО эпизода). Общая часть — _label_event_times
+    # (issue #1253, одно место правды вместо трёх копий одного и того же
+    # цикла по таймлайну). Мутация: замени max() на min() в
+    # ai_changes_labeled_at — тест вернул бы 09-01 вместо 09-05, покраснеет.
+    fake = FakeGh({
+        "issues/560/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": sch.review_labels.AI_CHANGES},
+             "created_at": "2026-09-01T00:00:00Z"},
+            {"event": "unlabeled", "label": {"name": sch.review_labels.AI_CHANGES},
+             "created_at": "2026-09-02T00:00:00Z"},
+            {"event": "labeled", "label": {"name": sch.review_labels.AI_CHANGES},
+             "created_at": "2026-09-05T00:00:00Z"},
+            {"event": "labeled", "label": {"name": "review:ok"}, "created_at": "2026-09-06T00:00:00Z"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    assert sch.ai_changes_labeled_at(REPO, 560) == utc(2026, 9, 5, 0, 0)
+
+
+def test_ai_changes_labeled_at_none_when_never_labeled(monkeypatch):
+    fake = FakeGh({"issues/560/timeline?per_page=100": []})
+    patch_gh(monkeypatch, fake)
+    assert sch.ai_changes_labeled_at(REPO, 560) is None
 
 
 def test_conflict_rework_attempts_lifetime_survives_relabeling(monkeypatch):
@@ -4259,17 +4452,28 @@ def test_last_ready_labeled_at_none_when_either_status_missing(monkeypatch):
 
 def test_conflict_labeled_at_reads_timeline_through_paginated_helper():
     # Гвардия по исходнику (тот же приём, что для after_merge/list_pr_files
-    # выше): функции-читатели таймлайна конфликта (conflict_labeled_at и
-    # conflict_first_labeled_at, #588) обязаны ходить через
-    # review_labels.list_timeline (полный обход постранично), а не читать
-    # сырую первую страницу — поведенческая проверка самой пагинации живёт в
-    # scripts/lib/test_review_labels.py::test_list_timeline_paginates_finds_event_beyond_first_page
-    # (мутация доказана там: обход убран — тест краснеет). Сведение
-    # с main (#424): last_gate1/last_ready переведены на commit status
+    # выше): функции-читатели таймлайна метки (conflict_labeled_at/
+    # conflict_first_labeled_at, #588, и ai_changes_labeled_at, #1253)
+    # обязаны ходить через review_labels.list_timeline (полный обход
+    # постранично), а не читать сырую первую страницу — поведенческая
+    # проверка самой пагинации живёт в scripts/lib/test_review_labels.py::
+    # test_list_timeline_paginates_finds_event_beyond_first_page (мутация
+    # доказана там: обход убран — тест краснеет). Сведение с main (#424):
+    # last_gate1/last_ready переведены на commit status
     # (review_labels.status_posted_at) и таймлайн больше не читают — их
     # гвардии живут в соседних тестах выше.
+    #
+    # Issue #1253 (одно место правды): раньше три функции несли ТРИ копии
+    # одного и того же цикла по таймлайну — теперь ровно одна, в
+    # _label_event_times, и три потребителя (conflict_labeled_at/
+    # conflict_first_labeled_at/ai_changes_labeled_at) вызывают её, а не
+    # list_timeline напрямую. Мутация: разверни любую из трёх функций обратно
+    # в собственный цикл `for event in timeline: ...` — count() ниже
+    # перестанет совпадать (либо list_timeline снова встретится больше
+    # одного раза, либо _label_event_times вызовется меньше трёх раз).
     source = SCRIPT.read_text(encoding="utf-8")
-    assert source.count("review_labels.list_timeline(repo, pr_number, gh)") == 2
+    assert source.count("review_labels.list_timeline(repo, pr_number, gh)") == 1
+    assert source.count("_label_event_times(repo, pr_number,") == 3
     assert 'gh(f"repos/{repo}/issues/{pr_number}/timeline?per_page=100")' not in source
 
 
@@ -4892,11 +5096,12 @@ def test_after_merge_never_calls_create_pool_issue_for_review_findings(monkeypat
     # тест вообще», а свойство критерия «возврат вызова → краснеет» — это
     # прямая мутация здесь):
     #
-    # 1) Прямая (критерий 1): вернуть вызов create_pool_issue внутрь after_merge —
-    # тест краснеет ЗАГУШКОЙ, дословный вывод исполнения 2026-09-14:
+    # 1) Прямая (критерий 1): вернуть вызов create_pool_issue внутрь
+    # after_merge — тест краснеет ЗАГУШКОЙ, дословный вывод исполнения
+    # 2026-09-14:
     #   E       AssertionError: after_merge не должен звать create_pool_issue для находок ревью (#1262)
     #   E       AssertionError: after_merge не должен звать create_pool_issue для находок ревью (#1262)
-    #   scripts/orchestra/test_scheduler.py:5106: AssertionError
+    #   scripts/orchestra/test_scheduler.py: AssertionError
     #   =========================== short test summary info ============================
     #   FAILED scripts/orchestra/test_scheduler.py::test_after_merge_never_calls_create_pool_issue_for_review_findings - AssertionError: after_merge не должен звать create_pool_issue для находок ревью (#1262)
     #   1 failed, 369 deselected in 0.35s
