@@ -173,7 +173,7 @@ job), а вся серия ревьюится как обычный код ре�
 |---|---|---|
 | `0002-edge-plugins-module.patch` | + `installEdgePlugins(context, …)` в хвост `initialize()` (после `WorkspaceRegistry`); сгенерированный `src/edge-plugins.generated.ts` патч не содержит — его создаёт кодогенератор | точка инсталла; после ядра, потому что плагины могут опираться на его сервисы |
 | `0003-web-roster-manifest.patch` | `assemble-standalone-web.mjs`: после upstream-патчей читает `standalone/edge-plugins.json` и дописывает client-имена в `declared`; для манифестных записей добавляет громкий гвард web-декларации и `./client` | ростер; апстримный путь тихо пропускает пакет без декларации (строка 180) — для манифеста тишина = зелёная сборка без плагина, тот же класс, что #43, поэтому тут гвард громче апстрима |
-| `0004-harness-ingest.patch` | `src/http.ts`, `src/index.ts`, `src/instance.ts`, `src/session-store.ts`: `POST /api/sessions/:id/ingest` — приём событий раннера (#119) в сессию-просмотрщик морды | сессии агентов-раннеров не видны в нативной морде без шва приёма; апстрим не даёт штатного API дописывания чужой сессии |
+| `0004-harness-ingest.patch` | `src/http.ts`, `src/instance.ts`, `src/session-store.ts`: `POST /api/sessions/:id/ingest` — приём событий раннера (#119) в сессию-просмотрщик морды (`src/index.ts` патч больше не трогает — с бампа #505 апстрим сам вызывает `http.ts::instanceRequestBodyLimit`) | сессии агентов-раннеров не видны в нативной морде без шва приёма; апстрим не даёт штатного API дописывания чужой сессии |
 
 Патч `0001-alias-scope.patch` СНЯТ (бамп #1164, пин 0.14.1): апстрим принял
 [pawaca/dsh-edge#167](https://github.com/pawaca/dsh-edge/pull/167) —
