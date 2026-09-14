@@ -50,6 +50,18 @@ jobs:
       - name: Зомби-прогоны PR-чеков — снять и переэмиттить (issue #1106)
         env:
           GH_TOKEN: ${{ github.token }}
+          # PAT владельца для close→reopen (находка ревью PR #1212, круг 3):
+          # события от GITHUB_TOKEN не зажигают новые workflow-прогоны
+          # (docs/research/21-github-actions.md, класс #18/#929/#955) — под
+          # github.token close→reopen был бы no-op, PR оставался бы зомби
+          # НАВСЕГДА при сплошь зелёных прогонах сторожа. Тот же приём, что
+          # ORCHESTRA_PAT у orchestra.yml (update_branch) — раздельные
+          # переменные, не общий GH_TOKEN: маркер-комментарий и чтение
+          # маркеров дедупа обязаны остаться под github.token/`github-
+          # actions[bot]`, иначе trusted_login=EVENT_ACTOR_LOGIN перестанет
+          # находить свои же маркеры (они писались бы от лица владельца PAT),
+          # и дедуп «одна попытка на head_sha» сломается тихо и навсегда.
+          GH_PIPELINE_PAT: ${{ secrets.GH_PIPELINE_PAT }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}

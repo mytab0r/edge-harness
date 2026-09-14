@@ -107,6 +107,24 @@ ZOMBIE_RUN_ORCHESTRA = {
 }
 ZOMBIE_JOBS_EMPTY = {"total_count": 0, "jobs": []}
 
+# Достижимость на прод-величинах (issue #1172, доводка PR #1212): все ВОСЕМЬ
+# id — дословно те же зомби-прогоны, что называет докстринг модуля,
+# перепроверены живым `gh api .../actions/runs/<id>/jobs` за минуты до этого
+# коммита — все восемь всё ещё `total_count: 0` (permanent-зомби, как и
+# описано). PR #1088 к моменту перепроверки уже MERGED — этот же факт
+# воспроизводит "живой замер" докстринга (застрявшие run-объекты остаются
+# queued навсегда, даже когда PR давно закрыт); тест ниже реконструирует
+# состояние НА МОМЕНТ инцидента (PR ещё открыт, все 8 required-чеков на его
+# текущем head) — та форма, для которой сторож и написан.
+ZOMBIE_RUN_IDS_LIVE_INCIDENT = [
+    34748469966, 34748469981, 34748469982, 34748469975,
+    34748469992, 34748470003, 34748470010, 34748470011,
+]
+ZOMBIE_RUNS_ALL_EIGHT = [
+    {**ZOMBIE_RUN_ORCHESTRA, "id": run_id, "name": f"check-{i}"}
+    for i, run_id in enumerate(ZOMBIE_RUN_IDS_LIVE_INCIDENT)
+]
+
 HEALTHY_RUN = {
     "id": 34811586423,
     "name": "repo-ci",
@@ -285,6 +303,35 @@ def test_confirmed_zombie_on_open_pr_triggers_reopen(monkeypatch):
     opened_idx = fake.calls.index(next(c for c in fake.calls if "state=open" in c))
     post_idx = fake.calls.index(comment_calls[0])
     assert closed_idx < post_idx and opened_idx < post_idx
+
+
+def test_catches_all_eight_live_incident_zombies_grouped_on_one_pr(monkeypatch):
+    """Достижимость на прод-величинах (issue #1172): реальный инцидент —
+    ВОСЕМЬ required-чеков PR #1088, все `queued`/`total_count: 0`, один и
+    тот же head_sha (все 8 id перепроверены живым `gh api` минуты назад —
+    см. ZOMBIE_RUN_IDS_LIVE_INCIDENT выше). Сторож обязан сгруппировать все
+    8 под одним PR и переэмиттить события ОДИН раз (close→reopen чинит все
+    required-чеки сразу — не нужно 8 отдельных действий на 8 run'ов)."""
+    fake = FakeGh({
+        "actions/runs?event=pull_request&status=queued": {"workflow_runs": ZOMBIE_RUNS_ALL_EIGHT},
+        "pulls?state=open": [OPEN_PR_1088_MATCHING],
+        "issues/1088/comments": [],
+        f"issues/{pg.WATCHDOG_ISSUE}/comments": [],
+        **{f"actions/runs/{run_id}/jobs": ZOMBIE_JOBS_EMPTY for run_id in ZOMBIE_RUN_IDS_LIVE_INCIDENT},
+        "-X POST": None,
+        "-X PATCH": None,
+    })
+    patch_gh(monkeypatch, fake)
+    grouped = zrw.group_candidates_by_pr(
+        zrw.stale_candidates(ZOMBIE_RUNS_ALL_EIGHT, NOW),
+        {"agent/1087-react-dom-peer-major-mismatch": OPEN_PR_1088_MATCHING},
+    )
+    assert len(grouped[1088]["runs"]) == 8, "все 8 реальных зомби-прогонов обязаны сгруппироваться под PR #1088"
+    observations, actions = zrw.zombie_run_watch(REPO, NOW)
+    assert any("переоткрыт" in a for a in actions)
+    patch_calls = [c for c in fake.calls if "-X PATCH" in c and "pulls/1088" in c]
+    assert any("state=closed" in c for c in patch_calls)
+    assert any("state=open" in c for c in patch_calls)
 
 
 def test_zombie_matching_stale_head_is_not_touched(monkeypatch):
@@ -530,6 +577,107 @@ def test_report_failure_with_dead_channels_reddens_pulse(monkeypatch):
     patch_gh(monkeypatch, fake)
     with pytest.raises(RuntimeError, match="переэмиссия применена"):
         zrw.zombie_run_watch(REPO, NOW)
+
+
+def test_report_failure_with_dedup_carrier_lost_reddens_pulse_even_if_telegram_ok(monkeypatch):
+    """Находка ревью PR #1212, круг 3, п.3: форма (в) с Telegram ДОСТАВЛЕН,
+    но след в #120 НЕ оставлен (escalation_dedup_carrier_failed=True,
+    escalation_channel_failed=False — до фикса эта комбинация проходила
+    зелёной, т.к. проверялся только один предикат). Маркер переэмиссии не
+    найден НИГДЕ (ни в PR — падение записи и есть форма (в), ни в #120 —
+    запасной носитель тоже не записан): следующий пульс повторил бы
+    переэмиссию вслепую — молча нельзя, прогон обязан покраснеть."""
+    patch_escalate(monkeypatch, result="Telegram: доставлен; след в #120: НЕ оставлен")
+    fake = FakeGh({
+        "actions/runs?event=pull_request&status=queued": {"workflow_runs": [ZOMBIE_RUN_ORCHESTRA]},
+        "pulls?state=open": [OPEN_PR_1088_MATCHING],
+        "-X POST": RuntimeError("502 comment post failed"),
+        "issues/1088/comments": [],
+        f"issues/{pg.WATCHDOG_ISSUE}/comments": [],
+        "actions/runs/34748469966/jobs": ZOMBIE_JOBS_EMPTY,
+        "-X PATCH": None,
+    })
+    patch_gh(monkeypatch, fake)
+    with pytest.raises(RuntimeError, match="переэмиссия применена"):
+        zrw.zombie_run_watch(REPO, NOW)
+
+
+def test_recurrence_escalation_dead_channels_reddens_pulse(monkeypatch):
+    """Находка ревью PR #1212, круг 3, п.2: рецидив после переэмиссии — если
+    сама эскалация не доставлена НИ ОДНИМ каналом, сигнал «автогаз не
+    сработал, нужен человек» не дошёл никуда — до фикса результат escalate()
+    клался в actions и терялся молча, прогон оставался зелёным."""
+    reopened_marker = "[zombie-run-watch: переэмиссия 9a75c414]"
+    new_zombie_run = {
+        **ZOMBIE_RUN_ORCHESTRA, "id": 999999, "created_at": "2026-09-13T10:00:00Z",
+    }
+    fake = FakeGh({
+        "actions/runs?event=pull_request&status=queued": {"workflow_runs": [new_zombie_run]},
+        "pulls?state=open": [OPEN_PR_1088_MATCHING],
+        "issues/1088/comments": [
+            {"created_at": "2026-09-13T09:00:00Z", "body": reopened_marker,
+             "user": {"login": "github-actions[bot]"}},
+        ],
+        "actions/runs/999999/jobs": ZOMBIE_JOBS_EMPTY,
+        f"issues/{pg.WATCHDOG_ISSUE}/comments": [],
+    })
+    patch_gh(monkeypatch, fake)
+    patch_escalate(monkeypatch, result="Telegram: НЕ доставлен; след в #120: НЕ оставлен")
+    with pytest.raises(RuntimeError, match="не доставлена ни одним каналом"):
+        zrw.zombie_run_watch(REPO, NOW)
+
+
+# ── set_pr_state: PAT для close/reopen, github.token для остального ────────
+
+
+def test_set_pr_state_uses_pat_via_raw_subprocess_when_present(monkeypatch):
+    """Находка ревью PR #1212, круг 3, п.1: с `GH_PIPELINE_PAT` в окружении
+    close/reopen обязаны идти сырым subprocess с заголовком Authorization
+    (события GITHUB_TOKEN не зажигают новые workflow-прогоны) — НЕ через
+    `gh()` (тот читает `GH_TOKEN`=`github.token` из окружения)."""
+    monkeypatch.setenv("GH_PIPELINE_PAT", "test-pat-value")
+    monkeypatch.setattr(zrw, "gh", lambda *a: pytest.fail("gh() не должен вызываться — есть PAT"))
+    calls = []
+
+    class FakeCompleted:
+        returncode = 0
+        stderr = ""
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return FakeCompleted()
+
+    monkeypatch.setattr(zrw.subprocess, "run", fake_run)
+    zrw.set_pr_state(REPO, 1088, "closed")
+    assert len(calls) == 1
+    joined = " ".join(calls[0])
+    assert "Authorization: Bearer test-pat-value" in joined
+    assert "state=closed" in joined
+    assert f"repos/{REPO}/pulls/1088" in joined
+
+
+def test_set_pr_state_raises_loud_on_pat_failure(monkeypatch):
+    """PAT-путь обязан фейлиться так же громко, как gh(), не глотать stderr."""
+    monkeypatch.setenv("GH_PIPELINE_PAT", "test-pat-value")
+
+    class FakeFailed:
+        returncode = 1
+        stderr = "422 Unprocessable Entity"
+
+    monkeypatch.setattr(zrw.subprocess, "run", lambda *a, **kw: FakeFailed())
+    with pytest.raises(RuntimeError, match="422 Unprocessable Entity"):
+        zrw.set_pr_state(REPO, 1088, "open")
+
+
+def test_set_pr_state_falls_back_to_gh_without_pat(monkeypatch):
+    """Без `GH_PIPELINE_PAT` в окружении (дев/тест-прогон) — честный fallback
+    на `gh()`/`GH_TOKEN`, как у `scheduler.update_branch`."""
+    monkeypatch.delenv("GH_PIPELINE_PAT", raising=False)
+    calls = []
+    monkeypatch.setattr(zrw, "gh", lambda *a: calls.append(a))
+    zrw.set_pr_state(REPO, 1088, "closed")
+    assert len(calls) == 1
+    assert "state=closed" in calls[0]
 
 
 def test_candidate_cap_truncates_and_warns(monkeypatch):

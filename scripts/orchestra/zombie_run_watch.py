@@ -67,7 +67,30 @@ head SHA не меняется, все обязательные workflow пол�
   маркер переэмиссии дублируется эскалацией в #120 (запасной носитель):
   следующий пульс, не найдя маркера в PR, читает его из #120 и повторной
   переэмиссии на этом head не делает — контракт «одна попытка на head_sha»
-  держится на обоих носителях.
+  держится на обоих носителях. Проверяется ОБА предиката доставки эскалации
+  (`escalation_channel_failed` — оба канала молчат, `escalation_
+  dedup_carrier_failed` — след в #120 не оставлен даже при доставленном
+  Telegram): пропуск второго (находка ревью PR #1212, круг 3) означал бы, что
+  маркер не найден НИГДЕ, а прогон всё равно зелёный.
+
+## Токен: close/reopen под PAT, маркеры — под github.token (находка ревью PR #1212, круг 3)
+
+`.github/workflows/zombie-run-watch.yml` даёт этому скрипту ДВЕ переменные:
+`GH_TOKEN=github.token` (по умолчанию, для всех вызовов через `gh()`) и
+`GH_PIPELINE_PAT` (секрет, читается `set_pr_state()` напрямую). Раздельно не
+случайно: события, порождённые `GITHUB_TOKEN`, НЕ зажигают новые workflow-
+прогоны (docs/research/21-github-actions.md, класс #18/#929/#955, тот же
+класс, что #929/#955 — мерж под `GITHUB_TOKEN` не создавал push-событие) —
+под `github.token` close→reopen были бы no-op для required-чеков, PR
+оставался бы зомби НАВСЕГДА при сплошь зелёных прогонах сторожа. Только
+`set_pr_state()` (PATCH close/open) читает `GH_PIPELINE_PAT` напрямую и идёт
+сырым `subprocess` с заголовком `Authorization` (тот же приём, что
+`scheduler.update_branch` с `ORCHESTRA_PAT`). Маркер-комментарий,
+эскалация и ЧТЕНИЕ маркеров дедупа намеренно остаются под `github.token`
+(`github-actions[bot]`): `trusted_login=EVENT_ACTOR_LOGIN` ищет маркеры
+именно от этой identity — переведи их на PAT, и фильтр перестанет находить
+свои же маркеры (они писались бы от лица владельца PAT), дедуп «одна
+попытка на head_sha» сломался бы тихо и навсегда.
 
 Чтение маркеров фильтрует автора (`trusted_login=EVENT_ACTOR_LOGIN`,
 #1027): маркеры пишет только job под `github.token` (вне Actions запись
@@ -129,6 +152,7 @@ _console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_u
 
 import argparse
 import os
+import subprocess
 import sys
 from datetime import datetime, timezone
 
@@ -139,6 +163,7 @@ from pulse_guard import (  # noqa: E402
     WATCHDOG_ISSUE,
     escalate,
     escalation_channel_failed,
+    escalation_dedup_carrier_failed,
     gh,
     issue_marker_times,
     minutes_between,
@@ -308,9 +333,38 @@ def set_pr_state(repo: str, number: int, state: str) -> None:
     """Примитив газа (issue #1106, PR #1088): close и reopen выполняются
     РАЗДЕЛЬНЫМИ вызовами не зря — отказ reopen после успешного close
     оставляет PR закрытым, и вызывающий обязан различить эти два отказа
-    (находка ревью PR #1212: один catch-all над парой склеивал их в
-    «переэмиссия не выполнена»)."""
-    gh("-X", "PATCH", f"repos/{repo}/pulls/{number}", "-f", f"state={state}")
+    (находка ревью PR #1212, круг 2: один catch-all над парой склеивал их в
+    «переэмиссия не выполнена»).
+
+    PAT владельца (`GH_PIPELINE_PAT`), не `github.token` (находка ревью
+    PR #1212, круг 3): события от GITHUB_TOKEN не зажигают новые workflow-
+    прогоны (docs/research/21-github-actions.md, класс #18/#929/#955) — под
+    github.token этот PATCH был бы no-op для required-чеков, PR оставался бы
+    зомби НАВСЕГДА при сплошь зелёных прогонах сторожа. Сырой `subprocess` с
+    заголовком `Authorization` — тот же приём, что `scheduler.update_branch`
+    с `ORCHESTRA_PAT`, НЕ через `gh()` (тот читает `GH_TOKEN` из окружения,
+    которым для ОСТАЛЬНЫХ вызовов этого модуля намеренно остаётся
+    `github.token`/`github-actions[bot]`: маркер-комментарий и чтение
+    маркеров дедупа обязаны остаться под этой же identity, иначе
+    `trusted_login=EVENT_ACTOR_LOGIN` перестанет находить свои же маркеры —
+    они писались бы от лица владельца PAT, и дедуп «одна попытка на
+    head_sha» сломается тихо и навсегда). Без PAT в окружении (локальный
+    прогон/тест) — честный fallback на `gh()`/`GH_TOKEN`, как у
+    `update_branch`."""
+    pat = os.environ.get("GH_PIPELINE_PAT")
+    if not pat:
+        gh("-X", "PATCH", f"repos/{repo}/pulls/{number}", "-f", f"state={state}")
+        return
+    result = subprocess.run(
+        ["gh", "api", "-X", "PATCH", f"repos/{repo}/pulls/{number}",
+         "-f", f"state={state}", "-H", f"Authorization: Bearer {pat}"],
+        capture_output=True, text=True, encoding="utf-8",
+        env={**os.environ, "NO_COLOR": "1"},
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"gh api -X PATCH repos/{repo}/pulls/{number} state={state} (PAT): "
+            f"{result.stderr.strip()}")
 
 
 def zombie_run_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
@@ -454,7 +508,14 @@ def zombie_run_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
                     f"⚠️🔁 zombie-run-watch: PR #{pr_number} переэмиссия ПРИМЕНЕНА "
                     f"(run {run_ids[0]}, head {sha8}), отчёт в PR не записан — "
                     f"дедуп-якорь в #{WATCHDOG_ISSUE}: {esc_result}")
-                if escalation_channel_failed(esc_result):
+                # Находка ревью PR #1212 (круг 3): проверять ОБА предиката, не
+                # только «оба канала молчат». Здесь важен именно
+                # escalation_dedup_carrier_failed — комментарий в #120 это
+                # запасной носитель дедупа (report_failed_text несёт тот же
+                # маркер переэмиссии), и если он не записан, следующий пульс
+                # не найдёт маркер НИГДЕ (ни в PR, ни в #120) и повторит
+                # переэмиссию вслепую — даже если Telegram сам алерт доставил.
+                if escalation_channel_failed(esc_result) or escalation_dedup_carrier_failed(esc_result):
                     raise RuntimeError(
                         f"zombie-run-watch: PR #{pr_number} переэмиссия применена, "
                         f"но отчёт-дедуп не записан ни в PR ({error}), ни в "
@@ -482,6 +543,15 @@ def zombie_run_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
             actions.append(
                 f"🚨 zombie-run-watch: PR #{pr_number} — рецидив после переэмиссии, "
                 f"эскалация #{WATCHDOG_ISSUE}: {esc_result}")
+            # Находка ревью PR #1212 (круг 3): результат escalate() здесь
+            # клался в actions и терялся молча — при отказе обоих каналов
+            # (Telegram и след в #120) сигнал «автогаз не сработал, нужен
+            # человек» не доходил никуда, а прогон оставался зелёным.
+            if escalation_channel_failed(esc_result):
+                raise RuntimeError(
+                    f"zombie-run-watch: PR #{pr_number} — рецидив после переэмиссии, "
+                    f"эскалация #{WATCHDOG_ISSUE} не доставлена ни одним каналом "
+                    f"({esc_result}) — красный прогон вместо молчаливого зомби")
 
     if not observations and not actions:
         observations.append("zombie-run-watch: кандидатов не было")
