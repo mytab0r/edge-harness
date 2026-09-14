@@ -48,6 +48,10 @@ _rf_spec = importlib.util.spec_from_file_location("review_findings", _LIB / "rev
 review_findings = importlib.util.module_from_spec(_rf_spec)
 _rf_spec.loader.exec_module(review_findings)
 
+_rc_spec = importlib.util.spec_from_file_location("review_checklist", _LIB / "review_checklist.py")
+review_checklist = importlib.util.module_from_spec(_rc_spec)
+_rc_spec.loader.exec_module(review_checklist)
+
 
 def gh(*args: str):
     result = subprocess.run(
@@ -62,7 +66,9 @@ def gh(*args: str):
 
 # ── Чистая логика (тестируется без сети, test_migrate_review_findings.py) ────
 
-TAIL_TITLE_RE = re.compile(r"^Хвост чеклиста ревью PR #(\d+)$")
+# Формат заголовка хвоста — из review_checklist (одно место правды, находка
+# ревью PR #1268: вторая копия литерала здесь разошлась бы с продюсером).
+TAIL_TITLE_RE = review_checklist.TAIL_TITLE_RE
 # Формат находки — review_checklist.tail_issue_body (до удаления функции
 # этой же правкой): "- [ ] <текст>" одной строкой на находку.
 FINDING_LINE_RE = re.compile(r"^- \[ \] (.+)$")
@@ -155,11 +161,14 @@ def plan_migration(tails: list[dict], repo_files: set[str], pr_files_lookup) -> 
 
 def fetch_open_tails(repo: str) -> list[dict]:
     """Все открытые issues с заголовком «Хвост чеклиста ревью PR #N» —
-    постранично (класс #308, тот же приём, что review_labels.list_pages)."""
+    постранично (класс #308, тот же приём, что review_labels.list_pages).
+    Поисковая строка — префикс формата из review_checklist.TAIL_TITLE_FORMAT,
+    не третья копия литерала."""
     tails: list[dict] = []
     page = 1
+    title_prefix = review_checklist.TAIL_TITLE_FORMAT.split("#")[0].strip()
     while True:
-        query = f'repo:{repo} "Хвост чеклиста ревью PR" in:title is:open is:issue'
+        query = f'repo:{repo} "{title_prefix}" in:title is:open is:issue'
         payload = gh(f"search/issues?q={urllib.parse.quote(query)}&per_page=100&page={page}")
         items = payload.get("items", []) if payload else []
         if not items:

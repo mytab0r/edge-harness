@@ -12,7 +12,8 @@
 Историческое описание ниже (2026-09-11) остаётся верным ДЛЯ СВОЕГО времени
 — ссылки на `review_checklist.tail_issue_body`/`tail_issue_title` относятся
 к формату, который эти функции производили ДО удаления (#1262); актуальный
-формат заголовка теперь — `tail_issue_title` этого файла, ниже.
+формат заголовка — `review_checklist.tail_issue_title` (одно место правды,
+алиас ниже).
 
 Факт (замер владельца 2026-09-11, начало аудита): за 5 дней `after_merge`
 (scripts/orchestra/scheduler.py) завела 46 задач «Хвост чеклиста ревью PR
@@ -110,6 +111,10 @@ _TR_SPEC = importlib.util.spec_from_file_location("task_ref", _LIB / "task_ref.p
 task_ref = importlib.util.module_from_spec(_TR_SPEC)
 _TR_SPEC.loader.exec_module(task_ref)  # type: ignore[union-attr]
 
+_RC_SPEC = importlib.util.spec_from_file_location("review_checklist", _LIB / "review_checklist.py")
+review_checklist = importlib.util.module_from_spec(_RC_SPEC)
+_RC_SPEC.loader.exec_module(review_checklist)  # type: ignore[union-attr]
+
 TASK_LABEL = "task"
 
 
@@ -117,20 +122,15 @@ def tail_issue_title(pr: int) -> str:
     """Заголовок задачи-хвоста — формат, который `create_pool_issue` в
     `scheduler.py::after_merge` заводил ДО #1262 (носитель сменился на
     файловый реестр `scripts/lib/review_findings.py` — новые хвосты этим
-    форматом больше не заводятся). Функция живёт ЗДЕСЬ, не в
-    `review_checklist.py` (там она была `tail_issue_title` до #1262, удалена
-    вместе с созданием хвостов): `checklist_tail_labels.py` и его workflow
-    `checklist-tail-triage.yml` — вестигиальные, дообслуживают только уже
-    существующие хвосты до их переноса/закрытия (#1262), поэтому единственный
-    оставшийся владелец этого строкового формата — они."""
-    return f"Хвост чеклиста ревью PR #{pr}"
+    форматом больше не заводятся). Владелец формата — `review_checklist.py`
+    (одно место правды, находка ревью PR #1268: третья копия литерала здесь
+    расходилась бы с миграцией при первой правке); здесь — только алиас
+    для вестигиальных вызовов этого модуля и его тестов."""
+    return review_checklist.tail_issue_title(pr)
 
 
-# Синхронность с фактическим форматом держит
-# test_tail_title_re_matches_real_tail_issue_title (кормит регулярку
-# результатом самой функции tail_issue_title выше, не пересказом), не копия
-# строки-литерала наугад.
-TAIL_TITLE_RE = re.compile(r"^Хвост чеклиста ревью PR #(\d+)$")
+# Регэксп того же формата — из того же единственного места, не вторая копия.
+TAIL_TITLE_RE = review_checklist.TAIL_TITLE_RE
 
 # Маркер «этот хвост уже разобран» — ставится независимо от результата
 # (нашлась ли area:*-метка у родителя), чтобы обычный пульс не гонял сеть

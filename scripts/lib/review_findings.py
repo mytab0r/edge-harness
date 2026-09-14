@@ -37,10 +37,14 @@ docs_missing читает repos/{repo}/contents/{file}?ref=main тем же сп
 запись живёт ТОЛЬКО в scheduler.py::after_merge (при слиянии PR), не в
 ai_review.py::cmd_verdict — тот только читает реестр (cmd_gather, contents:
 read достаточно для GET) и разбирает НАХОДКА-ЗАКРЫТА из ответа модели в
-структурный факт шапки комментария (resolved-findings, review_labels.
-FACT_RE) — сам реестр не трогает. after_merge на слиянии читает и факт
-resolved-findings из последнего вердикта, и незакрытые пункты чеклиста PR
-(review_checklist.unresolved_findings) — это ЕДИНСТВЕННЫЙ момент мутации.
+МАШИННЫЙ МАРКЕР ТЕЛА PR (`merge_resolved_marker`, HTML-комментарий
+`<!-- ai-review:resolved-findings:… -->`, отдельный PATCH тела) — сам реестр
+не трогает. after_merge на слиянии читает и закрытые id из маркера ТЕЛА
+(`parse_resolved_marker(pull["body"])`, без сети — тело уже в руках), и
+незакрытые пункты чеклиста PR (review_checklist.unresolved_findings) — это
+ЕДИНСТВЕННЫЙ момент мутации. Носителем факта закрытия НЕ является шапка
+комментария: тот носитель отвергнут design.md (развилка 3) — он требовал бы
+лишний GET истории комментариев на каждом слиянии.
 
 Итог: то же самое ai-review, что уже гоняется на каждый PR, получает выписку
 находок по трогаемым PR файлам (ai_review.py::findings_section) и либо видит
@@ -258,9 +262,11 @@ def sync_after_merge(gh_func: GhFn, repo: str, pr_number: int,
     чеклисте самого PR, это НЕ потеря (правило `# половина находки хуже
     отсутствия` здесь работает в обратную сторону: без файла находку некуда
     вернуть при следующем ревью, честнее не притворяться, что реестр её
-    несёт). resolved_ids — review_findings.parse_resolved_ids() последнего
-    вердикта ai-review этого PR (шапка комментария, review_labels.
-    FACT_RE, поле resolved-findings).
+    несёт). resolved_ids — parse_resolved_marker() ТЕЛА этого PR (маркер
+    `<!-- ai-review:resolved-findings:… -->`, записан cmd_verdict через
+    merge_resolved_marker при вердикте; design.md развилка 3 отвергла
+    носитель «шапка комментария» — он требовал бы отдельный GET истории
+    комментариев на каждое слияние).
 
     Возвращает {"added": [id,...], "closed": [id,...], "skipped": int}
     — skipped считает пункты БЕЗ file, для видимого отчёта в actions
@@ -293,20 +299,27 @@ def sync_after_merge(gh_func: GhFn, repo: str, pr_number: int,
 # Одна строка на находку, тот же стиль, что КЛАСС: (defect_classes.
 # CLASS_LINE_RE) — не блок-забор (ЗАМЕЧАНИЕ/ЗАДАЧА): тело не нужно, только
 # ссылка на уже существующий id из выписки findings_section.
-RESOLVED_LINE_RE = re.compile(r"^НАХОДКА-ЗАКРЫТА:\s*#?(\d+)\s*\.?\s*$")
+RESOLVED_LINE_RE = re.compile(r"^(``|`|\*\*|__|)НАХОДКА-ЗАКРЫТА:\s*#?(\d+)\s*\.?\1\s*$")
 
 
 def parse_resolved_ids(answer: str) -> list[int]:
     """Список id находок, которые модель считает исправленными в этом
     раунде — порядок первого упоминания, без дублей (findings_of ниже
     вырезает эти строки из свободной прозы комментария тем же приёмом, что
-    defect_classes.CLASS_LINE_RE)."""
+    defect_classes.CLASS_LINE_RE).
+
+    Допуск markdown-обрамления (``…``, `…`, **…**, __…__) — тот же приём,
+    что VERDICT_RE в ai_review.py: это контрактная строка ВЕРХНЕГО уровня
+    (модель велена писать её отдельной строкой), и живая практика знает её
+    обрамлённой — требовать голую форму значило бы терять закрытие находки
+    из-за кавычек, которые модель ставит по привычке кода (класс ловли
+    «строка есть, парсер её не видит», тот же, что у КЛАСС)."""
     ids: list[int] = []
     seen: set[int] = set()
     for line in (answer or "").splitlines():
         match = RESOLVED_LINE_RE.match(line.strip())
         if match:
-            finding_id = int(match.group(1))
+            finding_id = int(match.group(2))
             if finding_id not in seen:
                 seen.add(finding_id)
                 ids.append(finding_id)

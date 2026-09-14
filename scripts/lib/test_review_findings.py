@@ -269,6 +269,37 @@ def test_parse_resolved_ids_extracts_ids_in_order_without_duplicates():
     assert rf.parse_resolved_ids(answer) == [5, 12]
 
 
+def test_parse_resolved_ids_tolerates_markdown_framing():
+    # Контрактная строка верхнего уровня — модель по живой практике обрамляет
+    # её как код/жирный (тот же класс дрейфа, что у ВЕРДИКТ, чей регэксп
+    # допуск `…`/**…**/__…__ уже несёт): голая форма — не единственная
+    # прод-форма (ревью PR #1268, чеклист тела). Граница допуска та же, что у
+    # ВЕРДИКТ: обрамление ДО строки да, маркер списка "- " нет — пункт
+    # списка это проза, а не контрактная строка.
+    answer = (
+        "`НАХОДКА-ЗАКРЫТА: 5`\n"
+        "**НАХОДКА-ЗАКРЫТА: 7**\n"
+        "__НАХОДКА-ЗАКРЫТА: #9__\n"
+        "``НАХОДКА-ЗАКРЫТА: 11``\n"
+        "НАХОДКА-ЗАКРЫТА: 13\n"
+        "- НАХОДКА-ЗАКРЫТА: 15\n"
+    )
+    assert rf.parse_resolved_ids(answer) == [5, 7, 9, 11, 13]
+
+
+def test_parse_resolved_ids_ignores_prose_mentions_and_wrong_ids():
+    # Проза с упоминанием находки НЕ форма контракта; мусор после номера
+    # (кроме точки) ломает строку — парсим только то, что обязана писать
+    # модель, не угадываем.
+    answer = (
+        "находка 5 исправлена в этом PR (см. НАХОДКА-ЗАКРЫТА: 5 ниже)\n"
+        "НАХОДКА-ЗАКРЫТА: abc\n"
+        "НАХОДКА-ЗАКРЫТА: 5 потому что чинилось\n"
+        "ВЕРДИКТ: approve"
+    )
+    assert rf.parse_resolved_ids(answer) == []
+
+
 def test_parse_resolved_ids_empty_answer_returns_empty_list():
     assert rf.parse_resolved_ids("") == []
     assert rf.parse_resolved_ids("ВЕРДИКТ: approve") == []

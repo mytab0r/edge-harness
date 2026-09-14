@@ -104,10 +104,12 @@ _rc_spec.loader.exec_module(review_checklist)
 # Реестр незакрытых находок ревью, ключ файл (#1262, объединяет #1217):
 # gather собирает выписку по файлам этого PR ($findings_section, contents:
 # read достаточно для чтения ветки данных data/review-findings); verdict
-# разбирает НАХОДКА-ЗАКРЫТА из ответа модели в факт шапки комментария
-# (resolved-findings, review_labels.FACT_RE) — сам реестр не пишет (нет
-# contents: write у job'а verdict, #939), мутация — только в
-# scheduler.py::after_merge при слиянии.
+# разбирает НАХОДКА-ЗАКРЫТА из ответа модели в МАРКЕР ТЕЛА PR
+# (review_findings.merge_resolved_marker, отдельный PATCH pull["body"]) —
+# сам реестр не пишет (нет contents: write у job'а verdict, #939), читает
+# after_merge маркер из тела же при слиянии (parse_resolved_marker, без
+# сети), мутация реестра — только там. Носитель «шапка комментария» отвергнут
+# design.md (развилка 3): лишний GET истории комментариев на каждое слияние.
 _rf_spec = importlib.util.spec_from_file_location(
     "review_findings", SCRIPT_DIR.parent / "lib" / "review_findings.py")
 review_findings = importlib.util.module_from_spec(_rf_spec)
@@ -655,7 +657,8 @@ def findings_of(answer: str, tasks: list[dict] | None = None,
         if defect_classes.CLASS_LINE_RE.match(stripped):
             continue
         # Строка НАХОДКА-ЗАКРЫТА (#1262) — тот же машинный трейлер, что
-        # КЛАСС: выше: уходит в факт шапки resolved-findings (build_comment),
+        # КЛАСС: выше: уходит в маркер ТЕЛА PR (merge_resolved_marker
+        # в cmd_verdict, читает after_merge из pull["body"] при слиянии),
         # не в прозу, которую видит человек.
         if review_findings.RESOLVED_LINE_RE.match(stripped):
             continue

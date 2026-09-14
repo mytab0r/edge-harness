@@ -211,3 +211,26 @@ def unresolved_findings(pr_body: str) -> list[dict]:
     _, items, _ = _read_section(pr_body)
     return [{"title": title, "file": file, "detail": detail}
             for checked, title, file, detail in items if not checked]
+
+
+# ── Формат заголовка задачи-хвоста «Хвост чеклиста ревью PR #N» ──────────────
+#
+# Носитель сменился (#1262): after_merge больше не заводит новые хвосты
+# (находки уходят в файловый реестр review_findings.py), но САМ формат жив,
+# пока живы уже заведённые хвосты: их разбирает миграция
+# (scripts/lib/migrate_review_findings.py) и дообслуживает вестигиальный
+# scripts/orchestra/checklist_tail_labels.py. Формат объявлен ЗДЕСЬ одним
+# местом правды — находка ревью PR #1268: строка-литерал жила в трёх копиях
+# (продюсер в checklist_tail_labels, регэксп миграции, поисковая строка
+# того же скрипта) и расходилась бы при первой правке любого из них.
+TAIL_TITLE_FORMAT = "Хвост чеклиста ревью PR #{pr}"
+TAIL_TITLE_RE = re.compile(r"^Хвост чеклиста ревью PR #(\d+)$")
+
+
+def tail_issue_title(pr: int) -> str:
+    """Заголовок задачи-хвоста слитого PR — формат, которым after_merge
+    заводила хвосты ДО #1262. Единственный владелец формата — константа
+    выше; синхронность регэкспа и функции держат тесты, кормящие регэксп
+    РЕАЛЬНЫМИ заголовками живых хвостов (test_pr_number_from_title_on_
+    real_tails — фикстуры прод-формы, не пересказ)."""
+    return TAIL_TITLE_FORMAT.format(pr=pr)
