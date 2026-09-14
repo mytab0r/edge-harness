@@ -309,17 +309,23 @@ def test_render_digest_table_lists_all_groups_not_only_over_threshold():
 def test_group_class_distinguishes_infra_from_defect():
     # Тот же приём, что #1115 просит для чеков PR — переиспользуем ЕДИНОЕ
     # место правды (pulse_guard.classify_failure_cause), не гадаем заново.
-    # Живая находка (см. отчёт PR #1136): дословный текст `gh` CLI «API rate
-    # limit exceeded for installation» НЕ совпадает ни с одной сигнатурой
-    # INFRA_ERROR_SIGNATURES (список ждёт «rate limit reached»/«rate_limit:» —
-    # другую форму) — сигнатура ниже подобрана РЕАЛЬНО совпадающей
-    # (`quota_exhausted`), не той, что дайджест реально видел в проде;
-    # разрыв между реальным текстом `gh` и списком сигнатур — находка для
-    # #1115, не фикс этим PR (pulse_guard.py занят параллельными PR).
     infra_group = {"sample": "ai_dsh.sh: RATE_LIMIT: Weekly Limit quota_exhausted, retry later"}
     defect_group = {"sample": "быстрый провайдер отказал: NO_ADAPTER"}
     assert sfd.group_class(infra_group) == "инфраструктура"
     assert sfd.group_class(defect_group) == "дефект/наблюдение"
+
+
+def test_group_class_classifies_installation_rate_limit_since_1177():
+    # Находка PR #1136: дословный текст `gh` CLI «API rate limit exceeded
+    # for installation» изначально НЕ совпадал ни с одной сигнатурой
+    # INFRA_ERROR_SIGNATURES — улика для #1115. PR #1177 добавил эту
+    # сигнатуру (см. pulse_guard.py, комментарий у INFRA_ERROR_SIGNATURES,
+    # issue #1115) — столбец «класс» на живых прогонах orchestra.yml теперь
+    # видит этот случай как инфраструктуру сам, без правки этого модуля.
+    live_group = {"sample": (
+        "orchestra: gh api repos/mytab0r/edge-harness/pulls?state=open"
+        "&per_page=100&page=1: gh: API rate limit exceeded for installation. ...")}
+    assert sfd.group_class(live_group) == "инфраструктура"
 
 
 def test_render_digest_table_shows_class_column():
