@@ -13,7 +13,11 @@ PR проходят ревью, но дольше; воркер продолжа
 
 ## Метрики и их цена (design.md §1, таблица «источник/уже читается/цена»)
 
-  - `merge_throughput`      — PR слито за сутки, `search/issues` (1 запрос).
+  - `merge_throughput`      — PR слито за ПРЕДЫДУЩИЕ полные календарные сутки
+    UTC (окно `[вчера 00:00, сегодня 00:00)`, не "сегодня, с полуночи до
+    момента снимка" — issue #1155, `merge_throughput_window`), `search/issues`
+    (1 запрос). Границы окна несутся в самом снимке
+    (`merge_throughput_window_start/_end`).
   - `pr_age_p50_hours`/`pr_age_p95_hours` — по уже прочитанному списку
     открытых PR (0 доп. запросов — тот же список, что `scheduler.open_pulls`).
   - `backlog_*`             — по уже прочитанному списку задач пула
@@ -66,7 +70,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -244,6 +248,7 @@ def search_merged_prs(repo: str, gh: GhFn, start: datetime, end: datetime) -> di
 def build_snapshot(
     today: date, *,
     merged_search: dict,
+    merge_window: tuple[datetime, datetime],
     open_pulls: list[dict],
     task_issues: list[dict],
     worker_runs: list[dict],
@@ -254,13 +259,25 @@ def build_snapshot(
 ) -> dict:
     """Чистая сборка снимка из уже полученных сырых данных — I/O живёт
     отдельно в `collect()`, эта функция тестируется без единого сетевого
-    вызова (прод-форма fixtures)."""
+    вызова (прод-форма fixtures).
+
+    `merge_window` — точные границы `[start, end)`, за которые реально
+    посчитан `merge_throughput` (issue #1155, живой корень: снимок брал
+    "сегодня..сегодня" в первые минуты суток UTC и получал 0 вместо
+    реальных 16 слияний за предыдущий день, см. `collect()`). Границы несём
+    В САМОМ снимке (`merge_throughput_window_start/_end`), а не только в
+    докстринге кода — подпись обязана соответствовать тому, что померено
+    (AGENTS.md), и по одним ISO-меткам легко отличить снимок, снятый ДО
+    этого фикса (поля нет вообще), от снятого после."""
     ages = pr_age_stats(open_pulls, now)
     backlog = backlog_counts(task_issues)
     cadence = pulse_cadence(tick_runs, now)
+    window_start, window_end = merge_window
     return {
         "date": today.isoformat(),
         "merge_throughput": merge_throughput_from_search(merged_search),
+        "merge_throughput_window_start": window_start.isoformat(),
+        "merge_throughput_window_end": window_end.isoformat(),
         "pr_age_p50_hours": ages["p50"],
         "pr_age_p95_hours": ages["p95"],
         "backlog_free": backlog["free"],
@@ -339,16 +356,46 @@ def _gh_rate_remaining_pct(gh: GhFn) -> float | None:
         return None
 
 
+def merge_throughput_window(today: date) -> tuple[datetime, datetime]:
+    """Окно `[вчера 00:00 UTC, сегодня 00:00 UTC)` — полные предыдущие сутки,
+    не "сегодня, с полуночи до момента снимка" (issue #1155, живой корень
+    ниже).
+
+    Выбор между двумя вариантами (AGENTS.md требует называть цену обоих):
+
+    - **Полные предыдущие сутки** (выбрано): окно детерминировано ДАТОЙ, не
+      временем снимка — снимок в 00:06 UTC и снимок в 23:50 UTC того же
+      дня-по-расписанию считают ОДНО И ТО ЖЕ число за один и тот же
+      календарный день, что напрямую воспроизводимо прямым запросом
+      `merged:YYYY-MM-DD..YYYY-MM-DD` (тем же, каким этот баг был пойман).
+      Цена: число «сегодняшних» слияний снимок никогда не покажет — оно
+      появится только на СЛЕДУЮЩЕМ снимке, задержка до 24ч.
+    - **Скользящие 24ч до момента снимка** (отвергнуто): не даёт этой
+      задержки, но само окно ездит вместе с фактическим временем срабатывания
+      пульса (гейт `should_snapshot` не гарантирует точное время, только
+      «раз в календарные сутки») — два снимка на соседних календарных днях
+      могут перекрыть общий отрезок времени дважды или пропустить отрезок
+      между ними; проверить такое число прямым запросом `merged:D..D`
+      невозможно (ровно то, чем воспользовался координатор, чтобы поймать
+      этот баг) — теряется свойство, ради которого чинится этот баг.
+
+    Живой пример из истории `data/pipeline-health` (issue #1155): снимок,
+    снятый 2026-09-12 в 00:15 UTC, обязан посчитать слияния ЗА 2026-09-11
+    целиком (16), не «за 2026-09-12» (0 в первые минуты суток)."""
+    yesterday = today - timedelta(days=1)
+    start = datetime.combine(yesterday, time.min, tzinfo=timezone.utc)
+    end = datetime.combine(today, time.min, tzinfo=timezone.utc)
+    return start, end
+
+
 def collect(repo: str, gh: GhFn, now: datetime) -> dict:
     """Собирает сырые данные и строит снимок. Каждый источник — тот же
     вызов/тот же список, что уже читает остальной конвейер (design.md §1) —
     единственный НОВЫЙ сетевой вызов на снимок — `search/issues` (merge
     throughput) и, раз в сутки, GraphQL Cloudflare (DO cost)."""
     today = now.date()
-    day_str = today.isoformat()
-    merged_search = gh(
-        f"search/issues?q=repo:{repo}+is:pr+is:merged+merged:{day_str}..{day_str}"
-    ) or {}
+    window_start, window_end = merge_throughput_window(today)
+    merged_search = search_merged_prs(repo, gh, window_start, window_end)
     open_pulls = review_labels.list_pages(f"repos/{repo}/pulls?state=open&per_page=100", gh)
     task_issues = [
         issue for issue in review_labels.list_pages(
@@ -363,9 +410,9 @@ def collect(repo: str, gh: GhFn, now: datetime) -> dict:
                                os.environ.get("CLOUDFLARE_API_TOKEN"))
     rate_pct = _gh_rate_remaining_pct(gh)
     return build_snapshot(
-        today, merged_search=merged_search, open_pulls=open_pulls,
-        task_issues=task_issues, worker_runs=worker_runs, tick_runs=tick_runs,
-        do_rows_read_pct=do_pct, gh_rate_remaining_pct=rate_pct, now=now,
+        today, merged_search=merged_search, merge_window=(window_start, window_end),
+        open_pulls=open_pulls, task_issues=task_issues, worker_runs=worker_runs,
+        tick_runs=tick_runs, do_rows_read_pct=do_pct, gh_rate_remaining_pct=rate_pct, now=now,
     )
 
 
