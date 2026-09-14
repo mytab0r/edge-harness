@@ -1886,6 +1886,73 @@ def test_findings_section_degrades_loudly_on_non_404_error(monkeypatch):
     assert "HTTP 500" in section
 
 
+def test_findings_section_degrades_loudly_on_broken_json_registry(monkeypatch):
+    # Битый JSON реестра — RuntimeError из load_registry (не голый
+    # json.JSONDecodeError) — деградирует тем же путём, что HTTP 500, а не
+    # роняет cmd_gather целиком (дельта-спека #1262: «сбой чтения реестра
+    # (сеть, битый JSON) не роняет gather»; репро исполнен на ревью PR #1268).
+    import base64
+
+    def fake_gh(url: str):
+        return {"content": base64.b64encode(b"{not json").decode("ascii"), "sha": "x"}
+
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    section = ai.findings_section("o/r", [{"filename": "a.py"}])
+    assert "недоступен" in section
+    assert "битый JSON" in section
+
+
+# ── ФАЙЛ мимо диффа: ::warning:: при вердикте, не тихий ключ в реестре ──────
+
+def test_remark_files_outside_diff_returns_only_paths_not_in_pr():
+    remarks = [
+        {"title": "В диффе", "file": "a.py", "body": ""},
+        {"title": "Мимо диффа", "file": "nowhere/ghost.py", "body": ""},
+        {"title": "Без файла", "file": None, "body": ""},
+    ]
+    files = [{"filename": "a.py"}, {"filename": "b.py"}]
+    assert ai.remark_files_outside_diff(remarks, files) == [("nowhere/ghost.py", "Мимо диффа")]
+
+
+def test_cmd_verdict_warns_when_remark_file_is_outside_diff(monkeypatch, tmp_path, capsys):
+    # Путь, выданный моделью мимо диффа, при слиянии стал бы ключом находки,
+    # которую никто никогда не увидит. Предупреждение называет факт (путь не
+    # среди файлов PR) и последствие, НЕ молча выбрасывая путь (легальную
+    # находку про файл вне диффа от галлюцинации здесь не отличить).
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+
+    def fake_gh(url: str):
+        if url == "repos/o/r/pulls/294":
+            return {"head": {"sha": "deadbeef"}, "labels": [], "body": "Описание PR."}
+        if url.startswith("repos/o/r/pulls/294/files"):
+            page = url.split("page=")[-1]
+            return files if page == "1" else []
+        raise AssertionError(f"неожиданный вызов gh: {url}")
+
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    answer = (
+        "ЗАМЕЧАНИЕ: Путь-призрак\n"
+        "ФАЙЛ: nowhere/ghost.py\n"
+        "деталь находки\n"
+        "КОНЕЦ ЗАМЕЧАНИЯ\n"
+        "ВЕРДИКТ: approve\n"
+    )
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, answer))
+    assert rc == 0
+    captured = capsys.readouterr().out
+    assert "::warning::verdict:" in captured
+    assert "nowhere/ghost.py" in captured
+    assert "Путь-призрак" in captured
+    # Пункт не выброшен: чеклист в теле PR несёт его как раньше.
+    patches = _pr_patches(run_gh_calls)
+    assert any("Путь-призрак" in str(p) for p in patches)
+
+
 def test_cmd_verdict_without_remarks_does_not_patch_pr_body(monkeypatch, tmp_path):
     files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
 

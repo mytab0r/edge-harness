@@ -131,32 +131,6 @@ def test_merge_checklist_returns_none_when_all_remarks_already_present():
     assert rc.merge_checklist(body, remarks) is None
 
 
-# ── unresolved_items: подсчёт незакрытых пунктов на момент слияния ──────────
-
-def test_unresolved_items_returns_only_unchecked():
-    body = (
-        f"{rc.CHECKLIST_BEGIN}\n{rc.CHECKLIST_TITLE}\n\n"
-        "- [ ] **Не сделано**\n"
-        "- [x] **Сделано**\n"
-        "- [X] **Тоже сделано заглавной X**\n"
-        f"{rc.CHECKLIST_END}\n"
-    )
-    assert rc.unresolved_items(body) == ["Не сделано"]
-
-
-def test_unresolved_items_empty_without_section():
-    assert rc.unresolved_items("Обычное описание PR без чеклиста.") == []
-
-
-def test_unresolved_items_empty_when_all_checked():
-    body = (
-        f"{rc.CHECKLIST_BEGIN}\n{rc.CHECKLIST_TITLE}\n\n"
-        "- [x] **Всё сделано**\n"
-        f"{rc.CHECKLIST_END}\n"
-    )
-    assert rc.unresolved_items(body) == []
-
-
 # ── unresolved_findings: структурная форма для переноса в реестр (#1262) ─────
 
 def test_unresolved_findings_returns_structured_unchecked_items():

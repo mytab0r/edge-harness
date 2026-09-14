@@ -8,6 +8,7 @@
 Запуск: python -m pytest scripts/lib/test_migrate_review_findings.py -q
 """
 
+import base64
 import importlib.util
 import json
 from pathlib import Path
@@ -16,6 +17,10 @@ _DIR = Path(__file__).resolve().parent
 _spec = importlib.util.spec_from_file_location("migrate_review_findings", _DIR / "migrate_review_findings.py")
 mrf = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mrf)  # type: ignore[union-attr]
+
+_rf_spec = importlib.util.spec_from_file_location("review_findings_for_migrate_tests", _DIR / "review_findings.py")
+rf = importlib.util.module_from_spec(_rf_spec)
+_rf_spec.loader.exec_module(rf)  # type: ignore[union-attr]
 
 
 def _fixture(number: int) -> dict:
@@ -141,3 +146,139 @@ def test_plan_migration_zero_findings_lost_across_all_three_real_fixtures():
     assert len(plan) == stats["total_findings"]
     assert stats["manual"] == stats["total_findings"]  # без repo_files/pr_files всё уходит в manual
     assert all(item["file"] is None for item in plan)
+
+
+# ── fetch_pr_files: удалённые файлы не годятся для broadcast ────────────────
+
+def test_fetch_pr_files_skips_removed_files(monkeypatch):
+    # files API отдаёт удалённым файлам status: "removed" — broadcast на
+    # такой путь замораживает находку навсегда (путь не появится в будущем
+    # диффе, пока его не воссоздадут; design.md развилка 5 отвергла
+    # `_legacy/pr-<N>` ровно за это). Переименованные/добавленные/правленные
+    # остаются — их будущие диффы реальны (ревью PR #1268).
+    def fake_gh(*args):
+        assert "pulls/1/files" in " ".join(args)
+        return [
+            {"filename": "live.py", "status": "added"},
+            {"filename": "gone.py", "status": "removed"},
+            {"filename": "renamed-to.py", "status": "renamed"},
+            {"filename": "edited.py", "status": "modified"},
+        ]
+
+    monkeypatch.setattr(mrf, "gh", fake_gh)
+    assert mrf.fetch_pr_files("mytab0r/edge-harness", 1) == [
+        "live.py", "renamed-to.py", "edited.py"]
+
+
+def test_plan_migration_manual_when_every_pr_file_removed(monkeypatch):
+    # PR, удаливший ВСЕ свои файлы, не даёт broadcast ни одного живого пути:
+    # после фильтра removed список пуст, а пустой список трактуется как
+    # «broadcast невозможен» — ручной разбор, не молчаливая «миграция» в
+    # мёртвые пути (та же ветка, что PR недоступен).
+    monkeypatch.setattr(
+        mrf, "fetch_pr_files", lambda repo, pr: [])  # уже отфильтровано выше
+    tails = [{"number": 999, "title": "Хвост чеклиста ревью PR #500",
+              "body": "- [ ] Находка на PR, удалившем единственный файл"}]
+    plan, stats = mrf.plan_migration(
+        tails, set(), lambda pr: mrf.fetch_pr_files("mytab0r/edge-harness", pr))
+    assert stats["broadcast"] == 0
+    assert stats["manual"] == 1
+    assert plan[0]["file"] is None
+
+
+# ── cmd_apply: идемпотентность повторного прогона ───────────────────────────
+
+def _make_server(stored) -> dict:
+    """Состояние эмулированного Contents API: то, что GET отдаёт до первого
+    PUT. ЕДИН на весь сценарий (включая повторный прогон cmd_apply) — иначе
+    второй прогон увидел бы пустой реестр и задвоение не поймалось бы."""
+    return {"content": base64.b64encode(rf.dump_registry(stored).encode("utf-8")).decode("ascii")}
+
+
+def _apply_plan(monkeypatch, tmp_path, server, plan_items):
+    """Прогон cmd_apply с эмуляцией сервера: GET всегда отдаёт актуальное
+    содержимое, PUT его перезаписывает. cmd_apply мутирует СВОЙ экземпляр
+    реестра (результат fetch_registry, распарсенный из текста), поэтому
+    наблюдаемый эффект — ТОЛЬКО содержимое PUT. Возвращает
+    (rc, число PUT, сервер)."""
+    import argparse
+    puts = []
+
+    def fake_gh(*args):
+        joined = " ".join(args)
+        if joined.startswith("-X PUT repos/mytab0r/edge-harness/contents/findings.json"):
+            for arg in args:
+                if arg.startswith("content="):
+                    server["content"] = arg[len("content="):]
+            puts.append(joined)
+            return {"content": {"sha": "newsha"}}
+        return {"content": server["content"], "sha": "blobsha"}
+
+    monkeypatch.setattr(mrf, "gh", fake_gh)
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps({"plan": plan_items, "stats": {}}), encoding="utf-8")
+    rc = mrf.cmd_apply(argparse.Namespace(repo="mytab0r/edge-harness", plan=str(plan_path)))
+    return rc, len(puts), server
+
+
+def _findings_on_server(server) -> list[dict]:
+    text = base64.b64decode(server["content"]).decode("utf-8")
+    return json.loads(text)["findings"]
+
+
+def test_cmd_apply_writes_findings_on_first_run(monkeypatch, tmp_path):
+    stored = rf.empty_registry()
+    plan = [
+        {"tail_issue": 900, "source_pr": 800, "file": "scripts/a.py",
+         "title": "Находка раз", "detail": "", "method": "exact"},
+        {"tail_issue": 900, "source_pr": 800, "file": "scripts/b.py",
+         "title": "Находка два", "detail": "", "method": "broadcast"},
+        {"tail_issue": 900, "source_pr": 800, "file": None,
+         "title": "Ручной разбор", "detail": "", "method": "manual"},
+    ]
+    server = _make_server(stored)
+    rc, puts, server = _apply_plan(monkeypatch, tmp_path, server, plan)
+    assert rc == 0
+    assert puts == 1
+    findings = _findings_on_server(server)
+    assert len(findings) == 2  # manual (file=None) не ключуется
+    assert {f["file"] for f in findings} == {"scripts/a.py", "scripts/b.py"}
+
+
+def test_cmd_apply_repeat_run_is_noop_not_duplicate(monkeypatch, tmp_path):
+    # Ретрай после сбоя / «а записалось ли?» не задваивает: тройка
+    # (file, title, source_pr) уже в реестре — пропуск, записи нет
+    # (ревью PR #1268, чеклист тела).
+    stored = rf.empty_registry()
+    plan = [
+        {"tail_issue": 900, "source_pr": 800, "file": "scripts/a.py",
+         "title": "Находка раз", "detail": "", "method": "exact"},
+        {"tail_issue": 900, "source_pr": 800, "file": "scripts/b.py",
+         "title": "Находка два", "detail": "", "method": "broadcast"},
+    ]
+    server = _make_server(stored)
+    rc1, puts1, server = _apply_plan(monkeypatch, tmp_path, server, plan)
+    assert (rc1, puts1) == (0, 1)
+    assert len(_findings_on_server(server)) == 2
+
+    rc2, puts2, server = _apply_plan(monkeypatch, tmp_path, server, plan)
+    assert rc2 == 0
+    assert puts2 == 0  # повторный прогон БЕЗ записи
+    assert len(_findings_on_server(server)) == 2  # и без дублей
+
+
+def test_cmd_apply_dedupes_duplicates_inside_single_plan(monkeypatch, tmp_path):
+    # Два одинаковых пункта в одном плане (два хвоста одного PR) — одна
+    # запись, не две.
+    stored = rf.empty_registry()
+    plan = [
+        {"tail_issue": 900, "source_pr": 800, "file": "scripts/a.py",
+         "title": "Находка раз", "detail": "", "method": "exact"},
+        {"tail_issue": 901, "source_pr": 800, "file": "scripts/a.py",
+         "title": "Находка раз", "detail": "", "method": "exact"},
+    ]
+    server = _make_server(stored)
+    rc, puts, server = _apply_plan(monkeypatch, tmp_path, server, plan)
+    assert rc == 0
+    assert puts == 1
+    assert len(_findings_on_server(server)) == 1

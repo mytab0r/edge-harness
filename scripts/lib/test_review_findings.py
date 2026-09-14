@@ -5,6 +5,7 @@
 Запуск: python -m pytest scripts/lib/test_review_findings.py -q
 """
 
+import base64
 import importlib.util
 import json
 from pathlib import Path
@@ -57,6 +58,34 @@ def test_empty_registry_shape():
 def test_load_registry_empty_text_is_empty_registry():
     assert rf.load_registry("") == rf.empty_registry()
     assert rf.load_registry(None) == rf.empty_registry()
+
+
+def test_load_registry_broken_json_raises_runtime_error_not_jsondecodeerror():
+    # Битый JSON — RuntimeError, НЕ голый json.JSONDecodeError (наследник
+    # ValueError): оба потребителя реестра (ai_review.py::findings_section,
+    # scheduler.py::after_merge) ловят только RuntimeError — до этой правки
+    # неспецошибка пролетала сквозь оба обработчика и роняла cmd_gather и
+    # пульс оркестратора ПОСЛЕ уже состоявшегося мержа (ревью PR #1268;
+    # дельта-спека: «сбой чтения реестра (сеть, битый JSON) не роняет
+    # gather»).
+    try:
+        rf.load_registry("{not json")
+        assert False, "ожидался RuntimeError"
+    except RuntimeError as error:
+        assert "битый JSON" in str(error)
+        assert "не состоялось" in str(error)
+
+
+def test_load_registry_json_not_object_raises_runtime_error():
+    # Валидный JSON не-объект (список/строка/число) — тот же класс битого
+    # реестра: без guard'а падал бы AttributeError на setdefault, снова мимо
+    # except RuntimeError потребителей.
+    for broken in ('[1, 2]', '"строка"', '42', 'null'):
+        try:
+            rf.load_registry(broken)
+            assert False, f"ожидался RuntimeError на {broken}"
+        except RuntimeError as error:
+            assert "не объект" in str(error) or "битый JSON" in str(error)
 
 
 def test_add_finding_assigns_sequential_ids():
@@ -151,6 +180,20 @@ def test_fetch_registry_reraises_non_404_errors():
         assert False, "ожидался RuntimeError"
     except RuntimeError as error:
         assert "HTTP 500" in str(error)
+
+
+def test_fetch_registry_broken_json_surfaces_as_runtime_error():
+    # Прод-форма отказа: реальный Contents API отдаёт content в base64 —
+    # репро ревью PR #1268 исполнено на этой форме. RuntimeError (не
+    # JSONDecodeError) — единственное, что оба потребителя умеют деградировать
+    # не падая.
+    fake = FakeGh({f"repos/{REPO}/contents/findings.json": {
+        "content": base64.b64encode(b"{not json").decode("ascii"), "sha": "x"}})
+    try:
+        rf.fetch_registry(fake, REPO)
+        assert False, "ожидался RuntimeError"
+    except RuntimeError as error:
+        assert "битый JSON" in str(error)
 
 
 # ── sync_after_merge: единственная точка мутации ────────────────────────────

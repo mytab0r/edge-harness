@@ -75,10 +75,27 @@ def load_registry(text: str | None) -> dict:
     """Пустой/отсутствующий текст — пустой реестр (ветка/файл ещё не
     существуют — первый писатель создаёт их, см. sync_after_merge), не
     ошибка: тот же приём, что review_checklist._read_section для тела без
-    секции чеклиста."""
+    секции чеклиста.
+
+    Битый JSON/JSON не-объект — RuntimeError с причиной, НЕ голый
+    json.JSONDecodeError (наследник ValueError): оба потребителя реестра
+    (ai_review.py::findings_section, scheduler.py::after_merge) ловят
+    RuntimeError — дельта-спека этого PR требует дословно «сбой чтения
+    реестра (сеть, битый JSON) не роняет gather», а неспецошибка пролетала
+    бы сквозь оба обработчика и роняла бы cmd_gather целиком и пульс
+    оркестратора ПОСЛЕ уже состоявшегося мержа (находка ревью PR #1268)."""
     if not text or not text.strip():
         return empty_registry()
-    data = json.loads(text)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            f"реестр находок: битый JSON ({error}) — чтение не состоялось, "
+            "это не «находок нет»") from error
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f"реестр находок: JSON не объект ({type(data).__name__}) — "
+            "чтение не состоялось, это не «находок нет»")
     data.setdefault("next_id", 1)
     data.setdefault("findings", [])
     return data
@@ -110,9 +127,9 @@ def add_finding(registry: dict, file: str, title: str, detail: str,
 def close_findings(registry: dict, ids: list[int], closed_by_pr: int) -> list[int]:
     """Возвращает реально закрытые id. Отсутствующий/уже закрытый/чужой id —
     не ошибка (модель могла сослаться на устаревший номер, увиденный в
-    прошлом раунде выписки) — тот же принцип терпимости, что unresolved_items
-    к незнакомому тексту: тихий пропуск точнее, чем громкий отказ вердикта из-
-    за одной неверной цифры."""
+    прошлом раунде выписки) — тот же принцип терпимости, что _read_section
+    в review_checklist к строкам вне формы пункта: тихий пропуск точнее,
+    чем громкий отказ вердикта из-за одной неверной цифры."""
     open_ids = {f["id"] for f in registry["findings"] if f.get("status") == "open"}
     closed = [i for i in ids if i in open_ids]
     closed_set = set(closed)
@@ -138,7 +155,7 @@ def render_findings_section(findings: list[dict]) -> str:
     if not findings:
         return "Открытых находок реестра по файлам этого PR нет."
     lines = [
-        "Открытые находки реестра (docs через #1262) по файлам этого PR — "
+        "Открытые находки реестра (заведены через #1262) по файлам этого PR — "
         "если код уже чинит находку, закрой её строкой `НАХОДКА-ЗАКРЫТА: <id>` "
         "(можно несколько строк); не упомянутая находка останется открытой "
         "сама, повторно заводить её как ЗАМЕЧАНИЕ не нужно:",

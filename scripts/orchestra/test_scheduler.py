@@ -5060,6 +5060,30 @@ def test_after_merge_closes_findings_marked_resolved_in_pr_body(monkeypatch):
     assert any("+0" in line and "-1" in line for line in actions)
 
 
+def test_after_merge_survives_broken_json_registry_with_loud_observation(monkeypatch):
+    # Битый JSON реестра — RuntimeError из load_registry (не голый
+    # json.JSONDecodeError, ревью PR #1268): ловится тем же except RuntimeError,
+    # что и сетевые отказы, и превращается в видимое ⚠️, НЕ уронив after_merge.
+    # Без этого мерж (уже состоявшийся к моменту вызова) убивал бы отчёт пульса
+    # и цикл слияний остальных PR — дельта-спека требует обратного.
+    import base64
+    merged = pull(163, pr_body=_checklist_body(unchecked=("Первое",)))
+    broken = {
+        "content": base64.b64encode(b"{not json").decode("ascii"), "sha": "regsha"}
+    fake = FakeGh({
+        "pulls/163/files": [],
+        f"repos/{REPO}/contents/{sch.review_findings.REGISTRY_PATH}": broken,
+    })
+    monkeypatch.setattr(sch, "gh", fake)
+    monkeypatch.setattr(sch, "update_remaining_pulls", lambda *a, **k: ([], []))
+
+    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+
+    assert hard_failure is False
+    assert any("не обновлён" in line and "битый JSON" in line
+               for line in observations + actions)
+
+
 def test_after_merge_never_calls_create_pool_issue_for_review_findings(monkeypatch):
     # Гвардия против регрессии в старое поведение (#1262, критерий 1):
     # after_merge на незакрытом чеклисте НЕ имеет права звать

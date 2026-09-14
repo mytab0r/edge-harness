@@ -195,24 +195,19 @@ def merge_checklist(pr_body: str, remarks: list[dict]) -> str | None:
     return "\n\n".join(parts) + "\n"
 
 
-def unresolved_items(pr_body: str) -> list[str]:
-    """Незакрытые (не отмеченные) пункты чеклиста в теле PR одной строкой
-    каждый («заголовок — детали») — человекочитаемая форма, используется
-    там, где важен только текст, не файл (например, отчёт actions
-    after_merge). Для переноса в реестр находок используется
-    unresolved_findings() ниже — структурная форма с файлом."""
-    _, items, _ = _read_section(pr_body)
-    return [f"{title} — {detail}" if detail else title
-            for checked, title, _file, detail in items if not checked]
-
-
 def unresolved_findings(pr_body: str) -> list[dict]:
     """Незакрытые пункты чеклиста в структурной форме {title, file, detail}
     — вход review_findings.sync_after_merge (#1262): file=None у пунктов,
     заведённых ДО этой правки или без объявленного ФАЙЛ (см. докстринг
     модуля) — sync_after_merge пропускает их при переносе в реестр, считая
     и показывая в отчёте (не тихая потеря, см. review_findings.
-    sync_after_merge докстринг про `skipped`)."""
+    sync_after_merge докстринг про `skipped`).
+
+    Человекочитаемой копии этого списка больше нет (`unresolved_items`
+    удалён как мёртвый код, находка ревью PR #1268): единственный бывший
+    вызывающий — отчёт actions after_merge — с #1262 читает структурную
+    форму ниже (реестру нужен файл, не только текст), а второй формы одного
+    и того же списка здесь не держим (AGENTS.md, «одно место правды»)."""
     _, items, _ = _read_section(pr_body)
     return [{"title": title, "file": file, "detail": detail}
             for checked, title, file, detail in items if not checked]

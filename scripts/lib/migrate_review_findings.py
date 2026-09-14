@@ -185,7 +185,21 @@ def fetch_pr_files(repo: str, pr_number: int) -> list[str] | None:
             payload = gh(f"repos/{repo}/pulls/{pr_number}/files?per_page=100&page={page}")
             if not payload:
                 break
-            files.extend(f["filename"] for f in payload)
+            for f in payload:
+                # status == "removed" — файл УДАЛЁН этим PR: такой путь не
+                # появится в будущем диффе, пока его специально не воссоздадут,
+                # значит broadcast на него — та же заморозка находки навсегда,
+                # от которой design.md (развилка 5) отверг вариант
+                # `_legacy/pr-<N>` («такой путь никогда не встретится в диффе
+                # — находка фактически ЗАМОРАЖИВАЕТСЯ навсегда»). files API
+                # отдаёт удалённым файлам status: "removed" — без фильтра
+                # план считал бы такую находку «перенесённой broadcast», а
+                # статистика «ноль потерянных» врала бы (находка ревью
+                # PR #1268). Честный исход — файл не попадает в выписку
+                # broadcast, находка без точного пути уходит в manual.
+                if f.get("status") == "removed":
+                    continue
+                files.append(f["filename"])
             if len(payload) < 100:
                 break
             page += 1
@@ -224,26 +238,43 @@ def cmd_apply(args: argparse.Namespace) -> int:
     """Пишет план в реестр ОДНИМ прогоном (не по находке) — требует
     contents: write (см. proposal.md — тот же контур прав, что
     scheduler.py::after_merge). Не запускать вне CI/без явного мандата
-    владельца на прод-запись (AGENTS.md, git-identity)."""
+    владельца на прод-запись (AGENTS.md, git-identity).
+
+    Идемпотентен: перед add_finding пропускается запись, у которой тройка
+    (file, title, source_pr) уже есть в реестре, — повторный прогон (ретрай
+    после сбоя посреди записи, «а записалось ли?») не задваивает находки.
+    Раньше идемпотентность по заголовку имел СТАРЫЙ носитель (сама задача-хвост
+    не могла существовать дважды), реестр без этого фильтра накапливал бы по
+    копии за каждый прогон (находка ревью PR #1268, чеклист тела)."""
     plan_path = Path(args.plan)
     payload = json.loads(plan_path.read_text(encoding="utf-8"))
     plan = payload["plan"]
     now = datetime.now(timezone.utc).isoformat()
     registry, sha = review_findings.fetch_registry(gh, args.repo)
-    added = 0
+    existing = {(f["file"], f["title"], f.get("source_pr"))
+                for f in registry["findings"]}
+    added = skipped = 0
     for item in plan:
         if not item.get("file"):
             continue
-        review_findings.add_finding(registry, item["file"], item["title"], item.get("detail", ""),
-                                    item.get("source_pr") or 0, now)
+        source_pr = item.get("source_pr") or 0
+        key = (item["file"], item["title"], source_pr)
+        if key in existing:
+            skipped += 1
+            continue
+        review_findings.add_finding(registry, item["file"], item["title"],
+                                    item.get("detail", ""), source_pr, now)
+        existing.add(key)  # и от дублей ВНУТРИ самого плана
         added += 1
     if added == 0:
-        print("Нечего писать — план пуст после фильтра по file.")
+        print(f"Новых находок нет: {skipped} уже в реестре "
+              "(повторный прогон безопасен, запись не нужна).")
         return 0
     review_findings.write_registry(
         gh, args.repo, registry, sha,
-        f"review-findings: миграция {added} находок из 110 хвостов (#1262)")
-    print(f"Записано {added} находок в реестр ({review_findings.REGISTRY_BRANCH}).")
+        f"review-findings: миграция {added} находок из задач-хвостов (#1262)")
+    print(f"Записано {added} новых находок, пропущено {skipped} уже существующих "
+          f"({review_findings.REGISTRY_BRANCH}).")
     return 0
 
 
