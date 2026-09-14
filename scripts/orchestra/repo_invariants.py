@@ -2151,9 +2151,20 @@ def check_conveyor_gate_phantom_pause(repo: str, now: datetime) -> check_result.
         runs = runs_of(pulse_guard.gh(
             f"repos/{repo}/actions/workflows/{pulse_guard.WORKER_WORKFLOW}/runs?per_page=10"),
             pulse_guard.WORKER_WORKFLOW)
+        # require_job_token=True (#1242, находка ai-review этого PR): этот
+        # пересчёт существует ради НЕЗАВИСИМОЙ сверки с решением conveyor_gate
+        # — значит, обязан читать маркеры с ТЕМ ЖЕ доверием, что и сам гейт
+        # (тот фильтр там с этого же PR). Без фильтра гейт и инвариант
+        # расходятся по построению на любом поддельном маркере: фейковый
+        # PAUSE при здоровой серии даёт «фантомную паузу», которой для гейта
+        # (allowed=True) не существует; фейковый RESUME становится якорем
+        # пересчёта и молча обнуляет проверку реальной красной серии. Сама
+        # детекция подделки не теряется — её держит инвариант 18 (всё
+        # семейство `[статус конвейера:`).
         all_markers = pulse_guard.issue_markers_any(
             repo, pulse_guard.WATCHDOG_ISSUE,
-            (pulse_guard.PAUSE_MARKER, pulse_guard.RESUME_MARKER))
+            (pulse_guard.PAUSE_MARKER, pulse_guard.RESUME_MARKER),
+            require_job_token=True)
     except RuntimeError as error:
         return check_result.unknown(
             f"история прогонов {pulse_guard.WORKER_WORKFLOW} или маркеры "
@@ -2830,7 +2841,10 @@ def check_frontend_deploy_stale(repo: str) -> dict:
 # REST-ответа `GET .../issues/{n}/comments` (не `user.login`: чужой логин
 # совпадает и у легитимного ручного обсуждения человеком в этом же issue,
 # не только у поддельного маркера — судить нужно о ТОКЕНЕ публикации, не о
-# личности автора, см. AGENTS.md «Атрибуция событий»). Живые прод-формы
+# личности автора, см. AGENTS.md «Атрибуция событий»). Сам предикат живёт
+# ОДИН раз — `pulse_guard.comment_is_job_authored` (#1242): его же зовут
+# фильтры чтения маркеров в conveyor_gate/resume_series_by_merge/инварианте
+# 13; здесь — та же функция, вторая инлайн-копия сведена. Живые прод-формы
 # (сняты 2026-09-13, `gh api repos/mytab0r/edge-harness/issues/120/comments`):
 #   честный маркер: {"performed_via_github_app": {"id": 15368, ...},
 #                     "user": {"login": "github-actions[bot]", "type": "Bot"}}
@@ -2920,7 +2934,10 @@ def check_pipeline_status_marker_impersonation(comments: list[dict]) -> list[dic
         first_line = body.splitlines()[0]
         if not PIPELINE_STATUS_MARKER_FAMILY_RE.search(first_line):
             continue
-        if comment.get("performed_via_github_app") is not None:
+        # Признак честности — одно место правды (замечание ai-review #1242):
+        # pulse_guard.comment_is_job_authored, тот же предикат, что фильтрует
+        # чтение маркеров в conveyor_gate/resume_series_by_merge/инварианте 13.
+        if pulse_guard.comment_is_job_authored(comment):
             continue  # опубликовано через GitHub App/job-токен — легитимно
         violations.append({
             "id": comment.get("id"),
@@ -3414,13 +3431,19 @@ def summary(lines: list[str]) -> None:
 # Эскалирующие инварианты: run_escalations обязана нести ветку для каждого
 # номера отсюда — находка доходит до канала владельца (#120 + Telegram через
 # pulse_guard.escalate), а не живёт только строкой отчёта прогона. 18 в
-# списке — поставленная задача (#1101, находка ревью PR #1102): поддельный
-# PAUSE/RESUME — единственный класс этих находок, который не только
-# сигнализирует, но и МЕНЯЕТ решение (conveyor_gate читает маркеры #120 без
-# trusted_login); соседний 16 эскалирует, а более широкий 18 молчал бы.
-# Газ общий и автоматический: escalate_if_new дедуплицирует по множеству id
-# нарушителей (вечный долг — одна эскалация, новая подделка — новая), ручного
-# снятия не требует.
+# списке — поставленная задача (#1101, находка ревью PR #1102). Уточнение
+# #1242 (доводка ai-review): до фильтра require_job_token поддельный
+# PAUSE/RESUME не только сигнализировал, но и МЕНЯЛ решение — conveyor_gate,
+# resume_series_by_merge и инвариант 13 читали маркеры #120 без фильтра по
+# токену. После закрытия того PR на чтении (те три места + PAUSE_REMINDER в
+# conveyor_gate) менять решение гейта подделка больше НЕ может нигде — 18
+# остаётся детектором самого ФАКТА подделки: маркер семейства
+# `[статус конвейера:` в канале, опубликованный не токеном job'а, — сигнал
+# о постороннем писателе, даже если на поведение конвейера он уже не влияет.
+# Эскалация отсюда не снимается: появление подделки — факт, который владелец
+# обязан видеть (писатель под PAT активен), а газ общий и автоматический:
+# escalate_if_new дедуплицирует по множеству id нарушителей (вечный долг —
+# одна эскалация, новая подделка — новая), ручного снятия не требует.
 ESCALATING_INVARIANTS = (1, 3, 12, 15, 16, 17, 18)
 
 def escalate_if_new(repo: str, invariant_id: int, marker_key: str, text: str) -> str | None:

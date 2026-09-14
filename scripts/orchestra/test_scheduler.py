@@ -5723,8 +5723,13 @@ def test_after_merge_resume_series_by_merge_posts_marker(monkeypatch):
         joined = " ".join(args)
         # порядок важен: FakeGh матчит по подстроке, более частный фрагмент — раньше
         if joined.startswith(f"-X POST repos/{REPO}/issues/120/comments"):
+            # performed_via_github_app: fake_gh симулирует POST настоящего
+            # job'а (escalate() внутри resume_series_by_merge) — require_
+            # job_token=True (#1242) на перечитывании обязан увидеть маркер
+            # доверенным, той же прод-формой, что несёт честный REST-ответ.
             store.append({"created_at": "2026-09-06T04:41:00Z",
-                          "body": args[-1].removeprefix("body=")})
+                          "body": args[-1].removeprefix("body="),
+                          "performed_via_github_app": {"slug": "github-actions"}})
             return None
         if joined == f"repos/{REPO}/issues/120/comments?per_page=100&page=1":
             return list(store)
@@ -5854,7 +5859,8 @@ def test_after_merge_resume_dedupes_by_pr_marker(monkeypatch):
             {"created_at": "2026-09-06T04:17:30Z", "body": CLAIM_TRACE_BODY}],
         f"{REPO}/issues/120/comments?per_page": [
             {"created_at": "2026-09-06T04:41:00Z",
-             "body": pg.resume_alert_text(163, 217, None)}],
+             "body": pg.resume_alert_text(163, 217, None),
+             "performed_via_github_app": {"slug": "github-actions"}}],
         f"-X POST repos/{REPO}/issues/217/comments": None,
         f"repos/{REPO}/issues/217": {**issue(217, assignees=("mytab0r",)), "state": "open"},
         f"{REPO}/actions/workflows/worker.yml/runs": RESUME_RED_RUNS,
@@ -5868,6 +5874,74 @@ def test_after_merge_resume_dedupes_by_pr_marker(monkeypatch):
 
     assert hard_failure is False
     assert not any("сброшена мержем" in line for line in actions + observations)
+
+
+# Живой поддельный маркер (issue #1242, доводка #1101/#1074): issuecomment-
+# 5665003751, `gh api repos/mytab0r/edge-harness/issues/comments/5665003751`
+# (2026-09-14T13:47:30Z) — `performed_via_github_app` пусто, автор `mytab0r`.
+# Тело здесь ЗАМЕНЕНО на RESUME_MARKER этого PR (сам live-комментарий несёт
+# WIP-close текст, дедуп resume_series_by_merge на него не смотрит вовсе) —
+# envelope (user/performed_via_github_app), от которого зависит фильтр,
+# буквальный, скопирован без изменений.
+_FAKE_RESUME_ENVELOPE = {
+    "user": {"login": "mytab0r", "type": "User"},
+    "performed_via_github_app": None,
+}
+
+
+def test_after_merge_resume_ignores_fake_dedup_marker_without_job_token(monkeypatch):
+    """Без require_job_token=True поддельный RESUME_MARKER (та же форма, что
+    #1242 нашла в #120 живьём) навсегда блокирует ЛЕГИТИМНЫЙ авто-сброс —
+    дедуп «уже сигналился» решает по чужеродной подделке. escalate() зовётся
+    НАСТОЯЩИЙ (как в test_after_merge_resume_series_by_merge_posts_marker) —
+    поддельный маркер уже лежит в #120 ДО вызова, настоящий постинг
+    дописывает второй, честный. Мутация: убрать require_job_token=True у
+    обоих чтений resume_token в resume_series_by_merge — этот тест краснеет
+    (escalate не позовётся, дедуп решит «уже сигналился» на подделке)."""
+    merged = resume_pull()
+    store = [{
+        "created_at": "2026-09-06T04:41:00Z",
+        "body": pg.resume_alert_text(163, 217, None),
+        **_FAKE_RESUME_ENVELOPE,
+    }]
+
+    def fake_gh(*args):
+        joined = " ".join(args)
+        if joined.startswith(f"-X POST repos/{REPO}/issues/120/comments"):
+            store.append({"created_at": "2026-09-06T04:42:00Z",
+                          "body": args[-1].removeprefix("body="),
+                          "performed_via_github_app": {"slug": "github-actions"}})
+            return None
+        if joined == f"repos/{REPO}/issues/120/comments?per_page=100&page=1":
+            return list(store)
+        if joined.startswith(f"-X POST repos/{REPO}/issues/217/comments"):
+            return None
+        if joined in (f"repos/{REPO}/pulls/163/files?per_page=100&page=1",
+                      f"repos/{REPO}/pulls/163/files?per_page=100&page=2"):
+            return []
+        if joined == f"repos/{REPO}/pulls/163":
+            return {"number": 163, "merged_at": "2026-09-06T04:40:56Z"}
+        if joined == f"repos/{REPO}/issues/217/comments?per_page=100&page=1":
+            return [{"created_at": "2026-09-06T04:17:30Z", "body": CLAIM_TRACE_BODY}]
+        if joined == f"repos/{REPO}/issues/217":
+            return {**issue(217, assignees=("mytab0r",)), "state": "open"}
+        if joined == f"repos/{REPO}/actions/workflows/worker.yml/runs?per_page=10":
+            return RESUME_RED_RUNS
+        raise AssertionError(f"нет маршрута для: {joined}")
+
+    patch_gh(monkeypatch, fake_gh)
+    monkeypatch.setattr(pg, "send_telegram", lambda text: True)
+    monkeypatch.setattr(sch, "send_telegram", lambda text, as_html=False: True)
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
+
+    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+
+    assert hard_failure is False
+    # видимый результат: НАСТОЯЩИЙ маркер дописан в #120 — дедуп не спутал
+    # поддельный с реальным сигналом и не заблокировал сброс навсегда
+    assert len(store) == 2, "escalate() обязан был реально дописать честный маркер"
+    assert any("сброшена мержем #163" in line for line in actions + observations)
 
 
 def test_after_merge_resume_does_not_claim_reset_when_marker_not_posted(monkeypatch):
