@@ -46,30 +46,96 @@ def ok_no_body():
     return SimpleNamespace(returncode=0, stdout="", stderr="")
 
 
+def _parse_gh_call(args):
+    """Разбор `["gh", "api", ...]` на (method, path, fields) — точнее, чем
+    подстрока по всей склеенной строке (находка #1190: подстрока "git/ref" у
+    GET-эндпоинта единичного рефа совпадала бы и с "git/refs" у POST/DELETE,
+    если бы матчить по join(args) целиком)."""
+    method = "GET"
+    path = None
+    fields = {}
+    tokens = list(args[2:])  # после "gh", "api"
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token == "-X":
+            method = tokens[i + 1]
+            i += 2
+            continue
+        if token == "-f":
+            key, _, value = tokens[i + 1].partition("=")
+            fields[key] = value
+            i += 2
+            continue
+        if path is None and not token.startswith("-"):
+            path = token
+        i += 1
+    return method, path, fields
+
+
 class FakeServer:
-    """gh api на моке subprocess.run: маршруты по подстроке пути + состояние
-    refs (POST существующего → 422), как это серверно делает GitHub."""
+    """gh api на моке subprocess.run: маршруты по разобранному (method, path) +
+    состояние refs (POST существующего → 422), как это серверно делает GitHub.
+
+    Держатель замка (#1190): POST /git/commits создаёт коммит с ДИНАМИЧЕСКИМ
+    sha и реально сохраняет тело сообщения (`commit_messages`) — GET
+    /git/ref/locks/task-N и GET /git/commits/{sha} читают его обратно, ровно
+    как настоящий GitHub Data API. Раньше POST /git/commits был статичным
+    маршрутом с одним и тем же sha на все claim'ы — этого хватало, пока
+    претенденты не начали различаться держателем."""
 
     def __init__(self, routes: dict | None = None):
         self.routes = routes or {}
         self.calls = []
         self.existing_refs: set[str] = set()
+        self.ref_sha: dict[str, str] = {}
+        self.commit_messages: dict[str, str] = {}
+        self._commit_seq = 0
 
-    def add_ref(self, ref):
+    def add_ref(self, ref, sha=None):
         self.existing_refs.add(ref)
+        if sha is not None:
+            self.ref_sha[ref] = sha
 
     def run(self, args, capture_output=True, text=True, encoding=None, env=None):
         joined = " ".join(args)
         self.calls.append(joined)
-        if "-X" in args and "POST" in args and "git/refs" in joined and "matching-refs" not in joined:
+        method, path, fields = _parse_gh_call(args)
+
+        if method == "POST" and path is not None and path.endswith("/git/refs"):
             # POST /git/refs: атомарное создание ref'а — второй претендент отклонён
-            ref = next(a.split("=", 1)[1] for a in args if a.startswith("ref="))
+            ref = fields["ref"]
+            sha = fields.get("sha")
             if ref in self.existing_refs:
                 return fail(422, "Reference already exists")
             self.existing_refs.add(ref)
+            if sha is not None:
+                self.ref_sha[ref] = sha
             return ok_no_body()
-        if "-X" in args and "DELETE" in args and "git/refs" in joined:
+        if method == "DELETE" and path is not None and "/git/refs/locks/task-" in path:
+            # Реальный GitHub реально убирает реф на DELETE — раньше мок этого
+            # не делал (existing_refs не менялся), латентная дыра: ни один
+            # тест до #1190 не проверял состояние после release() достаточно
+            # строго, чтобы это заметить.
+            ref = "refs/" + path.split("/git/refs/", 1)[1]
+            self.existing_refs.discard(ref)
+            self.ref_sha.pop(ref, None)
             return ok_no_body()
+        if method == "POST" and path is not None and path.endswith("/git/commits"):
+            message = fields.get("message", "")
+            self._commit_seq += 1
+            sha = f"csha{self._commit_seq}"
+            self.commit_messages[sha] = message
+            return out({"sha": sha})
+        if method == "GET" and path is not None and "/git/ref/locks/task-" in path:
+            ref = "refs/" + path.split("/git/ref/", 1)[1]
+            sha = self.ref_sha.get(ref)
+            if sha is None:
+                return fail(404, "Not Found")
+            return out({"ref": ref, "object": {"sha": sha}})
+        if method == "GET" and path is not None and "/git/commits/" in path:
+            sha = path.rsplit("/", 1)[1]
+            return out({"sha": sha, "message": self.commit_messages.get(sha, "")})
         for fragment, payload in self.routes.items():
             if fragment in joined:
                 return payload if isinstance(payload, SimpleNamespace) else out(payload)
@@ -84,8 +150,6 @@ def install(monkeypatch, server: FakeServer) -> FakeServer:
 BASE = {
     "repos/o/r/commits/main": {
         "sha": "basesha", "commit": {"tree": {"sha": "treasha"}, "committer": {"date": "2026-08-31T11:00:00Z"}}},
-    "repos/o/r/git/commits": {
-        "sha": "locksha", "commit": {"committer": {"date": "2026-08-31T12:00:00Z"}}},
     "issues/5/assignees": ok_no_body(),
     "issues/5/comments": ok_no_body(),
     # Проверка на входе (claim не выдаёт аренду на закрытую задачу): дефолт
@@ -254,14 +318,128 @@ def test_stale_boundary_is_strictly_beyond_ttl():
 
 
 def test_race_two_claims_one_wins_other_refused(monkeypatch):
+    # Держатель (#1190) различает КАНАЛЫ, не логин (actor у обоих может
+    # совпадать) — двум разным претендентам нужны РАЗНЫЕ holder, иначе второй
+    # вызов читается как идемпотентный перезабор своего же замка (см. отдельный
+    # тест на это поведение ниже, test_claim_same_holder_reclaims_idempotently).
     server = install(monkeypatch, FakeServer(dict(BASE)))
-    first = ct.claim("o/r", 5, "worker-a", now=utc(12, 0))
-    second = ct.claim("o/r", 5, "worker-b", now=utc(12, 0, ))
+    first = ct.claim("o/r", 5, "worker-a", now=utc(12, 0), holder="run:A")
+    second = ct.claim("o/r", 5, "worker-b", now=utc(12, 0), holder="run:B")
     assert first.claimed is True
     assert second.claimed is False and "занята" in second.detail
+    assert second.holder == "run:A"  # чужой отказ называет держателя (#1190)
     # ref создан один раз — серверное доказательство атомарности
     assert sum(1 for c in server.calls if "git/refs" in c and "-X" in c and "POST" in c) == 2
     assert server.existing_refs == {"refs/locks/task-5"}
+
+
+# ── Держатель замка (#1190): свой / чужой / неизвестный ─────────────────────────
+
+
+def test_claim_same_holder_reclaims_idempotently_without_removing_lock(monkeypatch):
+    # Живой случай #1190: канал A держит замок; A же повторно вызывает claim
+    # (например перезапуск того же прогона/дерева) — обязан получить успех БЕЗ
+    # снятия и пересоздания ref'а (идемпотентность), не «занята».
+    server = install(monkeypatch, FakeServer(dict(BASE)))
+    first = ct.claim("o/r", 5, "worker-a", now=utc(12, 0), holder="tree:/work/A")
+    assert first.claimed is True
+    sha_after_first = server.ref_sha["refs/locks/task-5"]
+    posts_before = sum(1 for c in server.calls if "-X" in c and "POST" in c)
+
+    second = ct.claim("o/r", 5, "worker-a", now=utc(13, 0), holder="tree:/work/A")
+    assert second.claimed is True
+    assert second.holder == "tree:/work/A"
+    assert "идемпотентна" in second.detail
+    # Замок НЕ тронут: тот же sha, ни один DELETE не ушёл.
+    assert server.ref_sha["refs/locks/task-5"] == sha_after_first
+    assert not any("-X" in c and "DELETE" in c for c in server.calls)
+    # Мутация: если бы reclaim молча совпадал по detail с обычным успехом
+    # («установлен»), этот ассерт бы не различил их — намеренно проверяем
+    # именно слово «идемпотентна», а не факт claimed=True.
+
+
+def test_claim_unknown_holder_is_third_state_not_silent_success_or_refusal(monkeypatch):
+    # Замок старого формата (#1190: создан ДО этого изменения, без строки
+    # `holder:`) — держателя установить нельзя. Мутационная проверка класса:
+    # ЕСЛИ бы claim() трактовал None-держателя как «свой» — это был бы
+    # молчаливый успех поверх чужого живого замка (ровно инцидент #1190);
+    # если бы трактовал как обычного «чужого» — сообщение потеряло бы разницу
+    # между «есть конкретный держатель X» и «держателя не установить».
+    server = install(monkeypatch, FakeServer(dict(BASE)))
+    server.add_ref("refs/locks/task-5", sha="legacy-sha")  # без commit_messages записи
+    result = ct.claim("o/r", 5, "worker-b", now=utc(12, 0), holder="tree:/work/B")
+    assert result.claimed is False
+    assert result.holder is None
+    assert "неизвестен" in result.detail
+    assert "старого формата" in result.detail
+
+
+def test_release_own_holder_succeeds_without_force(monkeypatch):
+    server = install(monkeypatch, FakeServer(dict(BASE)))
+    claimed = ct.claim("o/r", 5, "worker-a", now=utc(12, 0), holder="tree:/work/A")
+    assert claimed.claimed is True
+    detail = ct.release("o/r", 5, holder="tree:/work/A")
+    assert "снят" in detail
+    assert "refs/locks/task-5" not in server.existing_refs
+
+
+def test_release_foreign_holder_refuses_and_names_holder(monkeypatch):
+    # Ровно инцидент #1190: канал B пытается снять замок канала A, полагая его
+    # своим — обязан получить ForeignLockError, называющий держателя A, а НЕ
+    # тихо снять чужой живой замок.
+    server = install(monkeypatch, FakeServer(dict(BASE)))
+    claimed = ct.claim("o/r", 5, "worker-a", now=utc(12, 0), holder="tree:/work/A")
+    assert claimed.claimed is True
+    with pytest.raises(ct.ForeignLockError, match="tree:/work/A"):
+        ct.release("o/r", 5, holder="tree:/work/B")
+    # Замок НЕ снят — отказ произошёл ДО DELETE.
+    assert "refs/locks/task-5" in server.existing_refs
+    assert not any("-X" in c and "DELETE" in c for c in server.calls)
+
+
+def test_release_unknown_holder_lock_refuses_by_default(monkeypatch):
+    # Третье состояние и у release(): замок старого формата (без holder) —
+    # безопасный дефолт отказывает, не снимает вслепую.
+    server = install(monkeypatch, FakeServer(dict(BASE)))
+    server.add_ref("refs/locks/task-5", sha="legacy-sha")
+    with pytest.raises(ct.ForeignLockError, match="старого формата"):
+        ct.release("o/r", 5, holder="tree:/work/B")
+    assert not any("-X" in c and "DELETE" in c for c in server.calls)
+
+
+def test_release_force_bypasses_ownership_check(monkeypatch):
+    # Газ для тормоза (AGENTS.md «Тормоз без газа не принимается»): явный
+    # обход для того, кто уверен, что имеет право снять чужой/неизвестный замок.
+    server = install(monkeypatch, FakeServer(dict(BASE)))
+    claimed = ct.claim("o/r", 5, "worker-a", now=utc(12, 0), holder="tree:/work/A")
+    assert claimed.claimed is True
+    detail = ct.release("o/r", 5, holder="tree:/work/B", force=True)
+    assert "снят" in detail
+    assert "refs/locks/task-5" not in server.existing_refs
+
+
+def test_release_default_holder_none_is_unchanged_force_behavior(monkeypatch):
+    # scheduler.py зовёт release(repo, task) без holder — поведение НЕ меняется
+    # этим change: снятие идёт БЕЗ проверки владения (post-merge/TTL-сборщик
+    # авторитетны независимо от держателя). Мутация: если бы holder=None стал
+    # проверяться — этот тест упал бы ForeignLockError.
+    server = install(monkeypatch, FakeServer(dict(BASE)))
+    claimed = ct.claim("o/r", 5, "worker-a", now=utc(12, 0), holder="tree:/work/A")
+    assert claimed.claimed is True
+    detail = ct.release("o/r", 5)  # holder не передан вовсе
+    assert "снят" in detail
+
+
+def test_current_holder_prefers_env_over_run_id_over_cwd(monkeypatch):
+    monkeypatch.delenv("CLAIM_HOLDER", raising=False)
+    monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
+    assert ct.current_holder().startswith("tree:")
+
+    monkeypatch.setenv("GITHUB_RUN_ID", "998877")
+    assert ct.current_holder() == "run:998877"
+
+    monkeypatch.setenv("CLAIM_HOLDER", "explicit-holder")
+    assert ct.current_holder() == "explicit-holder"
 
 
 def test_claim_refuses_closed_task_without_creating_lock(monkeypatch):
@@ -612,6 +790,56 @@ def test_cli_exit_codes_contract(monkeypatch):
     assert ct.main(["x", "release", "5"]) == ct.EXIT_OK
     monkeypatch.setattr(ct, "release_full", lambda *a, **kw: "назначение снято; снят")
     assert ct.main(["x", "release-full", "5"]) == ct.EXIT_OK
+
+
+def test_cli_release_default_passes_current_holder(monkeypatch):
+    # Без --force CLI обязан передать holder=current_holder() в release() —
+    # это и есть переключение с «слепого force-снятия» на «снимает только
+    # своё» (#1190). Мутация: убери holder=current_holder() из main() — этот
+    # тест покраснеет (seen['holder'] останется None).
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setenv("CLAIM_HOLDER", "tree:/work/mine")
+    seen = {}
+
+    def fake_release(repo, task, holder=None, force=False):
+        seen["holder"] = holder
+        seen["force"] = force
+        return "снят"
+
+    monkeypatch.setattr(ct, "release", fake_release)
+    assert ct.main(["x", "release", "5"]) == ct.EXIT_OK
+    assert seen == {"holder": "tree:/work/mine", "force": False}
+
+
+def test_cli_release_force_skips_holder_check(monkeypatch):
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    seen = {}
+
+    def fake_release(repo, task):  # старая сигнатура — --force не должен передавать holder
+        seen["called"] = True
+        return "снят"
+
+    monkeypatch.setattr(ct, "release", fake_release)
+    assert ct.main(["x", "release", "5", "--force"]) == ct.EXIT_OK
+    assert seen == {"called": True}
+
+
+def test_cli_release_foreign_lock_error_is_busy_not_broken(monkeypatch):
+    # ForeignLockError — это «не смог снять чужое», не «инструмент сломан»:
+    # CLI обязан дать EXIT_BUSY (1), а не EXIT_ERROR (2), иначе вызывающий
+    # (человек/скрипт) не отличит осмысленный отказ владения от поломки.
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    def fake_release(repo, task, holder=None, force=False):
+        raise ct.ForeignLockError(f"замок task-{task} принадлежит держателю run:OTHER")
+
+    monkeypatch.setattr(ct, "release", fake_release)
+    assert ct.main(["x", "release", "5"]) == ct.EXIT_BUSY
+
+
+def test_cli_release_rejects_unknown_flag(monkeypatch):
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    assert ct.main(["x", "release", "5", "--wat"]) == ct.EXIT_ERROR
 
 
 def test_cli_requires_repo_and_valid_task(monkeypatch):
