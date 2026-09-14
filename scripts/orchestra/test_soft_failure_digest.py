@@ -22,7 +22,7 @@ skipped/skipped/skipped/success — ровно тот паттерн «усло�
 
 import importlib.util
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -439,7 +439,8 @@ def test_collect_window_end_to_end_finds_no_adapter_and_conditional_rollback(mon
     groups, observations, stats = sfd.collect_window(REPO, NOW)
     assert observations == []
     assert stats == {"workflows_total": 5, "workflows_ok": 5,
-                     "workflows_read": list(sfd.DIGEST_WORKFLOWS)}
+                     "workflows_read": list(sfd.DIGEST_WORKFLOWS),
+                     "partial_reads_failed": {}}
     # Канал A (аннотации): 3 прогона worker.yml несут одну и ту же аннотацию
     # NO_ADAPTER — над порогом 3, попадает в эскалацию.
     ranked = sfd.groups_over_threshold(groups, threshold=3)
@@ -550,6 +551,127 @@ def test_escalate_groups_cap_exhausted_skips_and_escalates_once(monkeypatch):
     assert actions == []
     assert any("отсечён потолком" in o for o in observations)
     assert any("-X POST" in c and "issues/120/comments" in c for c in fake.calls)
+
+
+# ── Частичный провал внутри "прочитанного" workflow (находка ревью PR
+# #1136, пятый круг, блокер 1) ────────────────────────────────────────────
+
+
+def test_collect_window_counts_partial_reads_failed_per_workflow(monkeypatch):
+    """workflow целиком прочитан (список прогонов есть), но check-runs ОДНОГО
+    из прогонов падает — это partial, не workflows_ok=0 и не полностью
+    прочитанное окно молча."""
+    routes = [
+        ("workflows/worker.yml/runs", {"workflow_runs": [
+            {"id": 100, "updated_at": "2026-09-13T10:00:00Z", "head_sha": "sha0", "html_url": "u0"},
+        ]}),
+        ("workflows/hands.yml/runs", {"workflow_runs": []}),
+        ("workflows/ai-review.yml/runs", {"workflow_runs": []}),
+        ("workflows/orchestra.yml/runs", {"workflow_runs": []}),
+        ("workflows/deploy-dsh-edge.yml/runs", {"workflow_runs": []}),
+        ("commits/sha0/check-runs", RuntimeError("rate limit")),
+    ]
+    monkeypatch.setattr(sfd, "load_workflow_layout", lambda path: {})
+    fake = FakeGh(routes)
+    patch_gh(monkeypatch, fake)
+
+    groups, observations, stats = sfd.collect_window(REPO, NOW)
+    assert stats["workflows_ok"] == 5
+    assert "worker.yml" in stats["workflows_read"]
+    assert stats["partial_reads_failed"] == {"worker.yml": 1}
+    assert any("check-runs" in o and "не прочитаны" in o for o in observations)
+
+
+def test_soft_failure_digest_heartbeat_names_partial_failures(monkeypatch):
+    """Находка ревью PR #1136 (пятый круг, блокер 1): partial_reads_failed
+    обязан попасть в heartbeat (единственное гарантированно читаемое место),
+    не только в наблюдения step summary."""
+    monkeypatch.setattr(sfd.rate_guard, "fetch_core", lambda: {"remaining": 950, "limit": 1000})
+    monkeypatch.setattr(sfd, "load_workflow_layout", lambda path: {})
+    posted: list[str] = []
+
+    def fake_post(repo, issue, body):
+        posted.append(body)
+        return {"id": 1}
+
+    routes = [
+        ("repos/mytab0r/edge-harness/issues/120", {"comments": 0}),
+        ("workflows/worker.yml/runs", {"workflow_runs": [
+            {"id": 100, "updated_at": "2026-09-13T10:00:00Z", "head_sha": "sha0", "html_url": "u0"},
+        ]}),
+        ("workflows/hands.yml/runs", {"workflow_runs": []}),
+        ("workflows/ai-review.yml/runs", {"workflow_runs": []}),
+        ("workflows/orchestra.yml/runs", {"workflow_runs": []}),
+        ("workflows/deploy-dsh-edge.yml/runs", {"workflow_runs": []}),
+        ("commits/sha0/check-runs", RuntimeError("rate limit")),
+    ]
+    fake = FakeGh(routes)
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sfd, "post_issue_comment", fake_post)
+
+    observations, actions, ok = sfd.soft_failure_digest(REPO, NOW)
+    assert ok is True
+    assert len(posted) == 1
+    assert "worker.yml" in posted[0] and "частично" in posted[0]
+
+
+# ── Дайджест давно не сканировал успешно (находка ревью PR #1136, пятый
+# круг, блокер 2) ──────────────────────────────────────────────────────────
+
+
+def test_escalate_stale_scan_silent_when_no_history(monkeypatch):
+    """Ни одного heartbeat'а в истории вовсе — либо только что заведён, либо
+    очень долгая деградация вне окна max_pages=3; неотличимо этим чтением —
+    не гадаем, молчим (см. докстринг escalate_stale_scan)."""
+    fake = FakeGh([("repos/mytab0r/edge-harness/issues/120", {"comments": 0})])
+    patch_gh(monkeypatch, fake)
+    observations = sfd.escalate_stale_scan(REPO, NOW)
+    assert observations == []
+    assert not any("-X POST" in c for c in fake.calls)
+
+
+def test_escalate_stale_scan_no_escalation_when_marker_fresh(monkeypatch):
+    fake = FakeGh([
+        ("issues/120/comments?per_page=100&page=1",
+         [{"created_at": "2026-09-13T11:00:00Z",
+           "body": f"{sfd.DIGEST_HEARTBEAT_MARKER} 2026-09-13T11:00:00+00:00]"}]),
+        ("repos/mytab0r/edge-harness/issues/120", {"comments": 1}),
+    ])
+    patch_gh(monkeypatch, fake)
+    observations = sfd.escalate_stale_scan(REPO, NOW)
+    assert observations == []
+    assert not any("-X POST" in c for c in fake.calls)
+
+
+def test_escalate_stale_scan_escalates_once_past_threshold(monkeypatch):
+    stale_time = (NOW - timedelta(hours=sfd.STALE_SCAN_THRESHOLD_HOURS + 1)).isoformat()
+    fake = FakeGh([
+        (f"comments?per_page=100&page=1",
+         [{"created_at": stale_time,
+           "body": f"{sfd.DIGEST_HEARTBEAT_MARKER} {stale_time}]"}]),
+        ("-X POST repos/mytab0r/edge-harness/issues/120/comments", {"id": 1}),
+        ("repos/mytab0r/edge-harness/issues/120", {"comments": 1}),
+    ])
+    patch_gh(monkeypatch, fake)
+    observations = sfd.escalate_stale_scan(REPO, NOW)
+    assert any("эскалировано" in o for o in observations)
+    assert any("-X POST" in c and "issues/120/comments" in c for c in fake.calls)
+
+
+def test_escalate_stale_scan_does_not_double_escalate_same_day(monkeypatch):
+    stale_time = (NOW - timedelta(hours=sfd.STALE_SCAN_THRESHOLD_HOURS + 1)).isoformat()
+    own_marker = f"{sfd.STALE_SCAN_MARKER} {NOW.date().isoformat()}]"
+    fake = FakeGh([
+        (f"comments?per_page=100&page=1",
+         [{"created_at": stale_time,
+           "body": f"{sfd.DIGEST_HEARTBEAT_MARKER} {stale_time}]"},
+          {"created_at": NOW.isoformat(), "body": own_marker}]),
+        ("repos/mytab0r/edge-harness/issues/120", {"comments": 2}),
+    ])
+    patch_gh(monkeypatch, fake)
+    observations = sfd.escalate_stale_scan(REPO, NOW)
+    assert observations == []
+    assert not any("-X POST" in c for c in fake.calls)
 
 
 # ── Квота (находка ревью PR #1136, блокер 2) ─────────────────────────────

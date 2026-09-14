@@ -311,10 +311,13 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
       вечный долг даёт одну эскалацию (#120 + Telegram), новая подделка
       меняет множество и даёт новую; владелец узнаёт о каждом новом эпизоде
       без спама на каждый пульс.
-  19. check_continue_on_error_readers (#1121) — инвариант «прогон зелёный,
+  20. check_continue_on_error_readers (#1121) — инвариант «прогон зелёный,
       а шаг красный» (номер 17 занят параллельным #1076/check_frontend_
       deploy_stale, 18 — #1101/check_pipeline_status_marker_impersonation,
-      оба выше; доводка ревью PR #1136 переехала на первый свободный):
+      19 — обнаружен занят открытым параллельным PR #1061/#925/
+      check_ci_failure_closed_but_main_red живым прогоном invariant_
+      numbering.py check ПОСЛЕ ребейза на свежий main (доводка PR #1136 по
+      итогам триажа); переехал на первый свободный):
       каждый `continue-on-error: true` в workflow-файлах
       обязан иметь ОБЪЯВЛЕННОГО читателя своего красного исхода. Читателем
       годится дайджест мягких отказов (soft_failure_digest.py, канал A —
@@ -334,7 +337,7 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
       может молча не обновляться) — гейтить с ходу означало бы красить
       обязательную проверку за накопленный долг (тот же порядок, что у
       1/4/5/9/10/12/13/14); газ и условие включения —
-      GATING_RELEASE_CONDITION[19].
+      GATING_RELEASE_CONDITION[20].
 
 Расписание: главный канал — периодический шаг orchestra.yml (cron */15 мин),
 он же вызывает escalate() для всех эскалирующих инвариантов — реестр
@@ -575,18 +578,20 @@ GATING_RELEASE_CONDITION: dict[int, str] = {
        "заархивировать (ключ держим не в CI_GATING, см. комментарий выше "
        "константы — как и у 3, это факт про газ, а не про то, гейтит ли "
        "сейчас 4)",
-    19: "дай шагу читателя: либо он в пяти workflow дайджеста "
+    20: "дай шагу читателя: либо он в пяти workflow дайджеста "
         "(DIGEST_WORKFLOWS в scripts/orchestra/soft_failure_digest.py — "
         "расширяй осознанно, это бюджет скана), либо внеси (workflow-файл, "
         "имя шага) в CONTINUE_ON_ERROR_READERS (repo_invariants.py), назвав "
         "механизм, который читает его красный исход; записи «читателя нет» "
         "реестр не допускает. После нуля нарушений на живом репозитории "
-        "(python scripts/orchestra/repo_invariants.py, секция [19]) инвариант "
+        "(python scripts/orchestra/repo_invariants.py, секция [20]) инвариант "
         "включается в CI_GATING той же правкой константы — ключ держим не в "
         "CI_GATING (см. комментарий у константы), как и у 4/9: это факт про "
-        "газ, а не про то, гейтит ли сейчас 19 (номер 17 занят #1076/"
+        "газ, а не про то, гейтит ли сейчас 20 (номер 17 занят #1076/"
         "check_frontend_deploy_stale, 18 — #1101/check_pipeline_status_"
-        "marker_impersonation, оба слиты раньше доводки этого инварианта)",
+        "marker_impersonation (оба слиты раньше доводки этого инварианта), 19 — "
+        "открытым (на момент доводки) параллельным PR #1061/#925/"
+        "check_ci_failure_closed_but_main_red)",
     7: "переформулируй однозначно — «артефакт владельца по адресу X» либо "
        "«наш плагин (пишем мы, не апстрим)»; правило — AGENTS.md, "
        "«Утверждение о готовом артефакте обязано нести его адрес» (#219). "
@@ -2849,7 +2854,7 @@ def check_pipeline_status_marker_impersonation(comments: list[dict]) -> list[dic
     return sorted(violations, key=lambda item: item["created_at"] or "")
 
 
-# ── Инвариант 19: continue-on-error обязан иметь объявленного читателя ──────
+# ── Инвариант 20: continue-on-error обязан иметь объявленного читателя ──────
 # (#1121, доводка ревью PR #1136: номер 17 к моменту этой доводки уже занят
 # #1076 «живая морда dsh-edge отстаёт от main» — здесь первый свободный,
 # 18 занят маркером статуса конвейера выше)
@@ -2902,14 +2907,33 @@ def _digest_module():
             "им workflow не сверить") from error
 
 
+def _continue_on_error_active(value) -> bool:
+    """Некритичная находка ревью PR #1136 (пятый круг): проверка `is True`
+    видит только литеральный YAML-булев `true` — форма `continue-on-error:
+    "${{ steps.x.outputs.y }}"` (GitHub Actions вычисляет её в рантайме,
+    PyYAML отдаёт обычную строку) или строка `'true'` в кавычках молча
+    выпадали из поля зрения целиком: инвариант считал бы такой шаг
+    безопасным просто потому, что распарсенное значение — не Python `True`.
+    Любое значение, кроме `False`/отсутствия ключа (`None`), теперь
+    засчитывается как «маскировка активна» — тот же принцип, что и
+    `unreadable` у нечитаемого YAML: непроверяемое состояние не имеет права
+    выглядеть здоровым (fail loud), даже если мы не можем статически
+    вычислить `${{ }}`-выражение до true/false."""
+    return value is not None and value is not False
+
+
 def check_continue_on_error_readers(workflows_dir: Path) -> list[dict]:
-    r"""Инвариант 19 (#1121), чистый файловый скан без сети (детерминированный,
+    r"""Инвариант 20 (#1121), чистый файловый скан без сети (детерминированный,
     тестируется на синтетических workflow, доказывается мутацией): каждый
     `continue-on-error: true` (шаг ИЛИ job целиком) обязан быть покрыт (a)
     списком workflow дайджеста (DIGEST_WORKFLOWS — импорт, не копия) или (b)
     записью CONTINUE_ON_ERROR_READERS с читателем. Имя файла, не разобранное
     YAML'ом, — тоже нарушение («unreadable»): непроверяемое состояние не имеет
-    права выглядеть здоровым (fail loud)."""
+    права выглядеть здоровым (fail loud).
+
+    `_continue_on_error_active` (не буквальный `is True`) — см. её докстринг:
+    строковые/выраженческие формы `continue-on-error` не выпадают из
+    проверки молча."""
     digest = _digest_module()
     yaml = digest.yaml  # тот же PyYAML, что читает сам дайджест, — без второго импорта
     violations: list[dict] = []
@@ -2940,7 +2964,7 @@ def check_continue_on_error_readers(workflows_dir: Path) -> list[dict]:
             # которую код не читал). Теперь job-уровень проверяется теми же
             # двумя ветками, что и шаг — ключ реестра при отсутствии
             # конкретного шага — (workflow, None).
-            if job.get("continue-on-error") is True:
+            if _continue_on_error_active(job.get("continue-on-error")):
                 if name in digest.DIGEST_WORKFLOWS:
                     pass  # читатель — дайджест, тот же довод, что у шагов ниже
                 elif CONTINUE_ON_ERROR_READERS.get((name, None)):
@@ -2949,7 +2973,7 @@ def check_continue_on_error_readers(workflows_dir: Path) -> list[dict]:
                     violations.append({"kind": "no-reader", "workflow": name,
                                        "job": str(job_key), "step": None})
             for step in (job.get("steps") or []):
-                if not isinstance(step, dict) or step.get("continue-on-error") is not True:
+                if not isinstance(step, dict) or not _continue_on_error_active(step.get("continue-on-error")):
                     continue
                 step_name = digest.step_display_name(step)
                 if name in digest.DIGEST_WORKFLOWS:
@@ -3369,36 +3393,39 @@ def build_report(repo: str, now: datetime,
             "опубликованы токеном job'а"
         )
 
-    # Инвариант 19 (#1121, доводка ревью PR #1136): номер 17 к моменту этой
-    # доводки уже занят #1076 («живая морда dsh-edge отстаёт от main») —
-    # переехал на первый свободный (18 занят маркером статуса конвейера
-    # выше). См. блок-комментарий у CONTINUE_ON_ERROR_READERS/check_
-    # continue_on_error_readers.
+    # Инвариант 20 (#1121, доводка ревью PR #1136): номер 17 к моменту этой
+    # доводки уже занят #1076 («живая морда dsh-edge отстаёт от main»), 18 —
+    # маркером статуса конвейера выше, 19 — обнаружен занят ПОСЛЕ ребейза
+    # на свежий main живым прогоном invariant_numbering.py check (доводка
+    # #1136 по итогам триажа): открытый параллельный PR #1061/#925
+    # (check_ci_failure_closed_but_main_red) независимо занял тот же номер —
+    # переехал на следующий свободный. См. блок-комментарий у
+    # CONTINUE_ON_ERROR_READERS/check_continue_on_error_readers.
     try:
-        v19 = check_continue_on_error_readers(REPO_ROOT / ".github" / "workflows")
+        v20 = check_continue_on_error_readers(REPO_ROOT / ".github" / "workflows")
     except RuntimeError as error:
-        findings[19] = []
-        lines.append(f"🚨 [19] проверка читателей continue-on-error недоступна: {error} — "
+        findings[20] = []
+        lines.append(f"🚨 [20] проверка читателей continue-on-error недоступна: {error} — "
                       "инвариант пропущен на этом прогоне (это НЕ «нарушений нет»)")
     else:
-        findings[19] = v19
-        unreadable19 = [item for item in v19 if item["kind"] == "unreadable"]
-        no_reader19 = [item for item in v19 if item["kind"] == "no-reader"]
-        if no_reader19:
-            lines.append(f"🚨 [19] {len(no_reader19)} шаг(ов) под continue-on-error: true "
+        findings[20] = v20
+        unreadable20 = [item for item in v20 if item["kind"] == "unreadable"]
+        no_reader20 = [item for item in v20 if item["kind"] == "no-reader"]
+        if no_reader20:
+            lines.append(f"🚨 [20] {len(no_reader20)} шаг(ов) под continue-on-error: true "
                           "без объявленного читателя (#1121, «прогон зелёный — шаг красный»):")
-            for item in no_reader19:
+            for item in no_reader20:
                 step = f"«{item['step']}»" if item["step"] else "весь job"
                 lines.append(f"   — {item['workflow']} / job {item['job']} / {step}")
-            lines.append("   газ — GATING_RELEASE_CONDITION[19]; форма объявления читателя — "
+            lines.append("   газ — GATING_RELEASE_CONDITION[20]; форма объявления читателя — "
                           "докстринг check_continue_on_error_readers")
-        elif not unreadable19:
-            lines.append("💚 [19] у всех continue-on-error: true в workflow есть объявленный "
+        elif not unreadable20:
+            lines.append("💚 [20] у всех continue-on-error: true в workflow есть объявленный "
                           "читатель (дайджест #1121 или CONTINUE_ON_ERROR_READERS)")
-        if unreadable19:
-            lines.append(f"⚠️ [19] {len(unreadable19)} workflow-файл(ов) не разобраны — статус "
+        if unreadable20:
+            lines.append(f"⚠️ [20] {len(unreadable20)} workflow-файл(ов) не разобраны — статус "
                           "НЕИЗВЕСТЕН, это не подтверждение здоровья:")
-            for item in unreadable19:
+            for item in unreadable20:
                 lines.append(f"   — {item['workflow']}: {item['error']}")
 
     return lines, findings

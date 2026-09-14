@@ -126,10 +126,19 @@ def test_parse_registry_entries_pins_the_live_repo_invariants_registry():
     text = live_path.read_text(encoding="utf-8")
     parsed = inv.parse_registry_entries(text)
 
-    assert set(parsed) == {str(n) for n in range(1, 19)}, (
+    # Номер 19 сознательно ПРОПУЩЕН в этом пине (доводка PR #1136, пятый
+    # круг): живой прогон `invariant_numbering.py check` после ребейза на
+    # свежий main нашёл коллизию — открытый параллельный PR #1061/#925
+    # (`check_ci_failure_closed_but_main_red`) независимо занял 19, этот
+    # PR переехал на первый реально свободный номер (20). Диапазон реестра
+    # не обязан быть непрерывным — общий числовой ресурс без арбитра
+    # (issue #904) конкурирует между PR, и «дыра» на месте номера,
+    # занятого ещё не смёрженным PR, — штатное временное состояние, не
+    # дефект парсера.
+    assert set(parsed) == {str(n) for n in range(1, 19)} | {"20"}, (
         "диапазон номеров реестра изменился (см. docstring "
-        "scripts/orchestra/repo_invariants.py) — обнови range(1, 19) в этом "
-        "пине, ИЛИ REGISTRY_ENTRY_RE перестал видеть живую запись"
+        "scripts/orchestra/repo_invariants.py) — обнови этот пин, ИЛИ "
+        "REGISTRY_ENTRY_RE перестал видеть живую запись"
     )
 
     registry_functions = {name for names in parsed.values() for name in names}

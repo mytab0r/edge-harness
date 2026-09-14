@@ -232,6 +232,17 @@ SOFT_FAILURE_DAILY_CAP = 5
 SOFT_FAILURE_FINGERPRINT_MARKER = "<!-- soft-failure-fingerprint: "
 SOFT_FAILURE_CAP_MARKER = "[soft-failure-digest: потолок исчерпан"
 
+# Находка ревью PR #1136 (пятый круг, блокер 2): «скан давно не выполнялся
+# успешно» — свой отдельный маркер и своя эскалация раз в календарный день,
+# тем же приёмом, что SOFT_FAILURE_CAP_MARKER выше. Не путать с
+# DIGEST_HEARTBEAT_MARKER — тот пишется КАЖДЫЙ успешный скан, этот маркер
+# читается, чтобы обнаружить, что успешных сканов давно не было.
+STALE_SCAN_MARKER = "[soft-failure-digest: скан устарел"
+# ~2×DIGEST_INTERVAL_HOURS (находка дословно): один пропущенный скан —
+# самозалечивание окном 24ч ещё не под угрозой, два подряд пропущенных —
+# уже сигнал, что квота/сеть деградируют устойчиво (живой класс #1100).
+STALE_SCAN_THRESHOLD_HOURS = DIGEST_INTERVAL_HOURS * 2
+
 
 # ── Нормализация и отпечаток (чистые функции, без сети) ──────────────────────
 
@@ -555,18 +566,32 @@ def collect_window(
     Сбой чтения одного прогона/workflow — наблюдение, не остановка всего
     скана (тот же приём, что pulse_guard.failure_watch: continue, не raise).
 
-    Третий элемент — `{"workflows_total": N, "workflows_ok": M}` (находка
+    Третий элемент — `{"workflows_total": N, "workflows_ok": M, ...}` (находка
     ревью PR #1136, блокер 3): «список прогонов НЕ прочитан ни для одного
     workflow» и «прочитан, групп просто нет» — разные факты, вызывающий
     (`soft_failure_digest`) обязан различать их, а не печатать одинаковое
     «группы не найдены» на оба (AGENTS.md, «алерт не гадает» — здесь тот же
-    класс: пустой результат должен нести причину пустоты)."""
+    класс: пустой результат должен нести причину пустоты).
+
+    `partial_reads_failed` (находка ревью PR #1136, пятый круг, блокер 1):
+    список прогонов workflow может прочитаться ЦЕЛИКОМ (workflow попадает в
+    `workflows_read`), а чтение check-runs/jobs/аннотаций для отдельных
+    прогонов ВНУТРИ него — падать (rate limit посреди скана, живой #1100).
+    Раньше это тонуло ⚠️-строкой в step summary (непрочитываемо, докстринг
+    `mark_heartbeat`), а сам workflow всё равно засчитывался «прочитанным» —
+    heartbeat закрывал гейт на `DIGEST_INTERVAL_HOURS`, хотя реально
+    прочитана была только часть окна этого workflow. Счётчик — по числу
+    неудачных попыток на прогон (check-runs ИЛИ jobs ИЛИ аннотации), не по
+    workflow одной галочкой: `soft_failure_digest` передаёт его в
+    `mark_heartbeat`, чтобы гейт называл честную степень покрытия, не только
+    факт «workflow вообще тронут»."""
     since = now - timedelta(hours=window_hours)
     groups: dict[str, dict] = {}
     observations: list[str] = []
     step_conclusions: dict[tuple, list] = {}
     workflows_ok = 0
     workflows_read: list[str] = []
+    partial_reads_failed: dict[str, int] = {}
 
     for workflow in workflows:
         # Локальное чтение (0 сетевых вызовов) — какие шаги ЭТОГО workflow
@@ -597,6 +622,7 @@ def collect_window(
                 annotated = fetch_annotated_check_runs(repo, run)
             except RuntimeError as error:
                 observations.append(f"⚠️ soft-failure-digest {workflow}: check-runs {run_url} не прочитаны ({error})")
+                partial_reads_failed[workflow] = partial_reads_failed.get(workflow, 0) + 1
                 annotated = []
             for check_run in annotated:
                 job_name = check_run.get("name", "?")
@@ -605,6 +631,7 @@ def collect_window(
                 except RuntimeError as error:
                     observations.append(
                         f"⚠️ soft-failure-digest {workflow} (job «{job_name}»): аннотации не прочитаны ({error})")
+                    partial_reads_failed[workflow] = partial_reads_failed.get(workflow, 0) + 1
                     continue
                 for annotation in annotations:
                     level = annotation.get("annotation_level")
@@ -620,6 +647,7 @@ def collect_window(
                 jobs = fetch_jobs(repo, run)
             except RuntimeError as error:
                 observations.append(f"⚠️ soft-failure-digest {workflow}: jobs {run_url} не прочитаны ({error})")
+                partial_reads_failed[workflow] = partial_reads_failed.get(workflow, 0) + 1
                 continue
             for job in jobs:
                 job_name = job.get("name", "?")
@@ -651,7 +679,7 @@ def collect_window(
 
     add_step_occurrences(groups, step_conclusions)
     stats = {"workflows_total": len(workflows), "workflows_ok": workflows_ok,
-             "workflows_read": workflows_read}
+             "workflows_read": workflows_read, "partial_reads_failed": partial_reads_failed}
     return groups, observations, stats
 
 
@@ -691,6 +719,63 @@ def mark_heartbeat(repo: str, now: datetime, unread: list[str] | None = None) ->
         repo, WATCHDOG_ISSUE,
         f"{DIGEST_HEARTBEAT_MARKER} {now.isoformat()}]\n"
         "soft-failure-digest: очередной полный скан выполнен." + suffix)
+
+
+def escalate_stale_scan(repo: str, now: datetime) -> list[str]:
+    """Находка ревью PR #1136 (пятый круг, блокер 2): все внутренние отказы
+    `escalate_groups`/`quota_sufficient`/`digest_due` раньше оставляли след
+    только в step summary (непрочитываемо) — при устойчивом исчерпании квоты
+    (живой #1100) дайджест мог сидеть мёртвым днями, а критерий 3 задачи
+    («заводит задачу сама») молча переставал выполняться при формально
+    зелёной системе. Эскалация по ВОЗРАСТУ последнего УСПЕШНОГО heartbeat'а
+    (`DIGEST_HEARTBEAT_MARKER`), не по факту конкретного отказа — не важно,
+    КАКОЙ шаг внутри скана деградировал, важно, что скана не было
+    `STALE_SCAN_THRESHOLD_HOURS` часов подряд. Раз в календарный день —
+    тот же приём, что `SOFT_FAILURE_CAP_MARKER` выше (собственный маркер,
+    `issue_marker_times` проверяет, не эскалировали ли уже сегодня).
+
+    Читает маркер НЕЗАВИСИМО от `digest_due`/квоты — вызывается ДО обоих
+    (см. `soft_failure_digest`), чтобы застой сообщался, даже если сам скан
+    в этом тике пропущен (рано или квоты не хватает): иначе устойчивое
+    исчерпание квоты держало бы `digest_due()`/`quota_sufficient()` в
+    состоянии «пропускаю» бесконечно, и эта функция никогда бы не вызвалась.
+
+    Сбой чтения самого маркера — не эскалируем вслепую (нечем отличить
+    «стухло» от «просто не прочиталось»), только наблюдение."""
+    try:
+        times = issue_marker_times(repo, WATCHDOG_ISSUE, DIGEST_HEARTBEAT_MARKER, max_pages=3)
+    except RuntimeError as error:
+        return [f"::warning::soft-failure-digest: маркер heartbeat не прочитан ({error}) — "
+                "возраст последнего успешного скана неизвестен"]
+    if not times:
+        # Ни одного heartbeat'а в истории вовсе — либо только что заведён
+        # (первый скан ещё не случился), либо очень долгая деградация вне
+        # окна max_pages=3. Первое — не деградация, второе неотличимо от
+        # первого этим чтением; молчим, не гадаем (AGENTS.md, «алерт не
+        # гадает») — ближайший digest_due() всё равно попытается просканировать.
+        return []
+    age_hours = (now - max(times)).total_seconds() / 3600
+    if age_hours < STALE_SCAN_THRESHOLD_HOURS:
+        return []
+    marker = f"{STALE_SCAN_MARKER} {now.date().isoformat()}]"
+    try:
+        already_escalated = bool(issue_marker_times(repo, WATCHDOG_ISSUE, marker, max_pages=3))
+    except RuntimeError as error:
+        return [f"::warning::soft-failure-digest: маркер {STALE_SCAN_MARKER} не прочитан ({error})"]
+    if already_escalated:
+        return []
+    escalate(
+        repo, WATCHDOG_ISSUE,
+        f"🚨 edge-harness: {marker}\n"
+        f"soft-failure-digest не завершал успешный скан {age_hours:.1f}ч "
+        f"(порог {STALE_SCAN_THRESHOLD_HOURS:.0f}ч) — конвейер мог деградировать "
+        "молча всё это время, критерий #1121 «заводит задачу сама» не "
+        "выполняется, пока скан не выполнился.\n\n"
+        "Что дальше: посмотреть step summary последних прогонов orchestra "
+        "(шаг «Дайджест мягких отказов») и квоту GitHub API "
+        "(`gh api rate_limit`) — устойчивое исчерпание квоты (#1100) "
+        "самая частая причина.")
+    return [f"🚨 soft-failure-digest: скан не выполнялся {age_hours:.1f}ч — эскалировано в #{WATCHDOG_ISSUE}"]
 
 
 # ── Дедуп/эскалация — по ОТКРЫТЫМ issues SOFT_FAILURE_LABEL, не по #120 ──────
@@ -769,8 +854,14 @@ def escalate_groups(repo: str, ranked_groups: list[dict], now: datetime) -> tupl
     try:
         open_issues = open_soft_failure_issues(repo)
     except RuntimeError as error:
+        # `::warning::` — не `⚠️` (находка ревью PR #1136, пятый круг, блокер
+        # 2): текст с эмодзи-префиксом попадает только в step summary
+        # (непрочитываемо, докстринг mark_heartbeat) — настоящая аннотация
+        # Checks API даёт каналу A этого же дайджеста шанс поймать деградацию
+        # самой эскалации на следующем скане, ровно как уже сделано для
+        # workflows_ok == 0.
         observations.append(
-            f"⚠️ soft-failure-digest: список задач {SOFT_FAILURE_LABEL} не прочитан ({error}) — "
+            f"::warning::soft-failure-digest: список задач {SOFT_FAILURE_LABEL} не прочитан ({error}) — "
             "дедуп недоступен, задачи в этом пульсе не заводятся")
         return observations, actions
     tracked = tracked_fingerprints(open_issues)
@@ -792,7 +883,7 @@ def escalate_groups(repo: str, ranked_groups: list[dict], now: datetime) -> tupl
             except RuntimeError as error:
                 counter_failed = True
                 observations.append(
-                    f"⚠️ soft-failure-digest: счётчик суточного потолка не прочитан ({error}) — "
+                    f"::warning::soft-failure-digest: счётчик суточного потолка не прочитан ({error}) — "
                     f"класс {fp} и следующие в этом пульсе не заводятся")
                 continue
         if created_today >= SOFT_FAILURE_DAILY_CAP:
@@ -807,7 +898,7 @@ def escalate_groups(repo: str, ranked_groups: list[dict], now: datetime) -> tupl
             created = pool_issue.create_pool_issue(gh, repo, title, body,
                                                 ["task", SOFT_FAILURE_LABEL, "area:orchestra"])
         except RuntimeError as error:
-            observations.append(f"⚠️ soft-failure-digest: класс {fp} не заведён ({error})")
+            observations.append(f"::warning::soft-failure-digest: класс {fp} не заведён ({error})")
             continue
         created_today += 1
         actions.append(f"📋 soft-failure-digest: класс {fp} → задача #{created['number']}")
@@ -817,7 +908,7 @@ def escalate_groups(repo: str, ranked_groups: list[dict], now: datetime) -> tupl
         try:
             already_capped = bool(issue_marker_times(repo, WATCHDOG_ISSUE, marker, max_pages=3))
         except RuntimeError as error:
-            observations.append(f"⚠️ soft-failure-digest: маркеры #{WATCHDOG_ISSUE} не прочитаны ({error})")
+            observations.append(f"::warning::soft-failure-digest: маркеры #{WATCHDOG_ISSUE} не прочитаны ({error})")
             already_capped = True
         if not already_capped:
             escalate(
@@ -867,15 +958,24 @@ def soft_failure_digest(repo: str, now: datetime) -> tuple[list[str], list[str],
     тогда, когда #1100 (исчерпание квоты) делает такой провал вероятнее.
     Heartbeat при `ok=False` НЕ пишется — гейт остаётся открытым, следующий
     обычный тик (~15 мин) повторит попытку, пока падение дешёвое (один
-    вызов метаданных #120 на несостоявшийся скан)."""
+    вызов метаданных #120 на несостоявшийся скан).
+
+    `escalate_stale_scan` (находка ревью PR #1136, пятый круг, блокер 2)
+    вызывается ПЕРВЫМ, ДО обоих ранних `return` ниже (рано / квоты не
+    хватает) — иначе устойчивая нехватка квоты держала бы оба гейта в
+    состоянии «пропускаю» бесконечно, и застой самого дайджеста никогда бы
+    не сообщился."""
+    stale_obs = escalate_stale_scan(repo, now)
+
     if not digest_due(repo, now):
-        return ["⏭️ soft-failure-digest: рано — предыдущий полный скан моложе интервала"], [], True
+        return stale_obs + ["⏭️ soft-failure-digest: рано — предыдущий полный скан моложе интервала"], [], True
 
     quota_ok, quota_text = quota_sufficient()
     if not quota_ok:
-        return [f"⏭️ soft-failure-digest: {quota_text}"], [], True
+        return stale_obs + [f"⏭️ soft-failure-digest: {quota_text}"], [], True
 
     groups, observations, stats = collect_window(repo, now)
+    observations = stale_obs + observations
     if stats["workflows_ok"] == 0:
         # Находка ревью PR #1136 (третий круг): текст с эмодзи-префиксом
         # 🚨 попадал только в наблюдения/step summary — НЕ становился
@@ -902,11 +1002,19 @@ def soft_failure_digest(repo: str, now: datetime) -> tuple[list[str], list[str],
     esc_obs, actions = escalate_groups(repo, ranked, now)
     observations += esc_obs
 
+    # Находка ревью PR #1136 (пятый круг, блокер 1): «workflow целиком не
+    # прочитан» и «workflow прочитан, но часть его прогонов — нет» — оба
+    # обязаны попасть в единственное место, которое гейт цикла читает
+    # гарантированно (heartbeat), а не рассыпаться ⚠️-строками step summary.
     unread = [w for w in DIGEST_WORKFLOWS if w not in stats["workflows_read"]]
+    unread += [
+        f"{w} (частично: {n} прогонов)"
+        for w, n in sorted(stats["partial_reads_failed"].items()) if n
+    ]
     try:
         mark_heartbeat(repo, now, unread=unread)
     except RuntimeError as error:
-        observations.append(f"⚠️ soft-failure-digest: heartbeat в #{WATCHDOG_ISSUE} не оставлен ({error})")
+        observations.append(f"::warning::soft-failure-digest: heartbeat в #{WATCHDOG_ISSUE} не оставлен ({error})")
 
     return observations, actions, True
 

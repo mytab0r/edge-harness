@@ -3935,7 +3935,7 @@ def test_run_escalations_invariant_18_key_stays_compact(monkeypatch):
     assert seen_markers[0] != seen_markers[1]  # новый состав — новая эскалация
 
 
-# ── Инвариант 19 (#1121): continue-on-error обязан иметь читателя ──────────
+# ── Инвариант 20 (#1121): continue-on-error обязан иметь читателя ──────────
 # (номер 17 занят check_frontend_deploy_stale выше, 18 —
 # check_pipeline_status_marker_impersonation выше — доводка ревью PR #1136
 # переехала на первый свободный)
@@ -3958,6 +3958,31 @@ jobs:
     violations = ri.check_continue_on_error_readers(tmp_path)
     assert violations == [{"kind": "no-reader", "workflow": "some-new.yml",
                            "job": "job1", "step": "Быстрый шаг"}]
+
+
+def test_continue_on_error_string_expression_form_is_not_invisible(tmp_path):
+    """Некритичная находка ревью PR #1136 (пятый круг): `continue-on-error:
+    "${{ steps.x.outputs.y }}"` — PyYAML отдаёт обычную строку, не Python
+    `True` — раньше `is True` пропускал такую форму молча целиком."""
+    _write_workflow(tmp_path, "some-new.yml", """
+jobs:
+  job1:
+    steps:
+      - name: Условный шаг
+        continue-on-error: "${{ steps.x.outputs.y }}"
+        run: echo hi
+""")
+    violations = ri.check_continue_on_error_readers(tmp_path)
+    assert violations == [{"kind": "no-reader", "workflow": "some-new.yml",
+                           "job": "job1", "step": "Условный шаг"}]
+
+
+def test_continue_on_error_active_helper_treats_false_and_absent_as_inactive():
+    assert ri._continue_on_error_active(True) is True
+    assert ri._continue_on_error_active("${{ steps.x.outputs.y }}") is True
+    assert ri._continue_on_error_active("true") is True
+    assert ri._continue_on_error_active(False) is False
+    assert ri._continue_on_error_active(None) is False
 
 
 def test_continue_on_error_in_digest_workflow_is_covered(tmp_path):
@@ -4084,7 +4109,7 @@ def test_live_debt_snapshot_known_violations():
     """Замер долга на живом репозитории (момент внедрения #1121): ровно 4
     нарушения, все — за пределами пяти workflow дайджеста. Новый
     continue-on-error без читателя в ЛЮБОМ workflow добавит строку и покрасит
-    этот тест — включение инварианта в CI_GATING (GATING_RELEASE_CONDITION[19])
+    этот тест — включение инварианта в CI_GATING (GATING_RELEASE_CONDITION[20])
     сознательная правка, не дрейф."""
     violations = ri.check_continue_on_error_readers(ri.REPO_ROOT / ".github" / "workflows")
     found = {(v["workflow"], v["step"]) for v in violations if v["kind"] == "no-reader"}
