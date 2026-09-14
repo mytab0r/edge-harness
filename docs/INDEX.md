@@ -76,6 +76,7 @@
 - [0016. Конкуренция за код не устраняется приёмом регистрации: границы параллельной работы](decisions/0016-parallel-work-on-shared-code-boundaries.md)
 - [0017. Второй гейт морды dsh-edge: e2e-смоук на PR против локального воркера](decisions/0017-dsh-edge-pr-smoke-local-worker.md)
 - [0018. Алерт «пульс не бьётся» живёт в DO (Cloudflare), не в GitHub Actions](decisions/0018-pulse-alert-lives-in-do.md)
+- [0022. Связывание контекста между каналами: три точечных приёма вместо общего носителя](decisions/0022-cross-channel-context-transfer.md)
 
 ## Операционные процедуры
 
