@@ -132,6 +132,13 @@ _cp_spec = importlib.util.spec_from_file_location(
 check_pr = importlib.util.module_from_spec(_cp_spec)
 _cp_spec.loader.exec_module(check_pr)
 
+# Классификация класса дефекта в источнике (#1237): контракт КЛАСС, словарь
+# известных/кандидатов, третье состояние (см. докстринг defect_classes.py).
+_dc_spec = importlib.util.spec_from_file_location(
+    "defect_classes", SCRIPT_DIR / "defect_classes.py")
+defect_classes = importlib.util.module_from_spec(_dc_spec)
+_dc_spec.loader.exec_module(defect_classes)
+
 # Контракт ответа модели. Строка ВЕРДИКТ обязана быть последней непустой и
 # единственной — двусмысленность это error, а не одобрение. Модель периодически
 # оборачивает машиночитаемую строку в markdown-выделение (**…**/__…__) вопреки
@@ -610,6 +617,13 @@ def findings_of(answer: str, tasks: list[dict] | None = None,
         stripped = line.strip()
         if VERDICT_RE.match(stripped):
             continue
+        # Строка КЛАСС (#1237) — машинный трейлер находки п.1 «блокирует
+        # мерж», не часть текста, который читает человек в комментарии PR;
+        # снимается тем же приёмом, что строка ВЕРДИКТ выше (findings_of не
+        # знает о defect_classes.classify() — просто убирает строки по форме
+        # defect_classes.CLASS_LINE_RE, третье место правды не заводим).
+        if defect_classes.CLASS_LINE_RE.match(stripped):
+            continue
         if in_task:
             if stripped == TASK_CLOSE:
                 in_task = False
@@ -635,7 +649,8 @@ def build_comment(number: int, sha: str, verdict: str, findings: str,
                   remarks: list[dict] | None = None,
                   chain_provider: str | None = None,
                   reset_hint: str | None = None,
-                  reason_tag_value: str | None = None) -> str:
+                  reason_tag_value: str | None = None,
+                  class_signal: "defect_classes.ClassSignal | None" = None) -> str:
     """Канонический комментарий-вердикт. Шапка-факты — САМЫЕ ПЕРВЫЕ строки,
     до первого пустой строки (инвариант: file_tasks.py парсит ТОЛЬКО эту
     зону и фенсы задач, проза и заборы не могут притвориться фактами).
@@ -671,14 +686,25 @@ def build_comment(number: int, sha: str, verdict: str, findings: str,
     #431): факт `reason:` в шапке, который scheduler.trigger_ai_review читает
     для решения о бюджете автоповторов ЭТОЙ эпохи. None (verdict != "error"
     или вызов без классификации) не добавляет строку — та же обратная
-    совместимость, что у diff_fp."""
+    совместимость, что у diff_fp.
+
+    class_signal (#1237) — defect_classes.ClassSignal с трёх-состояньным
+    полем `.state` (not_named/candidate/known) и списками slug'ов; строка
+    `class:` добавляется, только если состояние не "not_named" — молчание на
+    approve-вердиктах без блокирующих находок (у них полю КЛАСС неоткуда
+    взяться, п.1 контракта их не касается) не раздувает шапку сотнями пустых
+    строк."""
     diff_line = f"diff: {diff_fp}\n" if diff_fp else ""
     provider_line = f"provider: {chain_provider}\n" if chain_provider else ""
     reset_line = f"reset-at: {reset_hint}\n" if reset_hint else ""
     reason_line = f"reason: {reason_tag_value}\n" if reason_tag_value else ""
+    class_line = ""
+    if class_signal is not None and class_signal.state != defect_classes.STATE_NOT_NAMED:
+        slugs = ",".join(class_signal.known + class_signal.candidates)
+        class_line = f"class: {class_signal.state}={slugs}\n"
     head = (
         f"pr: {number}\nhead: {sha}\nreviewer: {verdict}\n"
-        f"{diff_line}{provider_line}{reset_line}{reason_line}\n"
+        f"{diff_line}{provider_line}{reset_line}{reason_line}{class_line}\n"
         f"🤖 AI-ревью — второй гейт конвейера (#18). Вердикт: {verdict}."
     )
     backlog, tail, unscoped = partition_tasks(tasks)
@@ -820,6 +846,23 @@ def rules_section() -> str:
     )
 
 
+def defect_classes_section(repo: str) -> str:
+    """$defect_classes_section (#1237) — известные классы + кандидаты
+    (см. defect_classes.py). Чтение кандидатов — сетевой вызов (issue #1238,
+    несколько страниц, defect_classes.MAX_CANDIDATE_READ_PAGES); сбой чтения
+    не должен ронять gather целиком (дифф-ревью важнее словаря-кандидатов) —
+    деградирует на defect_classes.render_prompt_section_unavailable, которая
+    называет причину явно (AGENTS.md, «алерт не гадает»), не молчит «кандидатов
+    нет» вместо настоящего «не прочитано»."""
+    try:
+        candidates = defect_classes.recent_candidate_stats(repo, gh)
+    except RuntimeError as error:
+        print(f"::warning::gather: кандидаты классов дефектов не прочитаны ({error}) — "
+              "промпт получит только утверждённые классы")
+        return defect_classes.render_prompt_section_unavailable(str(error))
+    return defect_classes.render_prompt_section(candidates)
+
+
 def cmd_gather(args: argparse.Namespace) -> int:
     repo = os.environ["GITHUB_REPOSITORY"]
     pull = gh(f"repos/{repo}/pulls/{args.pr}")
@@ -918,6 +961,7 @@ def cmd_gather(args: argparse.Namespace) -> int:
         "task_section": task_section(pull, repo),
         "size_section": size_question_section(added),
         "rules_section": rules_section(),
+        "defect_classes_section": defect_classes_section(repo),
     }
     # Гвардия silent-wrong: если какой-то плейсхолдер шаблона не попал в мэппинг
     # (опечатка, переименование, удаление ключа) — safe_substitute молча оставит
@@ -1203,6 +1247,20 @@ def cmd_verdict(args: argparse.Namespace) -> int:
                for r in remarks]
     remarks = [r for r in remarks if r["title"]]
 
+    # Классификация класса дефекта (#1237) — на СЫРОМ answer, до redact():
+    # slug состоит из русских/латинских букв и дефисов (SLUG_RE), redact
+    # маскирует только формы секретов, находку не тронет, но считать на
+    # исходном тексте — не тратить время на редактирование ради поля, которое
+    # заведомо не несёт секретов. Отсутствие поля — НЕ ошибка контракта (см.
+    # docstring defect_classes.classify): старые ответы без строки КЛАСС
+    # (контракт используют параллельные PR, #1237 п.8) разбираются как
+    # state=not_named, verdict не трогается.
+    class_signal = defect_classes.classify(answer)
+    if verdict == "rework" and class_signal.state == defect_classes.STATE_NOT_NAMED:
+        print("::warning::ai-review: вердикт rework без единой строки КЛАСС — "
+              "блокирующие находки не классифицированы (#1237), промоушен "
+              "кандидатов не получит сигнала с этого PR")
+
     # rework без единой находки — нарушение контракта (#210), не валидный
     # ai:changes-requested: см. докстринг rework_without_findings. Проверяется
     # ПОСЛЕ финальной фильтрации tasks/remarks (пустые заголовки уже отброшены
@@ -1342,9 +1400,22 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     diff_fp = review_labels.diff_fingerprint(files)
     body = build_comment(args.pr, args.head, verdict, findings, tasks, diff_fp=diff_fp,
                           remarks=remarks, chain_provider=args.chain_provider,
-                          reset_hint=args.reset_hint, reason_tag_value=reason_tag_value)
+                          reset_hint=args.reset_hint, reason_tag_value=reason_tag_value,
+                          class_signal=class_signal)
     run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/comments",
            "-f", "body=" + body)
+
+    # Маркер-наблюдение кандидата (#1237, issue #1238) — ПОСЛЕ обоих
+    # head-чеков выше: не пишем наблюдение для вердикта, который уже
+    # отброшен гонкой (head уехал), иначе кандидат накапливал бы шум от
+    # ревью, чей вердикт человек никогда не увидит. Сбой записи — не должен
+    # ронять сам вердикт (словарь — вторичный канал, не критичный путь comment/
+    # label/status выше, уже отправленных к этому моменту).
+    for slug in class_signal.candidates:
+        try:
+            defect_classes.record_candidate_observation(repo, run_gh, slug, args.pr)
+        except RuntimeError as error:
+            print(f"::warning::ai-review: кандидат класса «{slug}» не записан в #{defect_classes.DEFECT_CLASS_TRACKER_ISSUE} ({error})")
 
     if verdict == "error":
         tail = redact("\n".join((answer or "").splitlines()[-12:]))
