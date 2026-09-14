@@ -205,13 +205,32 @@ def fetch_registry(gh_func: GhFn, repo: str) -> tuple[dict, str | None]:
     (первая находка когда-нибудь создаст и то, и другое, см.
     sync_after_merge._ensure_branch). Любой отказ, кроме точного «файла нет»,
     поднимается наверх — вызывающий (findings_section) обязан отличить
-    «находок нет» от «не прочитано» (см. render_unavailable)."""
+    «находок нет» от «не прочитано» (см. render_unavailable).
+
+    Ответ `encoding: "none"` с пустым content — отказ, не пустой реестр:
+    GET /contents/{path} отдаёт такую форму для файла КРУПНЕЕ потолка 1 МБ
+    (HTTP 200, content="", encoding="none"). Трактовать её как пустой
+    реестр значило бы два silent-wrong разом: выписка findings_section
+    отвечала бы «находок нет» при полном реестре, а sync_after_merge
+    приписал бы новые пункты к ПУСТОМУ реестру и записал бы его с валидным
+    sha — молчаливо стерев все накопленные находки (находка ревью
+    PR #1268; файл растёт монотонно — closed записи не удаляются, — так
+    что потолок не теоретический). RuntimeError с причиной: оба
+    потребителя уже умеют громко деградировать (render_unavailable /
+    ⚠️-observation), а запись при этом не состоится."""
     try:
         payload = gh_func(f"repos/{repo}/contents/{REGISTRY_PATH}?ref={REGISTRY_BRANCH}")
     except RuntimeError as error:
         if _is_not_found(error):
             return empty_registry(), None
         raise
+    if payload.get("encoding") == "none" or (payload.get("sha") and not payload.get("content")):
+        raise RuntimeError(
+            f"реестр находок: файл крупнее потолка Contents API 1 МБ "
+            f"(encoding={payload.get('encoding')!r}, content пуст) — чтение "
+            "не состоялось, это не «находок нет»; записывать поверх нельзя, "
+            "иначе реестр будет стёрт (нужна компактация реестра, см. "
+            "proposal.md)")
     content = base64.b64decode(payload["content"]).decode("utf-8")
     return load_registry(content), payload["sha"]
 

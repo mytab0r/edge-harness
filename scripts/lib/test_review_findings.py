@@ -196,6 +196,39 @@ def test_fetch_registry_broken_json_surfaces_as_runtime_error():
         assert "битый JSON" in str(error)
 
 
+def test_fetch_registry_oversized_file_encoding_none_is_error_not_empty():
+    # Прод-форма GET /contents/{path} для файла КРУПНЕЕ потолка 1 МБ:
+    # HTTP 200, content="", encoding="none" (ревью PR #1268). Трактовать это
+    # как пустой реестр значило бы: findings_section молчит «находок нет»
+    # при полном реестре, а sync_after_merge приписывает новые пункты к
+    # пустому реестру и ПЕРЕЗАПИСЫВАЕТ файл с валидным sha — молчаливое
+    # стирание всех накопленных находок. Обязан быть RuntimeError с
+    # названием причины.
+    fake = FakeGh({f"repos/{REPO}/contents/findings.json": {
+        "content": "", "encoding": "none", "sha": "bigfileblobsha"}})
+    try:
+        rf.fetch_registry(fake, REPO)
+        assert False, "ожидался RuntimeError"
+    except RuntimeError as error:
+        assert "1 МБ" in str(error)
+        assert "не «находок нет»" in str(error)
+
+
+def test_sync_after_merge_refuses_write_on_oversized_registry_response():
+    # Поведенческая гвардия второго (худшего) следствия: при encoding=none
+    # запись НЕ состоит — PUT-маршрута в fake нет специально, любой PUT
+    # покрасил бы тест AssertionError заглушки.
+    fake = FakeGh({f"repos/{REPO}/contents/findings.json": {
+        "content": "", "encoding": "none", "sha": "bigfileblobsha"}})
+    try:
+        rf.sync_after_merge(fake, REPO, 163,
+                            [{"title": "Т", "file": "a.py", "detail": ""}], [], "t")
+        assert False, "ожидался RuntimeError"
+    except RuntimeError as error:
+        assert "1 МБ" in str(error)
+    assert not any(c.startswith("-X PUT") for c in fake.calls)
+
+
 # ── sync_after_merge: единственная точка мутации ────────────────────────────
 
 def test_sync_after_merge_adds_only_items_with_file():
