@@ -3942,7 +3942,7 @@ def test_run_escalations_invariant_18_key_stays_compact(monkeypatch):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Инвариант 19 (issue #1253): «доводку не звали ни разу» отдельно от
+# Инвариант 22 (issue #1253): «доводку не звали ни разу» отдельно от
 # «доводка звалась и не помогла» — check_stuck_review_gate (инвариант 3)
 # структурно не видит PR с уже вынесенным ai:changes-requested.
 # ══════════════════════════════════════════════════════════════════════════
@@ -4005,6 +4005,47 @@ def test_ai_rework_never_dispatched_silent_when_marker_present(monkeypatch):
     patch_gh(monkeypatch, fake)
     now = utc(2026, 9, 14, 15, 33)  # ~7.5 суток с простановки метки
     assert ri.check_ai_rework_never_dispatched("mytab0r/edge-harness", now, [pull]) == []
+
+
+def test_ai_rework_never_dispatched_flags_recidivism_across_episodes(monkeypatch):
+    """Находка написания дельта-спеки этого PR (класс #1172 в новом коде):
+    `ever_dispatched` сканировал ВСЮ историю комментариев PR на маркер
+    доводки, не сверяясь с `labeled_at` ТЕКУЩЕГО эпизода — PR, которому
+    доводку делали в ПРОШЛОМ эпизоде ai:changes-requested, потом метку
+    сняли, потом навесили снова и он опять застоялся сверх порога, не
+    отмечался НИКОГДА: старый маркер глушил находку ровно на рецидиве, ради
+    которого инвариант написан.
+
+    Два эпизода на одном PR: доводка (маркер) в ПЕРВОМ эпизоде
+    (2026-08-25 → снята 2026-08-28), тишина во ВТОРОМ эпизоде (навешена
+    заново 2026-09-06) сверх порога — инвариант обязан найти, несмотря на
+    маркер первого эпизода.
+
+    Мутация: убери условие `pulse_guard.parse_time(comment["created_at"]) >=
+    labeled_at` (верни голое `MARKER in body for comment in comments`,
+    без сверки с episode) — этот тест покраснеет: старый маркер первого
+    эпизода снова заглушит находку второго."""
+    pull = open_pr(900, labels=[ri.review_labels.AI_CHANGES])
+    timeline = [
+        {"event": "labeled", "label": {"name": ri.review_labels.AI_CHANGES},
+         "created_at": "2026-08-25T00:00:00Z"},
+        {"event": "unlabeled", "label": {"name": ri.review_labels.AI_CHANGES},
+         "created_at": "2026-08-28T00:00:00Z"},
+        {"event": "labeled", "label": {"name": ri.review_labels.AI_CHANGES},
+         "created_at": "2026-09-06T00:00:00Z"},
+    ]
+    fake = FakeGh({
+        "issues/900/timeline": timeline,
+        # Маркер лежит МЕЖДУ первым labeled (08-25) и unlabeled (08-28) —
+        # принадлежит ПЕРВОМУ эпизоду, строго раньше второго labeled (09-06).
+        "issues/900/comments": [ai_rework_marker_comment("2026-08-26T12:00:00Z")],
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 14, 15, 33)  # ~8.6 суток со ВТОРОГО эпизода (09-06)
+    violations = ri.check_ai_rework_never_dispatched("mytab0r/edge-harness", now, [pull])
+    assert len(violations) == 1
+    assert violations[0]["pr"] == 900
+    assert violations[0]["labeled_at"].startswith("2026-09-06")  # возраст СЧИТАН от нового эпизода
 
 
 def test_ai_rework_never_dispatched_silent_for_conflict_pr(monkeypatch):
