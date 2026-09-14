@@ -18,6 +18,9 @@ print_infra_digest() {
 GitHub: gh issue/pr view/create — GraphQL, при отказе пробуй gh api. heredoc в bash —
         блокируется, многострочный текст через Write в файл.
         scripts/gh/queue.py и pr_blockers.py <N> — что мешает PR слиться.
+Git: свежее рабочее дерево может оказаться поверхностным клоном (git rev-parse
+     --is-shallow-repository = true) — даёт ложные конфликты add/add на файлах,
+     существующих в обеих ветках. Лечится git fetch --unshallow origin (#1203).
 Cloudflare: см. docs/agents/INFRA-CF.md (лимиты DO/Workers, если документ уже есть).
 ─────────────────────────────────────────────────────────────────────────────
 DIGEST
