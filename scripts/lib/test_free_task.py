@@ -195,7 +195,9 @@ def test_tier0_propagates_through_multi_step_chain():
     assert [i["number"] for i in result] == [610, 700, 629]
 
 
-def test_ordinary_task_that_blocks_nothing_and_is_not_meta_or_broken_is_tier2():
+def test_ordinary_task_that_blocks_nothing_and_is_not_meta_or_broken_is_tier3():
+    # Тир сдвинулся с 2 на 3 задачей #1178 (см. test_priority_reason_names_
+    # meta_label_for_tier2 ниже) — порядок между уровнями не изменился.
     plain = issue(50, labels=[])
     meta = issue(60, labels=["area:process"])
     broken = issue(70, labels=["ci-failure"])
@@ -212,6 +214,76 @@ def test_tier0_mutation_removing_broken_labels_check_breaks_ordering():
     meta_heavy = issue(300, labels=["area:process"], blocking_open=10)
     urgent = free_task._urgent_numbers([meta_heavy, broken], broken_labels=frozenset())
     assert urgent == set()  # метка ci-failure больше не даёт urgent
+
+
+# ── Тир 1 задачи #1178: impact:system обгоняет area:process, тай-брейк цел ──
+#
+# Живой дефект (замер #1178, 93 свободные задачи, 2026-09-14T00:30Z): внутри
+# тира area:process тай-брейк по номеру issue систематически топил свежие
+# барьерные задачи (#1161/#1172/…, номер > 1100) под старыми «хвостами
+# чеклиста ревью» (#1007..#1019, номер < 1020) — обеим не хватало отличающего
+# признака внутри тира. IMPACT_LABEL добавляет отдельный тир строго между
+# «сейчас красный» (0) и area:process (2 после сдвига), не трогая порядок
+# ВНУТРИ тиров 2/3 (номер по-прежнему решает при равенстве).
+
+
+def test_impact_label_beats_meta_even_with_higher_number():
+    # Ровно живой случай: свежая барьерная задача (номер БОЛЬШЕ) обгоняет
+    # старый «хвост чеклиста» той же меты area:process (номер МЕНЬШЕ) — без
+    # IMPACT_LABEL тай-брейк по номеру дал бы обратный порядок.
+    checklist_tail = issue(1007, title="Хвост чеклиста ревью PR #983", labels=["area:process"])
+    barrier = issue(1172, title="Механизм недостижим по построению",
+                     labels=["area:process", "impact:system"])
+    result = free_task.prioritized_free([checklist_tail, barrier])
+    assert [i["number"] for i in result] == [1172, 1007]
+
+
+def test_impact_label_works_without_meta_label_too():
+    # Живой случай #1149 замера #1178: барьерная задача БЕЗ area:process
+    # (дрейф патч-серии dsh-edge) всё равно обгоняет обычную мета-задачу.
+    barrier_no_meta = issue(1149, labels=["impact:system"])
+    ordinary_meta = issue(10, labels=["area:process"])
+    result = free_task.prioritized_free([ordinary_meta, barrier_no_meta])
+    assert [i["number"] for i in result] == [1149, 10]
+
+
+def test_impact_label_does_not_outrank_tier0_broken():
+    # Барьерная метка — самооценка (#1178), «сейчас красный» — факт (#224):
+    # тир 0 остаётся выше тира 1, IMPACT_LABEL его не подвинул.
+    broken = issue(70, labels=["ci-failure"])
+    barrier = issue(10, labels=["impact:system"])
+    result = free_task.prioritized_free([barrier, broken])
+    assert [i["number"] for i in result] == [70, 10]
+
+
+def test_impact_label_tiebreak_by_number_preserved_within_tier():
+    # «Старые долги не забываем» — намеренно НЕ тронуто задачей #1178: две
+    # барьерные задачи внутри одного тира по-прежнему сортируются по номеру.
+    older = issue(50, labels=["impact:system"])
+    newer = issue(90, labels=["impact:system"])
+    result = free_task.prioritized_free([newer, older])
+    assert [i["number"] for i in result] == [50, 90]
+
+
+def test_impact_beats_meta_mutation_removing_impact_check_reverts_order():
+    # Доказательство мутацией (AGENTS.md): без учёта IMPACT_LABEL (эквивалент
+    # «снять фикс» — вызвать issue_priority_key с несуществующей меткой)
+    # порядок ДОЛЖЕН вернуться к старому — старый «хвост чеклиста» (меньший
+    # номер) снова обгоняет свежую барьерную задачу.
+    checklist_tail = issue(1007, labels=["area:process"])
+    barrier = issue(1172, labels=["area:process", "impact:system"])
+    urgent = free_task._urgent_numbers([checklist_tail, barrier])
+    transitive = free_task.task_deps.transitive_blocking_counts([checklist_tail, barrier])
+    key_without_fix = sorted(
+        [checklist_tail, barrier],
+        key=lambda i: free_task.issue_priority_key(
+            i, urgent=urgent, transitive=transitive, impact_label="does-not-exist",
+        ),
+    )
+    assert [i["number"] for i in key_without_fix] == [1007, 1172]  # фикс снят — старый порядок
+
+    key_with_fix = free_task.prioritized_free([checklist_tail, barrier])
+    assert [i["number"] for i in key_with_fix] == [1172, 1007]  # фикс на месте — новый порядок
 
 
 # ── priority_reason: объяснимость (критерий 1 задачи #224) ─────────────────
@@ -235,18 +307,29 @@ def test_priority_reason_names_transitively_blocked_broken_task():
     assert "тир 0" in text
 
 
-def test_priority_reason_names_meta_label_for_tier1():
+def test_priority_reason_names_meta_label_for_tier2():
+    # Тир сдвинулся с 1 на 2 задачей #1178 (новый тир 1 — IMPACT_LABEL, см.
+    # ниже) — та же семантика («про сам процесс работы»), другой номер тира.
     pool = [issue(300, labels=["area:process"])]
     text = free_task.priority_reason(pool[0], pool)
     assert "area:process" in text
-    assert "тир 1" in text
+    assert "тир 2" in text
 
 
-def test_priority_reason_reports_blocked_by_open_and_tier2_for_plain_task():
+def test_priority_reason_reports_blocked_by_open_and_tier3_for_plain_task():
     pool = [issue(50, labels=[], blocked_by_open=[10])]
     text = free_task.priority_reason(pool[0], pool)
-    assert "тир 2" in text
+    assert "тир 3" in text
     assert "#10" in text  # чем сама заблокирована — тоже факт, не гадание
+
+
+def test_priority_reason_names_impact_label_for_tier1():
+    # Задача #1178: IMPACT_LABEL — новый тир 1, между «сейчас красный» (0) и
+    # area:process (2).
+    pool = [issue(400, labels=["impact:system"])]
+    text = free_task.priority_reason(pool[0], pool)
+    assert "impact:system" in text
+    assert "тир 1" in text
 
 
 def test_priority_reason_reports_transitive_weight_number():
