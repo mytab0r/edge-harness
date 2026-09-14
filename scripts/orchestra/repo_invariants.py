@@ -2029,7 +2029,9 @@ def check_recurring_worker_failure(repo: str) -> check_result.CheckResult:
 # порога 277+ — инвариант молчал бы до самого рипера и не давал бы ничего
 # сверх уже существующего. Типичный здоровый прогон (~59 мин/прогон,
 # замер 09-13, docs/research/33-worker-parallelism-limits.md) до 200 мин не
-# доходит с запасом >3x.
+# доходит с запасом >3x. Файл docs/research/33-worker-parallelism-limits.md
+# живёт в ветке ещё ОТКРЫТОГО PR #1093 — в дереве main его пока нет (форма
+# оговорки — docs/decisions/0022).
 WORKER_RUN_LONG_RUNNING_MINUTES = 200
 
 
@@ -3472,9 +3474,11 @@ def build_report(repo: str, now: datetime,
         lines.append(
             f"{check_result.status_emoji(check_result.STATUS_VIOLATION)} [21] "
             f"прогон {RECURRING_FAILURE_WORKFLOW} #{item['run_id']} идёт "
-            f"{item['age_minutes']} мин (порог {item['threshold_minutes']}, #1160/#1141) "
-            f"— держит единственный слот воркера дольше нового ожидаемого легитимного "
-            f"максимума, рипер (WORKER_STALL_MINUTES=295) сработает позже: {item['url']}"
+            f"{item['age_minutes']} мин — дольше порога раннего наблюдения "
+            f"{item['threshold_minutes']} мин (#1160/#1141); порог осознанно внутри "
+            f"легитимного коридора (~277 мин, комментарий над "
+            f"WORKER_RUN_LONG_RUNNING_MINUTES), отмену делает не этот инвариант, "
+            f"а рипер (WORKER_STALL_MINUTES=295), который сработает позже: {item['url']}"
         )
     else:
         lines.append(f"💚 [21] {RECURRING_FAILURE_WORKFLOW} не занимает единственный "
@@ -3494,8 +3498,11 @@ def build_report(repo: str, now: datetime,
 # отдельный канал для unknown (issue #1109, шаг 2). Инварианты 8 и 10
 # (issue #1109, F7 и класс «transport dead -> return []») мигрированы в этой
 # же задаче — оба уже не входят в CI_GATING/ESCALATING_INVARIANTS, коллизии
-# не возникает.
-CHECK_RESULT_MIGRATED_INVARIANTS = frozenset({8, 10, 13, 14, 19})
+# не возникает. Инвариант 21 (#1160) мигрирован в этой же задаче — номер 19 в
+# этом дереве не существует (уступлен открытым PR #1061/#1136 по arbitration
+# scripts/lib/invariant_numbering.py), оставленный бы 19 сделал объявленную
+# в комментарии к 21 природу «не гейтит и не эскалирует» незащищённой.
+CHECK_RESULT_MIGRATED_INVARIANTS = frozenset({8, 10, 13, 14, 21})
 
 
 def assert_check_result_invariants_not_gated_or_escalated(

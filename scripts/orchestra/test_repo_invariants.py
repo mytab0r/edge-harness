@@ -2765,6 +2765,17 @@ def test_assert_check_result_invariants_not_gated_or_escalated_passes_on_real_co
     ri.assert_check_result_invariants_not_gated_or_escalated(ri.CI_GATING, ri.ESCALATING_INVARIANTS)
 
 
+def test_invariant_21_is_in_check_result_migrated_registry():
+    # #1160: перенумерация 19 -> 21 (живая коллизия номера, arbitration
+    # invariant_numbering.py) обязана была доехать и до реестра
+    # CHECK_RESULT_MIGRATED_INVARIANTS — оставленный бы там 19 (номера в
+    # дереве нет) делал объявленную «наблюдательность» 21 незащищённой:
+    # добавь 21 в CI_GATING — unknown() коллапсировал бы в findings=[21]=[]
+    # молча. Мутация: вернуть 19/убрать 21 — тест краснеет.
+    assert 21 in ri.CHECK_RESULT_MIGRATED_INVARIANTS
+    assert 19 not in ri.CHECK_RESULT_MIGRATED_INVARIANTS
+
+
 def test_assert_check_result_invariants_raises_if_migrated_invariant_added_to_ci_gating():
     with pytest.raises(RuntimeError, match="13"):
         ri.assert_check_result_invariants_not_gated_or_escalated(frozenset({7, 11, 13}), ())

@@ -770,6 +770,17 @@ def test_error_reason_all_providers_exhausted_without_reset_hint_is_honest():
     assert "дата неизвестна" in reason
 
 
+def test_error_reason_chain_budget_exhausted_not_transport():
+    # #1160: третий потребитель контракта DSH_RUN_FAILURE_REASON (ai_dsh.sh
+    # пишет тег как есть, error_reason обязан различить) — без явной ветки
+    # незнакомый тег сваливается в «ошибка провайдера/транспорта DSH» через
+    # review_labels.reason_tag (rc!=0), и факт «бюджет цепочки исчерпан»
+    # теряется (алерт не гадает: данные различимы — различи сам).
+    reason = ai.error_reason("", "1", "chain_budget_exhausted", "")
+    assert "бюджет цепочки" in reason
+    assert "ошибка провайдера/транспорта DSH" not in reason
+
+
 def test_build_comment_chain_facts_in_header():
     # #727: имя провайдера и дата сброса — факты ШАПКИ (до первой пустой
     # строки), не прозы — их читает scheduler.py::header_facts.
