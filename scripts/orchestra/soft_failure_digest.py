@@ -877,8 +877,18 @@ def soft_failure_digest(repo: str, now: datetime) -> tuple[list[str], list[str],
 
     groups, observations, stats = collect_window(repo, now)
     if stats["workflows_ok"] == 0:
+        # Находка ревью PR #1136 (третий круг): текст с эмодзи-префиксом
+        # 🚨 попадал только в наблюдения/step summary — НЕ становился
+        # аннотацией Checks API (workflow command `::warning::` обязан
+        # быть началом СТРОКИ, эмодзи ломает распознавание), а значит канал
+        # A этого же дайджеста не мог поймать «наблюдатель не смог
+        # посмотреть» на следующем скане — обещание спеки не выполнялось.
+        # `::warning::` В НАЧАЛЕ строки — настоящая аннотация, отличимая по
+        # тексту (не «Process completed with exit code N», как у мёртвого
+        # шага) от группы continue-on-error orchestra, значит НЕ схлопнется
+        # с ней дедупом.
         observations.append(
-            f"🚨 soft-failure-digest: скан НЕ удался — прочитано "
+            f"::warning::soft-failure-digest: скан НЕ удался — прочитано "
             f"0/{stats['workflows_total']} workflow. Окно НЕ проверено — "
             "это не «группы не найдены» (группы не найдены значит «прочитано, "
             "пусто»; здесь — «не прочитано вовсе»). Heartbeat не пишется, "

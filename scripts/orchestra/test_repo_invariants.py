@@ -4005,6 +4005,42 @@ jobs:
                            "job": "whole-job", "step": None}]
 
 
+def test_job_level_continue_on_error_in_digest_workflow_is_covered(tmp_path):
+    """Находка ревью PR #1136 (третий круг): job-уровневый continue-on-error
+    раньше нарушал БЕЗУСЛОВНО, даже когда сам workflow входит в
+    DIGEST_WORKFLOWS — то же покрытие, что уже есть у шага, обязано
+    применяться и к job'у целиком (спека: «шаг ИЛИ job»)."""
+    _write_workflow(tmp_path, "worker.yml", """
+jobs:
+  whole-job:
+    continue-on-error: true
+    steps:
+      - run: echo hi
+""")
+    assert ri.check_continue_on_error_readers(tmp_path) == []
+
+
+def test_job_level_continue_on_error_with_registered_reader_is_covered(tmp_path):
+    """Реестр покрывает job-уровень тем же ключом, что и шаг, но с
+    `step=None` — ветка кода теперь читает CONTINUE_ON_ERROR_READERS[(name,
+    None)], не только DIGEST_WORKFLOWS."""
+    _write_workflow(tmp_path, "other.yml", """
+jobs:
+  whole-job:
+    continue-on-error: true
+    steps:
+      - run: echo hi
+""")
+    key = ("other.yml", None)
+    old = dict(ri.CONTINUE_ON_ERROR_READERS)
+    ri.CONTINUE_ON_ERROR_READERS[key] = "тестовый читатель job-уровня"
+    try:
+        assert ri.check_continue_on_error_readers(tmp_path) == []
+    finally:
+        ri.CONTINUE_ON_ERROR_READERS.clear()
+        ri.CONTINUE_ON_ERROR_READERS.update(old)
+
+
 def test_unreadable_workflow_is_loud_not_healthy(tmp_path):
     """Неразбираемый workflow — непроверяемое состояние: не имеет права
     выглядеть здоровым (fail loud), иначе правка с битым YAML гасила бы
@@ -4024,7 +4060,13 @@ def test_registered_reader_keys_match_real_workflows():
     workflows_dir = ri.REPO_ROOT / ".github" / "workflows"
     digest = ri._digest_module()
     real_keys = set()
-    for path in workflows_dir.glob("*.yml"):
+    # Некритичная находка ревью PR #1136: check_continue_on_error_readers
+    # сканирует и *.yml, и *.yaml — эта гвардия обязана видеть те же файлы,
+    # иначе регистрация ключа под будущим *.yaml молча не проверялась бы
+    # антипротуханием. Сегодня в репозитории только *.yml (см. ls
+    # .github/workflows), поэтому находка не меняла поведение теста, но
+    # покрытие обязано быть симметричным коду, который проверяет.
+    for path in sorted(list(workflows_dir.glob("*.yml")) + list(workflows_dir.glob("*.yaml"))):
         doc = digest.yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         for job in (doc.get("jobs") or {}).values():
             if not isinstance(job, dict):

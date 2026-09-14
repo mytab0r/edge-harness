@@ -2931,9 +2931,23 @@ def check_continue_on_error_readers(workflows_dir: Path) -> list[dict]:
         for job_key, job in (doc.get("jobs") or {}).items():
             if not isinstance(job, dict):
                 continue
+            # Находка ревью PR #1136 (третий круг): job-уровневый
+            # continue-on-error раньше нарушал БЕЗУСЛОВНО, даже если
+            # workflow входит в DIGEST_WORKFLOWS или реестр несёт запись
+            # (name, None) — противоречило и спеке («ЛИБО (a) … ЛИБО (b)»
+            # для «шаг или job целиком»), и создавало тупиковый газ
+            # (GATING_RELEASE_CONDITION советует внести запись в реестр,
+            # которую код не читал). Теперь job-уровень проверяется теми же
+            # двумя ветками, что и шаг — ключ реестра при отсутствии
+            # конкретного шага — (workflow, None).
             if job.get("continue-on-error") is True:
-                violations.append({"kind": "no-reader", "workflow": name,
-                                   "job": str(job_key), "step": None})
+                if name in digest.DIGEST_WORKFLOWS:
+                    pass  # читатель — дайджест, тот же довод, что у шагов ниже
+                elif CONTINUE_ON_ERROR_READERS.get((name, None)):
+                    pass  # читатель объявлен в реестре под ключом (workflow, None)
+                else:
+                    violations.append({"kind": "no-reader", "workflow": name,
+                                       "job": str(job_key), "step": None})
             for step in (job.get("steps") or []):
                 if not isinstance(step, dict) or step.get("continue-on-error") is not True:
                     continue
