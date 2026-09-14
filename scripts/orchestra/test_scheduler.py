@@ -3784,6 +3784,50 @@ def test_dispatch_ai_review_rework_escalation_names_attributed_non_success_concl
     assert any("исчерпана" in line and "#1020" in line for line in actions)
 
 
+def test_dispatch_ai_review_rework_defers_escalation_while_own_run_in_flight(monkeypatch):
+    """Находка ревью PR #1260 (класс «эскалация-до-итога-прогона»):
+    последний прогон worker.yml по ЭТОЙ задаче атрибутирован (след аренды
+    найден), но ещё не завершился (status='in_progress') — GitHub не
+    заполняет `conclusion` для in_progress/queued, поэтому наивное чтение
+    только `conclusion` (None) неотличимо от «атрибуции нет вовсе» и раньше
+    ошибочно эскалировало владельцу прогон, чья попытка доводки ЭТОЙ задачи
+    физически ещё идёт (AGENTS.md, «алерт не гадает» — «атрибуции нет» и
+    «атрибуция есть, исход неизвестен» — разные факты). Это НЕ возврат
+    снятого busy-гейта воркера (тот блокировал занятостью ЛЮБОГО прогона
+    репозитория, см. test_dispatch_ai_review_rework_escalates_while_
+    worker_active выше, где ЧУЖОЙ in_progress прогон эскалации не мешает) —
+    здесь откладываем только пока не известен исход СВОЕГО прогона.
+
+    Мутация: замени новую ветку `run.get("status") in ("in_progress",
+    "queued")` на всегда-False (то есть верни код к чтению одного
+    `last_worker_run_conclusion`) — этот тест покраснеет: escalated
+    перестанет быть пустым, наблюдение "эскалация отложена" исчезнет."""
+    task = issue(782, assignees=("mytab0r",))
+    p = pull(1020, labels=[sch.review_labels.AI_CHANGES], ref="agent/782-fix-waiting-owner-relabel-loop")
+    run_id = 34600000006
+    fingerprint, fixture = _ai_rework_base_fixture(
+        1020, 782, run_id, None, dispatched_since="2026-09-12T10:00:00Z")
+    fixture["workflows/worker.yml/runs?per_page=10"] = {
+        "workflow_runs": [workflow_run(run_id, "in_progress")]}
+    fake = FakeGh(fixture)
+    patch_gh(monkeypatch, fake)
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("исход СВОЕГО прогона неизвестен — эскалация преждевременна"))
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("бюджет исчерпан, исход не известен — редиспатч тоже преждевременен"))
+    monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("исход не известен — задачу не трогаем"))
+
+    observations, actions, dispatched = sch.dispatch_ai_review_rework(REPO, [p], pool=[task])
+
+    assert dispatched is False
+    assert not any("worker.yml/dispatches" in c for c in fake.calls)
+    assert escalated == []
+    assert any(
+        "эскалация отложена" in line and "#1020" in line and "in_progress" in line
+        for line in observations
+    )
+    assert task["assignees"] != []  # ни эскалация, ни редиспатч не трогают задачу
+
+
 def test_dispatch_ai_review_rework_skips_escalation_when_pr_already_closed(monkeypatch):
     """Исход 3: PR закрылся/слился между снимком `pulls` и перепроверкой
     (кем-то другим, или accept_merged_tasks этого же прогона) — эскалировать

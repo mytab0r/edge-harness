@@ -311,7 +311,7 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
       вечный долг даёт одну эскалацию (#120 + Telegram), новая подделка
       меняет множество и даёт новую; владелец узнаёт о каждом новом эпизоде
       без спама на каждый пульс.
-  19. check_ai_rework_never_dispatched (issue #1253): PR несёт
+  22. check_ai_rework_never_dispatched (issue #1253): PR несёт
       ai:changes-requested дольше AI_REWORK_NEVER_DISPATCHED_AFTER_MINUTES
       с начала текущего эпизода метки (scheduler.ai_changes_labeled_at) и НИ
       РАЗУ не получал маркер авто-доводки (scheduler.AI_REWORK_MARKER) —
@@ -960,7 +960,10 @@ def stuck_gate_fact_line(item: dict) -> str:
     )
 
 
-# Инвариант 19 (issue #1253) — «доводку не звали ни разу» отдельно от
+# Инвариант 22 (issue #1253; номер взят арбитром scripts/lib/
+# invariant_numbering.py — на 2026-09-14 19 занят PR #1061, 20 занят PR
+# #1136, 21 занят PR #1247, следующий свободный — 22) — «доводку не звали
+# ни разу» отдельно от
 # «доводка звалась и не помогла». check_stuck_review_gate (инвариант 3)
 # намеренно пропускает ЛЮБОЙ PR с ai:*-меткой (строки 836-838 выше) — это не
 # ошибка 3 (он про гейт 2 ДО вердикта), но структурный пробел: PR с уже
@@ -989,7 +992,7 @@ AI_REWORK_NEVER_DISPATCHED_AFTER_MINUTES = 1440
 
 
 def check_ai_rework_never_dispatched(repo: str, now: datetime, open_pulls: list[dict]) -> list[dict]:
-    """Инвариант 19 (issue #1253): PR несёт ai:changes-requested (не
+    """Инвариант 22 (issue #1253): PR несёт ai:changes-requested (не
     conflict — своя очередь, dispatch_conflict_rework обслуживает их
     отдельно) дольше AI_REWORK_NEVER_DISPATCHED_AFTER_MINUTES с начала
     ТЕКУЩЕГО эпизода метки (scheduler.ai_changes_labeled_at — тот же факт,
@@ -3322,27 +3325,27 @@ def build_report(repo: str, now: datetime,
         )
 
     try:
-        v19 = check_ai_rework_never_dispatched(repo, now, open_pulls)
+        v22 = check_ai_rework_never_dispatched(repo, now, open_pulls)
     except RuntimeError as error:
-        findings[19] = []
-        lines.append(f"🚨 [19] проверка голодания очереди доводки ai-review недоступна: {error} — "
+        findings[22] = []
+        lines.append(f"🚨 [22] проверка голодания очереди доводки ai-review недоступна: {error} — "
                       "инвариант пропущен на этом прогоне (это НЕ «нарушений нет»)")
     else:
-        findings[19] = v19
-        if v19:
+        findings[22] = v22
+        if v22:
             lines.append(
-                f"🚨 [19] {len(v19)} PR с ai:changes-requested старше "
+                f"🚨 [22] {len(v22)} PR с ai:changes-requested старше "
                 f"{AI_REWORK_NEVER_DISPATCHED_AFTER_MINUTES} мин ни разу не получали "
                 "авто-доводку (#1253):"
             )
-            for item in v19:
+            for item in v22:
                 lines.append(
                     f"   — PR #{item['pr']} — {int(item['age_minutes'])} мин с "
                     f"{item['labeled_at']}, ни одного диспатча авто-доводки"
                 )
         else:
             lines.append(
-                f"💚 [19] нет PR с ai:changes-requested старше "
+                f"💚 [22] нет PR с ai:changes-requested старше "
                 f"{AI_REWORK_NEVER_DISPATCHED_AFTER_MINUTES} мин без хотя бы одного "
                 "диспатча авто-доводки"
             )

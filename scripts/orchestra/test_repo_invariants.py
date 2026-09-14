@@ -253,15 +253,20 @@ class FakeGh:
 
 
 def patch_gh(monkeypatch, fake):
-    """Единая точка патча — оба модуля читают gh() по имени (repo_invariants
+    """Единая точка патча — ТРИ модуля читают gh() по имени (repo_invariants
     реэкспортирует pulse_guard.gh как свой атрибут `ri.gh`, но
     post_issue_comment/escalate внутри pulse_guard.py вызывают СВОЙ
-    module-level `gh`, а не `ri.gh`). Патчить только `ri.gh` недостаточно —
-    так один прогон реально ушёл в живой issue #120 (инцидент этой задачи,
-    #244: очищено вручную, gh api -X DELETE .../comments/5527288512).
-    Патчим оба имени — тот же приём, что test_scheduler.py::patch_gh."""
+    module-level `gh`, а не `ri.gh`; ai_changes_labeled_at внутри
+    scheduler.py — третий, самостоятельный биндинг `scheduler.gh`).
+    Патчить только `ri.gh`/`ri.pulse_guard.gh` недостаточно — так один
+    прогон реально ушёл в живой issue #120 (инцидент этой задачи, #244:
+    очищено вручную, gh api -X DELETE .../comments/5527288512), а находка
+    ревью PR #1260 поймала тот же класс на `scheduler.gh`: тесты
+    check_ai_rework_never_dispatched читали живой GitHub вместо фикстур.
+    Патчим все три имени — тот же приём, что test_scheduler.py::patch_gh."""
     monkeypatch.setattr(ri, "gh", fake)
     monkeypatch.setattr(ri.pulse_guard, "gh", fake)
+    monkeypatch.setattr(ri.scheduler, "gh", fake)
 
 
 def gate1_status(when: str):
@@ -4032,11 +4037,11 @@ def test_ai_rework_never_dispatched_silent_when_label_event_not_found(monkeypatc
 def test_ai_rework_never_dispatched_not_in_ci_gating_or_escalating():
     # Наблюдательный (docstring build_report/CI_GATING): свежедобавленный
     # инвариант, ноль истории эскалаций — тот же порядок, что у 8/9/10/12/14.
-    assert 19 not in ri.CI_GATING
-    assert 19 not in ri.ESCALATING_INVARIANTS
+    assert 22 not in ri.CI_GATING
+    assert 22 not in ri.ESCALATING_INVARIANTS
 
 
-def test_build_report_wires_invariant_19(monkeypatch):
+def test_build_report_wires_invariant_22(monkeypatch):
     fake = FakeGh({
         f"issues?state=open&labels={ri.TASK_LABEL}": [],
         "pulls?state=closed": [],
@@ -4052,7 +4057,7 @@ def test_build_report_wires_invariant_19(monkeypatch):
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
     now = utc(2026, 9, 14, 15, 33)
     lines, findings = ri.build_report("mytab0r/edge-harness", now)
-    assert len(findings[19]) == 1
-    assert findings[19][0]["pr"] == 261
-    assert any("🚨" in line and "[19]" in line for line in lines)
+    assert len(findings[22]) == 1
+    assert findings[22][0]["pr"] == 261
+    assert any("🚨" in line and "[22]" in line for line in lines)
     assert any("#261" in line for line in lines)
