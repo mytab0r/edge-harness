@@ -199,11 +199,16 @@ def find_similar_open_tasks(
 # конкретный трекер, не общий шаблонный файл) — граница честная, а не
 # подогнанная: см. отчёт агента, приложивший разбор конкретных 28 пар.
 #
-# Область (#570 vs #566): в отличие от первого слоя (только ОТКРЫТЫЕ, чтобы
-# не наказывать санкционированный паттерн «закрыли → завели новую, более
-# узкую, related»), этот слой сравнивает и с ЗАКРЫТЫМИ задачами тоже — сам
-# санкционированный паттерн не блокируется НАВСЕГДА, он просто проходит через
-# тот же газ `--confirm-not-duplicate`, что и обычный дубль.
+# Область (#570 vs #566): критерий готовности #570 называет её явно —
+# «Сравнение только с ОТКРЫТЫМИ задачами» (тем же обоснованием, что и первый
+# слой: правило «закрытая задача не переоткрывается никогда» САНКЦИОНИРУЕТ
+# новую, более узкую задачу со ссылкой на закрытую — сравнение с закрытой
+# issue наказывало бы разрешённый паттерн, а не ловило бы дубль). Обе целевые
+# пары (#518/#548, #562/#564) ловятся и на ОТКРЫТОМ пуле: на момент заведения
+# «новой» задачи её кандидат ещё не был закрыт (#518 был открыт, когда
+# появился #548) — состояние пула СЕГОДНЯ (обе пары уже закрыты) не влияет на
+# проверку по фикстурам ниже, только на то, что реальный `gh issue list
+# --state open` больше не найдёт их как живые кандидаты.
 
 EVIDENCE_COMMON_MIN_POOL = 3
 EVIDENCE_COMMON_MAX_SHARE = 0.02
@@ -268,8 +273,8 @@ def _common_items(key: str, pool: Sequence[Evidence]) -> set[str]:
 def find_evidence_matches(
     body: str, candidates: Sequence[CandidateWithBody], number: int | None = None,
 ) -> list[EvidenceMatch]:
-    """Кандидаты (ОТКРЫТЫЕ и ЗАКРЫТЫЕ — см. докстринг раздела), чьё тело
-    делит с `body` улику дефекта. Правило совпадения — САМОДОСТАТОЧНАЯ
+    """Кандидаты (ОТКРЫТЫЕ — критерий готовности #570, см. докстринг раздела
+    выше), чьё тело делит с `body` улику дефекта. Правило совпадения — САМОДОСТАТОЧНАЯ
     дословная цитата ``` или общий прогон Actions, либо явная ссылка на
     номер кандидата ВМЕСТЕ с общим (не common) путём/ссылкой — см. докстринг
     раздела выше за измеренным обоснованием каждого условия. Отсортировано
@@ -333,22 +338,29 @@ def fetch_open_task_candidates(repo: str) -> list[Candidate]:
     fixture = os.environ.get("DUPLICATE_GUARD_FIXTURE")
     if fixture:
         return json.loads(Path(fixture).read_text(encoding="utf-8"))
+    limit = 500
     result = subprocess.run(
         ["gh", "issue", "list", "--repo", repo, "--state", "open", "--label", "task",
-         "--json", "number,title,url", "--limit", "500"],
+         "--json", "number,title,url", "--limit", str(limit)],
         capture_output=True, text=True, encoding="utf-8",
         env={**os.environ, "NO_COLOR": "1"},
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "gh issue list завершился с ошибкой")
-    return json.loads(result.stdout or "[]")
+    candidates = json.loads(result.stdout or "[]")
+    if len(candidates) >= limit:
+        print(f"WARN: duplicate_guard: пул открытых задач достиг --limit {limit} — "
+              f"старейшие задачи могли не попасть в сравнение (класс «вход, растущий "
+              f"со временем», находка ревью PR #579).", file=sys.stderr)
+    return candidates
 
 
 def fetch_evidence_candidates(repo: str) -> list[CandidateWithBody]:
-    """Как `fetch_open_task_candidates`, но `--state all` (ОТКРЫТЫЕ И
-    ЗАКРЫТЫЕ — см. докстринг раздела «Второй слой» за обоснованием) и с
-    телом (`body`) — без него не из чего извлечь улики. `--limit` с запасом
-    над измеренным размером пула (324 задачи с меткой task, 2026-09-07).
+    """Как `fetch_open_task_candidates`, но с телом (`body`) — без него не из
+    чего извлечь улики. `--state open` (критерий готовности #570: только
+    ОТКРЫТЫЕ, то же обоснование, что у первого слоя — см. докстринг раздела
+    «Второй слой» выше). `--limit` с запасом над измеренным размером
+    открытого пула (138 задач с меткой task, 2026-09-07).
 
     Тестовый шов: `DUPLICATE_GUARD_EVIDENCE_FIXTURE=<путь>` — отдельная
     переменная от `DUPLICATE_GUARD_FIXTURE` (та фикстура без `body`, не
@@ -356,15 +368,21 @@ def fetch_evidence_candidates(repo: str) -> list[CandidateWithBody]:
     fixture = os.environ.get("DUPLICATE_GUARD_EVIDENCE_FIXTURE")
     if fixture:
         return json.loads(Path(fixture).read_text(encoding="utf-8"))
+    limit = 1000
     result = subprocess.run(
-        ["gh", "issue", "list", "--repo", repo, "--state", "all", "--label", "task",
-         "--json", "number,title,url,body", "--limit", "1000"],
+        ["gh", "issue", "list", "--repo", repo, "--state", "open", "--label", "task",
+         "--json", "number,title,url,body", "--limit", str(limit)],
         capture_output=True, text=True, encoding="utf-8",
         env={**os.environ, "NO_COLOR": "1"},
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "gh issue list завершился с ошибкой")
-    return json.loads(result.stdout or "[]")
+    candidates = json.loads(result.stdout or "[]")
+    if len(candidates) >= limit:
+        print(f"WARN: duplicate_guard: пул для улик достиг --limit {limit} — "
+              f"старейшие задачи могли не попасть в сравнение (класс «вход, растущий "
+              f"со временем», находка ревью PR #579).", file=sys.stderr)
+    return candidates
 
 
 def _print_matches(matches: Sequence[Match | EvidenceMatch]) -> None:
