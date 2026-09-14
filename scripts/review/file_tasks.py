@@ -124,7 +124,8 @@ def file_task(repo: str, task: dict) -> int:
     """Создать issue с меткой task; ответ API — созданный issue (номер из него,
     а не из догадок по спискам — гонка невозможна по построению)."""
     body = task["body"] or "(тело не предложено ревью — уточни цель и критерий готовности)"
-    created = pool_issue.create_pool_issue(gh, repo, task["title"], body, ["task"])
+    created = pool_issue.create_pool_issue(
+        gh, repo, task["title"], body, ["task"], producer="review-findings")
     return int(created["number"])
 
 

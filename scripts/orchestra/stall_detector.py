@@ -341,7 +341,8 @@ def _render_body(fingerprint: str, evidence: list[str], run_url: str | None) -> 
 def create_task(repo: str, fingerprint: str, evidence: list[str], run_url: str | None) -> int:
     body = _render_body(fingerprint, evidence, run_url)
     title = f"Простой конвейера: {fingerprint}"
-    result = pool_issue.create_pool_issue(gh, repo, title, body, [TASK_LABEL, AUTO_LABEL])
+    result = pool_issue.create_pool_issue(
+        gh, repo, title, body, [TASK_LABEL, AUTO_LABEL], producer="stall-detector")
     return result["number"]
 
 

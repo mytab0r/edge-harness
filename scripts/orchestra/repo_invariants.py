@@ -329,6 +329,45 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
       в ESCALATING_INVARIANTS: живой замер долга на момент внедрения — см.
       PR #1260 (задача #1253, число и датировка находок в описании PR),
       порог обоснован той же датой, не вкусом.
+  23. check_pool_producer_orphaned (issue #1277) — производитель задач пула
+      (`scripts/lib/pool_issue.py::create_pool_issue`, все девять — см.
+      `scripts/lib/producer_orphan_watch.py`) заводит выше порога объёма
+      задач за скользящее окно 30 дней при доле закрытия на/ниже 10%, и
+      достаточно времени прошло, чтобы «пока не успели» перестало быть
+      объяснением. Живая улика — «Хвост чеклиста ревью PR #N»: 112 открытых
+      на дату замера, 0 когда-либо закрытых, 0 когда-либо взятых в работу,
+      старейшая висит 8 суток; ни один механизм репозитория этого не
+      заметил (замер владельца 2026-09-14, не система). Три исхода на
+      КАЖДОГО из девяти производителей отдельно (issue #1096, носитель
+      `check_result.py`, см. `producer_orphan_watch.evaluate_producer`):
+      объёма недостаточно (либо производитель ни разу не сработал, либо
+      слишком молод) — `unknown()`, не `ok()` и не `violation()`; доля
+      закрытия здоровая — `ok()`; доля закрытия на/ниже порога, но
+      единственная старейшая открытая задача моложе 24ч (то же значение,
+      что `scheduler.STALE_HOURS`, не второй порог) — тоже `unknown()`
+      (рано считать застоем); иначе — `violation()`. Признак производителя
+      — маркер тела `<!-- pool-issue-producer: <id> -->`, проставляемый
+      `create_pool_issue` в единственной точке создания (переживает
+      переименование заголовка/метки — живой замер показал минимум двух
+      производителей без отличительной метки и двух, делящих одну и ту же);
+      для issues до внедрения маркера — замороженный `_legacy_classify`
+      (title/label-эвристика), не расширяемый для новых производителей.
+      Честная граница: инвариант называет ТОЛЬКО факт «нет потребителя» —
+      что с этим делать (остановить производителя, поднять приоритет,
+      признать журналом вместо задач пула — как уже сделано отдельно для
+      самого хвоста чеклиста, #1262/#1268) решает не он. ЭСКАЛИРУЮЩИЙ
+      (ESCALATING_INVARIANTS): сигнал без канала — тот же класс, что уже
+      наказан для 12/15/16/18 («алерт нужен канал, а не текст»), а цена
+      ложной тревоги здесь низкая — `escalate_if_new` дедуплицирует по
+      множеству мёртвых производителей, новый мёртвый или пропавший старый
+      меняет ключ и даёт новую эскалацию, тот же набор — тишина. НЕ в
+      CI_GATING: это состояние репозитория, накопленное независимо от
+      текущего PR (тот же принцип, что у 1/5/9/10/12/13/14/15/16/17).
+      Обратный прогон на исторических данных тем же классификатором и
+      порогами (issue #1277): инвариант сработал бы 2026-09-07 (21 задача
+      в 30-дневном окне, 0 закрыто, старейшая открытая — 26.3ч) — на
+      следующий день после первой issue этого производителя, за 7 суток до
+      того, как долг обнаружил человек (2026-09-14).
 
 Расписание: главный канал — периодический шаг orchestra.yml (cron */15 мин),
 он же вызывает escalate() для всех эскалирующих инвариантов — реестр
@@ -394,7 +433,7 @@ import importlib.util
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -495,6 +534,14 @@ _MR_SPEC = importlib.util.spec_from_file_location(
     "merge_reactions", REPO_ROOT / "scripts" / "lib" / "merge_reactions.py")
 merge_reactions = importlib.util.module_from_spec(_MR_SPEC)
 _MR_SPEC.loader.exec_module(merge_reactions)  # type: ignore[union-attr]
+
+# Классификатор/пороги/вердикт по девяти производителям задач пула (#1277,
+# инвариант 23 ниже) — чистая логика без сети, тестируется отдельно
+# (scripts/lib/test_producer_orphan_watch.py).
+_POW_SPEC = importlib.util.spec_from_file_location(
+    "producer_orphan_watch", REPO_ROOT / "scripts" / "lib" / "producer_orphan_watch.py")
+producer_orphan_watch = importlib.util.module_from_spec(_POW_SPEC)
+_POW_SPEC.loader.exec_module(producer_orphan_watch)  # type: ignore[union-attr]
 
 TASK_LABEL = "task"
 OPENSPEC_CHANGES = REPO_ROOT / "openspec" / "changes"
@@ -2931,6 +2978,85 @@ def check_pipeline_status_marker_impersonation(comments: list[dict]) -> list[dic
         })
     return sorted(violations, key=lambda item: item["created_at"] or "")
 
+
+# ══════════════════════════════════════════════════════════════════════════
+# Инвариант 23: производитель задач пула без измеримого потребителя (#1277)
+# ══════════════════════════════════════════════════════════════════════════
+
+# Потолок страниц Search API (100/страница, лимит самого API — 1000 items,
+# #308/#309 «страница без обхода» — здесь обход есть, потолок только
+# fail-loud страховка на случай неожиданно широкого окна/произошедшего
+# всплеска, не молчаливый обрыв).
+_PRODUCER_WATCH_MAX_PAGES = 10
+
+
+def fetch_producer_pool_issues(repo: str, now: datetime) -> list[dict]:
+    """Задачи пула (`label:task`), созданные за `producer_orphan_watch.
+    WINDOW_DAYS` — источник инварианта 23. GitHub Search API (`search/
+    issues`, `created:>=YYYY-MM-DD`), не REST-список: REST `since` фильтрует
+    по ОБНОВЛЕНИЮ, не по созданию (не подошёл бы — issue, созданная в окне,
+    но обновлённая позже, потерялась бы), а Search API уже используют
+    инварианты 14/18 этого файла тем же приёмом. Форма ответа (dict с
+    ключом `items`, список) — та же прод-форма, что уже разбирает
+    `check_worker_false_success_comment`; неожиданная форма — RuntimeError
+    (fail loud, не молчаливая пустая страница, класс #308)."""
+    since = (now - timedelta(days=producer_orphan_watch.WINDOW_DAYS)).strftime("%Y-%m-%d")
+    # label_query_value — единое место кодирования значения метки в query
+    # (#938): TASK_LABEL сегодня без двоеточия, но гвардия
+    # test_label_query_encoding_guard.py требует прохода через хелпер на
+    # КАЖДОЙ подстановке после `label:`, не только там, где значение уже
+    # несёт спецсимвол — второй копии решения «когда кодировать» не заводим.
+    query = (f"repo:{repo} label:{review_labels.label_query_value(TASK_LABEL)} "
+              f"is:issue created:>={since}")
+    issues: list[dict] = []
+    page = 1
+    while True:
+        result = gh("-X", "GET", "search/issues", "-f", f"q={query}",
+                     "-f", "per_page=100", "-f", f"page={page}")
+        if not isinstance(result, dict) or "items" not in result:
+            raise RuntimeError(
+                f"search/issues (producer-orphan-watch): неожиданная форма ответа: {result!r}")
+        items = result.get("items")
+        if not isinstance(items, list):
+            raise RuntimeError(
+                f"search/issues (producer-orphan-watch): items не список: {items!r}")
+        issues.extend(items)
+        if len(items) < 100:
+            return issues
+        page += 1
+        if page > _PRODUCER_WATCH_MAX_PAGES:
+            raise RuntimeError(
+                f"search/issues (producer-orphan-watch): страниц больше "
+                f"{_PRODUCER_WATCH_MAX_PAGES} — окно {producer_orphan_watch.WINDOW_DAYS}д "
+                "внезапно шире 1000 задач, досмотр остановлен (fail loud, не тихий обрыв)")
+
+
+def check_pool_producer_orphaned(
+    repo: str, now: datetime,
+) -> dict[str, "check_result.CheckResult"]:
+    """Инвариант 23 (#1277): вердикт по каждому из `producer_orphan_watch.
+    PRODUCER_IDS` отдельно (см. докстринг модуля репозитория выше и
+    докстринг `producer_orphan_watch.evaluate_producer` — три исхода на
+    производителя, не два).
+
+    Транспорт (фетч ВСЕГО списка issues окна) отказал целиком — КАЖДЫЙ
+    производитель получает `check_result.unknown()` с одной и той же
+    причиной: различить «этот конкретный производитель здоров» от «мы
+    вообще ничего не увидели» здесь нельзя, весь список — общий вход для
+    всех девяти (в отличие от инвариантов 10/14, где сеть дёргается ПО
+    кандидату и частичный успех законен)."""
+    try:
+        issues = fetch_producer_pool_issues(repo, now)
+    except RuntimeError as error:
+        reason = f"фетч задач пула за окно не удался: {error}"
+        return {
+            producer: check_result.unknown(reason)
+            for producer in producer_orphan_watch.PRODUCER_IDS
+        }
+    stats = producer_orphan_watch.compute_stats(issues, now)
+    return producer_orphan_watch.evaluate_all(stats)
+
+
 def build_report(repo: str, now: datetime,
                   check_branch_protection: bool = False,
                   check_declared_deps: bool = True) -> tuple[list[str], dict[int, list]]:
@@ -3364,6 +3490,34 @@ def build_report(repo: str, now: datetime,
                 f"{AI_REWORK_NEVER_DISPATCHED_AFTER_MINUTES} мин без хотя бы одного "
                 "диспатча авто-доводки"
             )
+
+    # Инвариант 23 (#1277): вердикт на КАЖДОГО из девяти производителей
+    # отдельно (check_result.CheckResult — issue #1096, три исхода) —
+    # findings[23] несёт только реальные violation() (по построению findings
+    # читают CI_GATING/run_escalations по истинности списка, ok()/unknown()
+    # там неотличимы, если попадут внутрь — не должны); ok()/unknown() видны
+    # ТОЛЬКО построчно в отчёте (требование 3: молодой производитель не
+    # обвиняется молчаливым исключением из отчёта).
+    v23_results = check_pool_producer_orphaned(repo, now)
+    v23_violations: list[dict] = []
+    for producer in producer_orphan_watch.PRODUCER_IDS:
+        result = v23_results[producer]
+        if result.status == check_result.STATUS_VIOLATION:
+            item = result.violations[0]
+            v23_violations.append(item)
+            lines.append(
+                f"🚨 [23] {producer}: {item['total']} задач за "
+                f"{producer_orphan_watch.WINDOW_DAYS}д окно, {item['closed']} закрыто "
+                f"({item['close_rate']:.0%}), {item['ever_taken']} когда-либо взято "
+                f"в работу, старейшая открытая — {item['oldest_open_hours']:.0f}ч "
+                "(нет измеримого потребителя)"
+            )
+        elif result.status == check_result.STATUS_UNKNOWN:
+            lines.append(f"❓ [23] {producer}: {result.reason}")
+        else:
+            lines.append(f"💚 [23] {producer}: доля закрытия выше порога")
+    findings[23] = v23_violations
+
     return lines, findings
 
 
@@ -3421,7 +3575,15 @@ def summary(lines: list[str]) -> None:
 # Газ общий и автоматический: escalate_if_new дедуплицирует по множеству id
 # нарушителей (вечный долг — одна эскалация, новая подделка — новая), ручного
 # снятия не требует.
-ESCALATING_INVARIANTS = (1, 3, 12, 15, 16, 17, 18)
+#
+# 23 (#1277) — решение владельца задачи: сигнал без канала (step summary,
+# читаемый только если кто-то открыл Actions) — тот же класс, что уже
+# наказан памяткой «алерт нужен канал, а не текст» и что уже исправлен для
+# 12/15/16/18 в этом же файле; цена ложной тревоги здесь низкая — газ
+# (escalate_if_new) дедуплицирует по множеству МЁРТВЫХ производителей, тот
+# же набор молчит, новый мёртвый/пропавший старый даёт ровно одну новую
+# эскалацию, не спам на каждый 15-минутный такт.
+ESCALATING_INVARIANTS = (1, 3, 12, 15, 16, 17, 18, 23)
 
 def escalate_if_new(repo: str, invariant_id: int, marker_key: str, text: str) -> str | None:
     """Эскалация «один раз на состояние»: маркер кодирует конкретный набор
@@ -3615,6 +3777,29 @@ def run_escalations(repo: str, findings: dict[int, list]) -> list[str]:
         result = escalate_if_new(repo, 18, key, text)
         if result:
             lines.append(f"📣 инвариант 18 эскалирован: {result}")
+    if findings.get(23):
+        v23 = findings[23]
+        # Ключ — множество мёртвых производителей (не полные числа): новый
+        # мёртвый производитель или пропажа старого из списка (fix landed)
+        # меняет ключ и даёт новую эскалацию; тот же набор молчит (тот же
+        # приём, что pipeline_status_marker_key у инварианта 18).
+        key = ",".join(sorted(item["producer"] for item in v23))
+        details = "\n".join(
+            f"— {item['producer']}: {item['total']} задач/{item['closed']} закрыто "
+            f"({item['close_rate']:.0%}), старейшая открытая {item['oldest_open_hours']:.0f}ч"
+            for item in v23
+        )
+        text = (
+            "🚨 edge-harness: инвариант 23 (производитель задач пула без "
+            f"измеримого потребителя, #1277) — {len(v23)} производителей:\n{details}\n"
+            "Машина видит только факт «нет потребителя» — что делать (остановить "
+            "производителя, поднять приоритет находок, перевести на другой "
+            "носитель, как уже сделано для хвоста чеклиста #1262/#1268) решает "
+            "не она."
+        )
+        result = escalate_if_new(repo, 23, key, text)
+        if result:
+            lines.append(f"📣 инвариант 23 эскалирован: {result}")
     return lines
 
 
