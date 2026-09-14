@@ -709,6 +709,23 @@ def conflict_overlap_hint(repo: str, pull: dict) -> str:
     return ", ".join(sorted(pr_files & main_files))
 
 
+def _label_event_times(repo: str, pr_number: int, label_name: str) -> list[str]:
+    """Сырые ISO `created_at` всех событий `labeled` с указанным именем метки
+    в таймлайне PR — общая часть conflict_labeled_at/conflict_first_labeled_at
+    (issue #588) и ai_changes_labeled_at (issue #1253, симметрия голодания по
+    возрасту очереди доводки ai-review): три места считали один и тот же факт
+    «когда метка появилась» тремя копиями, теперь одна. Пустой список — метки
+    не было НИ РАЗУ (не «неизвестно», вызывающая сторона решает, что это
+    значит — для сортировки это null-возраст, для лифтайм-границы бюджета —
+    «бюджет ещё не открывался»)."""
+    timeline = review_labels.list_timeline(repo, pr_number, gh)
+    return [
+        event["created_at"] for event in timeline
+        if event.get("event") == "labeled"
+        and (event.get("label") or {}).get("name") == label_name
+    ]
+
+
 def conflict_labeled_at(repo: str, pr_number: int) -> datetime | None:
     """Момент последней простановки метки CONFLICT_LABEL (тот же приём, что
     last_gate1_labeled_at: max(), не min() — метка могла сниматься/ставиться
@@ -722,12 +739,7 @@ def conflict_labeled_at(repo: str, pr_number: int) -> datetime | None:
     Только для СОРТИРОВКИ очереди по возрасту — не путать с границей бюджета
     conflict_rework_attempts (conflict_first_labeled_at ниже, min() вместо
     max(): там нужна лифтайм-граница, не сбрасывающаяся по эпизодам)."""
-    timeline = review_labels.list_timeline(repo, pr_number, gh)
-    labeled_at = [
-        event["created_at"] for event in timeline
-        if event.get("event") == "labeled"
-        and (event.get("label") or {}).get("name") == CONFLICT_LABEL
-    ]
+    labeled_at = _label_event_times(repo, pr_number, CONFLICT_LABEL)
     return parse_time(max(labeled_at)) if labeled_at else None
 
 
@@ -748,13 +760,24 @@ def conflict_first_labeled_at(repo: str, pr_number: int) -> datetime | None:
     conflict_rework_attempts) при этом не теряется: даже первая простановка
     метки случается уже ПОСЛЕ того, как PR создан и исходный прогон
     завершился."""
-    timeline = review_labels.list_timeline(repo, pr_number, gh)
-    labeled_at = [
-        event["created_at"] for event in timeline
-        if event.get("event") == "labeled"
-        and (event.get("label") or {}).get("name") == CONFLICT_LABEL
-    ]
+    labeled_at = _label_event_times(repo, pr_number, CONFLICT_LABEL)
     return parse_time(min(labeled_at)) if labeled_at else None
+
+
+def ai_changes_labeled_at(repo: str, pr_number: int) -> datetime | None:
+    """Момент последней простановки review_labels.AI_CHANGES — аналог
+    conflict_labeled_at выше (issue #1253, симметрия #588): очередь
+    dispatch_ai_review_rework перебирала кандидатов в сыром порядке
+    open_pulls (новые PR первыми), из-за чего старые PR с
+    ai:changes-requested голодали бесконечно (замер 2026-09-14: 31 открытый
+    PR с этой меткой, 15 не получили ни одного диспатча доводки никогда).
+    max(), не min(): нас интересует возраст ТЕКУЩЕГО эпизода вердикта, метка
+    могла сниматься/ставиться заново новым прогоном ai-review. Своей
+    лифтайм-границы (аналог conflict_first_labeled_at) здесь не нужно —
+    бюджет авто-доводки уже считается ПО ОТПЕЧАТКУ диффа (ai_rework_attempts,
+    ai_rework_dispatched_at), не по возрасту метки."""
+    labeled_at = _label_event_times(repo, pr_number, review_labels.AI_CHANGES)
+    return parse_time(max(labeled_at)) if labeled_at else None
 
 
 def conflict_rework_attempts(repo: str, pr_number: int, task_number: int) -> int:
@@ -1112,17 +1135,28 @@ def dispatch_ai_review_rework(
     (ai_rework_attempts), не лифтайм на PR: изменившийся отпечаток — это
     новая, ещё не пробованная задача (агент реально что-то поменял), сгоревшая
     попытка на СТАРОМ отпечатке не должна её блокировать. Исчерпание бюджета
-    на текущем отпечатке — ТРИ исхода, не один (#1027, живой случай PR #1020,
-    2026-09-11/12): (1) последний прогон worker.yml по этой задаче сам
-    завершился FAILURE_CONCLUSIONS (rc≠0/нет ответившего провайдера/нет
-    новых коммитов, см. scripts/lib/dsh-ci.sh::dsh_worker_run_is_success) —
-    попытка нечестная, budget не в счёт, диспатч повторяется автоматически
-    БЕЗ эскалации; (2) прогон реально отработал (conclusion=='success') или
-    атрибуции нет вовсе — законная эскалация владельцу; (3) PR уже закрыт/слит
-    между снимком `pulls` и перепроверкой —
-    эскалация не нужна, предмет исчез сам. Раньше `last_worker_run_conclusion`
-    читался только для ТЕКСТА эскалации — решение эскалировать не зависело от
-    него, хотя conclusion уже нёс факт «инфраструктурный отказ vs находки».
+    на текущем отпечатке — ЧЕТЫРЕ исхода, не один (#1027, живой случай PR
+    #1020, 2026-09-11/12; четвёртый — находка ревью PR #1260,
+    эскалация-до-итога-прогона): (1) последний прогон worker.yml по этой
+    задаче сам завершился FAILURE_CONCLUSIONS (rc≠0/нет ответившего
+    провайдера/нет новых коммитов, см. scripts/lib/dsh-ci.sh::
+    dsh_worker_run_is_success) — попытка нечестная, budget не в счёт, диспатч
+    повторяется автоматически БЕЗ эскалации; (2) прогон реально отработал
+    (conclusion=='success') или атрибуции нет вовсе — законная эскалация
+    владельцу; (3) PR уже закрыт/слит между снимком `pulls` и перепроверкой —
+    эскалация не нужна, предмет исчез сам; (4) прогон атрибутирован, но ещё
+    не завершился (status != "completed" — ПЕРВАЯ версия проверяла белый
+    список неконечных статусов ("in_progress", "queued"), но у GitHub Actions
+    их больше ("requested", "waiting", "pending", …); conclusion пока не
+    заполнен GitHub ни для одного неконечного статуса — тот же None, что у
+    «атрибуции нет вовсе» в исходе (2), но ДРУГОЙ факт) — эскалация
+    откладывается до известного исхода, не занятостью воркера вообще
+    (busy-гейт снят этим же PR намеренно), а именно ожиданием исхода СВОЕГО
+    последнего прогона. Раньше `last_worker_run_conclusion` читался только
+    для ТЕКСТА эскалации —
+    решение эскалировать не зависело от него, хотя conclusion уже нёс факт
+    «инфраструктурный отказ vs находки»; после #1260 решение читает ещё и
+    `status` того же прогона (`last_worker_run`), не только `conclusion`.
 
     Дедуп «тот же head, тот же отпечаток находок» — ai_rework_dispatched_at:
     неизменный отпечаток при уже висящем маркере не даёт второй, дублирующий
@@ -1135,12 +1169,38 @@ def dispatch_ai_review_rework(
     Идемпотентность — worker_runs_active, тот же гейт, что и у
     dispatch_conflict_rework/dispatch_worker: воркер один на репозиторий,
     пока прошлый прогон жив. Третий элемент кортежа (dispatched) — сигнал
-    main() не звать следом dispatch_worker в этом же проходе."""
+    main() не звать следом dispatch_worker в этом же проходе.
+
+    Порядок обхода — от старейшего вердикта ai:changes-requested к новейшему
+    (issue #1253, симметрия #588/dispatch_conflict_rework): сырой порядок
+    `pulls` (`open_pulls()`, `GET /pulls?state=open`) отдаёт новые PR
+    первыми, а диспатч на пульс — один, поэтому раньше всегда доставался
+    самому свежему PR. Замер живого репозитория 2026-09-14: 31 открытый PR
+    с ai:changes-requested, 15 не получили ни одного диспатча доводки
+    НИКОГДА. ai_changes_labeled_at (момент простановки метки ТЕКУЩЕГО
+    эпизода), не created_at PR — тот же довод, что у conflict_labeled_at:
+    PR мог быть открыт неделю назад и получить changes-requested только
+    сегодня. PR без задачи (resolve_pr_task is None) сортировкой не платят —
+    идут первыми как заведомый дешёвый `continue` (тот же приём, что
+    unscheduled в dispatch_conflict_rework)."""
     observations: list[str] = []
     actions: list[str] = []
     dispatched = False
     pool_by_number = {issue["number"]: issue for issue in pool}
-    for pull in pulls:
+    ai_pulls = [
+        p for p in pulls
+        if review_labels.AI_CHANGES in {label["name"] for label in p["labels"]}
+        and CONFLICT_LABEL not in {label["name"] for label in p["labels"]}
+    ]
+    schedulable, unscheduled = [], []
+    for p in ai_pulls:
+        (schedulable if task_ref.resolve_pr_task(p) is not None else unscheduled).append(p)
+    schedulable.sort(
+        key=lambda p: ai_changes_labeled_at(repo, p["number"]) or parse_time(p["created_at"])
+    )
+    ai_numbers = {p["number"] for p in ai_pulls}
+    ordered_pulls = unscheduled + schedulable + [p for p in pulls if p["number"] not in ai_numbers]
+    for pull in ordered_pulls:
         infra_retry = False  # Исход 1: этот диспатч — повтор после инфра-отказа, бюджет не тратит
         labels = {label["name"] for label in pull["labels"]}
         if review_labels.AI_CHANGES not in labels:
@@ -1169,12 +1229,16 @@ def dispatch_ai_review_rework(
             observations.append(f"⚠️ PR #{number}: не удалось сверить бюджет авто-доводки: {error}")
             continue
         if attempts >= AI_REWORK_MAX_ATTEMPTS:
-            if dispatched or worker_runs_active(repo):
-                observations.append(
-                    f"⏸️ PR #{number}: авто-доводка по находкам ai-review ещё идёт "
-                    "(worker.yml активен) — решение об эскалации отложено"
-                )
-                continue
+            # Решение об эскалации НЕ гейтится занятостью воркера (issue
+            # #1253): в отличие от диспатча worker.yml несколькими строками
+            # ниже, эскалация не трогает воркер — это комментарий в PR/#120 +
+            # Telegram. Раньше оба решения жили за одним `if dispatched or
+            # worker_runs_active(repo)`, и живой воркер (занят 3–16-минутными
+            # интервалами почти постоянно) откладывал решение пульс за
+            # пульсом. Живая цена: PR #804/задача #720 — воркер упал честным
+            # инфра-отказом 2026-09-12T13:43, авто-повтор без штрафа бюджета
+            # должен был сработать следующим свободным пульсом, не сработал
+            # почти двое суток.
             marker = f"{AI_REWORK_ESCALATION_MARKER} #{number} fp:{fingerprint[:12]}"
             try:
                 already = issue_marker_times(repo, WATCHDOG_ISSUE, marker)
@@ -1212,7 +1276,38 @@ def dispatch_ai_review_rework(
             # факт (scripts/lib/dsh-ci.sh::dsh_worker_run_is_success решает
             # ЕГО conclusion по rc/провайдеру/новым коммитам — не второй
             # классификатор, тот же факт, уже вычисленный воркером).
-            run_conclusion = last_worker_run_conclusion(repo, task_number)
+            run = last_worker_run(repo, task_number)
+            run_conclusion = run.get("conclusion") if run else None
+            if run is not None and run.get("status") != "completed":
+                # Находка ревью PR #1260, ВТОРОЙ круг (эскалация-до-итога-
+                # прогона вернулась через дверь, которую белый список не
+                # закрыл): первая версия проверяла `status in ("in_progress",
+                # "queued")` — белый список неконечных статусов, а у GitHub
+                # Actions их больше (`requested`, `waiting`, `pending`, …), и
+                # `conclusion` у ВСЕХ них тоже None. Ревьюер исполнил сценарии
+                # со status="requested"/"waiting" — эскалация уходила
+                # владельцу с текстом «не атрибутирован», хотя атрибуция
+                # ЕСТЬ, просто исход неизвестен: ровно то, против чего эта
+                # ветка написана, вернулось через нехватку статуса в списке.
+                # Проверяем ЗАВЕРШЁННОСТЬ (`!= "completed"`), не перечисляем
+                # неконечные — только `"completed"` гарантированно несёт
+                # заполненный `conclusion` (прод-форма GitHub Actions API).
+                # «Атрибуции нет вовсе» и «атрибуция есть, но исход прогона
+                # ещё не известен» — разные факты (AGENTS.md, «алерт не
+                # гадает»); раньше это неотличимо трактовалось веткой ниже
+                # как «атрибуции нет». Это НЕ возврат снятого busy-гейта
+                # воркера (issue #1253 снял его намеренно — решение
+                # эскалировать не обязано ждать, пока освободится воркер ДЛЯ
+                # ДРУГОЙ задачи): здесь откладываем только пока не известен
+                # исход СОБСТВЕННОГО последнего прогона этой задачи, не
+                # занятостью воркера вообще.
+                observations.append(
+                    f"⏸️ PR #{number}: авто-доводка исчерпала бюджет ({attempts}/"
+                    f"{AI_REWORK_MAX_ATTEMPTS} на этом отпечатке), но собственный "
+                    f"последний прогон worker.yml ещё не завершился (status="
+                    f"{run.get('status')!r}) — эскалация отложена до известного исхода"
+                )
+                continue
             if run_conclusion in FAILURE_CONCLUSIONS:
                 # Исход 1: инфраструктурный отказ ЭТОГО прогона (rc≠0/нет
                 # ответившего провайдера/нет новых коммитов — см. gate выше)
@@ -2068,19 +2163,34 @@ def run_claimed_task(repo: str, task_number: int, run_id: int | str) -> bool:
     )
 
 
-def last_worker_run_conclusion(repo: str, task_number: int) -> str | None:
-    """Conclusion последнего прогона worker.yml, атрибутированного задаче
-    (run_claimed_task ищет след аренды среди свежих прогонов, новее→старше) —
-    None, если атрибуции не нашлось вовсе (аренда сгорела до следа/прогон
-    ещё не отметился). Используется dispatch_conflict_rework::escalate ниже
-    (находка ревью PR #478 — "алерт не гадает"): текст эскалации обязан
-    называть ФАКТ (conclusion прогона), а не утверждать причину («содержательный
-    конфликт»), которую отсюда не различить (инфраструктурный сбой/квота/
-    таймаут дают тот же итог «PR всё ещё dirty», что и настоящий конфликт)."""
+def last_worker_run(repo: str, task_number: int) -> dict | None:
+    """Последний прогон worker.yml, атрибутированный задаче (run_claimed_task
+    ищет след аренды среди свежих прогонов, новее→старше) — сырой объект
+    GitHub Actions API целиком (несёт и `status`, и `conclusion` — конечный
+    заполнен только после завершения), None, если атрибуции не нашлось вовсе
+    (аренда сгорела до следа/прогон ещё не отметился). Единственное место,
+    где прогон и задача сопоставлены по следу аренды — `last_worker_run_
+    conclusion` ниже и находка ревью PR #1260 (эскалация-до-итога-прогона в
+    dispatch_ai_review_rework) читают отсюда, не заводят вторую выборку."""
     for run in recent_runs(repo, WORKER_WORKFLOW, per_page=10):
         if run_claimed_task(repo, task_number, run.get("id")):
-            return run.get("conclusion")
+            return run
     return None
+
+
+def last_worker_run_conclusion(repo: str, task_number: int) -> str | None:
+    """Conclusion последнего прогона worker.yml, атрибутированного задаче —
+    None, если атрибуции не нашлось вовсе ИЛИ прогон ещё не завершился
+    (GitHub не заполняет `conclusion` для in_progress/queued — оба случая
+    неразличимы этой функцией по конструкции; `last_worker_run` — для
+    вызывающих, которым важно различить их). Используется
+    dispatch_conflict_rework::escalate ниже (находка ревью PR #478 —
+    "алерт не гадает"): текст эскалации обязан называть ФАКТ (conclusion
+    прогона), а не утверждать причину («содержательный конфликт»), которую
+    отсюда не различить (инфраструктурный сбой/квота/таймаут дают тот же
+    итог «PR всё ещё dirty», что и настоящий конфликт)."""
+    run = last_worker_run(repo, task_number)
+    return run.get("conclusion") if run else None
 
 
 def resume_series_by_merge(repo: str, pull: dict, task_number: int) -> str | None:

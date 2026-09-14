@@ -253,15 +253,20 @@ class FakeGh:
 
 
 def patch_gh(monkeypatch, fake):
-    """Единая точка патча — оба модуля читают gh() по имени (repo_invariants
+    """Единая точка патча — ТРИ модуля читают gh() по имени (repo_invariants
     реэкспортирует pulse_guard.gh как свой атрибут `ri.gh`, но
     post_issue_comment/escalate внутри pulse_guard.py вызывают СВОЙ
-    module-level `gh`, а не `ri.gh`). Патчить только `ri.gh` недостаточно —
-    так один прогон реально ушёл в живой issue #120 (инцидент этой задачи,
-    #244: очищено вручную, gh api -X DELETE .../comments/5527288512).
-    Патчим оба имени — тот же приём, что test_scheduler.py::patch_gh."""
+    module-level `gh`, а не `ri.gh`; ai_changes_labeled_at внутри
+    scheduler.py — третий, самостоятельный биндинг `scheduler.gh`).
+    Патчить только `ri.gh`/`ri.pulse_guard.gh` недостаточно — так один
+    прогон реально ушёл в живой issue #120 (инцидент этой задачи, #244:
+    очищено вручную, gh api -X DELETE .../comments/5527288512), а находка
+    ревью PR #1260 поймала тот же класс на `scheduler.gh`: тесты
+    check_ai_rework_never_dispatched читали живой GitHub вместо фикстур.
+    Патчим все три имени — тот же приём, что test_scheduler.py::patch_gh."""
     monkeypatch.setattr(ri, "gh", fake)
     monkeypatch.setattr(ri.pulse_guard, "gh", fake)
+    monkeypatch.setattr(ri.scheduler, "gh", fake)
 
 
 def gate1_status(when: str):
@@ -4172,3 +4177,166 @@ def test_run_escalations_invariant_18_key_stays_compact(monkeypatch):
     ri.run_escalations("mytab0r/edge-harness", {18: many_plus_one})
     assert len(seen_markers) == 2
     assert seen_markers[0] != seen_markers[1]  # новый состав — новая эскалация
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Инвариант 22 (issue #1253): «доводку не звали ни разу» отдельно от
+# «доводка звалась и не помогла» — check_stuck_review_gate (инвариант 3)
+# структурно не видит PR с уже вынесенным ai:changes-requested.
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def timeline_with_ai_changes(when: str):
+    return [{"event": "labeled", "label": {"name": ri.review_labels.AI_CHANGES}, "created_at": when}]
+
+
+def ai_rework_marker_comment(when: str):
+    return {"created_at": when, "body": f"🤖 {ri.scheduler.AI_REWORK_MARKER} fp:abc123 текст"}
+
+
+def test_ai_rework_never_dispatched_flags_after_threshold_without_marker(monkeypatch):
+    # Живой случай (issue #1253, замер 2026-09-14): PR #261 несёт
+    # ai:changes-requested с 2026-09-06T09:13:49Z (~8.3 сут на момент замера)
+    # и ни разу не получал маркер авто-доводки — голодание очереди по
+    # возрасту (dispatch_ai_review_rework перебирал сырой порядок open_pulls,
+    # новые PR первыми, до фикса этим же PR).
+    pull = open_pr(261, labels=[ri.review_labels.AI_CHANGES])
+    fake = FakeGh({
+        "issues/261/timeline": timeline_with_ai_changes("2026-09-06T09:13:49Z"),
+        "issues/261/comments": [],
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 14, 15, 33)
+    violations = ri.check_ai_rework_never_dispatched("mytab0r/edge-harness", now, [pull])
+    assert len(violations) == 1
+    assert violations[0]["pr"] == 261
+    assert violations[0]["age_minutes"] > ri.AI_REWORK_NEVER_DISPATCHED_AFTER_MINUTES
+
+
+def test_ai_rework_never_dispatched_silent_within_threshold(monkeypatch):
+    # Свежепомеченный PR — формирующийся бэклог сразу после дисптача,
+    # НЕ находка (тот же класс «тормоз без газа», от которого уже
+    # отказались для 1/4/5/9): очередь из N PR разгребается сама за часы.
+    pull = open_pr(1254, labels=[ri.review_labels.AI_CHANGES])
+    fake = FakeGh({
+        "issues/1254/timeline": timeline_with_ai_changes("2026-09-14T15:33:15Z"),
+        "issues/1254/comments": [],
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 14, 15, 34)
+    assert ri.check_ai_rework_never_dispatched("mytab0r/edge-harness", now, [pull]) == []
+
+
+def test_ai_rework_never_dispatched_silent_when_marker_present(monkeypatch):
+    # «Доводка звалась и не помогла» — ДРУГОЕ состояние: бюджет
+    # dispatch_ai_review_rework (AI_REWORK_MAX_ATTEMPTS + эскалация) уже
+    # отвечает за него, второй тормоз здесь не заводится.
+    #
+    # Мутация: убери ветку `if ever_dispatched: continue` в
+    # check_ai_rework_never_dispatched — этот тест покраснеет (PR #804,
+    # 7.5 суток с меткой, стал бы ложной находкой несмотря на маркер доводки).
+    pull = open_pr(804, labels=[ri.review_labels.AI_CHANGES])
+    fake = FakeGh({
+        "issues/804/timeline": timeline_with_ai_changes("2026-09-09T09:35:51Z"),
+        "issues/804/comments": [ai_rework_marker_comment("2026-09-12T13:00:00Z")],
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 14, 15, 33)  # ~7.5 суток с простановки метки
+    assert ri.check_ai_rework_never_dispatched("mytab0r/edge-harness", now, [pull]) == []
+
+
+def test_ai_rework_never_dispatched_flags_recidivism_across_episodes(monkeypatch):
+    """Находка написания дельта-спеки этого PR (класс #1172 в новом коде):
+    `ever_dispatched` сканировал ВСЮ историю комментариев PR на маркер
+    доводки, не сверяясь с `labeled_at` ТЕКУЩЕГО эпизода — PR, которому
+    доводку делали в ПРОШЛОМ эпизоде ai:changes-requested, потом метку
+    сняли, потом навесили снова и он опять застоялся сверх порога, не
+    отмечался НИКОГДА: старый маркер глушил находку ровно на рецидиве, ради
+    которого инвариант написан.
+
+    Два эпизода на одном PR: доводка (маркер) в ПЕРВОМ эпизоде
+    (2026-08-25 → снята 2026-08-28), тишина во ВТОРОМ эпизоде (навешена
+    заново 2026-09-06) сверх порога — инвариант обязан найти, несмотря на
+    маркер первого эпизода.
+
+    Мутация: убери условие `pulse_guard.parse_time(comment["created_at"]) >=
+    labeled_at` (верни голое `MARKER in body for comment in comments`,
+    без сверки с episode) — этот тест покраснеет: старый маркер первого
+    эпизода снова заглушит находку второго."""
+    pull = open_pr(900, labels=[ri.review_labels.AI_CHANGES])
+    timeline = [
+        {"event": "labeled", "label": {"name": ri.review_labels.AI_CHANGES},
+         "created_at": "2026-08-25T00:00:00Z"},
+        {"event": "unlabeled", "label": {"name": ri.review_labels.AI_CHANGES},
+         "created_at": "2026-08-28T00:00:00Z"},
+        {"event": "labeled", "label": {"name": ri.review_labels.AI_CHANGES},
+         "created_at": "2026-09-06T00:00:00Z"},
+    ]
+    fake = FakeGh({
+        "issues/900/timeline": timeline,
+        # Маркер лежит МЕЖДУ первым labeled (08-25) и unlabeled (08-28) —
+        # принадлежит ПЕРВОМУ эпизоду, строго раньше второго labeled (09-06).
+        "issues/900/comments": [ai_rework_marker_comment("2026-08-26T12:00:00Z")],
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 14, 15, 33)  # ~8.6 суток со ВТОРОГО эпизода (09-06)
+    violations = ri.check_ai_rework_never_dispatched("mytab0r/edge-harness", now, [pull])
+    assert len(violations) == 1
+    assert violations[0]["pr"] == 900
+    assert violations[0]["labeled_at"].startswith("2026-09-06")  # возраст СЧИТАН от нового эпизода
+
+
+def test_ai_rework_never_dispatched_silent_for_conflict_pr(monkeypatch):
+    # Conflict-PR — своя очередь (dispatch_conflict_rework), этот инвариант
+    # их не трогает вовсе, даже если ai:changes-requested тоже висит.
+    pull = open_pr(560, labels=[ri.review_labels.AI_CHANGES, ri.scheduler.CONFLICT_LABEL])
+    fake = FakeGh({})  # маршрут даже не должен запрашиваться
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 14, 15, 33)
+    assert ri.check_ai_rework_never_dispatched("mytab0r/edge-harness", now, [pull]) == []
+    assert fake.calls == []
+
+
+def test_ai_rework_never_dispatched_silent_when_no_ai_changes_label():
+    pull = open_pr(1, labels=["review:ok"])
+    now = utc(2026, 9, 14, 15, 33)
+    assert ri.check_ai_rework_never_dispatched("mytab0r/edge-harness", now, [pull]) == []
+
+
+def test_ai_rework_never_dispatched_silent_when_label_event_not_found(monkeypatch):
+    # ai_changes_labeled_at вернул None (таймлайн не отдал событие — метка
+    # снята и переставлена мимо API, редкий факт) — не гадаем, не находка.
+    pull = open_pr(1, labels=[ri.review_labels.AI_CHANGES])
+    fake = FakeGh({"issues/1/timeline": []})
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 14, 15, 33)
+    assert ri.check_ai_rework_never_dispatched("mytab0r/edge-harness", now, [pull]) == []
+
+
+def test_ai_rework_never_dispatched_not_in_ci_gating_or_escalating():
+    # Наблюдательный (docstring build_report/CI_GATING): свежедобавленный
+    # инвариант, ноль истории эскалаций — тот же порядок, что у 8/9/10/12/14.
+    assert 22 not in ri.CI_GATING
+    assert 22 not in ri.ESCALATING_INVARIANTS
+
+
+def test_build_report_wires_invariant_22(monkeypatch):
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": [{**open_pr(261, labels=[ri.review_labels.AI_CHANGES]),
+                               "created_at": "2026-09-06T00:00:00Z"}],
+        "graphql": graphql_pool_page(),
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+        "search/issues": {"items": []},
+        "issues/261/timeline": timeline_with_ai_changes("2026-09-06T09:13:49Z"),
+        "issues/261/comments": [],
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    now = utc(2026, 9, 14, 15, 33)
+    lines, findings = ri.build_report("mytab0r/edge-harness", now)
+    assert len(findings[22]) == 1
+    assert findings[22][0]["pr"] == 261
+    assert any("🚨" in line and "[22]" in line for line in lines)
+    assert any("#261" in line for line in lines)

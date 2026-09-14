@@ -311,6 +311,24 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
       вечный долг даёт одну эскалацию (#120 + Telegram), новая подделка
       меняет множество и даёт новую; владелец узнаёт о каждом новом эпизоде
       без спама на каждый пульс.
+  22. check_ai_rework_never_dispatched (issue #1253): PR несёт
+      ai:changes-requested дольше AI_REWORK_NEVER_DISPATCHED_AFTER_MINUTES
+      с начала текущего эпизода метки (scheduler.ai_changes_labeled_at) и НИ
+      РАЗУ не получал маркер авто-доводки (scheduler.AI_REWORK_MARKER) —
+      «доводку не звали ни разу», отдельно от «доводка звалась и не
+      помогла» (за это отвечает бюджет dispatch_ai_review_rework, второй
+      тормоз здесь не заводится). check_stuck_review_gate (инвариант 3)
+      намеренно пропускает любой PR с ai:*-меткой (строки 836-838 выше) —
+      структурный пробел, а не ошибка 3: он про гейт 2 ДО вердикта, этот —
+      про доводку ПОСЛЕ. Живой класс, который этот инвариант закрывает как
+      РЕГРЕССИОННЫЙ детектор: голодание очереди по возрасту (сырой порядок
+      open_pulls, новые PR первыми) — 31 открытый PR с ai:changes-requested
+      на замере 2026-09-14, 15 никогда не получали диспатч доводки,
+      старейший восстановленный случай — PR #261 (8 суток простоя); фикс —
+      сортировка очереди в этом же PR. Наблюдательный, не в CI_GATING и не
+      в ESCALATING_INVARIANTS: живой замер долга на момент внедрения — см.
+      PR #1260 (задача #1253, число и датировка находок в описании PR),
+      порог обоснован той же датой, не вкусом.
 
 Расписание: главный канал — периодический шаг orchestra.yml (cron */15 мин),
 он же вызывает escalate() для всех эскалирующих инвариантов — реестр
@@ -940,6 +958,107 @@ def stuck_gate_fact_line(item: dict) -> str:
         f"PR #{item['pr']} — {int(item['age_minutes'])} мин без вердикта в "
         f"текущей эпохе (с {item['labeled_at']}); автоповтор: {budget}; {verdict_text}"
     )
+
+
+# Инвариант 22 (issue #1253; номер взят арбитром scripts/lib/
+# invariant_numbering.py — на 2026-09-14 19 занят PR #1061, 20 занят PR
+# #1136, 21 занят PR #1247, следующий свободный — 22) — «доводку не звали
+# ни разу» отдельно от
+# «доводка звалась и не помогла». check_stuck_review_gate (инвариант 3)
+# намеренно пропускает ЛЮБОЙ PR с ai:*-меткой (строки 836-838 выше) — это не
+# ошибка 3 (он про гейт 2 ДО вердикта), но структурный пробел: PR с уже
+# вынесенным ai:changes-requested, которому dispatch_ai_review_rework ни разу
+# не звонил, был невидим ЛЮБОМУ инварианту репозитория. Живой класс до этой
+# задачи — голодание очереди по возрасту (dispatch_ai_review_rework перебирал
+# сырой порядок open_pulls, новые PR первыми): 31 открытый PR с
+# ai:changes-requested на замере 2026-09-14, 15 никогда не получали диспатч
+# доводки, старейший восстановленный случай — PR #261 (8 суток простоя).
+#
+# Порог AI_REWORK_NEVER_DISPATCHED_AFTER_MINUTES — замер живой популяции
+# 2026-09-14 (после сортировки очереди этим же PR, `dispatch_ai_review_rework`
+# read-only прогон по `ai_changes_labeled_at`/`AI_REWORK_MARKER`): 22 открытых
+# PR с ai:changes-requested (без conflict), 17 никогда не получали маркер
+# авто-доводки. Возраст текущего эпизода метки у этих 17 распадается на два
+# явно разделённых кластера с зазором: «формирующийся бэклог сразу после
+# внедрения» — от 0.2 до 438.8 мин (до ~7.3 ч, естественно — очередь из 22 PR
+# при серийном слоте воркера и диспатче раз в пульс разгребается САМА за
+# считаные часы, флагать эту фазу как находку было бы «тормозом без газа»
+# сразу после включения, тот же класс, от которого уже отказались для 1/4/5/9)
+# — и «реальный многодневный застой» — от 2894.0 мин (~2.0 сут, PR #1033) до
+# 11899.6 мин (~8.3 сут, PR #261). Порог 1440 мин (24 ч) лежит строго в
+# зазоре между кластерами (> 438.8, < 2894.0) — режет по факту распределения,
+# не по вкусу. На момент внедрения это даёт 4 находки: #261/#919/#1028/#1033.
+AI_REWORK_NEVER_DISPATCHED_AFTER_MINUTES = 1440
+
+
+def check_ai_rework_never_dispatched(repo: str, now: datetime, open_pulls: list[dict]) -> list[dict]:
+    """Инвариант 22 (issue #1253): PR несёт ai:changes-requested (не
+    conflict — своя очередь, dispatch_conflict_rework обслуживает их
+    отдельно) дольше AI_REWORK_NEVER_DISPATCHED_AFTER_MINUTES с начала
+    ТЕКУЩЕГО эпизода метки (scheduler.ai_changes_labeled_at — тот же факт,
+    что теперь сортирует саму очередь диспатча, #1253) и НИ РАЗУ не получал
+    маркер авто-доводки (scheduler.AI_REWORK_MARKER в комментариях самого
+    PR — dispatch_ai_review_rework пишет его туда при КАЖДОМ диспатче,
+    независимо от исхода попытки).
+
+    Отличие от check_stuck_review_gate (инвариант 3) одной фразой: 3 ловит
+    PR БЕЗ вердикта ai:* вообще (гейт 2 ещё не отработал), этот — PR С
+    вердиктом ai:changes-requested, которому dispatch_ai_review_rework ни
+    разу не звонил (3 такой PR структурно не видит — гейт 2 у него уже
+    отработал). Это РЕГРЕССИОННЫЙ детектор симптома, который закрывает
+    #1253: если очередь снова начнёт голодать (новый канал добавления PR,
+    поломка сортировки, порча ai_changes_labeled_at), находка появится
+    здесь раньше, чем кто-то заметит по логам вручную (AGENTS.md,
+    «Инцидент оставляет инвариант»).
+
+    «Доводка звалась хоть раз В ТЕКУЩЕМ ЭПИЗОДЕ метки, но не помогла» —
+    ДРУГОЕ состояние, НЕ находка этого инварианта: за него уже отвечает
+    бюджет dispatch_ai_review_rework (AI_REWORK_MAX_ATTEMPTS попыток на
+    отпечаток диффа + законная эскалация владельцу,
+    AI_REWORK_ESCALATION_MARKER) — второй тормоз здесь не заводим, инвариант
+    проверяет ровно то, что этот бюджет структурно не видит: PR, которому
+    адресный диспатч не звонил НИКОГДА В ТЕКУЩЕМ ЭПИЗОДЕ, поэтому и бюджет
+    по нему (считается по отпечатку диффа, не по эпизоду метки) ещё не
+    открывался. Маркер из ПРОШЛОГО эпизода (метка снята и навешена заново)
+    к текущему эпизоду отношения не имеет — см. `ever_dispatched_this_episode`
+    ниже, эпизодная привязка по `labeled_at`."""
+    violations = []
+    for pull in open_pulls:
+        labels = {label["name"] for label in pull["labels"]}
+        if review_labels.AI_CHANGES not in labels:
+            continue
+        if scheduler.CONFLICT_LABEL in labels:
+            continue  # своя очередь — dispatch_conflict_rework
+        number = pull["number"]
+        labeled_at = scheduler.ai_changes_labeled_at(repo, number)
+        if labeled_at is None:
+            continue  # факт не восстановлен (таймлайн не отдал событие) — не гадаем
+        age = minutes_between(labeled_at, now)
+        if age <= AI_REWORK_NEVER_DISPATCHED_AFTER_MINUTES:
+            continue
+        comments = pulse_guard.all_issue_comments(repo, number)
+        # Эпизодная привязка (класс #1172 в новом коде, находка написания
+        # дельта-спеки этого PR): маркер считается ТОЛЬКО если он новее
+        # labeled_at ТЕКУЩЕГО эпизода метки, не всей истории PR. Без этой
+        # привязки маркер из ПРОШЛОГО эпизода (доводка звалась, метка снята,
+        # потом навешена заново и PR застоялся сверх порога СНОВА) глушит
+        # находку навсегда — рецидив, ради которого инвариант написан,
+        # оказывается ровно тем случаем, где он молчит. «Звалась и не
+        # помогла» в докстринге функции — это про ТЕКУЩИЙ эпизод: старый
+        # маркер прошлого эпизода к нему отношения не имеет.
+        ever_dispatched_this_episode = any(
+            scheduler.AI_REWORK_MARKER in (comment.get("body") or "")
+            and pulse_guard.parse_time(comment["created_at"]) >= labeled_at
+            for comment in comments
+        )
+        if ever_dispatched_this_episode:
+            continue  # «звалась и не помогла» — бюджет dispatch_ai_review_rework уже видит это
+        violations.append({
+            "pr": number,
+            "age_minutes": round(age, 1),
+            "labeled_at": labeled_at.isoformat(),
+        })
+    return violations
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -3231,6 +3350,32 @@ def build_report(repo: str, now: datetime,
             f"💚 [18] все маркеры статуса конвейера в #{WATCHDOG_ISSUE} "
             "опубликованы токеном job'а"
         )
+
+    try:
+        v22 = check_ai_rework_never_dispatched(repo, now, open_pulls)
+    except RuntimeError as error:
+        findings[22] = []
+        lines.append(f"🚨 [22] проверка голодания очереди доводки ai-review недоступна: {error} — "
+                      "инвариант пропущен на этом прогоне (это НЕ «нарушений нет»)")
+    else:
+        findings[22] = v22
+        if v22:
+            lines.append(
+                f"🚨 [22] {len(v22)} PR с ai:changes-requested старше "
+                f"{AI_REWORK_NEVER_DISPATCHED_AFTER_MINUTES} мин ни разу не получали "
+                "авто-доводку (#1253):"
+            )
+            for item in v22:
+                lines.append(
+                    f"   — PR #{item['pr']} — {int(item['age_minutes'])} мин с "
+                    f"{item['labeled_at']}, ни одного диспатча авто-доводки"
+                )
+        else:
+            lines.append(
+                f"💚 [22] нет PR с ai:changes-requested старше "
+                f"{AI_REWORK_NEVER_DISPATCHED_AFTER_MINUTES} мин без хотя бы одного "
+                "диспатча авто-доводки"
+            )
     return lines, findings
 
 
