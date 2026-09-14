@@ -48,6 +48,66 @@ export function isExpected(finding) {
 }
 
 /**
+ * Закрывает оверлей-тур первого визита (кнопка «Continue»), если он есть.
+ * Флейк #1066/34700537627: старая версия глушила отказ клика через
+ * `.catch(() => {})` и ждала фиксированные 500 мс — если клик не прошёл или
+ * тур появился позже проверки `count() > 0`, маска (`role="presentation"` +
+ * `aria-hidden="true"` сиблинг) оставалась поверх шелла и перехватывала
+ * следующий клик («Settings»), а видимое сообщение об отказе называло
+ * СЛЕДСТВИЕ («кнопка не найдена/не кликнулась»), а не причину.
+ *
+ * Третья рука той же гонки (#1070, находка ai-review PR #1070): мгновенный
+ * снимок `count() === 0` неотличим от «тур ещё не смонтировался» — оба
+ * реальных вызывающих (smoke.mjs, pr-check.mjs) открывают свежий контекст
+ * браузера на каждый прогон, «первый визит» там ВСЕГДА, поэтому
+ * `count() === 0` физически не может означать «возвращавшийся пользователь
+ * без тура». Вместо мгновенного снимка ждём факт появления с потолком
+ * (`appearTimeoutMs`) — не найден за этот срок, значит тура правда не было
+ * (или апстрим его вырезал), а не гонка с монтированием. В штатном случае
+ * (тур монтируется) ожидание резолвится сразу по факту появления, без
+ * добавленной задержки; цена таймаута ложится только на прогон без тура.
+ *
+ * Дальше — тот же факт закрытия, что и раньше: сама кнопка «Continue» в
+ * состоянии `hidden` — это тот же узел дерева, что закрывающий диалог/маска
+ * тура размонтирует вместе с собой, и ждать его не требует хрупкого
+ * селектора по хешу CSS-модуля маски (см. заголовок файла — то же
+ * обоснование, что и для отказа от хардкода классов вкладок).
+ *
+ * Кидает Error с точной причиной (клик не прошёл / тур не закрылся) —
+ * вызывающий код оборачивает её в findings через throwWithFindings.
+ *
+ * @param {import('playwright-core').Locator} tourContinue
+ * @param {{ appearTimeoutMs?: number, clickTimeoutMs?: number, hideTimeoutMs?: number }} [opts]
+ * @returns {Promise<boolean>} true — тур был и закрыт; false — тура не было
+ */
+export async function closeTourOverlay(tourContinue, { appearTimeoutMs = 2000, clickTimeoutMs = 5000, hideTimeoutMs = 5000 } = {}) {
+  const appeared = await tourContinue
+    .waitFor({ state: 'visible', timeout: appearTimeoutMs })
+    .then(() => true, () => false)
+  if (!appeared) return false
+
+  try {
+    await tourContinue.click({ timeout: clickTimeoutMs })
+  } catch (error) {
+    throw new Error(
+      `оверлей-тур: клик по кнопке «Continue» не прошёл за ${clickTimeoutMs}мс — ${error.message}`,
+      { cause: error },
+    )
+  }
+
+  try {
+    await tourContinue.waitFor({ state: 'hidden', timeout: hideTimeoutMs })
+  } catch (error) {
+    throw new Error(
+      `оверлей-тур не закрылся за ${hideTimeoutMs}мс после клика «Continue» — маска, вероятно, всё ещё перекрывает шелл`,
+      { cause: error },
+    )
+  }
+
+  return true
+}
+
+/**
  * Прогоняет смоук против одного воркера (прод ИЛИ локальный unstable_dev —
  * вызывающий код решает, чем является baseUrl). Не вызывает process.exit —
  * возвращает { findings, elapsedMs } при штатном завершении обхода; при
@@ -119,11 +179,13 @@ export async function runBrowserSmoke({ browser, baseUrl, accessKey }) {
     console.log(`smoke: логин прошёл, url ${page.url()}`)
 
     // Первый визит показывает оверлей-тур ("Continue") поверх шелла — закрыть,
-    // иначе клики по реальным элементам перехватывает маска.
+    // иначе клики по реальным элементам перехватывает маска (класс #1066:
+    // см. докстринг closeTourOverlay выше — ждём факт закрытия, не паузу).
     const tourContinue = page.getByRole('button', { name: 'Continue' })
-    if (await tourContinue.count() > 0) {
-      await tourContinue.click({ timeout: 5000 }).catch(() => {})
-      await page.waitForTimeout(500)
+    try {
+      await closeTourOverlay(tourContinue)
+    } catch (error) {
+      throwWithFindings(error.message, error)
     }
 
     // ── Открыть Settings ──────────────────────────────────────────────────────
