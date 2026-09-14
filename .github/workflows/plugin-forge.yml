@@ -680,7 +680,15 @@ jobs:
           # Дым инсталла (cordis + ToolRuntime)
           node "$GITHUB_WORKSPACE/dsh-edge/smoke-edge-plugins.mjs" "$GITHUB_WORKSPACE/forge-clone"
 
-          # Сборка
+          # Сборка. Скоуп алиасов published-пакетов: с бампа #1164 (пин 0.14.1)
+          # патч 0001 снят — апстрим сам принимает DSH_EDGE_EXTRA_ALIAS_SCOPES
+          # (dsh-edge/PATCHES.md). Значение — НЕ литерал: читаем PLUGIN_SCOPE
+          # из dsh-edge/manifest.mjs (одно место правды, тот же приём, что с
+          # DIRECT_GZIP_BUDGET_BYTES ниже); нечитаемый скоуп — громкое падение
+          # здесь, не тихий tarball без плагинных алиасов.
+          DSH_EDGE_EXTRA_ALIAS_SCOPES="$(node -e "import('$GITHUB_WORKSPACE/dsh-edge/manifest.mjs').then(m => process.stdout.write(m.PLUGIN_SCOPE))")"
+          [ -n "$DSH_EDGE_EXTRA_ALIAS_SCOPES" ] || { echo "::error::не удалось прочитать PLUGIN_SCOPE из dsh-edge/manifest.mjs — скоуп алиасов плагинов не задан"; exit 1; }
+          export DSH_EDGE_EXTRA_ALIAS_SCOPES
           pnpm --dir apps/dsh-edge/standalone run build
 
           # Гвардия gzip-бюджета direct-воркера (design.md «Workers-совместимость»,
