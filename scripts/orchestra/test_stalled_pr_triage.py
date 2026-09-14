@@ -62,11 +62,13 @@ def test_large_conflict_no_verdict_is_recreate():
 
 def test_functional_overlap_alone_forces_recreate_even_when_git_reports_clean():
     """Величина 3 (дефект 3): git может считать PR MERGEABLE, но AST-регионы
-    пересекаются с main — «дёшево по git» не значит «дёшево по смыслу»."""
+    пересекаются с main — «дёшево по git» не значит «дёшево по смыслу».
+    Докстринг, decide() и reason-строка говорят одно (находка ревью PR
+    #1219): пересечение → «пересоздать», что читать — часть исполнения."""
     result = tri.decide(conflicting=False, functional_overlap_count=3,
                          task_state="open", ai_verdict=None)
     assert result["action"] == tri.ACTION_RECREATE
-    assert any("функций/классов" in r for r in result["reasons"])
+    assert any("регион" in r and "пересоздать" in r for r in result["reasons"])
 
 
 def test_large_conflict_with_rework_verdict_names_extra_cost_reason():
@@ -113,26 +115,37 @@ def test_task_with_no_pool_task_at_all_is_not_treated_as_closed():
     assert result["action"] == tri.ACTION_PROCEED
 
 
+def test_unknown_task_state_is_honest_not_silently_open():
+    """Находка ревью PR #1219: отсутствующий ответ GraphQL не имеет права
+    притворяться «задача открыта» — «не знаю» остаётся «не знаю», решение
+    на величине 4 не строится, в reasons попадает честное «не подтверждено»."""
+    result = tri.decide(conflicting=False, functional_overlap_count=0,
+                         task_state="unknown", ai_verdict=None)
+    assert result["action"] == tri.ACTION_PROCEED
+    assert any("не подтверждено" in r for r in result["reasons"])
+
+
 def test_declaration_collision_is_a_warning_overlaid_on_any_action():
     """Дефект 4: коллизия номера — не отдельная ветка действия, а
-    обязательное предупреждение поверх решения, каким бы оно ни было."""
+    обязательное предупреждение поверх решения, каким бы оно ни было.
+    Половины названы раздельно (находка ревью PR #1219: reason обязан
+    описывать сработавшую половину, не гадать)."""
     proceed = tri.decide(conflicting=False, functional_overlap_count=0,
-                          task_state="open", ai_verdict=None, declaration_collision=True)
+                          task_state="open", ai_verdict=None,
+                          invariant_collision=True)
     assert proceed["action"] == tri.ACTION_PROCEED
-    assert any("коллизию" in r or "коллизия" in r or "дубль" in r for r in proceed["reasons"])
+    assert any("инварианты" in r and "дубль" in r for r in proceed["reasons"])
 
     recreate = tri.decide(conflicting=True, functional_overlap_count=0,
-                           task_state="open", ai_verdict=None, declaration_collision=True)
+                           task_state="open", ai_verdict=None,
+                           decision_doc_collision=True)
     assert recreate["action"] == tri.ACTION_RECREATE
-    assert any("дубль" in r for r in recreate["reasons"])
+    assert any("decision/research-номера" in r for r in recreate["reasons"])
+    # Инвариантная формулировка в doc-случае не появляется — «алерт не гадает».
+    assert not any("инварианты" in r for r in recreate["reasons"])
 
 
-# ── declared_invariant_numbers / declaration_collisions (чистые) ───────────
-
-def test_declared_invariant_numbers_extracts_all_mentions():
-    source = "# Инвариант 15: X\ndef f():\n    '''Инвариант 15 (#900)'''\n# Инвариант 9\n"
-    assert tri.declared_invariant_numbers(source) == {15, 9}
-
+# ── declaration_collisions (чистые) ─────────────────────────────────────────
 
 def test_declaration_collisions_only_flags_numbers_added_by_both_sides():
     added_by_pr = {15, 20}
@@ -144,11 +157,29 @@ def test_declaration_collisions_empty_when_disjoint():
     assert tri.declaration_collisions({20}, {17}) == set()
 
 
-# ── parse_added_line_numbers / python_def_ranges (чистые) ──────────────────
+def test_invariant_registry_format_is_single_sourced_to_invariant_numbering():
+    """Находка ревью PR #1219 (в связке с #1201, слитым 2026-09-14): формат
+    записи реестра инвариантов парсится только invariant_numbering — путь и
+    парсер не копируются в триаж."""
+    assert tri.INVARIANT_FILE == tri.invariant_numbering.TARGET_PATH
 
-def test_parse_added_line_numbers_reads_plus_side_of_hunk_header():
+
+# ── parse_base_touched_lines / python_def_ranges (чистые) ──────────────────
+
+def test_parse_base_touched_lines_reads_minus_side_of_hunk_header():
+    """БАЗОВЫЕ координаты (сторона минус), не плюс-стороны (находка ревью
+    PR #1219): сверять можно только с регионами того же файла, что в
+    заголовке минус-стороны."""
     diff = "@@ -10,2 +12,4 @@\n+a\n+b\n+c\n+d\n@@ -30 +34,0 @@\n"
-    assert tri.parse_added_line_numbers(diff) == {12, 13, 14, 15, 34}
+    assert tri.parse_base_touched_lines(diff) == {10, 11, 30}
+
+
+def test_parse_base_touched_lines_pure_insertion_touches_base_line():
+    """`b == 0` — вставка после базовой строки a: регион замыкается
+    строкой a (иначе вставка внутри функции никогда бы не пересеклась), а
+    `-0,0` (вставка в начало файла) — строкой 1, не 0."""
+    diff = "@@ -15,0 +16,3 @@\n+x\n+y\n+z\n@@ -0,0 +1,2 @@\n+new\n+file\n"
+    assert tri.parse_base_touched_lines(diff) == {15, 1}
 
 
 def test_python_def_ranges_keys_by_name_and_start_line_to_avoid_collapsing_same_name():
@@ -158,8 +189,43 @@ def test_python_def_ranges_keys_by_name_and_start_line_to_avoid_collapsing_same_
     assert "f:2" in ranges and "f:5" in ranges
 
 
+def test_python_def_ranges_region_starts_at_decorator_not_at_def():
+    """Находка ревью PR #1219: правка только `@декоратора` — правка
+    поведения функции; регион, начатый со строки `def`, её бы не заметил."""
+    source = "@staticmethod\n@deprecated\ndef f():\n    pass\n"
+    ranges = tri.python_def_ranges(source)
+    assert ranges == {"f:1": (1, 4)}
+
+
 def test_python_def_ranges_on_syntax_error_returns_empty_not_raises():
     assert tri.python_def_ranges("def f(:\n") == {}
+
+
+def test_region_word_agrees_with_russian_plural():
+    assert tri.region_word(1) == "1 регион"
+    assert tri.region_word(3) == "3 региона"
+    assert tri.region_word(5) == "5 регионов"
+    assert tri.region_word(11) == "11 регионов"
+    assert tri.region_word(21) == "21 регион"
+    assert tri.region_word(14) == "14 регионов"
+
+
+def test_intersecting_line_runs_groups_contiguous_lines_into_ranges():
+    """Line-range fallback: единица — РЕГИОН (диапазон), не строка, иначе
+    величина раздувается пропорционально длине блока."""
+    pr = {10, 11, 12, 13, 40}
+    main = {11, 12, 13, 14, 40}
+    assert tri.intersecting_line_runs(pr, main) == ["11-13", "40"]
+
+
+def test_intersecting_line_runs_empty_when_disjoint():
+    assert tri.intersecting_line_runs({1, 2}, {50}) == []
+
+
+def test_count_changed_lines_counts_plus_and_minus_not_headers():
+    diff = ("--- a/f.md\n+++ b/f.md\n@@ -1,2 +1,2 @@\n-old\n+new\n"
+            "\\ No newline at end of file\n")
+    assert tri.count_changed_lines(diff) == 2
 
 
 def test_functional_overlap_is_intersection_of_region_names():
@@ -255,6 +321,114 @@ def test_measure_functional_overlap_finds_real_semantic_collision_like_pr831(rep
     result = tri.measure_functional_overlap("main", "pr", cwd=str(repo))
     assert result["overlap_count"] == 1
     assert "wip_gate" in result["overlap_detail"]["scripts/orchestra/scheduler.py"][0]
+    assert result["overlap_mode_by_file"]["scripts/orchestra/scheduler.py"] == "ast"
+
+
+SHIFTED_SOURCE = (
+    "def alpha():\n"       # 1-4: тело, которое PR удаляет целиком
+    "    return 1\n"
+    "    return 2\n"
+    "    return 3\n"
+    "def gamma():\n"       # 5-6: main правит здесь
+    "    return 30\n"
+    "def beta():\n"        # 7-8: PR правит здесь
+    "    return 2\n"
+)
+
+
+def test_measure_functional_overlap_uses_base_coordinates_not_shifted_plus_side(repo):
+    """Находка ревью PR #1219 (класс «сдвиги дают ложные пересечения»):
+    PR удаляет тело alpha (−3 строки ВЫШЕ) и правит beta; в плюс-координатах
+    правка beta получает номер 5 — внутри региона gamma, и правка main
+    gamma ложно давала бы «пересечение» → ложное «пересоздать». Базовые
+    (минус-)координаты обязаны дать ноль."""
+    write(repo / "scripts" / "orchestra" / "scheduler.py", SHIFTED_SOURCE)
+    git("commit", "-am", "base shifted layout", cwd=repo)
+
+    git("checkout", "-b", "pr", cwd=repo)
+    write(repo / "scripts" / "orchestra" / "scheduler.py",
+          SHIFTED_SOURCE.replace("def alpha():\n    return 1\n    return 2\n    return 3\n",
+                                 "def alpha():\n    return 0\n")
+          .replace("def beta():\n    return 2\n", "def beta():\n    return 200\n"))
+    git("commit", "-am", "pr shrinks alpha and rewrites beta", cwd=repo)
+
+    git("checkout", "main", cwd=repo)
+    write(repo / "scripts" / "orchestra" / "scheduler.py",
+          SHIFTED_SOURCE.replace("def gamma():\n    return 30\n", "def gamma():\n    return 31\n"))
+    git("commit", "-am", "main rewrites gamma", cwd=repo)
+
+    result = tri.measure_functional_overlap("main", "pr", cwd=str(repo))
+    assert result["overlap_count"] == 0
+
+
+def test_measure_functional_overlap_line_range_fallback_for_non_python_files(repo):
+    """Блокирующая находка ревью PR #1219 (п. 4 задачи #1218): fallback для
+    не-.py — пересечение задетых обеими сторонами базовых строк. Живой
+    класс: #1026 — конфликт в config json/markdown, где AST-версия величины
+    3 честно рапортовала «код не пересекается», ничего не измерив."""
+    write(repo / "docs" / "guide.md", "t1\nt2\nt3\nt4\nt5\n")
+    git("add", "-A", cwd=repo)
+    git("commit", "-qm", "base guide", cwd=repo)
+
+    git("checkout", "-b", "pr", cwd=repo)
+    write(repo / "docs" / "guide.md", "t1\nP2\nP3\nt4\nt5\n")
+    git("commit", "-am", "pr edits same lines 2-3", cwd=repo)
+
+    git("checkout", "main", cwd=repo)
+    write(repo / "docs" / "guide.md", "t1\nM2\nM3\nt4\nt5\n")
+    git("commit", "-am", "main edits lines 2-3", cwd=repo)
+
+    result = tri.measure_functional_overlap("main", "pr", cwd=str(repo))
+    assert result["overlap_count"] == 1
+    assert result["overlap_mode_by_file"]["docs/guide.md"] == "line-range"
+    assert result["overlap_detail"]["docs/guide.md"] == ["2-3"]
+
+
+def test_measure_functional_overlap_line_range_fallback_disjoint_is_zero(repo):
+    """Обратный случай fallback: обе стороны правят ОДИН не-.py файл, но
+    РАЗНЫЕ его строки — пересечения нет, и ноль обязан остаться нулём."""
+    write(repo / "docs" / "guide.md", "t1\nt2\nt3\nt4\nt5\n")
+    git("add", "-A", cwd=repo)
+    git("commit", "-qm", "base guide", cwd=repo)
+
+    git("checkout", "-b", "pr", cwd=repo)
+    write(repo / "docs" / "guide.md", "P1\nt2\nt3\nt4\nt5\n")
+    git("commit", "-am", "pr edits first line only", cwd=repo)
+
+    git("checkout", "main", cwd=repo)
+    write(repo / "docs" / "guide.md", "t1\nt2\nt3\nt4\nM5\n")
+    git("commit", "-am", "main edits last line", cwd=repo)
+
+    result = tri.measure_functional_overlap("main", "pr", cwd=str(repo))
+    assert result["overlap_count"] == 0
+    assert "docs/guide.md" not in result["overlap_mode_by_file"]
+
+
+def test_measure_functional_overlap_carries_reference_line_ratio(repo):
+    """Блокирующая находка ревью PR #1219: справочный строковый ratio ADR
+    считается машиной и доходит до вывода, не остаётся формулой рядом с
+    мёртвой функцией. PR: 1 строка изменена (−1/+1); main: +80 строк
+    (дописывание в конец, живой класс #542/#1053) → ratio 40.0."""
+    git("checkout", "-b", "pr", cwd=repo)
+    source = SCHEDULER_SOURCE.replace(
+        "def dispatch_conflict_rework():\n    return 1\n",
+        "def dispatch_conflict_rework():\n    return 100\n")
+    write(repo / "scripts" / "orchestra" / "scheduler.py", source)
+    git("commit", "-am", "pr edits one line", cwd=repo)
+
+    git("checkout", "main", cwd=repo)
+    grown = SCHEDULER_SOURCE + "\n\ndef unrelated_helper_2():\n    return 4\n" * 20
+    write(repo / "scripts" / "orchestra" / "scheduler.py", grown)
+    git("commit", "-am", "main appends helpers", cwd=repo)
+
+    result = tri.measure_functional_overlap("main", "pr", cwd=str(repo))
+    assert result["line_drift_main_lines"] == 80
+    assert result["line_drift_pr_lines"] == 2
+    assert result["line_drift_ratio"] == 40.0
+    # Справочная величина обязана ДОХОДИТЬ до вывода measure_pr (мутация:
+    # ключ удаляется — тест красный), не жить только внутри measure.
+    full = tri.measure_pr("main", "pr", cwd=str(repo))
+    assert full["velichina3_line_drift_ratio_reference"] == 40.0
 
 
 def test_is_conflicting_true_on_real_textual_conflict(repo):
@@ -269,6 +443,51 @@ def test_is_conflicting_true_on_real_textual_conflict(repo):
     conflicting, files = tri.is_conflicting("main", "pr", cwd=str(repo))
     assert conflicting is True
     assert "scripts/orchestra/scheduler.py" in files
+
+
+def test_is_conflicting_true_on_real_modify_delete_conflict(repo):
+    """Блокирующая находка ревью PR #1219: modify/delete-конфликт даёт
+    rc=1 и строку «CONFLICT (modify/delete): …», НЕ формы «Merge conflict
+    in» — старый код, решавший по regex одной формы, возвращал
+    `(False, [])`, то есть «не конфликтует», и PR ушёл бы в «довести»."""
+    write(repo / "del_target.txt", "content\n")
+    git("add", "-A", cwd=repo)
+    git("commit", "-m", "base with del_target", cwd=repo)
+
+    git("checkout", "-b", "pr", cwd=repo)
+    git("rm", "--quiet", "del_target.txt", cwd=repo)
+    git("commit", "-m", "pr deletes file", cwd=repo)
+
+    git("checkout", "main", cwd=repo)
+    write(repo / "del_target.txt", "content changed in main\n")
+    git("commit", "-am", "main modifies same file", cwd=repo)
+
+    conflicting, files = tri.is_conflicting("main", "pr", cwd=str(repo))
+    assert conflicting is True
+    assert "del_target.txt" in files
+
+
+def test_is_conflicting_parses_real_modify_delete_output_form():
+    """Прод-форма вывода `git merge-tree --write-tree` (modify/delete):
+    парсер обязан извлечь путь и из неё, не только из «Merge conflict in».
+    Строка — реальный формат вывода git, не пересказ."""
+    stdout = (
+        "Auto-merging del_target.txt\n"
+        "CONFLICT (modify/delete): del_target.txt deleted in pr and modified in main."
+        "  Version main of del_target.txt left in tree.\n"
+    )
+    files = sorted(set(tri._CONFLICT_MERGE_IN_RE.findall(stdout))
+                   | set(tri._CONFLICT_PATH_RE.findall(stdout)))
+    assert "del_target.txt" in files
+
+
+def test_is_conflicting_raises_giterror_when_tool_fails(repo):
+    """Блокирующая находка ревью PR #1219: отказ merge-tree (несуществующий
+    ref, старый git без --write-tree) — не «чисто», а громкий отказ.
+    Сбой инструмента, притворившийся «конфликта нет», уводил бы PR в
+    «довести» молча."""
+    with pytest.raises(tri.GitError):
+        tri.is_conflicting("main", "no-such-ref-anywhere", cwd=str(repo))
 
 
 # ── ensure_unshallow (issue #1213/#1218: ловушка поверхностного клона) ─────
@@ -324,20 +543,31 @@ def test_is_conflicting_false_on_clean_rebase(repo):
     assert files == []
 
 
+REGISTRY = (
+    "# Реестр инвариантов\n"
+    "\n"
+    "  14. check_existing — единственная запись базы\n"
+)
+
+
 def test_measure_invariant_collision_detects_live_class_from_870_883_944(repo):
     """Живой случай issue #1218 (дефект 4): main и PR независимо добавляют
-    один и тот же номер `# Инвариант N` с общего merge-base (870→15/883→18/
-    944→17 против main)."""
-    write(repo / tri.INVARIANT_FILE, "# Инвариант 14\n")
+    один и тот же номер реестра repo_invariants.py с общего merge-base
+    (870→15/883→18/944→17 против main). Формат записей — живой формат
+    реестра (`N. check_имя — …`), который парсится invariant_numbering
+    (#904), не пересказ."""
+    write(repo / tri.INVARIANT_FILE, REGISTRY)
     git("add", "-A", cwd=repo)
     git("commit", "-m", "base with invariant 14", cwd=repo)
 
     git("checkout", "-b", "pr", cwd=repo)
-    write(repo / tri.INVARIANT_FILE, "# Инвариант 14\n# Инвариант 15: PR adds drain quiet check\n")
+    write(repo / tri.INVARIANT_FILE,
+          REGISTRY + "  15. check_drain_quiet — PR adds drain quiet check\n")
     git("commit", "-am", "pr adds invariant 15", cwd=repo)
 
     git("checkout", "main", cwd=repo)
-    write(repo / tri.INVARIANT_FILE, "# Инвариант 14\n# Инвариант 15: main adds push-trigger check\n")
+    write(repo / tri.INVARIANT_FILE,
+          REGISTRY + "  15. check_push_trigger — main adds push-trigger check\n")
     git("commit", "-am", "main independently adds invariant 15", cwd=repo)
 
     result = tri.measure_invariant_collision("main", "pr", cwd=str(repo))
@@ -376,7 +606,7 @@ def test_decision_doc_collision_pr_numbers_empty_on_unknown_not_raises(monkeypat
 
 
 def test_measure_invariant_collision_empty_when_pr_only_inherits_mains_number(repo):
-    write(repo / tri.INVARIANT_FILE, "# Инвариант 14\n")
+    write(repo / tri.INVARIANT_FILE, REGISTRY)
     git("add", "-A", cwd=repo)
     git("commit", "-m", "base", cwd=repo)
 
@@ -386,8 +616,38 @@ def test_measure_invariant_collision_empty_when_pr_only_inherits_mains_number(re
     git("commit", "-m", "pr", cwd=repo)
 
     git("checkout", "main", cwd=repo)
-    write(repo / tri.INVARIANT_FILE, "# Инвариант 14\n# Инвариант 15: main adds\n")
+    write(repo / tri.INVARIANT_FILE,
+          REGISTRY + "  15. check_push_trigger — main adds\n")
     git("commit", "-am", "main adds invariant 15 alone", cwd=repo)
 
     result = tri.measure_invariant_collision("main", "pr", cwd=str(repo))
     assert result["collisions"] == []
+
+
+def test_measure_invariant_collision_raises_when_registry_format_drifts(repo):
+    """Слепота парсера не имеет права выглядеть как «номер не занят»
+    (та же находка ai-review PR #1201 в invariant_numbering): непустой
+    файл без распознанных записей реестра — GitError, не пустое множество.
+    Файл в живом repo_invariants.py никогда не бывает легитимно пуст от
+    записей реестра."""
+    write(repo / tri.INVARIANT_FILE, REGISTRY)
+    git("add", "-A", cwd=repo)
+    git("commit", "-m", "base", cwd=repo)
+
+    git("checkout", "-b", "pr", cwd=repo)
+    write(repo / "README.md", "pr touches something else\n")
+    git("add", "-A", cwd=repo)
+    git("commit", "-m", "pr", cwd=repo)
+
+    git("checkout", "main", cwd=repo)
+    write(repo / tri.INVARIANT_FILE,
+          "# дрейф формата: запись реестра не распознаётся\n- ~~инварианты~~\n")
+    git("commit", "-am", "main rewrites registry in unknown format", cwd=repo)
+
+    # Исключение бросает переиспользуемая machinery invariant_numbering.
+    # Ловим RuntimeError (общий родитель GitError): importlib-загрузка по
+    # файлу создаёт для каждого модуля СВОЙ объект класса GitError, поэтому
+    # точный класс в raises не сослать — контракт «громкий отказ семейства
+    # GitError», не тип-объект.
+    with pytest.raises(RuntimeError, match="формат"):
+        tri.measure_invariant_collision("main", "pr", cwd=str(repo))

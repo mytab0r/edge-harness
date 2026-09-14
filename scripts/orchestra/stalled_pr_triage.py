@@ -20,21 +20,28 @@ PR) руками вскрыл четыре дефекта:
   3. Величина 3 ADR (строк дрейфа main в файлах PR / строк PR) — считает по
      СТРОКАМ, инфлируется несвязанным дописыванием в конец файла (живой
      случай — `test_scheduler.py`). Здесь она заменена на пересечение
-     изменённых Python-функций/классов (AST-регионы по merge-base) между
-     PR-диффом и main-диффом в общих файлах — `functional_overlap`. Для
-     не-Python файлов региона нет (AST не универсален) — оверлап по ним не
-     считается, это честно помечено, не подделывается нулём.
-  4. Метода не было вовсе: PR добавляет номер `# Инвариант N`
+     изменённых РЕГИОНОВ между PR-диффом и main-диффом в общих файлах
+     (`functional_overlap`): AST def/class-регионы для `.py`, line-range
+     fallback (пересечение задетых строк обеих сторон в КООРДИНАТАХ
+     MERGE-BASE) для остальных файлов — живой класс прогона 2026-09-14:
+     #395/#613/#920/#1057 конфликтуют в shell/yaml/json/markdown, и
+     величина 3 без fallback честно рапортовала им «пересечений нет»,
+     ничего не измерив. Сам строковый ratio сохранён как СПРАВОЧНАЯ
+     величина: `line_drift_ratio` считается машиной по общим файлам и
+     попадает в вывод прогона, в `decide()` не входит.
+  4. Метода не было вовсе: PR добавляет номер инварианта
      (`scripts/orchestra/repo_invariants.py`), который main НЕЗАВИСИМО
-     ТОЖЕ добавил с общего merge-base — коллизия, найденная после сведения,
-     тихо портит реестр. `declaration_collisions` здесь закрывает этот
-     класс для repo_invariants.py (узкий, читает только этот файл, не
-     трогает сам файл и не дублирует #904/PR #1201 — тот чинит ДРУГОЕ:
-     назначение свободного номера внутри файла, не коллизию между PR и
-     main). `docs/decisions`/`docs/research` тем же классом уже закрыты
-     `scripts/lib/decision_numbering.py` (#1078) — этот модуль их не
-     переизобретает, `cmd_queue` ниже переиспользует
-     `check_decision_doc_number_collisions` напрямую.
+     ТОЖЕ добавил с общего merge-base — коллизия, найденная после
+     сведения, тихо портит реестр. ФОРМАТ объявления (`N. check_имя — …`)
+     переиспользуется из `scripts/lib/invariant_numbering.py` (#904, слит
+     2026-09-14) — второй копии парсера реестра этот модуль не заводит;
+     СРАВНЕНИЕ сторон относительно merge-base остаётся здесь, потому что
+     вопрос другой: арбитр #1201 сравнивает два дерева напрямую
+     («коллизия ЕСТЬ СЕЙЧАС»), триаж — «обе стороны независимо добавили
+     один и тот же номер С ОБЩЕГО ПРЕДКА» (история независимости, не
+     снимок). `docs/decisions`/`docs/research` тем же классом закрыты
+     `scripts/lib/decision_numbering.py` (#1078) — `cmd_queue` ниже
+     переиспользует `check_decision_doc_number_collisions` напрямую.
 
 Величина 5 («есть ли уже эквивалент в main») сюда НЕ включена намеренно —
 ADR прав: это чтение и суждение, не число (см. его раздел «Что машине
@@ -84,22 +91,17 @@ _DN_SPEC = importlib.util.spec_from_file_location(
 decision_numbering = importlib.util.module_from_spec(_DN_SPEC)
 _DN_SPEC.loader.exec_module(decision_numbering)  # type: ignore[union-attr]
 
+_IN_SPEC = importlib.util.spec_from_file_location(
+    "invariant_numbering", Path(__file__).resolve().parents[1] / "lib" / "invariant_numbering.py")
+invariant_numbering = importlib.util.module_from_spec(_IN_SPEC)
+_IN_SPEC.loader.exec_module(invariant_numbering)  # type: ignore[union-attr]
 
-# ── Носитель величины 7 для repo_invariants.py (узкий, см. шапку модуля) ────
 
-INVARIANT_FILE = "scripts/orchestra/repo_invariants.py"
-_INVARIANT_NUMBER_RE = re.compile(r"Инвариант (\d+)")
+# ── Носитель величины 7 для repo_invariants.py (см. шапку модуля, п. 4) ─────
 
-
-def declared_invariant_numbers(source: str) -> set[int]:
-    """Номера `# Инвариант N`, упомянутые в исходнике. Не различает
-    «объявление» от «упоминание в прозе комментария» — тем же способом,
-    каким `decision_numbering` не различает файл от ссылки на файл: цена
-    ложного совпадения (лишний, безвредный элемент множества) на порядок
-    дешевле цены пропуска настоящей коллизии."""
-    if not source:
-        return set()
-    return {int(n) for n in _INVARIANT_NUMBER_RE.findall(source)}
+# Путь и ФОРМАТ объявления — из invariant_numbering (#904), не вторая копия:
+# реестр инвариантов в докстринге repo_invariants.py парсится только там.
+INVARIANT_FILE = invariant_numbering.TARGET_PATH
 
 
 def declaration_collisions(added_by_pr: set[int], added_by_main: set[int]) -> set[int]:
@@ -116,11 +118,14 @@ def declaration_collisions(added_by_pr: set[int], added_by_main: set[int]) -> se
 
 def python_def_ranges(source: str) -> dict[str, tuple[int, int]]:
     """{"имя:строка_начала": (start, end)} для def/class верхнего и вложенного
-    уровня. Ключ несёт номер строки объявления — два метода с одинаковым
-    именем в разных классах (`__init__` дюжину раз) не должны схлопываться в
-    один регион. Синтаксическая ошибка (PR мог оставить файл битым на
-    промежуточном коммите) — пустой словарь, не исключение: величина 3
-    просто не считается для этого файла, это не диагностируется отдельно."""
+    уровня. Ключ несёт номер строки начала — два метода с одинаковым именем
+    в разных классах (`__init__` дюжину раз) не должны схлопываться в один
+    регион. Начало региона — МИНИМУМ по декораторам (находка ревью PR
+    #1219): правка только `@декоратора` — правка поведения функции, регион,
+    начатый с строки `def`, её бы не заметил. Синтаксическая ошибка (PR мог
+    оставить файл битым на промежуточном коммите) — пустой словарь, не
+    исключение: вызывающий (`measure_functional_overlap`) уводит такой файл
+    в line-range fallback, не молчит."""
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -129,19 +134,30 @@ def python_def_ranges(source: str) -> dict[str, tuple[int, int]]:
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             end = getattr(node, "end_lineno", node.lineno)
-            ranges[f"{node.name}:{node.lineno}"] = (node.lineno, end)
+            decorators = [d.lineno for d in getattr(node, "decorator_list", [])
+                          if hasattr(d, "lineno")]
+            start = min([node.lineno, *decorators])
+            ranges[f"{node.name}:{start}"] = (start, end)
     return ranges
 
 
-_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@")
 
 
-def parse_added_line_numbers(unified_diff: str) -> set[int]:
-    """Номера строк, задетых на стороне `+` унифицированного диффа
-    (`git diff --unified=0`), из hunk-заголовков `@@ -a,b +c,d @@`. `d`
-    отсутствует ИЛИ равен 0 — чистое удаление, регион всё равно считается
-    задетым ЛИНИЕЙ ПОСЛЕ точки удаления (c), иначе строка "функция целиком
-    вырезана" никогда бы не пересеклась ни с чем."""
+def parse_base_touched_lines(unified_diff: str) -> set[int]:
+    """Номера строк БАЗОВОГО файла (merge-base), задетых одной стороной
+    унифицированного диффа (`git diff --unified=0`), из hunk-заголовков
+    `@@ -a,b +c,d @@`. Сторона МИНУС, не плюс (находка ревью PR #1219):
+    сверять с регионами базового файла можно только в базовых координатах —
+    плюс-сторона сдвигается удалениями выше по файлу, и правка функции f
+    засчитывалась бы соседней g (ложное «пересечение» → ложное
+    «пересоздать»).
+
+    `b` отсутствует — 1 строка (обычная замена). `b == 0` — чистая вставка
+    ПОСЛЕ базовой строки a (`-0,0` — вставка в начало файла), регион
+    считается задетым строкой a: точка вставки замыкается предыдущей
+    строкой; ложную цену на границе регионов (вставка сразу ПОСЛЕ конца
+    функции) гасит требование согласия ОБЕИХ сторон (пересечение)."""
     lines: set[int] = set()
     for line in unified_diff.splitlines():
         match = _HUNK_RE.match(line)
@@ -156,6 +172,31 @@ def parse_added_line_numbers(unified_diff: str) -> set[int]:
     return lines
 
 
+def count_changed_lines(unified_diff: str) -> int:
+    """Число строк `+`/`-` в диффе (единица справочного строкового ratio
+    ADR 0021: «насколько большие изменения»). Заголовки файлов
+    (`+++`/`---`) содержимым не считаются."""
+    return sum(1 for line in unified_diff.splitlines()
+               if (line.startswith("+") and not line.startswith("+++"))
+               or (line.startswith("-") and not line.startswith("---")))
+
+
+def intersecting_line_runs(pr_lines: set[int], main_lines: set[int]) -> list[str]:
+    """Line-range fallback величины 3 (файлы без AST-регионов): пересечение
+    задетых обеими сторонами базовых строк, сгруппированное в непрерывные
+    диапазоны `"10-14"` / `"7"`. Единица подсчёта — РЕГИОН, не строка
+    (одинаковая с AST-режимом), иначе величина раздувается пропорционально
+    длине блока, а не количеству смысловых столкновений."""
+    common = sorted(pr_lines & main_lines)
+    spans: list[list[int]] = []
+    for line in common:
+        if spans and line == spans[-1][1] + 1:
+            spans[-1][1] = line
+        else:
+            spans.append([line, line])
+    return [f"{start}-{end}" if end > start else str(start) for start, end in spans]
+
+
 def touched_regions(ranges: dict[str, tuple[int, int]], changed_lines: set[int]) -> set[str]:
     return {
         name for name, (start, end) in ranges.items()
@@ -164,18 +205,35 @@ def touched_regions(ranges: dict[str, tuple[int, int]], changed_lines: set[int])
 
 
 def functional_overlap(pr_regions: set[str], main_regions: set[str]) -> set[str]:
-    """Пересечение имён регионов (def/class), которые задели ОБЕ стороны
-    (PR и main) относительно общего merge-base — величина 3 вместо строкового
-    ratio ADR (см. шапку модуля). Непустое пересечение — сигнал «читать»
-    (ADR прав: смысловое столкновение решает человек), не автоматический
-    вердикт «пересоздать»."""
+    """Пересечение имён регионов, которые задели ОБЕ стороны (PR и main)
+    относительно общего merge-base — величина 3 вместо строкового ratio ADR
+    (см. шапку модуля). Непустое пересечение делает величины 1–3 «ВЕЛИКИМИ»
+    → исход «пересоздать» по таблице ADR 0024 — то же правило, что для
+    git-конфликта: механическое сведение вернёт дефект или сотрёт правку
+    одной из сторон. Чтение того, КАКИЕ именно функции столкнулись, — часть
+    ИСПОЛНЕНИЯ решения (пересоздание начинается с чтения), не условие его
+    отсрочки: одна формулировка во всех трёх местах (докстринг, `decide`,
+    reason-строка), находка ревью PR #1219."""
     return pr_regions & main_regions
 
 
+def region_word(count: int) -> str:
+    """«1 регион» / «2 региона» / «5 регионов» — согласование числа
+    с существительным в reason-строке, которую читает человек."""
+    if count % 10 == 1 and count % 100 != 11:
+        return f"{count} регион"
+    if count % 10 in (2, 3, 4) and count % 100 not in (12, 13, 14):
+        return f"{count} региона"
+    return f"{count} регионов"
+
+
 def line_drift_ratio(main_drift_lines: int, pr_own_lines: int) -> float | None:
-    """Легаси-формула ADR 0021 (строки дрейфа main / строки PR в тех же
-    файлах) — оставлена СПРАВОЧНОЙ величиной (issue #1218, дефект 3: она
-    инфлируется несвязанными изменениями и не входит в decide()).
+    """Легаси-формула ADR 0021 (строки дрейфа main / строки PR) — СПРАВОЧНАЯ
+    величина (issue #1218, дефект 3: инфлируется несвязанными изменениями,
+    в `decide()` не входит). Не мёртвый код: считается машиной в
+    `measure_functional_overlap` по общим файлам (находка ревью PR #1219:
+    «справочная величина», которую машина не вычисляет ни для одного PR, —
+    утверждение об артефакте без адреса) и попадает в вывод прогона.
     `None` — PR не менял строк в общих файлах, делить не на что."""
     if pr_own_lines <= 0:
         return None
@@ -199,12 +257,16 @@ def decide(
     task_state: str,
     ai_verdict: str | None,
     replacement_found: bool | None = None,
-    declaration_collision: bool = False,
+    invariant_collision: bool = False,
+    decision_doc_collision: bool = False,
 ) -> dict:
     """Единая точка решения — читает ВСЕ входы вместе (ADR 0021, «шесть
     величин вместе», не порог на одной). `task_state` — "open"/"closed"/
-    "none" (PR без задачи пула, боты). `ai_verdict` — одна из
-    `review_labels.AI_VERDICTS` либо `None` (вердикта ещё нет).
+    "none" (PR без задачи пула, боты)/"unknown" (GraphQL не ответил —
+    «не знаю» не превращается в «открыта», находка ревью PR #1219; решение
+    при этом не строится на величине 4 вовсе, а в reasons попадает честное
+    «не подтверждено»). `ai_verdict` — одна из `review_labels.AI_VERDICTS`
+    либо `None` (вердикта ещё нет).
 
     Порядок проверок — от самого дешёвого решения (замена/закрытая задача)
     к самому дорогому суждению (велики ли 1–3):
@@ -225,14 +287,24 @@ def decide(
     Коллизия объявления (величина 7) — не самостоятельная ветка действия
     (сама по себе не решает довести/пересоздать/закрыть), а ОБЯЗАТЕЛЬНОЕ
     предупреждение поверх любого исхода: сведение, которое пройдёт молча,
-    после мержа даст дубль номера — читатель обязан увидеть это независимо
-    от того, что решили величины 1–6."""
+    после мержа даст дубль номера. Половины названы РАЗДЕЛЬНО
+    (`invariant_collision` — реестр repo_invariants.py против main,
+    `decision_doc_collision` — номера docs/decisions|research, где
+    виновником бывает и другой открытый PR, не только main), и reason
+    формулируется по сработавшей половине — «алерт не гадает» (находка
+    ревью PR #1219: одна строка про «# Инвариант N» описывала только
+    инвариантную половину и врала в doc-случаях)."""
     reasons: list[str] = []
-    if declaration_collision:
+    if invariant_collision:
         reasons.append(
-            "величина 7: PR добавляет номер объявления (# Инвариант N), который main "
-            "тоже независимо добавил с общего merge-base — сведение молча даст дубль, "
-            "снять коллизию ПЕРЕД доведением/пересозданием")
+            "величина 7 (инварианты): PR добавляет запись в реестре repo_invariants.py, "
+            "которую main тоже независимо добавил с общего merge-base — сведение молча "
+            "даст дубль номера, перенумеровать ПЕРЕД доведением/пересозданием")
+    if decision_doc_collision:
+        reasons.append(
+            "величина 7 (decision/research-номера): номер ADR/research-файла, который "
+            "несёт PR, занят другим источником (main или другой открытый PR) — "
+            "переиспользован decision_numbering, перенумеровать ПЕРЕД сведением")
 
     if replacement_found is True:
         reasons.append("величина 5: эквивалент уже в main (дублирование подтверждено чтением)")
@@ -241,6 +313,11 @@ def decide(
     if task_state == "closed" and replacement_found is not True:
         reasons.append("величина 4: задача закрыта, величина 5 замены не находит")
         return {"action": ACTION_CLOSE, "reasons": reasons}
+
+    if task_state == "unknown":
+        reasons.append(
+            "величина 4: состояние задачи не получено (GraphQL не ответил) — "
+            "не подтверждено, решение на величине 4 не строится")
 
     small = (not conflicting) and functional_overlap_count == 0
     rework_pending = ai_verdict in AI_REWORK_VERDICTS
@@ -258,8 +335,10 @@ def decide(
         reasons.append("величина 1: PR конфликтует с main")
     if functional_overlap_count > 0:
         reasons.append(
-            f"величина 3: {functional_overlap_count} функций/классов задеты и PR, и main "
-            "с общего merge-base — смысловое пересечение, прочитать перед решением")
+            f"величина 3: пересечение регионов PR и main с общего merge-base — "
+            f"{region_word(functional_overlap_count)}; механическое сведение вернёт дефект "
+            "или сотрёт правку одной из сторон, поэтому пересоздать; какие именно — "
+            "читать при исполнении")
     if rework_pending:
         reasons.append(
             f"величина 6: висит {ai_verdict} — сведение + доработка + повторное ревью "
@@ -321,58 +400,126 @@ def show_file(ref: str, path: str, cwd: str | None = None) -> str | None:
     return result.stdout
 
 
-def changed_python_files(base_sha: str, ref: str, cwd: str | None = None) -> set[str]:
-    out = run_git("diff", "--name-only", base_sha, ref, "--", "*.py", cwd=cwd)
+def changed_files(base_sha: str, ref: str, cwd: str | None = None) -> set[str]:
+    """Все файлы, изменённые между merge-base и `ref` (без фильтра по
+    расширению: line-range fallback величины 3 работает по НЕ-.py общим
+    файлам — находка ревью PR #1219, п. 4 блокирующих)."""
+    out = run_git("diff", "--name-only", base_sha, ref, cwd=cwd)
     return {line for line in out.splitlines() if line.strip()}
+
+
+# Формы CONFLICT-строк `git merge-tree --write-tree`. Решает КОД ВОЗВРАТА
+# (находка ревью PR #1219: rc — контракт git, regex — декорация); regex'ы —
+# best-effort детализация «какие файлы», не условие вердикта.
+_CONFLICT_MERGE_IN_RE = re.compile(r"^CONFLICT \([^)]*\): Merge conflict in (.+)$", re.MULTILINE)
+_CONFLICT_PATH_RE = re.compile(
+    r"^CONFLICT \((?:modify/delete|rename/delete|rename/add|add/add|delete/modify)\): (.+?) "
+    r"(?:deleted|added|modified) in ", re.MULTILINE)
 
 
 def is_conflicting(main_ref: str, head_ref: str, cwd: str | None = None) -> tuple[bool, list[str]]:
     """`(конфликтует?, [конфликтующие файлы])` — реальный `git merge-tree
     --write-tree`, не GitHub `mergeable` (тот считается GitHub асинхронно и
     может быть `null`/`unknown` — см. review_labels.CONFLICT_CLEAR_STATES;
-    здесь считаем сами, синхронно, на живом дереве)."""
+    здесь считаем сами, синхронно, на живом дереве).
+
+    Код возврата — вердикт (находка ревью PR #1219): `0` — сведение чисто;
+    `1` с НЕПУСТЫМ stdout — конфликт (включая формы, чей CONFLICT-текст не
+    совпадает с «Merge conflict in», например modify/delete; git печатает
+    дерево и CONFLICT-строки именно в stdout). `1` с ПУСТЫМ stdout — отказ
+    самого инструмента, не конфликт: замер с несуществующим ref отвечает
+    rc=1, но только в stderr (`merge-tree: … - not something we can merge`),
+    stdout пуст — так же отвечает старый git без `--write-tree`. Любой
+    другой код — отказ ИНСТРУМЕНТА. И то и другое — `GitError`: «не смогли
+    проверить» не имеет права выглядеть как «проверили, чисто» (silent-wrong)."""
     result = subprocess.run(
         ["git", "merge-tree", "--write-tree", main_ref, head_ref], cwd=cwd,
         capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
-    files = re.findall(r"^CONFLICT \([^)]*\): Merge conflict in (.+)$", result.stdout, re.MULTILINE)
-    return bool(files), files
+    if result.returncode == 0:
+        return False, []
+    if result.returncode == 1 and result.stdout.strip():
+        files = sorted(set(_CONFLICT_MERGE_IN_RE.findall(result.stdout))
+                       | set(_CONFLICT_PATH_RE.findall(result.stdout)))
+        return True, files
+    raise GitError(
+        f"git merge-tree --write-tree {main_ref} {head_ref} упал "
+        f"(rc={result.returncode}, stdout пуст: {not result.stdout.strip()}): "
+        f"{result.stderr.strip()}")
 
 
 def measure_functional_overlap(main_ref: str, head_ref: str, cwd: str | None = None) -> dict:
     """Величина 3 (см. шапку модуля) для одного PR: пересечение изменённых
-    Python def/class-регионов между PR и main относительно общего
-    merge-base, только в файлах, которые трогают ОБЕ стороны."""
+    регионов между PR и main относительно общего merge-base, только в
+    файлах, которые трогают ОБЕ стороны. AST def/class-регионы для `.py`
+    (база парсится, файл существует на базе); line-range fallback
+    (`intersecting_line_runs`) — для остальных файлов и для .py, чья база
+    не парсится (синт-ошибка) или отсутствует (файл добавлен обеими
+    сторонами). Режим каждого файла отдаётся в `overlap_mode_by_file` —
+    ноль из-за непосчитанного файла неотличим от нуля «пересечений нет»
+    только если режим назван (находка ревью PR #1219). Справочный строковый
+    ratio ADR считается по общим файлам (`line_drift_*`)."""
     base_sha = merge_base(main_ref, head_ref, cwd=cwd)
-    pr_files = changed_python_files(base_sha, head_ref, cwd=cwd)
-    main_files = changed_python_files(base_sha, main_ref, cwd=cwd)
+    pr_files = changed_files(base_sha, head_ref, cwd=cwd)
+    main_files = changed_files(base_sha, main_ref, cwd=cwd)
     common = sorted(pr_files & main_files)
     overlap_by_file: dict[str, list[str]] = {}
+    mode_by_file: dict[str, str] = {}
     total = 0
+    main_drift_lines = 0
+    pr_own_lines = 0
     for path in common:
-        base_source = show_file(base_sha, path, cwd=cwd)
-        if base_source is None:
-            continue
-        ranges = python_def_ranges(base_source)
         pr_diff = run_git("diff", "--unified=0", base_sha, head_ref, "--", path, cwd=cwd)
         main_diff = run_git("diff", "--unified=0", base_sha, main_ref, "--", path, cwd=cwd)
-        pr_regions = touched_regions(ranges, parse_added_line_numbers(pr_diff))
-        main_regions = touched_regions(ranges, parse_added_line_numbers(main_diff))
-        overlap = functional_overlap(pr_regions, main_regions)
-        if overlap:
-            overlap_by_file[path] = sorted(overlap)
-            total += len(overlap)
-    return {"merge_base": base_sha, "common_python_files": common,
-            "overlap_count": total, "overlap_detail": overlap_by_file}
+        pr_touched = parse_base_touched_lines(pr_diff)
+        main_touched = parse_base_touched_lines(main_diff)
+        main_drift_lines += count_changed_lines(main_diff)
+        pr_own_lines += count_changed_lines(pr_diff)
+
+        ranges: dict[str, tuple[int, int]] = {}
+        if path.endswith(".py"):
+            base_source = show_file(base_sha, path, cwd=cwd)
+            if base_source is not None:
+                ranges = python_def_ranges(base_source)
+        if ranges:
+            overlap = touched_regions(ranges, pr_touched) & touched_regions(ranges, main_touched)
+            mode, regions = "ast", sorted(overlap)
+        else:
+            mode, regions = "line-range", intersecting_line_runs(pr_touched, main_touched)
+        if regions:
+            overlap_by_file[path] = regions
+            mode_by_file[path] = mode
+            total += len(regions)
+    return {"merge_base": base_sha, "common_files": common,
+            "overlap_mode_by_file": mode_by_file,
+            "overlap_count": total, "overlap_detail": overlap_by_file,
+            "line_drift_main_lines": main_drift_lines,
+            "line_drift_pr_lines": pr_own_lines,
+            "line_drift_ratio": line_drift_ratio(main_drift_lines, pr_own_lines)}
 
 
 def measure_invariant_collision(main_ref: str, head_ref: str, cwd: str | None = None) -> dict:
+    """Величина 7 (инвариантная половина): номера реестра, добавленные
+    КАЖДОЙ стороной относительно общего merge-base. Формат записи парсится
+    `invariant_numbering.parse_registry_entries` (#904) — вторая копия
+    парсера не заводится; непустой файл без распознанных записей реестра —
+    громкий отказ через `_parse_full_registry_or_die` того же модуля
+    (слепота парсера к дрейфу формата не имеет права выглядеть как «номер
+    не занят»), а не пустое множество."""
     base_sha = merge_base(main_ref, head_ref, cwd=cwd)
-    base_source = show_file(base_sha, INVARIANT_FILE, cwd=cwd) or ""
-    pr_source = show_file(head_ref, INVARIANT_FILE, cwd=cwd) or ""
-    main_source = show_file(main_ref, INVARIANT_FILE, cwd=cwd) or ""
-    added_by_pr = declared_invariant_numbers(pr_source) - declared_invariant_numbers(base_source)
-    added_by_main = declared_invariant_numbers(main_source) - declared_invariant_numbers(base_source)
+
+    def registry_numbers(ref: str) -> set[int]:
+        """Номера реестра на `ref`; файла нет на этом ref — легитимное
+        «ничего» (файл создан позже/удалён стороной)."""
+        content = show_file(ref, INVARIANT_FILE, cwd=cwd)
+        if content is None:
+            return set()
+        return {int(number)
+                for number in invariant_numbering._parse_full_registry_or_die(ref, content)}
+
+    base_numbers = registry_numbers(base_sha)
+    added_by_pr = registry_numbers(head_ref) - base_numbers
+    added_by_main = registry_numbers(main_ref) - base_numbers
     collisions = declaration_collisions(added_by_pr, added_by_main)
     return {"added_by_pr": sorted(added_by_pr), "added_by_main": sorted(added_by_main),
             "collisions": sorted(collisions)}
@@ -390,7 +537,9 @@ def measure_pr(main_ref: str, head_ref: str, cwd: str | None = None) -> dict:
         "velichina1_conflict_files": conflict_files,
         "velichina2_commits_behind": commits_behind(base_sha, main_ref, cwd=cwd),
         "velichina3_functional_overlap": overlap["overlap_count"],
+        "velichina3_overlap_modes": overlap["overlap_mode_by_file"],
         "velichina3_detail": overlap["overlap_detail"],
+        "velichina3_line_drift_ratio_reference": overlap["line_drift_ratio"],
         "velichina7_invariant_collisions": invariant["collisions"],
     }
 
@@ -466,9 +615,15 @@ def decision_doc_collision_pr_numbers(repo: str, cwd: str | None = None) -> set[
 
 def cmd_queue(repo: str, cwd: str | None = None) -> list[dict]:
     """Величины 1,2,3,4,6,7 + решение для всех открытых PR репозитория.
-    Одна страница `pulls` + один GraphQL-батч задач (gh) + один прогон
-    decision_numbering (свой отдельный обход, см. его докстринг), дальше —
-    только локальный git (без сетевой цены) на КАЖДЫЙ PR.
+    Сеть: одна страница `pulls` + один GraphQL-батч задач (gh) + один прогон
+    decision_numbering (свой отдельный обход, см. его докстринг) + фетч
+    head'а КАЖДОГО PR (`refs/pull/N/head`, находка ревью PR #1219: это
+    сетевые запросы, «без сетевой цены на PR» — неправда; правда — «на PR
+    нет дорогих gh-вызовов: контрактов/комментариев/состояний, дальше
+    только git-объекты»). Refspec с `+`: назначение `origin/pr-N`
+    приватное для этого прогона, а force-push в чужой открытый PR отклонил
+    бы refspec как non-fast-forward и уронил весь обход очереди. Дальше —
+    только локальный git (merge-tree/diff/merge-base) на каждый PR.
 
     ГРАБЛЯ (issue #1218, тот же класс, что #1213): `decision_numbering.
     fetch_refs` делает `git fetch --depth 1` СВОЕЙ веткой `main` в отдельный
@@ -490,10 +645,16 @@ def cmd_queue(repo: str, cwd: str | None = None) -> list[dict]:
     for pull in pulls:
         number = pull["number"]
         head_ref = f"origin/pr-{number}"
-        run_git("fetch", "--quiet", "origin", f"refs/pull/{number}/head:refs/remotes/origin/pr-{number}", cwd=cwd)
+        run_git("fetch", "--quiet", "origin",
+                f"+refs/pull/{number}/head:refs/remotes/origin/pr-{number}", cwd=cwd)
         measured = measure_pr("origin/main", head_ref, cwd=cwd)
         task_number = task_ref.resolve_pr_task(pull)
-        task_state = states.get(task_number, "open") if task_number is not None else "none"
+        if task_number is None:
+            task_state = "none"
+        else:
+            # «Ответа нет» — НЕ «открыта» (находка ревью PR #1219): issue
+            # удалена/несуществует — «не знаю» остаётся «не знаю».
+            task_state = states.get(task_number, "unknown")
         verdict = ai_verdict_of(pull.get("labels", []))
         partial.append({
             "number": number, "title": pull.get("title", ""), "task": task_number,
@@ -506,14 +667,13 @@ def cmd_queue(repo: str, cwd: str | None = None) -> list[dict]:
 
     rows = []
     for row in partial:
-        declaration_collision = (bool(row["velichina7_invariant_collisions"])
-                                  or row["number"] in doc_collisions)
         decision = decide(
             conflicting=row["velichina1_conflicting"],
             functional_overlap_count=row["velichina3_functional_overlap"],
             task_state=row["task_state"],
             ai_verdict=row["ai_verdict"],
-            declaration_collision=declaration_collision,
+            invariant_collision=bool(row["velichina7_invariant_collisions"]),
+            decision_doc_collision=row["number"] in doc_collisions,
         )
         rows.append({
             **row,
@@ -534,7 +694,8 @@ def main(argv: list[str]) -> int:
             return 2
         number = rest[0]
         ensure_unshallow()
-        run_git("fetch", "--quiet", "origin", f"refs/pull/{number}/head:refs/remotes/origin/pr-{number}")
+        run_git("fetch", "--quiet", "origin",
+                f"+refs/pull/{number}/head:refs/remotes/origin/pr-{number}")
         print(json.dumps(measure_pr("origin/main", f"origin/pr-{number}"), indent=2, ensure_ascii=False))
         return 0
     if command == "queue":
