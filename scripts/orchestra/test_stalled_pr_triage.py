@@ -185,8 +185,40 @@ def test_parse_base_touched_lines_pure_insertion_touches_base_line():
 def test_python_def_ranges_keys_by_name_and_start_line_to_avoid_collapsing_same_name():
     source = "class A:\n    def f(self):\n        pass\n\ndef f():\n    pass\n"
     ranges = tri.python_def_ranges(source)
-    assert len(ranges) == 3  # class A, A.f, top-level f
+    # Метод A.f и верхнеуровневая f — два региона с одним именем; класс A
+    # регионом не остаётся (содержит метод — см. тест ниже).
     assert "f:2" in ranges and "f:5" in ranges
+    assert "A:1" not in ranges
+
+
+def test_python_def_ranges_drops_region_strictly_containing_other_regions():
+    """Блокирующая находка ревью PR #1219: регион класса покрывает всё тело,
+    и правки ДВУХ РАЗНЫХ методов одного класса давали пересечение `{класс}`
+    → ложное «пересоздать» (git сводит разные методы чисто). Минимальные
+    регионы: класс с методами и внешняя функция с вложенной — не единицы
+    пересечения; сигнал не теряется — вложенные регионы несут его сами
+    (PR, заменяющий класс целиком, задевает строки методов)."""
+    source = ("class Orchestrator:\n"
+              "    def start(self):\n"
+              "        return 1\n"
+              "\n"
+              "    def stop(self):\n"
+              "        return 2\n")
+    assert set(tri.python_def_ranges(source)) == {"start:2", "stop:5"}
+
+    nested = ("def outer():\n"
+              "    def inner():\n"
+              "        return 1\n"
+              "    return inner\n")
+    assert set(tri.python_def_ranges(nested)) == {"inner:2"}
+
+
+def test_python_def_ranges_keeps_class_without_tracked_children():
+    """Обратная сторона минимизации: класс БЕЗ отслеживаемых детей
+    (только атрибуты) — сам минимальный регион; правки его тела обеими
+    сторонами обязаны оставаться измеримыми."""
+    source = "class Config:\n    enabled = True\n    retries = 3\n"
+    assert tri.python_def_ranges(source) == {"Config:1": (1, 3)}
 
 
 def test_python_def_ranges_region_starts_at_decorator_not_at_def():
@@ -359,6 +391,110 @@ def test_measure_functional_overlap_uses_base_coordinates_not_shifted_plus_side(
 
     result = tri.measure_functional_overlap("main", "pr", cwd=str(repo))
     assert result["overlap_count"] == 0
+
+
+def test_measure_functional_overlap_zero_for_two_different_methods_of_same_class(repo):
+    """Блокирующая находка ревью PR #1219 (фантомные пересечения классов):
+    PR правит первый метод класса, main — второй. Регион класса (покрывал
+    всё тело) давал пересечение `{класс}` → ложное «пересоздать» с
+    reason'ом «сведение сотрёт правку», хотя git сводит разные методы
+    чисто; классовые файлы в очереди есть (scheduler.py, pulse_guard.py).
+    Минимальные регионы обязаны дать ноль."""
+    pulse_source = ("class Orchestrator:\n"
+                    "    def start(self):\n"
+                    "        return 1\n"
+                    "\n"
+                    "    def stop(self):\n"
+                    "        return 2\n")
+    write(repo / "scripts" / "orchestra" / "pulse_guard.py", pulse_source)
+    git("add", "-A", cwd=repo)
+    git("commit", "-qm", "base with Orchestrator class", cwd=repo)
+
+    git("checkout", "-b", "pr", cwd=repo)
+    write(repo / "scripts" / "orchestra" / "pulse_guard.py",
+          pulse_source.replace("        return 1\n", "        return 100  # PR\n"))
+    git("commit", "-am", "pr edits start method", cwd=repo)
+
+    git("checkout", "main", cwd=repo)
+    write(repo / "scripts" / "orchestra" / "pulse_guard.py",
+          pulse_source.replace("        return 2\n", "        return 200  # main\n"))
+    git("commit", "-am", "main edits stop method", cwd=repo)
+
+    result = tri.measure_functional_overlap("main", "pr", cwd=str(repo))
+    assert result["overlap_count"] == 0
+    assert result["overlap_detail"] == {}
+    # А тот же файл с правкой ОДНОГО метода обеими сторонами по-прежнему
+    # ловится (фикс не смазал сигнал реальной коллизии):
+    git("checkout", "pr", cwd=repo)
+    git("checkout", "-b", "pr2", cwd=repo)
+    write(repo / "scripts" / "orchestra" / "pulse_guard.py",
+          pulse_source.replace("        return 2\n", "        return 200  # PR2\n"))
+    git("commit", "-am", "pr2 edits stop method like main", cwd=repo)
+    result = tri.measure_functional_overlap("main", "pr2", cwd=str(repo))
+    assert result["overlap_count"] == 1
+    assert result["overlap_mode_by_file"]["scripts/orchestra/pulse_guard.py"] == "ast"
+    assert "stop:5" in result["overlap_detail"]["scripts/orchestra/pulse_guard.py"]
+
+
+def test_measure_functional_overlap_ast_mode_covers_module_level_lines(repo):
+    """Некритичная находка ревью PR #1219: в режиме ast строки ВНЕ def/class
+    (модульные константы, реестры уровня модуля) были невидимы — ноль «не
+    считали» был неотличим от нуля «пересечений нет». Модульные строки
+    считаются тем же line-range правилом поверх AST-регионов."""
+    module_source = ("CHAIN = [\n"        # 1-4: модульный код, вне регионов
+                     "    'a',\n"
+                     "    'b',\n"
+                     "]\n"
+                     "\n\n"
+                     "def helper():\n"    # 7-8: регион
+                     "    return 1\n")
+    write(repo / "scripts" / "orchestra" / "mod_levels.py", module_source)
+    git("add", "-A", cwd=repo)
+    git("commit", "-qm", "base with module const", cwd=repo)
+
+    git("checkout", "-b", "pr", cwd=repo)
+    write(repo / "scripts" / "orchestra" / "mod_levels.py",
+          module_source.replace("    'b',\n", "    'B-PR',\n"))
+    git("commit", "-am", "pr edits module const", cwd=repo)
+
+    git("checkout", "main", cwd=repo)
+    write(repo / "scripts" / "orchestra" / "mod_levels.py",
+          module_source.replace("    'b',\n", "    'B-MAIN',\n"))
+    git("commit", "-am", "main edits same module const", cwd=repo)
+
+    result = tri.measure_functional_overlap("main", "pr", cwd=str(repo))
+    assert result["overlap_count"] == 1
+    assert result["overlap_mode_by_file"]["scripts/orchestra/mod_levels.py"] == "ast+line-range"
+    assert result["overlap_detail"]["scripts/orchestra/mod_levels.py"] == ["3"]
+
+
+def test_measure_functional_overlap_module_line_versus_function_edit_is_zero(repo):
+    """Обратный случай того же класса: PR правит модульную строку, main —
+    тело функции; пересечения нет, и модульный учёт не выдумывает его."""
+    module_source = ("CHAIN = [\n"
+                     "    'a',\n"
+                     "    'b',\n"
+                     "]\n"
+                     "\n\n"
+                     "def helper():\n"
+                     "    return 1\n")
+    write(repo / "scripts" / "orchestra" / "mod_levels.py", module_source)
+    git("add", "-A", cwd=repo)
+    git("commit", "-qm", "base", cwd=repo)
+
+    git("checkout", "-b", "pr", cwd=repo)
+    write(repo / "scripts" / "orchestra" / "mod_levels.py",
+          module_source.replace("    'b',\n", "    'B-PR',\n"))
+    git("commit", "-am", "pr edits module const", cwd=repo)
+
+    git("checkout", "main", cwd=repo)
+    write(repo / "scripts" / "orchestra" / "mod_levels.py",
+          module_source.replace("    return 1\n", "    return 2  # main\n"))
+    git("commit", "-am", "main edits helper body", cwd=repo)
+
+    result = tri.measure_functional_overlap("main", "pr", cwd=str(repo))
+    assert result["overlap_count"] == 0
+    assert "scripts/orchestra/mod_levels.py" not in result["overlap_mode_by_file"]
 
 
 def test_measure_functional_overlap_line_range_fallback_for_non_python_files(repo):
@@ -587,22 +723,27 @@ def test_decision_doc_collision_pr_numbers_extracts_only_pr_sources(monkeypatch)
                              {"filename": "0017-y.md", "sources": ["PR #870"]}],
         }])
     monkeypatch.setattr(tri.decision_numbering, "check_decision_doc_number_collisions", fake_check)
-    result = tri.decision_doc_collision_pr_numbers("mytab0r/edge-harness")
-    assert result == {944, 870}
+    numbers, unknown = tri.decision_doc_collision_pr_numbers("mytab0r/edge-harness")
+    assert (numbers, unknown) == ({944, 870}, None)
 
 
 def test_decision_doc_collision_pr_numbers_empty_when_no_violation(monkeypatch):
     monkeypatch.setattr(tri.decision_numbering, "check_decision_doc_number_collisions",
                          lambda repo, cwd=None: tri.decision_numbering.check_result.ok())
-    assert tri.decision_doc_collision_pr_numbers("mytab0r/edge-harness") == set()
+    assert tri.decision_doc_collision_pr_numbers("mytab0r/edge-harness") == (set(), None)
 
 
-def test_decision_doc_collision_pr_numbers_empty_on_unknown_not_raises(monkeypatch):
-    """unknown() (сеть/git отказали внутри decision_numbering) — не падение
-    и не ложное 'коллизия есть', честное 'не нашли' (см. докстринг)."""
+def test_decision_doc_collision_pr_numbers_carries_unknown_reason_not_silent_clean(monkeypatch):
+    """unknown() (сеть/git отказали внутри decision_numbering) — не падение,
+    но и не «коллизий нет»: причина возвращается ВТОРЫМ элементом, чтобы
+    строка очереди различала «проверили, чисто» и «посмотреть не смогли»
+    (находка ревью PR #1219: unknown схлопывался в «коллизий нет»)."""
     monkeypatch.setattr(tri.decision_numbering, "check_decision_doc_number_collisions",
-                         lambda repo, cwd=None: tri.decision_numbering.check_result.unknown("сеть недоступна"))
-    assert tri.decision_doc_collision_pr_numbers("mytab0r/edge-harness") == set()
+                         lambda repo, cwd=None:
+                         tri.decision_numbering.check_result.unknown("сеть недоступна"))
+    numbers, unknown = tri.decision_doc_collision_pr_numbers("mytab0r/edge-harness")
+    assert numbers == set()
+    assert unknown == "сеть недоступна"
 
 
 def test_measure_invariant_collision_empty_when_pr_only_inherits_mains_number(repo):
@@ -651,3 +792,56 @@ def test_measure_invariant_collision_raises_when_registry_format_drifts(repo):
     # GitError», не тип-объект.
     with pytest.raises(RuntimeError, match="формат"):
         tri.measure_invariant_collision("main", "pr", cwd=str(repo))
+
+
+# ── cmd_queue: один кривой PR не валит обход очереди (настоящий git) ───────
+
+def test_cmd_queue_continues_past_one_broken_pr(tmp_path, monkeypatch):
+    """Некритичная находка ревью PR #1219: отказ измерения ОДНОГО PR (здесь —
+    ветка с историей, несводимой с main) не топит весь прогон: строка несёт
+    `error` и НЕ несёт `action` («не посчитано» не выглядит вердиктом),
+    остальные PR получают честные решения. Поведенчески: настоящий bare-
+    репозиторий, настоящий клон, настоящие refs/pull/N/head."""
+    origin = tmp_path / "origin.git"
+    origin.mkdir()
+    git("init", "--quiet", "--bare", cwd=origin)
+
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    init_repo(seed)
+    git("remote", "add", "origin", str(origin), cwd=seed)
+    write(seed / "f.txt", "1\n")
+    git("add", "-A", cwd=seed)
+    git("commit", "-qm", "c0", cwd=seed)
+    git("push", "-q", "origin", "main", cwd=seed)
+
+    git("checkout", "-qb", "pr501", cwd=seed)
+    write(seed / "f.txt", "2\n")
+    git("commit", "-am", "pr501", cwd=seed)
+    git("push", "-q", "origin", "pr501:refs/pull/501/head", cwd=seed)
+
+    git("checkout", "-q", "main", cwd=seed)
+    git("checkout", "-q", "--orphan", "pr502", cwd=seed)
+    git("commit", "--allow-empty", "-qm", "orphan root, no common ancestor", cwd=seed)
+    git("push", "-q", "origin", "pr502:refs/pull/502/head", cwd=seed)
+
+    clone = tmp_path / "clone"
+    git("clone", "--quiet", "--no-local", str(origin), str(clone), cwd=tmp_path)
+
+    pulls = [
+        {"number": 502, "title": "broken", "head": {"ref": "pr502"}, "labels": []},
+        {"number": 501, "title": "good", "head": {"ref": "pr501"}, "labels": []},
+    ]
+    monkeypatch.setattr(tri, "open_pulls", lambda repo: pulls)
+    monkeypatch.setattr(tri, "decision_doc_collision_pr_numbers",
+                        lambda repo, cwd=None: (set(), None))
+    rows = tri.cmd_queue("mytab0r/edge-harness", cwd=str(clone))
+
+    by_number = {row["number"]: row for row in rows}
+    assert set(by_number) == {501, 502}
+    assert "error" in by_number[502]
+    assert "action" not in by_number[502]
+    good = by_number[501]
+    assert good["velichina1_conflicting"] is False
+    assert good["action"] == tri.ACTION_PROCEED
+    assert good["velichina7_decision_doc_unknown"] is None

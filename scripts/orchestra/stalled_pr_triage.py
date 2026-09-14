@@ -18,17 +18,23 @@ PR) руками вскрыл четыре дефекта:
      просто не было на этом срезе), но `decide` не строит на них жёсткий
      порог там, где они не различают.
   3. Величина 3 ADR (строк дрейфа main в файлах PR / строк PR) — считает по
-     СТРОКАМ, инфлируется несвязанным дописыванием в конец файла (живой
-     случай — `test_scheduler.py`). Здесь она заменена на пересечение
-     изменённых РЕГИОНОВ между PR-диффом и main-диффом в общих файлах
-     (`functional_overlap`): AST def/class-регионы для `.py`, line-range
-     fallback (пересечение задетых строк обеих сторон в КООРДИНАТАХ
-     MERGE-BASE) для остальных файлов — живой класс прогона 2026-09-14:
-     #395/#613/#920/#1057 конфликтуют в shell/yaml/json/markdown, и
-     величина 3 без fallback честно рапортовала им «пересечений нет»,
-     ничего не измерив. Сам строковый ratio сохранён как СПРАВОЧНАЯ
-     величина: `line_drift_ratio` считается машиной по общим файлам и
-     попадает в вывод прогона, в `decide()` не входит.
+      СТРОКАМ, инфлируется несвязанным дописыванием в конец файла (живой
+      случай — `test_scheduler.py`). Здесь она заменена на пересечение
+      изменённых РЕГИОНОВ между PR-диффом и main-диффом в общих файлах
+      (`functional_overlap`): МИНИМАЛЬНЫЕ AST def/class-регионы для `.py`
+      (регион, СТРОГО содержащий другие регионы — класс с методами, функция
+      с вложенной, — фантомная единица: правки двух разных методов одного
+      класса давали ложное «пересоздать»; блокирующая находка второго ревью
+      PR #1219), line-range fallback (пересечение задетых строк обеих сторон
+      в КООРДИНАТАХ MERGE-BASE) для остальных файлов — живой класс прогона
+      2026-09-14:
+      #395/#613/#920/#1057 конфликтуют в shell/yaml/json/markdown, и
+      величина 3 без fallback честно рапортовала им «пересечений нет»,
+      ничего не измерив. Строки .py ВНЕ регионов (модульный код) считаются
+      тем же line-range правилом (режим `ast+line-range`), не невидимы. Сам
+      строковый ratio сохранён как СПРАВОЧНАЯ
+      величина: `line_drift_ratio` считается машиной по общим файлам и
+      попадает в вывод прогона, в `decide()` не входит.
   4. Метода не было вовсе: PR добавляет номер инварианта
      (`scripts/orchestra/repo_invariants.py`), который main НЕЗАВИСИМО
      ТОЖЕ добавил с общего merge-base — коллизия, найденная после
@@ -96,6 +102,14 @@ _IN_SPEC = importlib.util.spec_from_file_location(
 invariant_numbering = importlib.util.module_from_spec(_IN_SPEC)
 _IN_SPEC.loader.exec_module(invariant_numbering)  # type: ignore[union-attr]
 
+# Три состояния проверки (ok/violation/unknown) — одно место правды #1096;
+# вторая половина величины 7 различает «коллизий нет» и «проверка не
+# состоялась» именно по нему.
+_CR_SPEC = importlib.util.spec_from_file_location(
+    "check_result", Path(__file__).resolve().parents[1] / "lib" / "check_result.py")
+check_result = importlib.util.module_from_spec(_CR_SPEC)
+_CR_SPEC.loader.exec_module(check_result)  # type: ignore[union-attr]
+
 
 # ── Носитель величины 7 для repo_invariants.py (см. шапку модуля, п. 4) ─────
 
@@ -117,28 +131,47 @@ def declaration_collisions(added_by_pr: set[int], added_by_main: set[int]) -> se
 # ── Величина 3: функциональное пересечение (AST-регионы) ────────────────────
 
 def python_def_ranges(source: str) -> dict[str, tuple[int, int]]:
-    """{"имя:строка_начала": (start, end)} для def/class верхнего и вложенного
-    уровня. Ключ несёт номер строки начала — два метода с одинаковым именем
-    в разных классах (`__init__` дюжину раз) не должны схлопываться в один
-    регион. Начало региона — МИНИМУМ по декораторам (находка ревью PR
-    #1219): правка только `@декоратора` — правка поведения функции, регион,
-    начатый с строки `def`, её бы не заметил. Синтаксическая ошибка (PR мог
-    оставить файл битым на промежуточном коммите) — пустой словарь, не
+    """{«имя:строка_начала»: (start, end)} — МИНИМАЛЬНЫЕ def/class-регионы
+    верхнего и вложенного уровня. Ключ несёт номер строки начала — два метода
+    с одинаковым именем в разных классах (`__init__` дюжину раз) не должны
+    схлопываться в один регион. Начало региона — МИНИМУМ по декораторам
+    (находка ревью PR #1219): правка только `@декоратора` — правка поведения
+    функции, регион, начатый с строки `def`, её бы не заметил.
+
+    Регион, СТРОГО содержащий другой отслеживаемый регион (класс с методами,
+    внешняя функция с вложенной), единицей пересечения НЕ является
+    (блокирующая находка ревью PR #1219): его диапазон покрывает всё тело,
+    и правки двух РАЗНЫХ методов одного класса давали фантомное пересечение
+    `{класс}` → ложное «пересоздать» с reason'ом «сведение сотрёт правку»,
+    хотя git сводит разные методы чисто; тот же класс для вложенных функций.
+    Сигнал не теряется: вложенные регионы несут его сами — PR, заменяющий
+    класс целиком, задевает строки и методов внутри. Строки класса ВНЕ
+    методов (атрибуты, докстринг класса) отслеживаются в
+    `measure_functional_overlap` наравне с прочими внерегиональными строками
+    (line-range поверх AST), не регионом класса. Синтаксическая ошибка (PR
+    мог оставить файл битым на промежуточном коммите) — пустой словарь, не
     исключение: вызывающий (`measure_functional_overlap`) уводит такой файл
     в line-range fallback, не молчит."""
     try:
         tree = ast.parse(source)
     except SyntaxError:
         return {}
-    ranges: dict[str, tuple[int, int]] = {}
+    entries: list[tuple[str, int, int]] = []
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             end = getattr(node, "end_lineno", node.lineno)
             decorators = [d.lineno for d in getattr(node, "decorator_list", [])
                           if hasattr(d, "lineno")]
             start = min([node.lineno, *decorators])
-            ranges[f"{node.name}:{start}"] = (start, end)
-    return ranges
+            entries.append((f"{node.name}:{start}", start, end))
+    minimal: dict[str, tuple[int, int]] = {}
+    for name, start, end in entries:
+        contains_other = any(other_start >= start and other_end <= end
+                             for _, other_start, other_end in entries
+                             if (other_start, other_end) != (start, end))
+        if not contains_other:
+            minimal[name] = (start, end)
+    return minimal
 
 
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@")
@@ -452,7 +485,10 @@ def measure_functional_overlap(main_ref: str, head_ref: str, cwd: str | None = N
     """Величина 3 (см. шапку модуля) для одного PR: пересечение изменённых
     регионов между PR и main относительно общего merge-base, только в
     файлах, которые трогают ОБЕ стороны. AST def/class-регионы для `.py`
-    (база парсится, файл существует на базе); line-range fallback
+    (база парсится, файл существует на базе) — МИНИМАЛЬНЫЕ (см.
+    `python_def_ranges`: регион, содержащий другие регионы, фантомил);
+    строки .py ВНЕ регионов (модульный код) — тем же line-range правилом,
+    режим такого файла `ast+line-range`; line-range fallback
     (`intersecting_line_runs`) — для остальных файлов и для .py, чья база
     не парсится (синт-ошибка) или отсутствует (файл добавлен обеими
     сторонами). Режим каждого файла отдаётся в `overlap_mode_by_file` —
@@ -483,7 +519,20 @@ def measure_functional_overlap(main_ref: str, head_ref: str, cwd: str | None = N
                 ranges = python_def_ranges(base_source)
         if ranges:
             overlap = touched_regions(ranges, pr_touched) & touched_regions(ranges, main_touched)
-            mode, regions = "ast", sorted(overlap)
+            regions = sorted(overlap)
+            mode = "ast"
+            # Строки ВНЕ минимальных регионов (модульные константы, реестры
+            # уровня модуля, атрибуты класса вне методов) считаются тем же
+            # line-range правилом — некритичная находка ревью PR #1219:
+            # в чистом ast-режиме они были невидимы, и ноль «не считали»
+            # был неотличим от нуля «пересечений нет».
+            covered = {line for start, end in ranges.values()
+                       for line in range(start, end + 1)}
+            module_runs = intersecting_line_runs(pr_touched - covered,
+                                                 main_touched - covered)
+            if module_runs:
+                regions = regions + module_runs
+                mode = "ast+line-range"
         else:
             mode, regions = "line-range", intersecting_line_runs(pr_touched, main_touched)
         if regions:
@@ -590,27 +639,32 @@ def ai_verdict_of(labels) -> str | None:
 _PR_SOURCE_RE = re.compile(r"^PR #(\d+)$")
 
 
-def decision_doc_collision_pr_numbers(repo: str, cwd: str | None = None) -> set[int]:
-    """Номера PR, ЗАМЕШАННЫХ в коллизию `docs/decisions`/`docs/research`
-    (величина 7, вторая половина — см. шапку модуля): переиспользует
-    `decision_numbering.check_decision_doc_number_collisions` целиком, не
-    второй копией того же обхода git+gh (#1078 уже закрыл этот класс для
-    этого носителя). `unknown()` (сеть/git отказали внутри) — пустое
-    множество, не падение: `cmd_queue` не должен топить весь прогон из-за
-    того, что эта ДОПОЛНИТЕЛЬНАЯ проверка не досчиталась, но и не должен
-    выдавать её результат за «коллизий нет» где-то ещё — здесь честно
-    возвращается «не нашли ни одной» (тот же исход, что ok())."""
+def decision_doc_collision_pr_numbers(
+        repo: str, cwd: str | None = None) -> tuple[set[int], str | None]:
+    """`(номера PR, замешанных в коллизию docs/decisions|docs/research,
+    причина_неизвестности)` — величина 7, вторая половина (см. шапку
+    модуля): переиспользует `decision_numbering.
+    check_decision_doc_number_collisions` целиком, не второй копией того же
+    обхода git+gh (#1078 уже закрыл этот класс для этого носителя). Второй
+    элемент кортежа различает два исхода с пустым множеством (находка
+    ревью PR #1219: unknown схлопывался в «коллизий нет» в строке очереди):
+    `None` — проверка СОСТОЯЛАСЬ и коллизий с PR-источниками нет;
+    непустая причина — проверка НЕ СОСТОЯЛАСЬ (`unknown()`: сеть/git
+    отказали внутри), «не нашли» не имеет права выглядеть как «проверили».
+    `cmd_queue` несёт причину в строке очереди (`velichina7_decision_doc_
+    unknown`) рядом с решением, не выдавая её за чистый вердикт."""
     result = decision_numbering.check_decision_doc_number_collisions(repo, cwd=cwd)
-    if result.status != "violation":
-        return set()
+    if result.status == check_result.STATUS_UNKNOWN:
+        return set(), result.reason
     numbers: set[int] = set()
-    for found in result.violations:
-        for occ in found["occurrences"]:
-            for source in occ["sources"]:
-                match = _PR_SOURCE_RE.match(source)
-                if match:
-                    numbers.add(int(match.group(1)))
-    return numbers
+    if result.status == check_result.STATUS_VIOLATION:
+        for found in result.violations:
+            for occ in found["occurrences"]:
+                for source in occ["sources"]:
+                    match = _PR_SOURCE_RE.match(source)
+                    if match:
+                        numbers.add(int(match.group(1)))
+    return numbers, None
 
 
 def cmd_queue(repo: str, cwd: str | None = None) -> list[dict]:
@@ -623,7 +677,10 @@ def cmd_queue(repo: str, cwd: str | None = None) -> list[dict]:
     только git-объекты»). Refspec с `+`: назначение `origin/pr-N`
     приватное для этого прогона, а force-push в чужой открытый PR отклонил
     бы refspec как non-fast-forward и уронил весь обход очереди. Дальше —
-    только локальный git (merge-tree/diff/merge-base) на каждый PR.
+    только локальный git (merge-tree/diff/merge-base) на каждый PR. Строка
+    PR, чьё измерение упало (битый head, несводимые с main истории, отказ
+    merge-tree), несёт `error` и НЕ несёт `action`: один кривой PR не валит
+    весь прогон (находка ревью PR #1219), но и не выглядит решённым.
 
     ГРАБЛЯ (issue #1218, тот же класс, что #1213): `decision_numbering.
     fetch_refs` делает `git fetch --depth 1` СВОЕЙ веткой `main` в отдельный
@@ -644,10 +701,6 @@ def cmd_queue(repo: str, cwd: str | None = None) -> list[dict]:
     partial = []
     for pull in pulls:
         number = pull["number"]
-        head_ref = f"origin/pr-{number}"
-        run_git("fetch", "--quiet", "origin",
-                f"+refs/pull/{number}/head:refs/remotes/origin/pr-{number}", cwd=cwd)
-        measured = measure_pr("origin/main", head_ref, cwd=cwd)
         task_number = task_ref.resolve_pr_task(pull)
         if task_number is None:
             task_state = "none"
@@ -655,18 +708,34 @@ def cmd_queue(repo: str, cwd: str | None = None) -> list[dict]:
             # «Ответа нет» — НЕ «открыта» (находка ревью PR #1219): issue
             # удалена/несуществует — «не знаю» остаётся «не знаю».
             task_state = states.get(task_number, "unknown")
-        verdict = ai_verdict_of(pull.get("labels", []))
-        partial.append({
-            "number": number, "title": pull.get("title", ""), "task": task_number,
-            "task_state": task_state, "ai_verdict": verdict, **measured,
-        })
+        row = {"number": number, "title": pull.get("title", ""), "task": task_number,
+               "task_state": task_state,
+               "ai_verdict": ai_verdict_of(pull.get("labels", []))}
+        try:
+            head_ref = f"origin/pr-{number}"
+            run_git("fetch", "--quiet", "origin",
+                    f"+refs/pull/{number}/head:refs/remotes/origin/pr-{number}", cwd=cwd)
+            measured = measure_pr("origin/main", head_ref, cwd=cwd)
+        except RuntimeError as error:  # GitError — подкласс RuntimeError
+            # Один кривой PR (несуществующий head, несводимые с main истории,
+            # отказ merge-tree, дрейф формата реестра) не валит весь обход
+            # очереди — находка ревью PR #1219; но и не растворяется молча:
+            # строка несёт `error`, решения (`action`) у неё НЕТ — «не
+            # посчитано» не выдаётся за вердикт (fail loud строкой, не прогоном).
+            row["error"] = str(error)
+            partial.append(row)
+            continue
+        partial.append({**row, **measured})
 
     # Последним — иначе реселлит .git/shallow для всех ссылок, см. докстринг выше.
-    doc_collisions = decision_doc_collision_pr_numbers(repo, cwd=cwd)
+    doc_collisions, doc_unknown = decision_doc_collision_pr_numbers(repo, cwd=cwd)
     ensure_unshallow(cwd=cwd)
 
     rows = []
     for row in partial:
+        if "error" in row:
+            rows.append(row)
+            continue
         decision = decide(
             conflicting=row["velichina1_conflicting"],
             functional_overlap_count=row["velichina3_functional_overlap"],
@@ -678,6 +747,10 @@ def cmd_queue(repo: str, cwd: str | None = None) -> list[dict]:
         rows.append({
             **row,
             "velichina7_decision_doc_collision": row["number"] in doc_collisions,
+            # None — проверка состоялась; причина — НЕ состоялась («коллизий
+            # нет» из несостоявшейся проверки не выдаётся, находка ревью
+            # PR #1219).
+            "velichina7_decision_doc_unknown": doc_unknown,
             **decision,
         })
     return rows
