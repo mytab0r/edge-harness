@@ -1,0 +1,115 @@
+# Дословные фрагменты cf-worker/src/harness.ts на коммите d848f99
+# (PR #1104, ПОСЛЕ фикса «честный текст алерта»: pulseAlertText больше не
+# принимает `now` — возрастная ветка физически невоспроизводима) — вендорятся
+# по той же причине, что и before-фикстура рядом (issue #1172, случай 2):
+# промежуточные sha не гарантированы долгоживущими. Заморожены как реальные
+# прод-данные, не пересказ. Те же три фрагмента, что у before-фикстуры.
+
+# ── 1/3: место вызова #tickPulseAlert (хвост #dispatchOrchestraTick) ──
+
+    // Живость пульса владельцу (issue #1103) — общий код для alarm() и
+    // scheduledTick() тем же приёмом, что и всё выше: одно место правды на
+    // тик, а не вторая копия у каждого вызывающего. lastPulse строим из уже
+    // посчитанных значений ЭТОГО тика (не второй SQL-раундтрип через
+    // #getStoredPulse — #recordPulse выше уже записала ровно это).
+    this.#tickPulseAlert(now, { ts: now, dispatch_ok: result.ok, detail, run_confirmed: runConfirmed });
+  }
+
+
+# ── 2/3: метод #tickPulseAlert ──
+
+  /**
+   * Живость пульса владельцу (issue #1103): единственный алерт, независимый
+   * от ЛЮБОГО workflow этого репозитория — тик, который его шлёт
+   * (#dispatchOrchestraTick), вызывается из alarm()/scheduledTick(),
+   * оба живут в Cloudflare-инфраструктуре (DO alarm, Cron Trigger), не в
+   * GitHub Actions. Существующий Python-сторож (pulse_guard.py::
+   * independent_pulse_check, issue #689) видит только СРАВНЕНИЕ независимого
+   * и событийного каналов и по построению не может сработать, если оба
+   * канала (и, значит, scheduler.py) не запускаются вовсе — ровно тот класс
+   * простоя, что случился 2026-09-13 (issue #1103). Этот алерт не читает
+   * GitHub API вообще (0 дополнительных вызовов/час — не может усугубить
+   * причину падения, если она в исчерпании квоты #1100), решение целиком
+   * из уже вычисленного pulseHealthy() (единственное место правды на
+   * «здоров ли пульс», не вторая копия порога).
+   *
+   * Переход, не каждый тик (storageReadyAlertDecision — прямое переиспользование
+   * решения перехода healthy↔unhealthy, семантика идентична, отдельной
+   * копии функции не заводим): один incident при первом нездоровом тике,
+   * один recovery при первом снова здоровом. Дедуп — по итогу ЗАПИСИ флага
+   * pulse_alert.alerted, тем же доводом, что у #tickStorageReadyAlert (чтение
+   * прошлого исхода падает вместе с самой аварией на исчерпании rows_read).
+   *
+   * Честная граница (issue #1143, найдено ревью PR #1104): `lastPulse` здесь
+   * — пульс, который #recordPulse ТОЛЬКО ЧТО записал этим же тиком (`ts:
+   * now`), не хранившееся ДО тика состояние. Если резервный dispatch
+   * scheduledTick() успевает восстановиться в ТОМ ЖЕ тике, где обнаружил
+   * подвисший alarm (pulseNeedsRecoveryDispatch), pulseHealthy() увидит уже
+   * исправленное (свежее, успешное) состояние — incident не пишется вовсе,
+   * хотя пульс реально молчал 20+ минут до этого. Не закрыто этим change'ом.
+   */
+  #tickPulseAlert(now: number, lastPulse: PulseStatus): void {
+    const healthy = pulseHealthy(now, lastPulse);
+    let dedupRowsWritten: number | null = null;
+    try {
+      dedupRowsWritten = this.#recordPulseAlertFlag(healthy);
+    } catch (error) {
+      console.error(
+        `pulse alert: запись дедуп-флага упала ` +
+          `(${error instanceof Error ? error.message : error}) — алерт этого тика пропущен, ` +
+          `первый удавшийся тик догонит`,
+      );
+      return;
+    }
+    if (!this.env.TELEGRAM_CHAT_ID) return; // «возможности нет» — алерту некуда идти
+    const decision = storageReadyAlertDecision(healthy, dedupRowsWritten);
+    if (decision === "incident") {
+      void this.#telegramApi("sendMessage", {
+        chat_id: this.env.TELEGRAM_CHAT_ID,
+        text: pulseAlertText(lastPulse),
+      });
+    } else if (decision === "recovery") {
+      void this.#telegramApi("sendMessage", {
+        chat_id: this.env.TELEGRAM_CHAT_ID,
+        text: "✅ edge-harness: пульс оркестратора снова в норме",
+      });
+    }
+  }
+
+
+# ── 3/3: функция pulseAlertText ──
+
+/**
+ * Текст алерта живости пульса владельцу (issue #1103). Единственный наблюдатель
+ * пульса, который не зависит вообще ни от одного workflow этого репозитория:
+ * тик, который его шлёт (#dispatchOrchestraTick, общий для alarm() и
+ * scheduledTick()), сам вызывается Cloudflare-инфраструктурой (DO alarm,
+ * Cron Trigger), а не GitHub Actions — он звонит и тогда, когда любой workflow
+ * (включая orchestra.yml целиком) не запускается вовсе.
+ *
+ * НЕ ветвится по pulseStale() (находка ревью PR #1104): #tickPulseAlert
+ * вызывает pulseHealthy()/эту функцию на пульсе, который #recordPulse ТОЛЬКО
+ * ЧТО записал этим же тиком (`ts: now`) — при `now - ts === 0` возрастная
+ * ветка pulseStale() («тик давно не обновлялся») по построению никогда не
+ * истинна, добавлять под неё отдельный текст означало бы обещать
+ * недостижимое поведение (сама она остаётся источником правды для бейджа
+ * /api/status, где сравнивается СОХРАНЁННЫЙ пульс с текущим моментом, а не
+ * пульс этого же тика). detail здесь поэтому ВСЕГДА человекочитаем
+ * (pulseDetailForRecord подставляет HEARTBEAT.runNotConfirmedDetail именно
+ * на той ветке, где иначе остался бы null) — правило AGENTS.md «алерт не
+ * гадает». Случай «пульс молчал N минут и внезапно самовосстановился ещё до
+ * первого замеченного алерта» — честно названный, но не закрытый здесь
+ * потолок наблюдаемости, issue #1143.
+ *
+ * Текст называет и газ (что уже делает самовосстановление, #689/#693/#713)
+ * и план (когда считать это неполадкой, требующей ручной проверки) —
+ * правило «алерт обязан кончаться планом».
+ */
+export function pulseAlertText(lastPulse: PulseStatus): string {
+  const retryMinutes = HEARTBEAT.selfOrchestrationMs / 60_000;
+  return (
+    `🚨 edge-harness: пульс оркестратора не бьётся: ${lastPulse.detail ?? "причина не записана"}. ` +
+    `alarm() пробует снова каждые ${retryMinutes} мин без ручного вмешательства. ` +
+    `Если в течение часа не придёт «пульс снова в норме» — проверь GH_DISPATCH_TOKEN и квоту GitHub API (rate_limit).`
+  );
+}

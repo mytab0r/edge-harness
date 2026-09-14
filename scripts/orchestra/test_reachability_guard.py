@@ -1,13 +1,15 @@
 """Тесты механизма issue #1172 (scripts/orchestra/reachability_guard.py):
 находит условие срабатывания, физически недостижимое из-за конкурирующего
-условия на той же величине (подпись 1) или из-за строки, не встречающейся ни
-в одном реальном логе (подпись 3).
+условия на той же величине (подпись 1), из-за величины, вычисленной и
+проверенной в одном такте (подпись 2), или из-за строки, не встречающейся
+ни в одном реальном логе (подпись 3).
 
 Критерий приёмки issue #1172 — измеримый: "находит все три случая на
 исторических коммитах ДО их фикса и не даёт ложных срабатываний на текущем
-main". Здесь — случаи 1 и 3 (случай 2 не формализован как отдельный
-детектор, см. докстринг reachability_guard.py, раздел "НЕ подтверждено"/
-преамбула о случае 2).
+main". Здесь — все три случая: 1 и 3 на вендоренных фикстурах PR #1089/#1114,
+2 — на вендоренных фикстурах PR #1104 (a414098 до фикса, d848f99 после);
+плюс живые проверки рабочего дерева на каждый случай (not_applicable либо
+reachable, никогда не «находка»).
 
 Запуск: python -m pytest scripts/orchestra/test_reachability_guard.py -q
 """
@@ -93,6 +95,23 @@ def test_is_gated_true_when_call_follows_age_condition():
     assert rg.is_gated_by_age_threshold(source, "resolve_thing", "FAST") is True
 
 
+def test_is_gated_recognizes_any_comparison_form_of_the_same_gate():
+    """Находка ревью PR #1180 (блокирующая 1): проба узнавала ровно одну
+    запись гейта (`age_minutes >= ИМЯ`); строгий `>`, переставленные операнды
+    и другое имя переменной давали False — «reachable» на коде, физически
+    неспособном сработать (ложное ОК). Все записи одного гейта обязаны
+    узнаваться."""
+    forms = [
+        "    if age_minutes >= FAST:\n",   # исходная наблюдавшаяся форма
+        "    if age_minutes > FAST:\n",    # строгий >
+        "    if FAST <= age_minutes:\n",   # переставленные операнды
+        "    if run_age >= FAST:\n",       # другое имя величины
+    ]
+    for gate_line in forms:
+        source = "def f():\n" + gate_line + "        resolve_thing()\n"
+        assert rg.is_gated_by_age_threshold(source, "resolve_thing", "FAST") is True, gate_line
+
+
 def test_is_gated_false_when_call_is_unconditional():
     source = "def f():\n    resolve_thing()\n"
     assert rg.is_gated_by_age_threshold(source, "resolve_thing", "FAST") is False
@@ -153,6 +172,39 @@ def test_case1_mutation_reverting_fix_text_flips_verdict_back_to_unreachable():
     assert verdict.status == "unreachable", verdict.detail
 
 
+GATE_FORM_MUTATIONS = [
+    ("строгий >", "    if age_minutes > WORKER_SILENCE_MINUTES:"),
+    ("переставленные операнды", "    if WORKER_SILENCE_MINUTES <= age_minutes:"),
+    ("другое имя величины", "    if run_age >= WORKER_SILENCE_MINUTES:"),
+]
+
+
+@pytest.mark.parametrize("label,gate_line", GATE_FORM_MUTATIONS)
+def test_case1_mutated_gate_form_must_not_give_reachable(label, gate_line):
+    """МУТАЦИИ находки ревью PR #1180 (блокирующая 1): беру РЕАЛЬНУЮ после-
+    фикстуру (зелёный текст после фикса #1089) и текстуально возвращаю гейт
+    в одной из записей, отличных от той единственной, что узнавала прежняя
+    проба. Каждая из трёх форм физически та же недостижимость (наблюдение
+    появляется не раньше порога, тишина — не раньше 2×порога=300 >= 295),
+    и НИ НА ОДНОЙ вердикт не имеет права быть «reachable» (ложное ОК)."""
+    fixed_source = read_fixture("scheduler_after_fix_reap.py.txt")
+    assert "task_number = _stalled_run_task_number(repo, pool, pulls, start)" in fixed_source
+    mutated = fixed_source.replace(
+        "    task_number = _stalled_run_task_number(repo, pool, pulls, start)",
+        "    task_number = None\n"
+        f"{gate_line}\n"
+        "        task_number = _stalled_run_task_number(repo, pool, pulls, start)",
+    )
+    verdict = rg.check_gate_then_duration_pair(
+        mutated,
+        container_func="reap_stalled_worker_run",
+        resolve_call="_stalled_run_task_number",
+        fast_const="WORKER_SILENCE_MINUTES",
+        slow_const="WORKER_STALL_MINUTES",
+    )
+    assert verdict.status == "unreachable", f"форма «{label}»: {verdict.detail}"
+
+
 def test_case1_no_false_positive_on_current_worktree_scheduler():
     """На текущем main/рабочем дереве этой пары констант ещё нет вовсе (PR
     #1089, задача #1085, не влит на момент этого PR) — guard обязан сказать
@@ -182,18 +234,45 @@ def test_case3_invalid_api_key_stop_class_unconfirmed_before_fix():
     assert verdict.status == "unconfirmed", verdict.detail
 
 
-def test_case3_rate_limit_signature_is_confirmed_by_real_corpus():
-    # Позитивный контроль: сигнатура, реально встречающаяся в корпусе,
-    # обязана классифицироваться как confirmed, не unconfirmed — иначе
-    # проверка красит ВСЁ подряд и ничего не доказывает.
+def test_case3_signature_present_in_real_corpus_is_confirmed():
+    # Позитивный контроль на РЕАЛЬНОМ корпусе, не синтетике (замечание ревью
+    # PR #1180): цитата «Server Error (HTTP 502)» действительно есть в
+    # real_error_log_corpus.txt (job `review`, run 34748740141, PR #1089) —
+    # сигнатура, реально встречающаяся в корпусе, обязана классифицироваться
+    # как confirmed, иначе проверка красит ВСЁ подряд и ничего не доказывает.
     source = (
-        "  if grep -qE 'RATE_LIMIT:' \"$err_file\"; then\n"
+        "  if grep -qE 'HTTP 502' \"$err_file\"; then\n"
         "    return 1\n"
         "  fi\n"
     )
-    corpus = "some line mentioning rate_limit: retry budget exceeded\n"
-    verdict = rg.check_stop_signature_in_corpus(source, "RATE_LIMIT:", corpus)
+    corpus = read_fixture("real_error_log_corpus.txt")
+    assert "HTTP 502" in corpus, "предпосылка контроля нарушена: сигнатуры нет в реальном корпусе"
+    verdict = rg.check_stop_signature_in_corpus(source, "HTTP 502", corpus)
     assert verdict.status == "confirmed", verdict.detail
+
+
+def test_case3_active_stop_branch_in_later_block_is_not_missed():
+    """Замечание ревью PR #1180 (чеклист): литерал может встретиться в тексте
+    ДВАЖДЫ — сначала переключаемой веткой с `return 0`, потом активным
+    стоп-классом с `return 1`. Поиск только по ПЕРВОМУ совпадению молчал бы
+    (`not_applicable`) о реально активном стоп-классе: проверяются ВСЕ
+    if/fi-блоки с литералом."""
+    source = (
+        "  if grep -qE 'TIMEOUT:' \"$err_file\"; then\n"
+        "    return 0  # переключаемый класс, не стоп\n"
+        "  fi\n"
+        "cond() {\n"
+        "  if grep -qE 'TIMEOUT:' \"$err_file\"; then\n"
+        "    return 1  # активный стоп-класс\n"
+        "  fi\n"
+        "}\n"
+    )
+    corpus = "real log line: connection reset by peer\n"
+    verdict = rg.check_stop_signature_in_corpus(source, "TIMEOUT:", corpus)
+    # корпус намеренно БЕЗ литерала: «unconfirmed» доказывает, что проверка
+    # увидела активный стоп-класс во ВТОРОМ блоке (не молчала not_applicable
+    # по первому блоку с return 0)
+    assert verdict.status == "unconfirmed", verdict.detail
 
 
 def test_case3_no_false_positive_on_current_dsh_ci():
@@ -295,6 +374,88 @@ def test_check_gate_then_duration_pair_degenerate_when_same_constant_passed_twic
         slow_const="WORKER_SILENCE_MINUTES",  # по ошибке та же константа дважды
     )
     assert verdict.status == "degenerate", verdict.detail
+
+
+# ── Случай 2 (issue #1172): harness.ts, алерт на записи этого же тика ────────
+# Исторические фикстуры — ДОСЛОВНЫЕ фрагменты cf-worker/src/harness.ts на
+# a414098 (до фикса PR #1104) и d848f99 (после) — вендорятся по той же
+# причине, что и фикстуры случая 1 выше.
+
+CASE2_CONSUMER = "#tickPulseAlert"
+CASE2_TEXT_FUNC = "pulseAlertText"
+
+
+def test_case2_pulse_alert_age_branch_unreachable_before_fix():
+    source = read_fixture("harness_before_fix_pulse_alert.ts.txt")
+    verdict = rg.check_same_tick_age_branch(source, CASE2_CONSUMER, CASE2_TEXT_FUNC)
+    assert verdict.status == "unreachable", verdict.detail
+
+
+def test_case2_pulse_alert_age_branch_reachable_after_fix():
+    source = read_fixture("harness_after_fix_pulse_alert.ts.txt")
+    verdict = rg.check_same_tick_age_branch(source, CASE2_CONSUMER, CASE2_TEXT_FUNC)
+    # Фикс PR #1104: pulseAlertText(lastPulse) — сигнатура без `now`; факты
+    # «тексту уходит now» и «возраст считается от now и ts» невоспроизводимы,
+    # сама форма бага исчезла — reachable, не not_applicable (проверка
+    # выполнена, нарушений нет).
+    assert verdict.status == "reachable", verdict.detail
+
+
+def test_case2_no_false_positive_on_current_worktree_harness():
+    """Текущий harness.ts (фикс #1104 на main) не должен давать «unreachable»:
+    запись этого же тика по-прежнему кормит #tickPulseAlert, но текстовая
+    функция больше не принимает `now` — форма недостижимой ветки
+    невоспроизводима. Живая проверка — обязательная часть критерия задачи
+    («не даёт ложных срабатываний на текущем main»)."""
+    live_path = REPO_ROOT / "cf-worker" / "src" / "harness.ts"
+    source = live_path.read_text(encoding="utf-8")
+    verdict = rg.check_same_tick_age_branch(source, CASE2_CONSUMER, CASE2_TEXT_FUNC)
+    assert verdict.status == "reachable", (
+        f"неожиданно {verdict.status} — возрастная ветка текста алерта вернулась в "
+        f"harness.ts или проба перестала узнавать зафиксированную форму: {verdict.detail}"
+    )
+
+
+def test_case2_mutation_reintroducing_now_into_alert_text_flips_to_unreachable():
+    """ДОКАЗАТЕЛЬСТВО МУТАЦИЕЙ: беру ПОСЛЕ-фикстуру (реальный зелёный текст)
+    и текстуально возвращаю обе правки фикса #1104 — `now` в вызов текста и
+    `now` в сигнатуру с возрастной строкой. Guard обязан снова увидеть
+    unreachable, доказывая, что вердикт зависит от факта в коде, а не от
+    случайности фикстуры."""
+    fixed_source = read_fixture("harness_after_fix_pulse_alert.ts.txt")
+    assert "text: pulseAlertText(lastPulse)," in fixed_source
+    mutated = fixed_source.replace(
+        "text: pulseAlertText(lastPulse),",
+        "text: pulseAlertText(now, lastPulse),",
+    ).replace(
+        "export function pulseAlertText(lastPulse: PulseStatus): string {",
+        "export function pulseAlertText(now: number, lastPulse: PulseStatus): string {\n"
+        "  const minutes = Math.round((now - lastPulse.ts) / 60_000);",
+    )
+    verdict = rg.check_same_tick_age_branch(mutated, CASE2_CONSUMER, CASE2_TEXT_FUNC)
+    assert verdict.status == "unreachable", verdict.detail
+
+
+def test_case2_not_applicable_when_any_fact_missing():
+    # «Доказывай доказыватель»: отсутствие любого из трёх фактов — третье,
+    # отдельное состояние, не молчаливое «reachable».
+    no_same_tick = rg.check_same_tick_age_branch(
+        "x = 1\n", CASE2_CONSUMER, CASE2_TEXT_FUNC
+    )
+    assert no_same_tick.status == "not_applicable"
+    same_tick_only = (
+        "this.#tickPulseAlert(now, { ts: now, dispatch_ok: true });\n"
+    )
+    assert rg.check_same_tick_age_branch(same_tick_only, CASE2_CONSUMER, CASE2_TEXT_FUNC).status == "not_applicable"
+
+
+def test_extract_braced_source_bounds_at_balanced_brace():
+    source = "class A {\n  m(): void {\n    if (x) { y(); }\n  }\n  other(): void {}\n}\n"
+    body = rg.extract_braced_source(source, r"^\s*m\(")
+    assert body is not None
+    assert "y();" in body
+    assert "other" not in body
+    assert rg.extract_braced_source(source, r"^\s*missing\(") is None
 
 
 if __name__ == "__main__":
