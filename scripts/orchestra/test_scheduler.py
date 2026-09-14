@@ -3635,10 +3635,18 @@ def test_dispatch_conflict_rework_processes_oldest_conflict_first(monkeypatch):
 
 
 def _ai_rework_base_fixture(pr_number, task_number, run_id, run_conclusion, *, dispatched_since):
-    """Общая часть фикстуры для трёх тестов ниже (#1027): один PR с
+    """Общая часть фикстуры для тестов ниже (#1027): один PR с
     ai:changes-requested, бюджет доводки уже исчерпан (одна ЗАСЧИТАННАЯ
     попытка — WORKER_GIT_STEP_MARKER в комментариях ЗАДАЧИ), последний
-    прогон worker.yml по задаче атрибутирован и несёт `run_conclusion`."""
+    прогон worker.yml по задаче атрибутирован и несёт `run_conclusion`.
+
+    `"status": "completed"` — прод-форма GitHub Actions API: `conclusion`
+    заполнен ТОЛЬКО у завершённых прогонов (класс #1260, второй круг —
+    находка ревью: без явного `status` в фикстуре `run.get("status")`
+    отдаёт `None`, а `!= "completed"` в dispatch_ai_review_rework трактует
+    `None` как «ещё не завершился» — те же 4 теста этого модуля ложно
+    ловили бы «эскалация отложена» вместо ожидаемого исхода, хотя
+    `run_conclusion` здесь ВСЕГДА конечный (failure/success/timed_out)."""
     files = files_payload(["x.py"])
     fingerprint = sch.review_labels.diff_fingerprint(files)
     return fingerprint, {
@@ -3657,7 +3665,8 @@ def _ai_rework_base_fixture(pr_number, task_number, run_id, run_conclusion, *, d
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
         "workflows/worker.yml/runs?per_page=10": {"workflow_runs": [
-            {"id": run_id, "conclusion": run_conclusion, "created_at": "2026-09-12T11:00:00Z"},
+            {"id": run_id, "status": "completed", "conclusion": run_conclusion,
+             "created_at": "2026-09-12T11:00:00Z"},
         ]},
         f"{REPO}/issues/{task_number}/comments?per_page": [
             {"created_at": "2026-09-12T11:00:30Z",
@@ -3784,31 +3793,43 @@ def test_dispatch_ai_review_rework_escalation_names_attributed_non_success_concl
     assert any("исчерпана" in line and "#1020" in line for line in actions)
 
 
-def test_dispatch_ai_review_rework_defers_escalation_while_own_run_in_flight(monkeypatch):
-    """Находка ревью PR #1260 (класс «эскалация-до-итога-прогона»):
-    последний прогон worker.yml по ЭТОЙ задаче атрибутирован (след аренды
-    найден), но ещё не завершился (status='in_progress') — GitHub не
-    заполняет `conclusion` для in_progress/queued, поэтому наивное чтение
-    только `conclusion` (None) неотличимо от «атрибуции нет вовсе» и раньше
-    ошибочно эскалировало владельцу прогон, чья попытка доводки ЭТОЙ задачи
-    физически ещё идёт (AGENTS.md, «алерт не гадает» — «атрибуции нет» и
-    «атрибуция есть, исход неизвестен» — разные факты). Это НЕ возврат
-    снятого busy-гейта воркера (тот блокировал занятостью ЛЮБОГО прогона
-    репозитория, см. test_dispatch_ai_review_rework_escalates_while_
-    worker_active выше, где ЧУЖОЙ in_progress прогон эскалации не мешает) —
-    здесь откладываем только пока не известен исход СВОЕГО прогона.
+@pytest.mark.parametrize("run_id, status", [
+    (34600000006, "in_progress"),
+    (34600000007, "queued"),
+    (34600000008, "requested"),
+    (34600000009, "waiting"),
+])
+def test_dispatch_ai_review_rework_defers_escalation_while_own_run_in_flight(monkeypatch, run_id, status):
+    """Находка ревью PR #1260 (класс «эскалация-до-итога-прогона»), ВТОРОЙ
+    круг: последний прогон worker.yml по ЭТОЙ задаче атрибутирован (след
+    аренды найден), но ещё не завершился — GitHub не заполняет `conclusion`
+    ни для одного НЕконечного статуса, поэтому наивное чтение только
+    `conclusion` (None) неотличимо от «атрибуции нет вовсе» и раньше ошибочно
+    эскалировало владельцу прогон, чья попытка доводки ЭТОЙ задачи физически
+    ещё идёт (AGENTS.md, «алерт не гадает» — «атрибуции нет» и «атрибуция
+    есть, исход неизвестен» — разные факты). Это НЕ возврат снятого
+    busy-гейта воркера (тот блокировал занятостью ЛЮБОГО прогона репозитория,
+    см. test_dispatch_ai_review_rework_escalates_while_worker_active выше,
+    где ЧУЖОЙ in_progress прогон эскалации не мешает) — здесь откладываем
+    только пока не известен исход СВОЕГО прогона.
 
-    Мутация: замени новую ветку `run.get("status") in ("in_progress",
-    "queued")` на всегда-False (то есть верни код к чтению одного
-    `last_worker_run_conclusion`) — этот тест покраснеет: escalated
-    перестанет быть пустым, наблюдение "эскалация отложена" исчезнет."""
+    Параметризация `requested`/`waiting` — ПЕРВАЯ версия фикса проверяла
+    белый список `status in ("in_progress", "queued")`: у GitHub Actions
+    статусов больше, ревьюер исполнил именно эти два сценария и получил
+    ложную эскалацию с текстом «не атрибутирован» — атрибуция БЫЛА, просто
+    белый список её не узнал.
+
+    Мутация: замени условие `run.get("status") != "completed"` обратно на
+    белый список `run.get("status") in ("in_progress", "queued")` — сценарии
+    requested/waiting в этом тесте покраснеют (escalated перестанет быть
+    пустым), in_progress/queued останутся зелёными (класс #1260, второй
+    круг — узкий белый список не покрывает все неконечные статусы)."""
     task = issue(782, assignees=("mytab0r",))
     p = pull(1020, labels=[sch.review_labels.AI_CHANGES], ref="agent/782-fix-waiting-owner-relabel-loop")
-    run_id = 34600000006
     fingerprint, fixture = _ai_rework_base_fixture(
         1020, 782, run_id, None, dispatched_since="2026-09-12T10:00:00Z")
     fixture["workflows/worker.yml/runs?per_page=10"] = {
-        "workflow_runs": [workflow_run(run_id, "in_progress")]}
+        "workflow_runs": [workflow_run(run_id, status)]}
     fake = FakeGh(fixture)
     patch_gh(monkeypatch, fake)
     escalated = []
@@ -3822,7 +3843,7 @@ def test_dispatch_ai_review_rework_defers_escalation_while_own_run_in_flight(mon
     assert not any("worker.yml/dispatches" in c for c in fake.calls)
     assert escalated == []
     assert any(
-        "эскалация отложена" in line and "#1020" in line and "in_progress" in line
+        "эскалация отложена" in line and "#1020" in line and status in line
         for line in observations
     )
     assert task["assignees"] != []  # ни эскалация, ни редиспатч не трогают задачу
