@@ -160,14 +160,23 @@ class ResidentStubStore {
   // #1161: this is the counter that ties #1163's dispose-safety fix to the
   // rows_read claim — a "cold load" here stands in for the real
   // do-session-persistence.ts::eventRows(id, 0) full-history SELECT that
-  // upstream's own resident cache now pays AT MOST ONCE per sessionId per DO
-  // activation (docs/research/11-dsh-edge.md, "resident agents"), not once
-  // per ingest call as it did before 0.14.0. If a future change to this patch
-  // (or to the upstream lifetime around it) makes appendHarnessEvents open a
-  // FRESH session/handle per call again — same effect as the pre-#1163
-  // per-batch dispose(), just via a different code path — this counter grows
-  // past 1 across repeated batches to the SAME session and the assertion
-  // below goes red.
+  // upstream's own resident cache is DOCUMENTED (docs/research/11-dsh-edge.md,
+  // "resident agents") to pay at most once per sessionId per DO activation,
+  // not once per ingest call as it did before 0.14.0.
+  //
+  // Honest boundary on detection power (ai-review PR #1173, round 2 finding):
+  // this counter lives entirely in THIS hand-written stub — it reads nothing
+  // from upstream (dsh-edge is not vendored here, PATCHES.md). It goes red
+  // mechanically for exactly two things: (a) an edit to the extracted patch
+  // TEXT that makes appendHarnessEvents open a fresh session/handle per call
+  // again (same effect as the pre-#1163 per-batch dispose(), different code
+  // path), or (b) an edit to this stub itself that stops caching in the
+  // residents map above. It CANNOT see a real change to upstream's
+  // resident-cache lifetime (e.g. a pin bump that shortens how long a
+  // resident survives between calls) — upstream_drift.py's pin-bump
+  // automation does not re-verify this stub against the new dsh-edge source;
+  // that has to happen by hand at each bump (see docs/research/11-dsh-edge.md
+  // before assuming this guard still matches reality on a new pin).
   coldLoads = 0
   context = { agentDefaultModel: { currentSelection: () => ({ model: 'stub-model' }) } }
   async services() {

@@ -21,7 +21,12 @@
 // (handle never dies) while still opening a FRESH session/handle on every
 // call (still correct, still O(history) per call, rows_read unchanged) — the
 // coldLoads assertion is what tells those two apart; disposeCalls alone does
-// not.
+// not. Honest boundary (ai-review PR #1173, round 2 finding): this only
+// tells the two apart WITHIN this stub — `coldLoads` reads nothing from
+// upstream, so it catches an edit to the patch text or to the stub itself,
+// not a real drift in dsh-edge's resident-cache lifetime after a pin bump
+// (see the fuller boundary note in verify-ingest-resident-safety.mjs next to
+// the counter's definition).
 //
 // Mutation proof (do this by hand before trusting the guard, per AGENTS.md
 // "поведенческий тест находит то, чего структурный не видит" — RUN it, do
@@ -62,5 +67,5 @@ test('#1161: три ingest-батча в одну сессию платят по
   const { batch3, batch3Error, coldLoads } = await runTwoBatchIngestScenario()
   assert.equal(batch3Error, undefined, `батч 3 в ту же сессию обязан пройти: ${batch3Error}`)
   assert.equal(batch3?.appended, 2, 'батч 3: оба события приняты')
-  assert.equal(coldLoads, 1, 'резидентный кэш обязан обслужить все три батча ОДНИМ холодным резюме сессии — рост здесь означает, что ingest снова платит rows_read полного ре-скана истории на каждый вызов (#1161)')
+  assert.equal(coldLoads, 1, 'стаб резидентного кэша обязан обслужить все три батча ОДНИМ "холодным" openAgentForTurn — рост здесь означает, что ЭКСТРАГИРОВАННЫЙ ТЕКСТ ПАТЧА снова открывает сессию/хэндл на каждый вызов (модель реального full-history rows_read из docs/research/11-dsh-edge.md; сам счётчик не читает апстрим и не ловит его дрейф, см. verify-ingest-resident-safety.mjs) (#1161)')
 })
