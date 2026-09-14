@@ -41,6 +41,15 @@ mkdir -p "$WORK/real-bin"
 MARKER="$WORK/real-gh-pr-create-called"
 cat >"$WORK/real-bin/gh" <<'REALGH'
 #!/usr/bin/env bash
+# Настоящий gh принимает глобальные флаги (-R/--repo, -H/--hostname) ДО
+# подкоманды — снимаем ведущую пару "-R o/r"/"--repo o/r" здесь же, чтобы
+# случай 1c (обход через global-flag) мог доказать и блокировку, и
+# прозрачность одним и тем же фейковым gh.
+argv=("$@")
+if [ "${argv[0]:-}" = "-R" ] || [ "${argv[0]:-}" = "--repo" ] || [ "${argv[0]:-}" = "-H" ] || [ "${argv[0]:-}" = "--hostname" ]; then
+  argv=("${argv[@]:2}")
+fi
+set -- "${argv[@]}"
 if [ "${1:-}" = "pr" ] && [ "${2:-}" = "create" ]; then
   echo called >"${REALGH_MARKER:?REALGH_MARKER не задан}"
   printf 'https://github.test/o/r/pull/1\n'
@@ -98,6 +107,20 @@ elif ! grep -q "scripts/git/pr-create" "$WORK/err1"; then
   note "FAIL случай 1: в stderr нет отсылки к scripts/git/pr-create"; cat "$WORK/err1"; fail=1
 else
   note "OK случай 1: gh pr create отклонён ДО сети, настоящий gh не вызван"
+fi
+
+# ── случай 1c (находка ревью PR #596, GLM): глобальный флаг ПЕРЕД
+# подкомандой не открывает обход. `gh -R o/r pr create ...` доходил до
+# настоящего gh, пока шим сравнивал только $1/$2 буквально.
+rm -f "$MARKER"
+if out=$(gh -R o/r pr create --title t --body-file "$WORK/body.md" 2>"$WORK/err1c"); then
+  note "FAIL случай 1c: gh -R o/r pr create принят шимом (обход через глобальный флаг): $out"; fail=1
+elif [ -f "$MARKER" ]; then
+  note "FAIL случай 1c: настоящий gh был вызван в обход через -R — обязан быть отклонён шимом"; fail=1
+elif ! grep -q "scripts/git/pr-create" "$WORK/err1c"; then
+  note "FAIL случай 1c: в stderr нет отсылки к scripts/git/pr-create"; cat "$WORK/err1c"; fail=1
+else
+  note "OK случай 1c: gh -R o/r pr create тоже отклонён ДО сети (глобальный флаг не открывает обход)"
 fi
 
 # ── случай 2: прозрачность — gh api (argv, exit code, ОБА потока, stdin) ────
@@ -257,5 +280,31 @@ else
     note "OK случай 7: task.sh source'ит шим, ставит его до dsh ($install_line < $dsh_line) и падает громко при неудаче"
   fi
 fi
+
+# ── случай 9 (находка ревью PR #596, оба раунда): повторный gh_shim_install
+# при УЖЕ установленном в PATH шиме не делает шим «настоящим gh» сам для
+# себя. Изолировано в подшелле — не должно повлиять на PATH/GH_SHIM_REAL_GH
+# остальных случаев.
+(
+  set -euo pipefail
+  export PATH="$BASE_PATH"
+  unset GH_SHIM_REAL_GH || true
+  W9="$WORK/case9-shim"
+  gh_shim_install "$W9" >/dev/null
+  first_real="$GH_SHIM_REAL_GH"
+  # Второй вызов НА ТОМ ЖЕ shim_dir, шим уже первый в PATH (PATH не сбрасывали).
+  gh_shim_install "$W9" >/dev/null
+  second_real="$GH_SHIM_REAL_GH"
+  if [ "$second_real" != "$first_real" ]; then
+    echo "FAIL случай 9: повторный gh_shim_install изменил GH_SHIM_REAL_GH ($first_real -> $second_real) — похоже, записал путь шима как настоящий gh"
+    exit 1
+  fi
+  case "$second_real" in
+    "$W9"/*)
+      echo "FAIL случай 9: GH_SHIM_REAL_GH указывает внутрь каталога шима после повторной установки — self-exec loop"
+      exit 1 ;;
+  esac
+  echo "OK случай 9: повторный gh_shim_install идемпотентен, GH_SHIM_REAL_GH не превратился в путь шима"
+) || { note "(случай 9 см. вывод выше)"; fail=1; }
 
 exit "$fail"
