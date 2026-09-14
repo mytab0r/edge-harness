@@ -1816,10 +1816,11 @@ def test_resume_alert_text_carries_marker_evidence():
     ("scripts/worker/task.sh: line 375: .../infra_digest.sh: No such file or directory", "defect"),
     ("AssertionError: expected 3 got 2", "defect"),
     ("что угодно нераспознанное", "defect"),  # fail loud: непонятное — дефект, не прощаем молча
-    # Граница (#1115, пункт 4): текст реального дефекта, который сам
-    # УПОМИНАЕТ "HTTP 403"/"502" как часть содержания (тест печатает код,
-    # который проверяет), не должен ложно классифицироваться как infra, если
-    # он не совпадает буквально с сигнатурой. Сигнатуры — узкие фразы целиком
+    # Граница (находка ревью PR #1177): консервативная политика списка
+    # (pulse_guard.py:386-389 — нераспознанное считается дефектом) требует,
+    # чтобы текст реального дефекта, который сам УПОМИНАЕТ "HTTP 403"/"502"
+    # как часть содержания (тест печатает код, который проверяет), не
+    # классифицировался ложно как infra. Сигнатуры — узкие фразы целиком
     # ("api rate limit exceeded for installation", "server error (http 502)"),
     # не голые коды "403"/"502" — assert с кодом в тексте их не задевает.
     ("AssertionError: expected status 403, got 200 (permission check)", "defect"),
@@ -2499,6 +2500,55 @@ def test_failure_watch_infra_cause_is_silent_after_first_marker(monkeypatch):
     observations2, _ = pg.failure_watch("mytab0r/edge-harness", NOW)
     assert posted == []
     assert any("уже сигналили" in line for line in observations2)
+
+
+def test_failure_watch_recognizes_installation_rate_limit_in_own_domain(monkeypatch):
+    """Находка ревью PR #1177 (issue #1115): классификатор проверялся раньше
+    только напрямую (`classify_failure_cause`) на тексте из job `review`
+    (ai-review.yml, событие pull_request) — workflow, который `failure_watch`
+    вообще не читает (не в WATCHED_WORKFLOWS, и событие pull_request отсеяно
+    отдельным фильтром). Диффа это не проверяло: сигнатура могла быть верной
+    строкой и одновременно мёртвым кодом для ЕДИНСТВЕННОГО сегодняшнего
+    потребителя.
+
+    Этот тест — сквозной, через реальный код-путь `pg.failure_watch`, на
+    прод-форме ИЗ ДОМЕНА: job `orchestra` (workflow orchestra.yml, событие
+    workflow_dispatch — как раз то, что failure_watch читает), дословно из
+    job id 103700086421, run 34748271080, 2026-09-13 08:40 UTC (тот же
+    инцидент — исчерпание квоты installation, окно 08:19–09:10 UTC, семь
+    прогонов orchestra.yml с идентичным текстом)."""
+    routes = dict(FAILURE_WATCH_QUIET_ROUTES)
+    routes["workflows/orchestra.yml/runs?status=completed"] = {"workflow_runs": [
+        run("failure", "2026-08-31T11:50:00Z", 34748271080),
+    ]}
+    routes["runs/34748271080/jobs"] = {"jobs": [
+        {"id": 103700086421, "name": "orchestra", "conclusion": "failure", "steps": [
+            {"name": "Обход пула и очередь слияний", "conclusion": "failure"},
+        ]},
+    ]}
+    routes["issues/120/comments"] = []
+    fake = FakeGh(routes)
+    monkeypatch.setattr(pg, "gh", fake)
+    monkeypatch.setattr(
+        pg, "subprocess",
+        SimpleNamespace(run=lambda *a, **k: _stdout_with_error(
+            "orchestra: gh api repos/mytab0r/edge-harness/pulls?state=open&per_page=100&page=1: "
+            "gh: API rate limit exceeded for installation. If you reach out to GitHub Support "
+            "for help, please include the request ID 080D:16F083:765F596:18005CC0:6AA6618F and "
+            "timestamp 2026-09-13 08:40:47 UTC. For more on scraping GitHub and how it may "
+            "affect your rights, please review our Terms of Service "
+            "(https://docs.github.com/en/site-policy/github-terms/github-terms-of-service) "
+            "(HTTP 403)")))
+    posted = []
+    created = []
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
+    monkeypatch.setattr(pg, "gh", fake)
+
+    observations, actions = pg.failure_watch("mytab0r/edge-harness", NOW)
+    assert len(posted) == 1
+    assert pg.FAILURE_WATCH_INFRA_MARKER in posted[0]
+    assert actions == []  # инфраструктура — наблюдение, не действие пула
+    assert not any("не заводим без факта" in line for line in observations)
 
 
 def test_failure_watch_ignores_run_older_than_freshness_window(monkeypatch):

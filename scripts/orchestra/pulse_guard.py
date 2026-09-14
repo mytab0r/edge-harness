@@ -397,14 +397,17 @@ INFRA_ERROR_SIGNATURES = (
     # Исчерпание квоты GitHub App installation-токена (issue #1115) — текст
     # gh CLI, ОТЛИЧНЫЙ от "rate limit reached"/"secondary rate limit" выше
     # (другая формулировка GitHub API на исчерпание общего лимита installation,
-    # не per-user/secondary). Дословно из живых прогонов PR #1099, 2026-09-13:
-    # job `review` (job id 103700060977, run 34748262115): "gh api
-    # repos/mytab0r/edge-harness/pulls/1099/files?per_page=100&page=1: gh: API
-    # rate limit exceeded for installation. ..."; тот же текст на job
-    # `contract` (run 34748262106) и job `orchestra`/`repo_invariants` семи
-    # прогонов orchestra.yml того же окна (08:40–09:10 UTC) — обратный прогон
-    # классификатора по реальным логам подтверждает 10 совпадений за сутки
-    # 2026-09-13 (см. отчёт PR).
+    # не per-user/secondary). ДОМЕННО достижимо через единственного сегодняшнего
+    # потребителя (failure_watch, WATCHED_WORKFLOWS × event != pull_request) —
+    # дословно из job `orchestra` (job id 103700086421, run 34748271080,
+    # workflow_dispatch, НЕ pull_request): "orchestra: gh api
+    # repos/mytab0r/edge-harness/pulls?state=open&per_page=100&page=1: gh: API
+    # rate limit exceeded for installation. ..." — тот же текст ещё на шести
+    # прогонах orchestra.yml того же окна (08:23–09:10 UTC, 2026-09-13). Вне
+    # домена failure_watch тот же текст встречался и в job `review`/`contract`
+    # (ai-review.yml/PR #1099, событие pull_request — этот workflow НЕ входит
+    # в WATCHED_WORKFLOWS, failure_watch его не читает); упомянуто как более
+    # широкий контекст инцидента #1115, не как доказательство домена.
     "api rate limit exceeded for installation",
     "dial tcp",
     "could not resolve host",
@@ -419,6 +422,24 @@ INFRA_ERROR_SIGNATURES = (
     # ловит. Дословно из живого прогона PR #1089, 2026-09-13: job `review`
     # (job id 103701285000, run 34748740141): "##[error]review: gh api -X: gh:
     # Server Error (HTTP 502)".
+    #
+    # ЧЕСТНО (находка ревью PR #1177): это job `review` (ai-review.yml,
+    # событие pull_request) — ВНЕ домена сегодняшнего единственного
+    # потребителя failure_watch (WATCHED_WORKFLOWS × не-pull_request). В
+    # выборке упавших прогонов WATCHED_WORKFLOWS за 2026-09-11..13 (orchestra.
+    # yml/worker.yml/deploy-worker.yml/deploy-dsh-edge.yml/plugin-forge.yml)
+    # этот текст не встретился ни разу — не исчерпывающий аудит, честная
+    # выборка. Сигнатура добавлена
+    # не потому, что доказана в домене failure_watch сегодня, а потому что
+    # classify_failure_cause — общая чистая функция: её уже переиспользует
+    # PR #1136 (дайджест мягких отказов) на более широком наборе прогонов, и
+    # ровно тот же приём gh CLI (оборачивание 5xx в "Server Error (HTTP N)")
+    # будет достижим там, где источником текста служит уже не только
+    # failure_watch. Решение по смежному замечанию (не расширять сигнатуру до
+    # класса "server error (http 5" на 500/503/504 без отдельного домённого
+    # подтверждения каждого кода) — то же самое: конкретный код (502) взят из
+    # реального лога, произвольное обобщение на соседние коды без такого же
+    # лога было бы недоказанной сигнатурой (класс #1172).
     "server error (http 502)",
     "503 service unavailable",
     "504 gateway",
