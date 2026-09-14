@@ -113,9 +113,11 @@ export function assertNoUnconditionalDispose(body) {
  * against the SAME session. Returns the outcome of all three batches plus
  * `coldLoads` so the test can assert on both the #1163 correctness property
  * (no dead resident) and the #1161 cost property (the O(full-history) load
- * this fix collapses into a per-session, not per-call, cost — issue #1161's
- * dominant `rows_read` contributor, docs/research/20-cloudflare-free.md
- * "Причина цены ≈427 rows_read/событие"). Never swallows a scenario-setup error.
+ * this fix collapses into a per-session, not per-call, cost — the mechanism
+ * docs/research/11-dsh-edge.md documents for the 0.14.0 resident-agent cache;
+ * NOT re-confirmed as the dominant share of #1161's measured 150,898
+ * rows_read/run on the current pin — that number/estimate lives in issue
+ * #1161, not here). Never swallows a scenario-setup error.
  * @param {string} patch - full unified diff text (defaults to the real patch on disk).
  * @returns {Promise<{batch1: {appended: number}, batch2Error: string|undefined, batch3Error: string|undefined, disposeCalls: number, coldLoads: number}>}
  */

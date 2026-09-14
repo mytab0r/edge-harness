@@ -10,22 +10,34 @@
 // #1161: the second assertion below (coldLoads) is a DIFFERENT property from
 // #1163's — not "the handle stays alive" but "the O(full session history)
 // cold-resume load this fix collapses is paid at most once per session, not
-// once per ingest call". That collapse is issue #1161's own dominant
-// rows_read contributor (docs/research/20-cloudflare-free.md, "Причина цены
-// ≈427 rows_read/событие... appendHarnessEvents на КАЖДЫЙ вызов... делает
-// полный проход по всей истории сессии"). A fix could satisfy #1163 (handle
-// never dies) while still opening a FRESH session/handle on every call
-// (still correct, still O(history) per call, rows_read unchanged) — the
+// once per ingest call". docs/research/11-dsh-edge.md ("resident agents")
+// documents the 0.14.0 mechanism this relies on (upstream's own resident
+// cache pays the cold-resume cost once per session per DO activation); the
+// ≈427 rows_read/event figure in docs/research/20-cloudflare-free.md predates
+// the 0.14.0 pin and its resident-agent model — NOT re-verified against the
+// current pin, so this comment does not claim it as the confirmed dominant
+// term, only as the mechanism this guard targets (issue #1161 carries the
+// number/estimate discussion, not this file). A fix could satisfy #1163
+// (handle never dies) while still opening a FRESH session/handle on every
+// call (still correct, still O(history) per call, rows_read unchanged) — the
 // coldLoads assertion is what tells those two apart; disposeCalls alone does
 // not.
 //
 // Mutation proof (do this by hand before trusting the guard, per AGENTS.md
-// "поведенческий тест находит то, чего структурный не видит"):
+// "поведенческий тест находит то, чего структурный не видит" — RUN it, do
+// not infer the numbers from reading the diff; that inference is exactly
+// what went stale here once before, see PR #1173 review history):
 //   1. Reintroduce `finally { await handle.dispose()... }` around the tail of
-//      appendHarnessEvents in the patch text (the pre-#1163 shape) -> the
-//      #1163 assertions go red: batch2Error is the "not live" message, not
-//      undefined, disposeCalls is 1 (not 0), and batch3 never runs (batch2
-//      already threw when preparing session.append after a dead resident).
+//      appendHarnessEvents in the patch text (the pre-#1163 shape, git
+//      history d239e324~1) -> the #1163 assertions go red: batch2Error is
+//      the "not live" message (not undefined), and disposeCalls is 3 (not
+//      0) — the pre-#1163 `finally` sits around the WHOLE try body (session
+//      read, append, flush), so it fires on batch1 (clean), then AGAIN on
+//      batch2 and batch3 even though each of those throws before reaching
+//      flush (dispose still runs in `finally` on the exception path).
+//      batch3 is NOT skipped: it runs against the same already-disposed
+//      cached handle and fails with the same "not live" message as batch2 —
+//      there is no short-circuit between batches in the scenario.
 //   2. Instead, keep the fix but make the stub's own `openAgentForTurn`
 //      always create a fresh session (drop the `if (handle === undefined)`
 //      short-circuit in ResidentStubStore, i.e. stop caching in `residents`)
