@@ -1,0 +1,56 @@
+# Сторож зомби-прогонов PR-чеков (issue #1106, живой случай PR #1088): run
+# застревает `status=queued` с `jobs.total_count: 0` навсегда — `gh run
+# rerun` отказывает («This workflow is already running», нечего
+# перезапускать), сторожа не было. Отдельный файл, не правка orchestra.yml
+# (та территория занята параллельной работой, PR #1136 — тот же приём, что
+# merge-health-watch.yml выбрал для issue #967) и не правка каденса самого
+# пульса.
+#
+# Газ — переэмиссия событий PR (close→reopen, head SHA не меняется) ровно
+# один раз на head_sha; рецидив ПОСЛЕ переэмиссии — эскалация (issue #120 +
+# Telegram), не повторный retry (scripts/orchestra/zombie_run_watch.py,
+# докстринг модуля целиком).
+name: zombie-run-watch
+
+on:
+  schedule:
+    # 15 минут — тот же порядок величины, что ZOMBIE_AGE_MINUTES в
+    # zombie_run_watch.py: детектор обязан успеть заметить застрявший
+    # прогон в пределах одного-двух тиков после того, как он пересёк порог.
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: zombie-run-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Job-level permissions ПОЛНОСТЬЮ заменяют workflow-level (docs/research/
+    # 21-github-actions.md, #884/#890) — перечислено явно, не понадеялись на
+    # наследование.
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Зомби-прогоны PR-чеков — снять и переэмиттить (issue #1106)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/orchestra/zombie_run_watch.py run

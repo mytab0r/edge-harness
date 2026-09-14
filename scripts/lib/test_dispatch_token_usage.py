@@ -144,6 +144,12 @@ EXPECTED_WORKFLOWS = frozenset({
     # dev, поэтому не входит ни в DISPATCH_CONSUMER, ни в PIPELINE_CONSUMERS.
     "worker-ci.yml",
     "worker.yml",
+    # Issue #1106: сторож зомби-прогонов PR-чеков (`queued`, 0 job'ов) —
+    # переэмиссия событий PR (close→reopen) через github.token
+    # (issues: write, pull-requests: write) + секреты TELEGRAM_* для
+    # эскалации рецидива. Ни GH_DISPATCH_TOKEN, ни GH_PIPELINE_PAT не
+    # читает — тот же класс, что merge-health-watch.yml выше.
+    "zombie-run-watch.yml",
 })
 
 ALL_WORKFLOWS = sorted(
