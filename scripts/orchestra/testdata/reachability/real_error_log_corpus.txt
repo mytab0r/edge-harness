@@ -1,0 +1,14 @@
+# Реальные цитаты из живых прогонов CI (не синтетика, не пересказ) —
+# используются как корпус для проверки «эта распознаваемая строка
+# встречается хотя бы в одном реальном логе» (issue #1172, случай 3;
+# приём взят из PR #1177, ai_dsh/pulse_guard.INFRA_ERROR_SIGNATURES).
+# Каждая строка ниже — дословная цитата, источник в комментарии сверху.
+
+# job `review`, job id 103700060977, run 34748262115, PR #1099, 2026-09-13 08:40 UTC:
+##[error]review: gh api repos/mytab0r/edge-harness/pulls/1099/files?per_page=100&page=1: gh: API rate limit exceeded for installation.
+
+# job `review`, job id 103701285000, run 34748740141, PR #1089, 2026-09-13 08:58 UTC:
+##[error]review: gh api -X: gh: Server Error (HTTP 502)
+
+# dsh-ci.sh::dsh_chain_should_advance, комментарий у INVALID_REQUEST (Ollama Cloud, run 34730173870):
+dsh: INVALID_REQUEST: max_tokens (131072) exceeds model's maximum output tokens (65536) for model nemotron-3-ultra
