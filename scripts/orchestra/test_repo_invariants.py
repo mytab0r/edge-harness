@@ -2604,6 +2604,26 @@ def test_worker_false_success_comment_query_uses_the_exact_contradiction_marker(
     )
 
 
+def test_worker_false_success_marker_matches_task_sh_template():
+    # Ai-review PR #1189: ничто механически не связывало WORKER_FALSE_SUCCESS_MARKER
+    # со строкой шаблона в scripts/worker/task.sh — следующий реворд текста
+    # успеха молча вернул бы инвариант 14 в класс #1172 (зелёный навсегда
+    # независимо от регресса). Читаем РЕАЛЬНЫЙ task.sh, извлекаем строку
+    # «🤖 Автономный воркер справился…», интерполируем пустой
+    # WORKER_CHAIN_PROVIDER и сверяем результат с ri.WORKER_FALSE_SUCCESS_MARKER.
+    task_sh = (_DIR.parent / "worker" / "task.sh").read_text(encoding="utf-8")
+    match = re.search(
+        r"^🤖 Автономный воркер справился \(провайдер: (\$\{WORKER_CHAIN_PROVIDER\})\)\.",
+        task_sh, re.MULTILINE,
+    )
+    assert match, "task.sh обязан нести дословный шаблон успеха с ${WORKER_CHAIN_PROVIDER}"
+    rendered_empty_provider = match.group(0)[:-1].replace(match.group(1), "")
+    assert ri.WORKER_FALSE_SUCCESS_MARKER in rendered_empty_provider, (
+        f"константа {ri.WORKER_FALSE_SUCCESS_MARKER!r} разошлась с прод-шаблоном "
+        f"task.sh при пустом WORKER_CHAIN_PROVIDER: {rendered_empty_provider!r}"
+    )
+
+
 def test_worker_false_success_comment_unknown_on_network_failure(monkeypatch):
     # issue #1096, F6: Search недоступен целиком — раньше тихий [] (то же
     # 💚, что у доказанного «нарушений нет»); теперь check_result.unknown()
