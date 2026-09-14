@@ -374,6 +374,25 @@ def test_claim_unknown_holder_is_third_state_not_silent_success_or_refusal(monke
     assert "старого формата" in result.detail
 
 
+def test_claim_race_lock_disappears_between_422_and_read_is_not_confused_with_old_format(monkeypatch):
+    """Находка ai-review PR #1206 (некритичная, зафиксирована): раньше
+    `claim()` отбрасывал `exists` из `_lock_state` и гадал — «либо замок
+    старого формата, либо гонка чтения» в одном сообщении, хотя данные уже
+    различают эти два случая. Здесь POST /git/refs получает 422 («уже
+    существует» — `existing_refs` содержит ref), но GET ref НЕ находит его
+    (`ref_sha` пуст — ref пропал, ровно 404, как отвечал бы настоящий GitHub
+    после снятия замка между попыткой и чтением). Сообщение обязано назвать
+    именно эту причину, не смешивать её с «замок стоит, но старого формата»."""
+    server = install(monkeypatch, FakeServer(dict(BASE)))
+    server.existing_refs.add("refs/locks/task-5")  # POST 422, но GET ref → 404 (нет sha)
+    result = ct.claim("o/r", 5, "worker-b", now=utc(12, 0), holder="tree:/work/B")
+    assert result.claimed is False
+    assert result.holder is None
+    assert "гонка снятия" in result.detail
+    assert "уже свободна" in result.detail
+    assert "старого формата" not in result.detail
+
+
 def test_release_own_holder_succeeds_without_force(monkeypatch):
     server = install(monkeypatch, FakeServer(dict(BASE)))
     claimed = ct.claim("o/r", 5, "worker-a", now=utc(12, 0), holder="tree:/work/A")
@@ -433,6 +452,7 @@ def test_release_default_holder_none_is_unchanged_force_behavior(monkeypatch):
 def test_current_holder_prefers_env_over_run_id_over_cwd(monkeypatch):
     monkeypatch.delenv("CLAIM_HOLDER", raising=False)
     monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
+    monkeypatch.delenv("GITHUB_JOB", raising=False)
     assert ct.current_holder().startswith("tree:")
 
     monkeypatch.setenv("GITHUB_RUN_ID", "998877")
@@ -440,6 +460,19 @@ def test_current_holder_prefers_env_over_run_id_over_cwd(monkeypatch):
 
     monkeypatch.setenv("CLAIM_HOLDER", "explicit-holder")
     assert ct.current_holder() == "explicit-holder"
+
+
+def test_current_holder_appends_job_to_run_id(monkeypatch):
+    """Находка ai-review PR #1206 (некритичная, зафиксирована): GITHUB_RUN_ID
+    один на ВСЕ job'ы одного прогона воркфлоу — второй job на том же прогоне
+    молча прочитал бы чужой замок как свой без этого различения."""
+    monkeypatch.delenv("CLAIM_HOLDER", raising=False)
+    monkeypatch.setenv("GITHUB_RUN_ID", "998877")
+    monkeypatch.delenv("GITHUB_JOB", raising=False)
+    assert ct.current_holder() == "run:998877"
+
+    monkeypatch.setenv("GITHUB_JOB", "task")
+    assert ct.current_holder() == "run:998877:task"
 
 
 def test_claim_refuses_closed_task_without_creating_lock(monkeypatch):

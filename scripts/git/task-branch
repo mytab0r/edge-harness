@@ -391,7 +391,21 @@ else
     else
       export GITHUB_REPOSITORY="$repo"
       export CLAIM_VIA="${CLAIM_VIA:-task-branch (local)}"
-      source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/lease.sh"
+      # Держатель (#1190) — путь БУДУЩЕГО рабочего дерева, не cwd вызова
+      # (находка ai-review PR #1206, некритичная): `wt_dir` уже вычислен
+      # (не-CI ветка, строка выше «Разрешение дерева стоит ДО аренды») и не
+      # существует на диске ДО `git worktree add` ниже — но `current_holder()`
+      # у ПОВТОРНОГО claim/release из уже заведённого дерева (доводка,
+      # WORKER-PLAYBOOK) вычислит именно `tree:$wt_dir` через cwd. Без этого
+      # override первый claim ставил бы `tree:<cwd вызова task-branch>`
+      # (обычно корень главного чекаута) — и повторный claim из
+      # `.claude/worktrees/<N>-<slug>` получил бы ForeignLockError на СВОЙ же
+      # замок. В CI (`wt_dir` не задан — работа идёт в изолированном чекауте
+      # без worktree) override не нужен: cwd вызова и есть единственное
+      # дерево на весь прогон.
+      if [ -n "${wt_dir:-}" ]; then
+        export CLAIM_HOLDER="tree:$wt_dir"
+      fi
       claim_out="$(lease_cli claim "$task_num" 2>&1)" && claim_rc=0 || claim_rc=$?
       if [ "$claim_rc" -eq 1 ]; then
         echo "ОШИБКА: задача #$task_num уже арендована другим исполнителем: $claim_out" >&2
