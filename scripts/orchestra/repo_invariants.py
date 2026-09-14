@@ -241,6 +241,37 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
       числа — факты одного и того же прогона (маркер + independent
       пересчёт), не гипотезы — «алерт не гадает» не нарушается.
 
+  17. check_frontend_deploy_stale (issue #1041, живой случай 2026-09-12/13):
+      живая морда dsh-edge молча отстаёт от main. deploy-dsh-edge.yml упал
+      на e2e-смоуке (React error #130, вкладка «DSH Edge»), канарейка
+      откатила прод на прошлую версию — но следующий прогон не наступил ни
+      разу за сутки, и единственным видимым признаком была красная вкладка
+      Actions: ни issue #1041, ни отчёт этого файла не называли факт «прод-
+      морда не соответствует main» явно. Сравнивает head_sha последнего
+      ЗЕЛЁНОГО прогона FRONTEND_DEPLOY_WORKFLOW с текущим main ПО ПУТЯМ,
+      которые тот же workflow объявляет своими (`on.push.paths`, читается из
+      файла — одно место правды, не задублирован литералом); нарушение —
+      только если main реально ушёл дальше по watched_paths (AGENTS.md,
+      «Алерт не гадает» — дрейф вне них деплою безразличен). Незавершённый
+      прогон текущего main не эскалируется как «устарела» (находка ревью
+      PR #1076) — деплой уже в полёте, следующий пульс либо застанет success,
+      либо ту же устарелость, если прогон упадёт. Наблюдательный, не в
+      CI_GATING (симметрично 10/12/15/16 — состояние деплоя не вина текущего
+      PR). Практическое следствие красного pr-smoke/канарейки шире, чем
+      просто устаревшая витрина: `scheduler.py::bad_check_names` считает
+      плохим ЛЮБОЙ красный check-run, даже необязательный, — красный смоук
+      морды молча держит `mergeStateStatus=UNSTABLE` и на ГОТОВЫХ PR (живой
+      случай #1066: оба вердикта зелёные, единственная причина —
+      `pr-smoke=FAILURE`), не только на деплое морды. Третий проход ревью
+      PR #1076: пять различимых status вместо коллапса в None (in-flight —
+      отдельная ⚠️-строка «не проверено», не 💚); текст эскалации различает
+      «деплой main УПАЛ (url)» от «не запускался вовсе — запускать
+      workflow_dispatch» по данным runs, не гадает (AGENTS.md); двери
+      FileNotFoundError (workflow переименован) и yaml.YAMLError (опечатка
+      в YAML) закрыты тем же RuntimeError-радиусом, что ImportError раньше
+      (крах всего модуля гвардий мимо except RuntimeError); compare/ с
+      потолком files (COMPARE_FILES_CEILING) — «сравнение неполно», не
+      молчаливое 💚 (класс «страница GitHub API без обхода», #308/#309).
   18. check_pipeline_status_marker_impersonation (#1101, найдено при доводке
       #1074/PR #1077, живой инцидент watchdog-issue #120, 2026-09-12/13):
       комментарий #120, несущий маркер СЕМЕЙСТВА «[статус конвейера: …]»
@@ -2345,6 +2376,318 @@ def fetch_wip_gate_markers(repo: str) -> list[tuple[datetime, str]]:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# Инвариант 17: живая морда dsh-edge отстаёт от main (issue #1041)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Живой случай 2026-09-12/13: deploy-dsh-edge.yml упал на run 34702503576
+# (e2e-смоук нашёл 440 находок), прод-канарейка сама откатилась на прошлую
+# 100%-версию (worker.js это умеет и сделал — деплой не оставил битую версию
+# в проде), но СЛЕДУЮЩИЙ прогон конвейера не наступил ни разу за сутки —
+# ни push (в dsh-edge/** с тех пор ничего не приходило), ни суточный cron
+# (`37 4 * * *`) не догнал. Единственный видимый признак — красная вкладка
+# Actions; ни issue #1041 (ci-failure), ни Telegram, ни отчёт repo_invariants
+# не называли этот факт как «морда молча устарела» — они называли только
+# «прогон упал», что не то же самое (AGENTS.md: «Проверяй видимый результат,
+# а не шаг»). check_frontend_deploy_stale переводит это в явный факт:
+# последний ЗЕЛЁНЫЙ прогон FRONTEND_DEPLOY_WORKFLOW стоит на коммите X, main
+# уехал дальше по путям, которые тот же workflow объявляет своими
+# (`on.push.paths`) — значит отданная прод-морда не соответствует main, и
+# это не наблюдение задним числом, а прямое сравнение sha/файлов.
+
+FRONTEND_DEPLOY_WORKFLOW = "deploy-dsh-edge.yml"
+# Симметрично RECURRING_FAILURE_RUNS_TO_SCAN (инвариант 10) — не нашли
+# успешного прогона даже в этом окне, отчёт обязан сказать именно это
+# («не подтверждено»), а не молчать за меньшим окном.
+FRONTEND_DEPLOY_RUNS_TO_SCAN = 20
+# Потолок массива files в ответе repos/.../compare (REST, по документации —
+# до 300; живым прогоном ответа с >300 файлами не подтверждено). Достижение
+# потолка = сравнение неполно → RuntimeError, не молчаливое 💚 (см.
+# check_frontend_deploy_stale).
+COMPARE_FILES_CEILING = 300
+
+
+def _frontend_deploy_watched_paths(
+    workflow_path: Path | None = None,
+) -> list[str]:
+    """`on.push.paths` из самого `deploy-dsh-edge.yml` — не задублированы
+    литералом здесь (AGENTS.md, «Одно место правды»): список путей,
+    реально триггерящих деплой, мог измениться в workflow без синхронной
+    правки этого файла, и тогда сравнение сверяло бы не то, что деплой
+    действительно слушает.
+
+    YAML 1.1: незакавыченный ключ `on:` парсится PyYAML как булево `True`,
+    не строка `'on'` — тот же гоч, что уже описан и обойдён в
+    `scripts/lib/merge_reactions_registry_guard.py` (issue #955),
+    `doc.get("on", doc.get(True))` переиспользует тот же приём.
+
+    Находка ревью PR #1076 (блокирующая 1): `_path_is_watched` понимает
+    только точное имя и `<префикс>/**`; узкая звезда вида `cf-worker/src/
+    *.cjs` молча матчилась бы как «не покрыто» — реальный дрейф по такому
+    пути читался бы 💚 «морда свежая», хотя деплой этот путь СЛУШАЕТ. «Алерт
+    не гадает» (AGENTS.md): нераспознанная форма глоба — не тихий пропуск, а
+    RuntimeError здесь, при загрузке (build_report превращает его в честное
+    «недоступна», НЕ «здорово», симметрично отказу пустого on.push.paths
+    выше).
+
+    Находка ревью PR #1076 (второй проход, блокирующая): `import yaml` НЕ
+    на уровне модуля — живые потребители этого файла (`orchestra.yml`,
+    каждые 15 минут, и `repo-ci.yml`, на каждый push/PR) не ставят PyYAML
+    явно, полагаясь на то, что он предустановлен в образе GitHub-раннера
+    (тот же факт, на который уже опирается `exec_bit_guard.py`); локальный
+    голый Python (класс #723) или смена образа раннера дали бы `ImportError`
+    на уровне модуля — это убило бы ВЕСЬ модуль (все инварианты разом, их
+    число здесь не фиксируется — реестр растёт) и канал эскалаций
+    целиком, а не только этот. Импорт — внутри функции, `ImportError`
+    превращается в тот же `RuntimeError`, что и пустой/нераспознанный
+    `on.push.paths` выше: радиус отказа остаётся внутри инварианта 17,
+    `build_report` уже умеет отличить «недоступна» от «здорово».
+
+    Находка ревью PR #1076 (третий проход, блокирующая 1): радиус тот же —
+    но закрыт был не весь. Переименованный/удалённый workflow давал
+    `FileNotFoundError` мимо `except RuntimeError`, опечатка в YAML —
+    `yaml.ScannerError`; оба роняли весь `main()` инвариантов, а шаг в
+    orchestra.yml стоит без continue-on-error — в этом проходе пропускались
+    ВСЕ гвардии после него. Обе двери закрыты тем же способом: отсутствие
+    файла и неразбираемый YAML — RuntimeError «недоступна», не крах модуля."""
+    try:
+        import yaml
+    except ImportError as error:
+        raise RuntimeError(f"PyYAML недоступна: {error} — инвариант 17 не может прочитать {FRONTEND_DEPLOY_WORKFLOW}") from error
+    path = workflow_path or (REPO_ROOT / ".github" / "workflows" / FRONTEND_DEPLOY_WORKFLOW)
+    if not path.exists():
+        raise RuntimeError(
+            f"{path}: файл не найден — workflow переименован или удалён; инвариант 17 не может "
+            "прочитать on.push.paths (это «недоступна», НЕ «морда свежая»)"
+        )
+    try:
+        doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as error:
+        raise RuntimeError(
+            f"{path}: YAML не разбирается ({error}) — инвариант 17 не может прочитать on.push.paths "
+            "(это «недоступна», НЕ «морда свежая»)"
+        ) from error
+    on_value = doc.get("on", doc.get(True))
+    paths = None
+    if isinstance(on_value, dict):
+        push_value = on_value.get("push")
+        if isinstance(push_value, dict):
+            paths = push_value.get("paths")
+    if not paths:
+        raise RuntimeError(
+            f"{path}: on.push.paths пуст или не найден — инвариант 17 не может "
+            "определить, какие пути обязаны триггерить свежий деплой"
+        )
+    for pattern in paths:
+        if pattern.startswith("!"):
+            continue  # исключение — _path_is_watched его не видит вовсе, отдельно не гейтим
+        if pattern.endswith("/**") and not any(ch in pattern[:-3] for ch in "*?["):
+            continue  # единственная распознаваемая форма глоба (см. _path_is_watched)
+        if not any(ch in pattern for ch in "*?[]"):
+            continue  # точное имя файла — без метасимволов глоба вовсе
+        raise RuntimeError(
+            f"{path}: on.push.paths содержит паттерн {pattern!r} — форма глоба, "
+            "которую _path_is_watched не умеет сопоставлять честно (не точное имя "
+            "и не '<префикс>/**') — падаю, а не тихо считаю его непокрытым"
+        )
+    return paths
+
+
+def _path_is_watched(filename: str, watched_paths: list[str]) -> bool:
+    """Совпадение с одним из `on.push.paths` — точное имя файла
+    (`.github/workflows/deploy-dsh-edge.yml`) либо префикс `dsh-edge/**`
+    (единственная форма глоба, которую эта функция понимает). Любая иная
+    форма глоба уже отсеяна на загрузке (`_frontend_deploy_watched_paths`
+    падает RuntimeError на неизвестной форме, находка ревью PR #1076) — сюда
+    попадают только эти два вида, ложноотрицательного молчания больше нет."""
+    for pattern in watched_paths:
+        if pattern.endswith("/**"):
+            if filename.startswith(pattern[: -len("**")]):
+                return True
+        elif filename == pattern:
+            return True
+    return False
+
+
+def decide_frontend_deploy_stale(
+    runs: list[dict],
+    main_sha: str,
+    changed_paths: list[str] | None,
+    watched_paths: list[str],
+) -> dict:
+    """Чистая функция (без сети). `runs` — прогоны FRONTEND_DEPLOY_WORKFLOW,
+    ОТСОРТИРОВАНЫ от новых к старым (контракт вызывающего кода, как и в
+    check_recurring_worker_failure). `main_sha` — текущий HEAD main.
+    `changed_paths` — список файлов, изменившихся между head_sha последнего
+    ЗЕЛЁНОГО прогона и main_sha (IO-обвязка передаёт None, когда сравнение не
+    нужно — last_good_sha уже совпал с main_sha). `watched_paths` —
+    `on.push.paths` из самого workflow.
+
+    Возвращает dict ВСЕГДА (не None) с полем "status" — пять различимых
+    состояний (находка ревью PR #1076, третий проход, блокирующая 2 и
+    чеклист: раньше "здорово", "дрейф вне watched" и "деплой main в полёте"
+    коллапсировали в один None, и build_report печатал для всех 💚 «морда
+    стоит на main» — в том числе когда видимый результат ещё НЕ проверен,
+    ровно класс «шаг вместо результата»):
+
+      - "in-flight"      — есть незавершённый прогон с head_sha == main_sha:
+                           деплой этого main идёт прямо сейчас; свежесть не
+                           подтверждена и не опровергнута. НЕ эскалируется
+                           (следующий пульс либо застанет success, либо ту же
+                           устарелость, если прогон упадёт — сигнал не
+                           теряется, просто не дублируется алармом на
+                           середине деплоя, окно которого до ~30 мин больше
+                           интервала пульса), но и печатается НЕ как 💚;
+      - "healthy"        — последний зелёный стоит на main_sha, ИЛИ дрейф
+                           main только вне watched_paths (деплою безразличен);
+      - "unconfirmed"    — ни одного ЗАВЕРШЁННОГО прогона в runs вовсе:
+                           до какого коммита доехала морда, неизвестно
+                           (симметрично инварианту 12 — «снимков не было НИ
+                           РАЗУ» ≠ «снимок свежий»);
+      - "never-succeeded"— завершённые прогоны есть, но ни один не success:
+                           сколько бы ни падало подряд, до какого коммита
+                           реально доехала морда, мы не знаем;
+      - "stale"          — последний зелёный позади main, и ХОТЬ ОДИН из
+                           changed_paths подпадает под watched_paths (реально
+                           триггерит деплой). Для этого состояния
+                           `main_deploy_state` различает два случая, которые
+                           данные различают сами (AGENTS.md, «Алерт не
+                           гадает» — текст алерта обязан назвать факт, а не
+                           гадать): "failed" — прогон на этом main_sha был и
+                           завершился неуспехом (`main_run_url` называет
+                           какой); "not-attempted" — прогона на main_sha в
+                           сканируемом окне нет вовсе (деплой не запускался:
+                           править причину падения нечего — надо запускать)."""
+    if any(r.get("head_sha") == main_sha and not r.get("conclusion") for r in runs):
+        in_flight = next(r for r in runs if r.get("head_sha") == main_sha and not r.get("conclusion"))
+        return {
+            "status": "in-flight",
+            "last_deployed_sha": None, "last_success_at": None, "last_success_url": None,
+            "main_sha": main_sha, "stale_paths": [],
+            "latest_run_url": in_flight.get("html_url"), "latest_conclusion": None,
+            "main_deploy_state": "in-flight", "main_run_url": in_flight.get("html_url"),
+        }
+
+    completed = [r for r in runs if r.get("conclusion")]
+    if not completed:
+        return {
+            "status": "unconfirmed",
+            "last_deployed_sha": None, "last_success_at": None, "last_success_url": None,
+            "main_sha": main_sha, "stale_paths": [],
+            "latest_run_url": None, "latest_conclusion": None,
+            "main_deploy_state": "not-attempted", "main_run_url": None,
+        }
+    last_good = next((r for r in completed if r.get("conclusion") == "success"), None)
+    if last_good is None:
+        latest = completed[0]
+        # Факт о прогоне на ЭТОМ main_sha — только если он БЫЛ: completed run
+        # с head_sha == main_sha и неуспехом. Последний упавший прогон с ЧУЖИМ
+        # head_sha «деплоем текущего main» не называется (AGENTS.md,
+        # «Алерт не гадает»).
+        main_failed = next(
+            (r for r in completed if r.get("head_sha") == main_sha and r.get("conclusion") != "success"),
+            None,
+        )
+        if main_failed is not None:
+            main_deploy_state, main_run_url = "failed", main_failed.get("html_url")
+        else:
+            main_deploy_state, main_run_url = "not-attempted", None
+        return {
+            "status": "never-succeeded",
+            "last_deployed_sha": None, "last_success_at": None, "last_success_url": None,
+            "main_sha": main_sha, "stale_paths": [],
+            "latest_run_url": latest.get("html_url"),
+            "latest_conclusion": latest.get("conclusion"),
+            "main_deploy_state": main_deploy_state, "main_run_url": main_run_url,
+        }
+    last_good_sha = last_good.get("head_sha")
+    if last_good_sha == main_sha:
+        return {
+            "status": "healthy",
+            "last_deployed_sha": last_good_sha, "last_success_at": last_good.get("created_at"),
+            "last_success_url": last_good.get("html_url"),
+            "main_sha": main_sha, "stale_paths": [],
+            "latest_run_url": last_good.get("html_url"), "latest_conclusion": "success",
+            "main_deploy_state": None, "main_run_url": None,
+        }
+    stale_paths = sorted({p for p in (changed_paths or []) if _path_is_watched(p, watched_paths)})
+    if not stale_paths:
+        return {
+            "status": "healthy",
+            "last_deployed_sha": last_good_sha, "last_success_at": last_good.get("created_at"),
+            "last_success_url": last_good.get("html_url"),
+            "main_sha": main_sha, "stale_paths": [],
+            "latest_run_url": last_good.get("html_url"), "latest_conclusion": "success",
+            "main_deploy_state": None, "main_run_url": None,
+        }
+    # Факт о прогонах на ЭТОМ main_sha данные дают сами: был и упал — «failed»,
+    # нет вовсе — «not-attempted». Незавершённых на main к этому месту остаться
+    # не может (проверены первым if).
+    main_failed = next(
+        (r for r in completed if r.get("head_sha") == main_sha and r.get("conclusion") != "success"),
+        None,
+    )
+    if main_failed is not None:
+        main_deploy_state, main_run_url = "failed", main_failed.get("html_url")
+    else:
+        main_deploy_state, main_run_url = "not-attempted", None
+    return {
+        "status": "stale",
+        "last_deployed_sha": last_good_sha,
+        "last_success_at": last_good.get("created_at"),
+        "last_success_url": last_good.get("html_url"),
+        "main_sha": main_sha,
+        "stale_paths": stale_paths,
+        "latest_run_url": main_run_url,
+        "latest_conclusion": main_failed.get("conclusion") if main_failed else None,
+        "main_deploy_state": main_deploy_state,
+        "main_run_url": main_run_url,
+    }
+
+
+def check_frontend_deploy_stale(repo: str) -> dict:
+    """IO-обвязка инварианта 17: последний ЗЕЛЁНЫЙ прогон
+    FRONTEND_DEPLOY_WORKFLOW против текущего main + on.push.paths того же
+    workflow (одно место правды, см. _frontend_deploy_watched_paths). Возвращает
+    decide-словарь ЦЕЛИКОМ (все пять status, не только нарушения) — build_report
+    обязан различить «морда свежая», «деплой main в полёте — не проверено» и
+    нарушение. Сеть недоступна/квота/неполное сравнение — RuntimeError наверх:
+    build_report обязан отличить «не проверено» от «здорово» (тот же приём, что
+    инварианты 12/15)."""
+    runs = pulse_guard.recent_runs(repo, FRONTEND_DEPLOY_WORKFLOW, per_page=FRONTEND_DEPLOY_RUNS_TO_SCAN)
+    runs = sorted(runs, key=lambda r: r.get("created_at") or "", reverse=True)
+    main_commit = gh(f"repos/{repo}/commits/main") or {}
+    main_sha = main_commit.get("sha")
+    if not main_sha:
+        raise RuntimeError(f"repos/{repo}/commits/main не вернул sha")
+
+    completed = [r for r in runs if r.get("conclusion")]
+    last_good = next((r for r in completed if r.get("conclusion") == "success"), None)
+    changed_paths: list[str] | None = None
+    watched_paths: list[str] = []
+    # Дешёвый путь в здоровом состоянии (тот же принцип, что
+    # check_recurring_worker_failure): last_good_sha уже совпал с main_sha —
+    # ни on.push.paths, ни compare/ не нужны вовсе.
+    if last_good is not None and last_good.get("head_sha") != main_sha:
+        watched_paths = _frontend_deploy_watched_paths()
+        compare = gh(f"repos/{repo}/compare/{last_good['head_sha']}...{main_sha}")
+        files = (compare or {}).get("files") or []
+        # Находка ревью PR #1076 (чеклист, «страница GitHub API без обхода»,
+        # класс #308/#309): compare/ режет массив files на жёстком потолке БЕЗ
+        # флага в ответе (по докам REST — до 300; число из документации API,
+        # живым прогоном ответа с >300 файлами не подтверждено). Ровно
+        # потолочное число файлов = сравнение неполно: окно между последним
+        # зелёным деплоем и текущим main копит ВСЕ файлы (включая docs/),
+        # а dsh-edge/** сортируется после — обрезка выбрасывает именно
+        # деплойные пути, и инвариант напечатал бы 💚 при реальном дрейфе.
+        # RuntimeError → честное «недоступна», НЕ «здорово».
+        if len(files) >= COMPARE_FILES_CEILING:
+            raise RuntimeError(
+                f"repos/{repo}/compare вернул {len(files)} файлов (>= потолка {COMPARE_FILES_CEILING}) — "
+                "сравнение обрезано API, дрейф по watched-путям не может быть проверен честно"
+            )
+        changed_paths = [f["filename"] for f in files]
+
+    return decide_frontend_deploy_stale(runs, main_sha, changed_paths, watched_paths)
 # Инвариант 18 (#1101, доводка #1074/PR #1077): маркер статуса конвейера в
 # #120 оставлен НЕ токеном job'а — нарушение по автору, не по числу
 # ══════════════════════════════════════════════════════════════════════════
@@ -2468,7 +2811,6 @@ def check_pipeline_status_marker_impersonation(comments: list[dict]) -> list[dic
             "url": comment.get("html_url"),
         })
     return sorted(violations, key=lambda item: item["created_at"] or "")
-
 
 def build_report(repo: str, now: datetime,
                   check_branch_protection: bool = False,
@@ -2797,6 +3139,62 @@ def build_report(repo: str, now: datetime,
     else:
         lines.append("💚 [16] заявленное и пересчитанное число PR, ждущих доработки, согласованы")
 
+    try:
+        v17 = check_frontend_deploy_stale(repo)
+    except RuntimeError as error:
+        findings[17] = []
+        lines.append(f"🚨 [17] проверка свежести морды dsh-edge недоступна: {error} — "
+                      "инвариант пропущен на этом прогоне (это НЕ «морда свежая»)")
+    else:
+        # Пять различимых состояний decide (ревью PR #1076, третий проход):
+        # «здорово», «в полёте — не проверено» и нарушение печатаются
+        # РАЗНЫМИ строками — раньше in-flight и дрейф вне watched коллапсировали
+        # в общий 💚 «морда стоит на main», т.е. непроверенное печаталось как
+        # проверенное (AGENTS.md, «Проверяй видимый результат, а не шаг»).
+        status17 = v17.get("status")
+        if status17 == "stale":
+            findings[17] = [v17]
+            state17 = v17.get("main_deploy_state")
+            where17 = (
+                f"деплой текущего main УПАЛ ({v17.get('main_run_url')})"
+                if state17 == "failed"
+                else "прогонов на текущем main в сканируемом окне нет — деплой не запускался"
+            )
+            lines.append(
+                f"🚨 [17] морда dsh-edge устарела относительно main (#1041): последний "
+                f"зелёный {FRONTEND_DEPLOY_WORKFLOW} — {v17['last_deployed_sha'][:8]} "
+                f"({v17['last_success_at']}), main ушёл дальше по "
+                f"{len(v17['stale_paths'])} затронутым путям деплоя: "
+                f"{', '.join(v17['stale_paths'][:5])}"
+                f"{' …' if len(v17['stale_paths']) > 5 else ''}; {where17} — снимается "
+                f"следующим зелёным прогоном {FRONTEND_DEPLOY_WORKFLOW} на текущем (или более новом) main"
+            )
+        elif status17 in ("unconfirmed", "never-succeeded"):
+            findings[17] = [v17]
+            if v17.get("latest_conclusion"):
+                lines.append(
+                    f"🚨 [17] {FRONTEND_DEPLOY_WORKFLOW}: ни одного успешного прогона в "
+                    f"последних {FRONTEND_DEPLOY_RUNS_TO_SCAN} — до какого коммита реально "
+                    f"дошла живая морда, неизвестно (последний прогон: "
+                    f"{v17['latest_conclusion']}, {v17['latest_run_url']}) — снимается "
+                    f"следующим зелёным прогоном"
+                )
+            else:
+                lines.append(
+                    f"🚨 [17] {FRONTEND_DEPLOY_WORKFLOW}: завершённых прогонов в последних "
+                    f"{FRONTEND_DEPLOY_RUNS_TO_SCAN} нет вовсе — до какого коммита реально "
+                    "дошла живая морда, неизвестно — снимается следующим зелёным прогоном"
+                )
+        elif status17 == "in-flight":
+            findings[17] = []
+            lines.append(
+                f"⚠️ [17] деплой текущего main ещё в полёте ({v17.get('latest_run_url')}) — "
+                "свежесть витрины на этом пульсе НЕ проверена; следующий пульс пересчитает"
+            )
+        else:
+            findings[17] = []
+            lines.append(f"💚 [17] живая морда dsh-edge стоит на текущем main "
+                          f"(или main не менял пути {FRONTEND_DEPLOY_WORKFLOW})")
     # Отдельный запрос на всю историю комментариев #120 (не переиспользует
     # wip_markers выше): fetch_wip_gate_markers отдаёт только (время, тело)
     # ДВУХ конкретных маркеров WIP-гейта — инварианту 18 нужны СЫРЫЕ поля
@@ -2821,7 +3219,6 @@ def build_report(repo: str, now: datetime,
             f"💚 [18] все маркеры статуса конвейера в #{WATCHDOG_ISSUE} "
             "опубликованы токеном job'а"
         )
-
     return lines, findings
 
 
@@ -2879,8 +3276,7 @@ def summary(lines: list[str]) -> None:
 # Газ общий и автоматический: escalate_if_new дедуплицирует по множеству id
 # нарушителей (вечный долг — одна эскалация, новая подделка — новая), ручного
 # снятия не требует.
-ESCALATING_INVARIANTS = (1, 3, 12, 15, 16, 18)
-
+ESCALATING_INVARIANTS = (1, 3, 12, 15, 16, 17, 18)
 
 def escalate_if_new(repo: str, invariant_id: int, marker_key: str, text: str) -> str | None:
     """Эскалация «один раз на состояние»: маркер кодирует конкретный набор
@@ -2998,6 +3394,58 @@ def run_escalations(repo: str, findings: dict[int, list]) -> list[str]:
         result = escalate_if_new(repo, 16, key, text)
         if result:
             lines.append(f"📣 инвариант 16 эскалирован: {result}")
+    if findings.get(17):
+        item = findings[17][0]
+        # Ревью PR #1076 (третий проход, блокирующая 2): данные (runs)
+        # различают «деплой текущего main упал» и «деплой на main не
+        # запускался вовсе» — текст эскалации обязан назвать ФАКТ, а не
+        # советовать «проверь причину падения» там, где падения не было
+        # (там запускать, а не чинить).
+        if item["last_deployed_sha"] is None:
+            key = f"no-success:{item['latest_run_url']}"
+            if item.get("latest_conclusion"):
+                facts17 = (
+                    f"Последний прогон: {item['latest_conclusion']}, "
+                    f"{item['latest_run_url']}."
+                )
+            else:
+                facts17 = "Завершённых прогонов в сканируемом окне нет вовсе."
+            text = (
+                f"🚨 edge-harness: инвариант 17 (морда dsh-edge, #1041) — ни одного "
+                f"успешного прогона {FRONTEND_DEPLOY_WORKFLOW} в последних "
+                f"{FRONTEND_DEPLOY_RUNS_TO_SCAN} — до какого коммита реально дошла "
+                f"живая морда, неизвестно. {facts17} Снимается следующим зелёным прогоном."
+            )
+        else:
+            key = f"{item['last_deployed_sha']}:{item['main_sha']}"
+            if item.get("main_deploy_state") == "failed":
+                action17 = (
+                    f"Деплой текущего main УПАЛ ({item.get('main_run_url')}) — "
+                    f"проверь причину падения (Actions → {FRONTEND_DEPLOY_WORKFLOW})."
+                )
+            else:
+                action17 = (
+                    f"Прогонов на текущем main в последних {FRONTEND_DEPLOY_RUNS_TO_SCAN} "
+                    "нет вовсе — деплой НЕ ЗАПУСКАЛСЯ (триггер не дошёл или расписание "
+                    "молчит): править причину падения нечего, запусти "
+                    f"{FRONTEND_DEPLOY_WORKFLOW} вручную (workflow_dispatch)."
+                )
+            text = (
+                "🚨 edge-harness: инвариант 17 (морда dsh-edge устарела относительно main, "
+                f"#1041) — последний зелёный {FRONTEND_DEPLOY_WORKFLOW} стоит на "
+                f"{item['last_deployed_sha'][:8]} ({item['last_success_at']}), main "
+                f"({item['main_sha'][:8]}) ушёл дальше по {len(item['stale_paths'])} "
+                f"путям деплоя: {', '.join(item['stale_paths'][:10])}"
+                f"{' …' if len(item['stale_paths']) > 10 else ''}. {action17} Тот же "
+                "красный check-run (если прогон на main был) молча держит "
+                "mergeStateStatus=UNSTABLE и на готовых PR (scheduler.py::bad_check_names "
+                "считает плохим любой красный check, необязательный в том числе — живой "
+                "случай #1066), не только устаревшую витрину. Снимается следующим зелёным "
+                "прогоном на текущем (или более новом) main."
+            )
+        result = escalate_if_new(repo, 17, key, text)
+        if result:
+            lines.append(f"📣 инвариант 17 эскалирован: {result}")
     if findings.get(18):
         v18 = findings[18]
         latest = v18[-1]  # check_* возвращает список, отсортированный по created_at

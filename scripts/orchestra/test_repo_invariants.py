@@ -12,6 +12,7 @@
 
 import importlib.util
 import re
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -219,6 +220,18 @@ class FakeGh:
         "contents/docs/research/data/pipeline-health.jsonl": RuntimeError(
             "gh api repos/o/r/contents/...: HTTP 404: Not Found"),
         "issues/120/comments": [],
+        # Запасной маршрут для инварианта 17 (морда dsh-edge, #1041): здоровый
+        # дефолт — последний прогон deploy-dsh-edge.yml зелёный и уже стоит на
+        # main_sha "deadbeef", совпадающем с commits/main — decide_frontend_
+        # deploy_stale молчит без единого доп. вызова compare/. Без этого
+        # дефолта КАЖДЫЙ существующий тест build_report был бы обязан завести
+        # собственные маршруты workflows/deploy-dsh-edge.yml/runs и
+        # commits/main, хотя свежесть морды — не их предмет.
+        "workflows/deploy-dsh-edge.yml/runs": {"workflow_runs": [
+            {"conclusion": "success", "head_sha": "deadbeef",
+             "created_at": "2026-09-01T00:00:00Z", "html_url": "https://example/runs/1"},
+        ]},
+        "commits/main": {"sha": "deadbeef"},
     }
 
     def __init__(self, routes):
@@ -3172,6 +3185,427 @@ def test_wip_gate_false_zero_is_escalating_not_gating():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# Инвариант 17: живая морда dsh-edge отстаёт от main (#1041)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Живой случай 2026-09-12/13: deploy-dsh-edge.yml упал на run 34702503576
+# (e2e-смоук нашёл 440 находок, «DSH Edge» вкладка), следующий прогон не
+# наступил сутки — единственный видимый признак был красной вкладкой Actions.
+# Повторный ручной прогон на ТОМ ЖЕ main (run 34742800780, без единого
+# коммита между ними) упал ТОЙ ЖЕ причиной — не флейк смоука, а факт, что
+# морда с этого коммита не деплоится вовсе; ниже — фикстуры именно этой формы.
+
+
+def deploy_run(head_sha, conclusion="success", created_at="2026-09-12T12:21:25Z",
+               html_url="https://example/runs/1"):
+    return {"head_sha": head_sha, "conclusion": conclusion, "created_at": created_at,
+            "html_url": html_url}
+
+
+def test_path_is_watched_matches_glob_suffix_and_exact_name():
+    watched = ["dsh-edge/**", ".github/workflows/deploy-dsh-edge.yml"]
+    assert ri._path_is_watched("dsh-edge/e2e-smoke/browser-walk.mjs", watched)
+    assert ri._path_is_watched(".github/workflows/deploy-dsh-edge.yml", watched)
+    assert not ri._path_is_watched("docs/INDEX.md", watched)
+    assert not ri._path_is_watched("dsh-edge-unrelated/x.txt", watched)  # префикс без "/"
+
+
+def test_frontend_deploy_watched_paths_reads_real_workflow():
+    # Одно место правды (AGENTS.md): читает РЕАЛЬНЫЙ deploy-dsh-edge.yml,
+    # не пересказ списком-литералом — список путей мог измениться в workflow
+    # без синхронной правки инварианта, тест ловит именно это расхождение.
+    paths = ri._frontend_deploy_watched_paths()
+    assert "dsh-edge/**" in paths
+    assert ".github/workflows/deploy-dsh-edge.yml" in paths
+
+
+def test_frontend_deploy_watched_paths_fail_loud_when_missing(tmp_path):
+    workflow = tmp_path / "deploy-dsh-edge.yml"
+    workflow.write_text("on:\n  push:\n    branches: [main]\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="on.push.paths"):
+        ri._frontend_deploy_watched_paths(workflow)
+
+
+def test_frontend_deploy_watched_paths_fail_loud_on_unrecognized_glob_form(tmp_path):
+    # Находка ревью PR #1076 (блокирующая 1): узкая звезда (`cf-worker/src/
+    # *.cjs`) — форма, которую _path_is_watched не понимает (не точное имя,
+    # не "<префикс>/**"). Раньше молча матчилась бы как "не покрыто" —
+    # реальный дрейф по такому пути читался бы 💚, хотя деплой его слушает.
+    # Живая репродукция: decide_frontend_deploy_stale с таким входом раньше
+    # возвращал None (см. коммит до этого фикса).
+    workflow = tmp_path / "deploy-dsh-edge.yml"
+    workflow.write_text(
+        "on:\n  push:\n    branches: [main]\n    paths:\n"
+        "      - dsh-edge/**\n      - cf-worker/src/*.cjs\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match=re.escape("cf-worker/src/*.cjs")):
+        ri._frontend_deploy_watched_paths(workflow)
+
+
+def test_frontend_deploy_watched_paths_accepts_exclusion_glob(tmp_path):
+    # "!"-исключения — форма, которую GitHub Actions понимает, но
+    # _path_is_watched её вовсе не видит (не в списке паттернов для матча) —
+    # не гейтим её отдельно, RuntimeError выше не про неё.
+    workflow = tmp_path / "deploy-dsh-edge.yml"
+    workflow.write_text(
+        "on:\n  push:\n    branches: [main]\n    paths:\n"
+        "      - dsh-edge/**\n      - '!dsh-edge/**.md'\n",
+        encoding="utf-8",
+    )
+    paths = ri._frontend_deploy_watched_paths(workflow)
+    assert paths == ["dsh-edge/**", "!dsh-edge/**.md"]
+
+
+def test_frontend_deploy_watched_paths_missing_pyyaml_is_runtime_error_not_import_error(monkeypatch, tmp_path):
+    # Находка ревью PR #1076 (второй проход, блокирующая): import yaml убран
+    # с уровня модуля именно затем, чтобы ImportError на голом Python (класс
+    # #723) или смене образа раннера не убивал ВСЕ 17 инвариантов сразу —
+    # радиус отказа обязан остаться внутри check_frontend_deploy_stale
+    # (build_report уже отличает RuntimeError "недоступна" от 💚 "здорово").
+    workflow = tmp_path / "deploy-dsh-edge.yml"
+    workflow.write_text("on:\n  push:\n    paths: ['dsh-edge/**']\n", encoding="utf-8")
+    monkeypatch.setitem(sys.modules, "yaml", None)  # следующий `import yaml` -> ImportError
+    with pytest.raises(RuntimeError, match="PyYAML недоступна"):
+        ri._frontend_deploy_watched_paths(workflow)
+
+
+def test_frontend_deploy_watched_paths_missing_workflow_file_is_runtime_error(tmp_path):
+    # Находка ревью PR #1076 (третий проход, блокирующая 1): переименованный/
+    # удалённый workflow давал FileNotFoundError МИМО except RuntimeError в
+    # build_report — падал весь main() инвариантов, шаг orchestra.yml без
+    # continue-on-error пропускал все гвардии после него. Радиус отказа
+    # обязан остаться внутри инварианта: «недоступна», не крах модуля.
+    with pytest.raises(RuntimeError, match="не найден"):
+        ri._frontend_deploy_watched_paths(tmp_path / "deploy-dsh-edge.yml")
+
+
+def test_frontend_deploy_watched_paths_broken_yaml_is_runtime_error(tmp_path):
+    # Тот же радиус: опечатка в YAML workflow на main давала yaml.ScannerError
+    # мимо except RuntimeError — тот же крах всего модуля гвардий.
+    workflow = tmp_path / "deploy-dsh-edge.yml"
+    workflow.write_text("on:\n  push:\n    paths: [dsh-edge/**\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="YAML не разбирается"):
+        ri._frontend_deploy_watched_paths(workflow)
+
+
+def test_decide_frontend_deploy_stale_no_completed_runs_is_unconfirmed_not_healthy():
+    # Пусто (или всё ещё бежит) — НЕ "здорово" (AGENTS.md: «возможности нет» и
+    # «возможность есть, но сломана» — разные сообщения).
+    result = ri.decide_frontend_deploy_stale([], "mainsha", None, ["dsh-edge/**"])
+    assert result["status"] == "unconfirmed"
+    assert result["last_deployed_sha"] is None
+    assert result["latest_run_url"] is None
+
+
+def test_decide_frontend_deploy_stale_no_success_in_scanned_runs():
+    runs = [deploy_run("aaa", conclusion="failure", html_url="https://example/runs/9")]
+    result = ri.decide_frontend_deploy_stale(runs, "mainsha", None, ["dsh-edge/**"])
+    assert result["status"] == "never-succeeded"
+    assert result["last_deployed_sha"] is None
+    assert result["latest_conclusion"] == "failure"
+    assert result["latest_run_url"] == "https://example/runs/9"
+    # Упавший прогон стоял на ЧУЖОМ sha — «деплой текущего main упал» фактами
+    # не является (AGENTS.md, «Алерт не гадает»).
+    assert result["main_deploy_state"] == "not-attempted"
+    assert result["main_run_url"] is None
+
+
+def test_decide_frontend_deploy_stale_silent_when_last_good_is_main():
+    runs = [deploy_run("mainsha")]
+    assert ri.decide_frontend_deploy_stale(runs, "mainsha", None, ["dsh-edge/**"])["status"] == "healthy"
+
+
+def test_decide_frontend_deploy_stale_silent_when_drift_outside_watched_paths():
+    # main ушёл дальше, но только по README.md — деплою это безразлично
+    # (AGENTS.md, «Алерт не гадает»): нельзя тревожить тем, что не триггерит
+    # деплой вовсе.
+    runs = [deploy_run("oldsha")]
+    changed = ["README.md", "docs/INDEX.md"]
+    assert ri.decide_frontend_deploy_stale(runs, "newsha", changed, ["dsh-edge/**"])["status"] == "healthy"
+
+
+def test_decide_frontend_deploy_stale_flags_live_incident_2026_09_12():
+    # Прод-форма живого случая: последний зелёный — dddd94c1 (бамп пина
+    # #810/#811), main ушёл на ecf646da (#600/#603, browser-walk.mjs) —
+    # ровно путь, который deploy-dsh-edge.yml слушает. Прогон на ecf646da
+    # БЫЛ и упал → main_deploy_state == "failed" с URL.
+    runs = [
+        deploy_run("ecf646da", conclusion="failure",
+                   created_at="2026-09-12T15:31:50Z", html_url="https://example/runs/34702503576"),
+        deploy_run("dddd94c1", conclusion="success",
+                   created_at="2026-09-12T12:21:25Z", html_url="https://example/runs/34693446228"),
+    ]
+    changed = ["dsh-edge/e2e-smoke/browser-walk.mjs", "docs/INDEX.md"]
+    result = ri.decide_frontend_deploy_stale(runs, "ecf646da", changed, ["dsh-edge/**"])
+    assert result == {
+        "status": "stale",
+        "last_deployed_sha": "dddd94c1",
+        "last_success_at": "2026-09-12T12:21:25Z",
+        "last_success_url": "https://example/runs/34693446228",
+        "main_sha": "ecf646da",
+        "stale_paths": ["dsh-edge/e2e-smoke/browser-walk.mjs"],
+        "latest_run_url": "https://example/runs/34702503576",
+        "latest_conclusion": "failure",
+        "main_deploy_state": "failed",
+        "main_run_url": "https://example/runs/34702503576",
+    }
+
+
+def test_decide_frontend_deploy_stale_not_attempted_when_no_run_on_main():
+    # Данные различают «деплой main упал» от «деплой на main не запускался»
+    # (ревью PR #1076, третий проход, блокирующая 2): последний зелёный позади,
+    # main ушёл по watched-пути, но прогона с head_sha == main в окне НЕТ —
+    # stale с main_deploy_state "not-attempted", алерт советует ЗАПУСТИТЬ, а не
+    # «проверь причину падения» (падения не было).
+    runs = [deploy_run("oldsha", html_url="https://example/runs/1")]
+    changed = ["dsh-edge/e2e-smoke/browser-walk.mjs"]
+    result = ri.decide_frontend_deploy_stale(runs, "newmain", changed, ["dsh-edge/**"])
+    assert result["status"] == "stale"
+    assert result["main_deploy_state"] == "not-attempted"
+    assert result["main_run_url"] is None
+
+
+def test_decide_frontend_deploy_stale_silent_while_current_main_deploy_in_flight():
+    # Находка ревью PR #1076 (блокирующая 2): незавершённый прогон с
+    # head_sha == main_sha — деплой ЭТОГО main уже идёт, не "устарела".
+    # Третий проход: это состояние БОЛЬШЕ не коллапсирует с «здорово» —
+    # отдельный статус "in-flight" (чеклист ревью: непроверенное не должно
+    # печататься как 💚 «морда стоит на main»).
+    runs = [
+        deploy_run("newmain", conclusion=None,
+                   created_at="2026-09-13T08:00:00Z", html_url="https://example/runs/99"),
+        deploy_run("oldsha", conclusion="success",
+                   created_at="2026-09-12T12:21:25Z", html_url="https://example/runs/1"),
+    ]
+    changed = ["dsh-edge/e2e-smoke/browser-walk.mjs"]
+    result = ri.decide_frontend_deploy_stale(runs, "newmain", changed, ["dsh-edge/**"])
+    assert result["status"] == "in-flight"
+    assert result["latest_run_url"] == "https://example/runs/99"
+    assert result["stale_paths"] == []
+
+
+def test_decide_frontend_deploy_stale_flags_after_inflight_deploy_fails():
+    # Симметрично: если тот же прогон, что был "в полёте", ЗАВЕРШИЛСЯ
+    # неуспехом — сигнал не потерян, следующий пересчёт (те же runs, но
+    # conclusion уже проставлен) обязан снова поднять устарелость.
+    runs = [
+        deploy_run("newmain", conclusion="failure",
+                   created_at="2026-09-13T08:00:00Z", html_url="https://example/runs/99"),
+        deploy_run("oldsha", conclusion="success",
+                   created_at="2026-09-12T12:21:25Z", html_url="https://example/runs/1"),
+    ]
+    changed = ["dsh-edge/e2e-smoke/browser-walk.mjs"]
+    result = ri.decide_frontend_deploy_stale(runs, "newmain", changed, ["dsh-edge/**"])
+    assert result["status"] == "stale"
+    assert result["last_deployed_sha"] == "oldsha"
+    assert result["main_deploy_state"] == "failed"
+    assert result["main_run_url"] == "https://example/runs/99"
+
+
+def test_check_frontend_deploy_stale_healthy_default(monkeypatch):
+    fake = FakeGh({})  # дефолт FakeGh уже здоров: last_good_sha == main_sha
+    patch_gh(monkeypatch, fake)
+    result = ri.check_frontend_deploy_stale(REPO)
+    assert result["status"] == "healthy"
+    # Дешёвый путь: last_good_sha уже совпал с main_sha — ни on.push.paths,
+    # ни compare/ не читаются.
+    assert not any("compare/" in c for c in fake.calls)
+
+
+def test_check_frontend_deploy_stale_flags_live_incident_via_gh(monkeypatch):
+    fake = FakeGh({
+        "workflows/deploy-dsh-edge.yml/runs": {"workflow_runs": [
+            deploy_run("ecf646da", conclusion="failure",
+                       created_at="2026-09-12T15:31:50Z", html_url="https://example/runs/34702503576"),
+            deploy_run("dddd94c1", conclusion="success",
+                       created_at="2026-09-12T12:21:25Z", html_url="https://example/runs/34693446228"),
+        ]},
+        "commits/main": {"sha": "ecf646da"},
+        "compare/dddd94c1...ecf646da": {"files": [
+            {"filename": "dsh-edge/e2e-smoke/browser-walk.mjs"},
+            {"filename": "docs/INDEX.md"},
+        ]},
+    })
+    patch_gh(monkeypatch, fake)
+    result = ri.check_frontend_deploy_stale(REPO)
+    assert result["status"] == "stale"
+    assert result["last_deployed_sha"] == "dddd94c1"
+    assert result["stale_paths"] == ["dsh-edge/e2e-smoke/browser-walk.mjs"]
+    assert result["main_deploy_state"] == "failed"
+
+
+def test_check_frontend_deploy_stale_compare_ceiling_is_runtime_error_not_false_healthy(monkeypatch):
+    # Находка ревью PR #1076 (чеклист, класс «страница GitHub API без обхода»,
+    # #308/#309): compare/ режет files на жёстком потолке БЕЗ флага в ответе —
+    # ровно потолочное число файлов означает «сравнение неполно». Обрезка
+    # выкидывает хвост (где dsh-edge/** после docs/) — раньше это читалось как
+    # «дрейфа нет» → ложное 💚. Теперь громкое «недоступна».
+    many = [{"filename": f"docs/file{i}.md"} for i in range(ri.COMPARE_FILES_CEILING)]
+    fake = FakeGh({
+        "workflows/deploy-dsh-edge.yml/runs": {"workflow_runs": [
+            deploy_run("ecf646da", conclusion="failure"),
+            deploy_run("dddd94c1", conclusion="success"),
+        ]},
+        "commits/main": {"sha": "ecf646da"},
+        "compare/dddd94c1...ecf646da": {"files": many},
+    })
+    patch_gh(monkeypatch, fake)
+    with pytest.raises(RuntimeError, match="сравнение обрезано"):
+        ri.check_frontend_deploy_stale(REPO)
+
+
+def test_build_report_flags_frontend_deploy_stale(monkeypatch):
+    now = utc(2026, 9, 13, 6, 30)
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": [],
+        "graphql": graphql_pool_page(),
+        "search/issues": {"items": []},
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+        "workflows/deploy-dsh-edge.yml/runs": {"workflow_runs": [
+            deploy_run("ecf646da", conclusion="failure"),
+            deploy_run("dddd94c1", conclusion="success"),
+        ]},
+        "commits/main": {"sha": "ecf646da"},
+        "compare/dddd94c1...ecf646da": {"files": [
+            {"filename": "dsh-edge/e2e-smoke/browser-walk.mjs"},
+        ]},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    lines, findings = ri.build_report(REPO, now)
+    assert findings[17][0]["last_deployed_sha"] == "dddd94c1"
+    assert any("🚨" in line and "[17]" in line and "устарела" in line for line in lines)
+
+
+def test_build_report_frontend_deploy_stale_reports_unavailable_not_healthy(monkeypatch):
+    # Сеть недоступна — build_report обязан отличить «не проверено» от
+    # «здорово» (тот же приём, что инварианты 12/15).
+    now = utc(2026, 9, 13, 6, 30)
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": [],
+        "graphql": graphql_pool_page(),
+        "search/issues": {"items": []},
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+        "workflows/deploy-dsh-edge.yml/runs": RuntimeError(
+            "gh api repos/o/r/actions/workflows/deploy-dsh-edge.yml/runs: HTTP 503"),
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    lines, findings = ri.build_report(REPO, now)
+    assert findings[17] == []
+    assert any("🚨" in line and "[17]" in line and "недоступна" in line for line in lines)
+
+
+def test_frontend_deploy_stale_not_in_ci_gating_is_escalating():
+    # Наблюдательный, не гейтящий (тот же класс, что 10/12/15/16): нарушение
+    # зависит от последнего успешного прогона деплоя, не от содержимого
+    # текущего PR — гейтить им PR означало бы красить чужой PR за чужой
+    # упавший деплой.
+    assert 17 not in ri.CI_GATING
+    assert 17 in ri.ESCALATING_INVARIANTS
+
+
+def test_run_escalations_posts_frontend_deploy_stale_once(monkeypatch):
+    fake = FakeGh({"issues/120/comments": []})
+    patch_gh(monkeypatch, fake)
+    findings = {17: [{
+        "status": "stale",
+        "last_deployed_sha": "dddd94c1", "last_success_at": "2026-09-12T12:21:25Z",
+        "last_success_url": "https://example/runs/1", "main_sha": "ecf646da",
+        "stale_paths": ["dsh-edge/e2e-smoke/browser-walk.mjs"],
+        "latest_run_url": "https://example/runs/9", "latest_conclusion": "failure",
+        "main_deploy_state": "failed", "main_run_url": "https://example/runs/9",
+    }]}
+    lines = ri.run_escalations(REPO, findings)
+    assert any("инвариант 17" in line for line in lines)
+    posts = fake.mutating_calls()
+    assert len(posts) == 1
+    # «Алерт не гадает»: факт «деплой main упал» назван С URL, не как гипотеза.
+    assert "https://example/runs/9" in posts[0]
+    assert "УПАЛ" in posts[0]
+
+
+def test_run_escalations_frontend_deploy_stale_not_attempted_advises_dispatch(monkeypatch):
+    # Ревью PR #1076 (третий проход, блокирующая 2): stale достижим и БЕЗ
+    # упавшего прогона на main (деплой не запускался вовсе). Текст обязан
+    # назвать это и советовать запуск, а не «проверь причину падения» —
+    # чинить нечего.
+    fake = FakeGh({"issues/120/comments": []})
+    patch_gh(monkeypatch, fake)
+    findings = {17: [{
+        "status": "stale",
+        "last_deployed_sha": "dddd94c1", "last_success_at": "2026-09-12T12:21:25Z",
+        "last_success_url": "https://example/runs/1", "main_sha": "ecf646da",
+        "stale_paths": ["dsh-edge/e2e-smoke/browser-walk.mjs"],
+        "latest_run_url": None, "latest_conclusion": None,
+        "main_deploy_state": "not-attempted", "main_run_url": None,
+    }]}
+    ri.run_escalations(REPO, findings)
+    posts = fake.mutating_calls()
+    assert len(posts) == 1
+    assert "НЕ ЗАПУСКАЛСЯ" in posts[0]
+    assert "workflow_dispatch" in posts[0]
+    # Ложный совет «проверь причину падения» (падения не было) отсутствует —
+    # фраза «править причину падения нечего» допустима, а вот императива
+    # «проверь причину» быть не должно.
+    assert "проверь причину падения" not in posts[0]
+
+
+def test_run_escalations_no_success_runs_states_window_fact(monkeypatch):
+    # unconfirmed (завершённых прогонов нет вовсе) печатает факт окна, а не
+    # «Последний прогон: None, None».
+    fake = FakeGh({"issues/120/comments": []})
+    patch_gh(monkeypatch, fake)
+    findings = {17: [{
+        "status": "unconfirmed",
+        "last_deployed_sha": None, "last_success_at": None, "last_success_url": None,
+        "main_sha": "ecf646da", "stale_paths": [],
+        "latest_run_url": None, "latest_conclusion": None,
+        "main_deploy_state": "not-attempted", "main_run_url": None,
+    }]}
+    ri.run_escalations(REPO, findings)
+    posts = fake.mutating_calls()
+    assert len(posts) == 1
+    assert "Завершённых прогонов в сканируемом окне нет вовсе" in posts[0]
+
+
+def test_build_report_in_flight_deploy_is_warning_not_false_healthy(monkeypatch):
+    # Ревью PR #1076 (чеклист): незавершённый деплой текущего main раньше
+    # печатался общим 💚 «морда стоит на main» — непроверенное выдавалось за
+    # проверенное («Проверяй видимый результат, а не шаг»). Теперь отдельная
+    # ⚠️-строка, нарушения нет, эскалация молчит.
+    now = utc(2026, 9, 13, 6, 30)
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": [],
+        "graphql": graphql_pool_page(),
+        "search/issues": {"items": []},
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+        "workflows/deploy-dsh-edge.yml/runs": {"workflow_runs": [
+            deploy_run("newmain", conclusion=None,
+                       created_at="2026-09-13T06:00:00Z", html_url="https://example/runs/99"),
+            deploy_run("oldsha", conclusion="success",
+                       created_at="2026-09-12T12:21:25Z", html_url="https://example/runs/1"),
+        ]},
+        "commits/main": {"sha": "newmain"},
+        "compare/oldsha...newmain": {"files": [
+            {"filename": "dsh-edge/e2e-smoke/browser-walk.mjs"},
+        ]},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    lines, findings = ri.build_report(REPO, now)
+    assert findings[17] == []
+    assert any("⚠️" in line and "[17]" in line and "в полёте" in line for line in lines)
+    assert not any("💚 [17]" in line for line in lines)
+
+
 # Инвариант 18 (#1101): маркер статуса конвейера в #120 не от токена job'а
 # ══════════════════════════════════════════════════════════════════════════
 
