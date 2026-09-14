@@ -126,11 +126,15 @@ ALLOWED_SINGLE_PAGE_CALLS = {
     # не находка PR #311, добавлены здесь только чтобы гвардия оставалась
     # зелёной после ребейза на main; классификация та же, что у соседних
     # записей pr_check_runs/merge_queue/recent_runs выше.
-    ("scripts/orchestra/scheduler.py", "deploy_evidence"):
+    ("scripts/orchestra/scheduler.py", "_workflow_run_for_merge"):
         "`per_page=10` — запрошены последние N прогонов ОДНОГО workflow "
-        "(deploy-worker.yml), кандидат ищется по head_sha=merge_commit_sha "
-        "среди них же — тот же контракт «дай N последних», что у "
-        "pulse_guard.recent_runs, не полный список.",
+        "(deploy-worker.yml или deploy-dsh-edge.yml — общий выбор кандидата "
+        "для обеих deploy-веток приёмки, #494), кандидат ищется по "
+        "head_sha=merge_commit_sha среди них же — тот же контракт «дай N "
+        "последних», что у pulse_guard.recent_runs, не полный список. Была "
+        "записью на deploy_evidence, до того как #494 вынес сырой вызов в "
+        "общую _workflow_run_for_merge (находка ai-ревью #542) — старый ключ "
+        "не матчился, гвардия красила repo-ci.",
     ("scripts/orchestra/scheduler.py", "script_evidence"):
         "check-runs ОДНОГО коммита (head_sha) — тот же контракт, что "
         "pr_check_runs выше: фиксированный малый список обязательных "

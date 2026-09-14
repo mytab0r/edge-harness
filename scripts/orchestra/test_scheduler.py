@@ -7307,29 +7307,21 @@ def test_main_closes_reopened_task_before_acceptance_sees_it(monkeypatch):
     assert calls_n[0] == 2
 
 
-class _FakeHealthResponse:
-    def __init__(self, status):
-        self.status = status
-
-    def read(self, n=-1):
-        return b'{"version":"0.8.0"}'
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        return False
+# `_FakeHealthResponse`/`_fake_urlopen` (моки `sch.urllib.request.urlopen`)
+# убраны находкой ai-ревью #542 (2026-09-12): `_dsh_edge_health_status` ходит
+# через `_morde_opener().open`, не module-level `urlopen` — мок был мёртвым
+# во всех четырёх местах, где стоял. Замена — настоящий сокет `health_server`
+# (см. фикстуру ниже, применена ко всем четырём тестам).
 
 
-def _fake_urlopen(status):
-    def _open(req, timeout=None):
-        return _FakeHealthResponse(status)
-    return _open
-
-
-def test_accept_merged_tasks_closes_on_green_deploy_and_health(monkeypatch):
+def test_accept_merged_tasks_closes_on_green_deploy_and_health(health_server, monkeypatch):
     """Деплой-класс (#21/PR #177 трогает cf-worker/): зелёный deploy-worker.yml
-    (канарейка UI — его последний шаг) + /api/health=200 → задача закрыта."""
+    (канарейка UI — его последний шаг) + /api/health=200 → задача закрыта.
+
+    Мок `sch.urllib.request.urlopen` здесь мёртв (находка ai-ревью #542,
+    2026-09-12): `_dsh_edge_health_status` ходит через `_morde_opener().open`,
+    не через module-level `urlopen`, — настоящий сокет `health_server` бьёт
+    по реальному коду, а не по обходной тени."""
     fake = FakeGh({
         "pulls/177/files": files_payload(PR_177_FILES),
         "issues/21/comments": [],
@@ -7340,8 +7332,8 @@ def test_accept_merged_tasks_closes_on_green_deploy_and_health(monkeypatch):
         ]},
     })
     patch_gh(monkeypatch, fake)
-    monkeypatch.setattr(sch, "DSH_EDGE_URL", "https://dsh-edge.mytab0r.workers.dev")
-    monkeypatch.setattr(sch.urllib.request, "urlopen", _fake_urlopen(200))
+    port = health_server.server_address[1]
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", f"http://127.0.0.1:{port}")
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     posted = []
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
@@ -7355,12 +7347,15 @@ def test_accept_merged_tasks_closes_on_green_deploy_and_health(monkeypatch):
     assert posted and "улика получена" in posted[0][1]
 
 
-def test_accept_merged_tasks_skips_close_when_second_pr_still_open(monkeypatch):
+def test_accept_merged_tasks_skips_close_when_second_pr_still_open(health_server, monkeypatch):
     """Проверка на входе (живой случай #320/#325): приёмка закрыла #320, пока
     по нему был открыт второй PR #325, чья ветка называет ту же задачу, —
     тот немедленно упал на contract («задача #320 закрыта»). Улика по
     уже слитому PR #177 не отменяет работу открытого PR #325 по той же
-    задаче — закрывать рано, задача остаётся в работе."""
+    задаче — закрывать рано, задача остаётся в работе.
+
+    Мок `sch.urllib.request.urlopen` здесь мёртв (та же находка, что у
+    соседнего теста выше) — настоящий сокет `health_server` вместо него."""
     fake = FakeGh({
         "pulls/177/files": files_payload(PR_177_FILES),
         "issues/21/comments": [],
@@ -7370,8 +7365,8 @@ def test_accept_merged_tasks_skips_close_when_second_pr_still_open(monkeypatch):
         ]},
     })
     patch_gh(monkeypatch, fake)
-    monkeypatch.setattr(sch, "DSH_EDGE_URL", "https://dsh-edge.mytab0r.workers.dev")
-    monkeypatch.setattr(sch.urllib.request, "urlopen", _fake_urlopen(200))
+    port = health_server.server_address[1]
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", f"http://127.0.0.1:{port}")
     posted = []
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
 
@@ -7387,7 +7382,7 @@ def test_accept_merged_tasks_skips_close_when_second_pr_still_open(monkeypatch):
     assert posted == []
 
 
-def test_deploy_evidence_matches_own_merge_commit_not_next_merge(monkeypatch):
+def test_deploy_evidence_matches_own_merge_commit_not_next_merge(health_server, monkeypatch):
     """Прод-форма находки AI-ревью PR #253: оркестратор сливает по одному PR
     каждые ~15 минут, `workflow_runs` идёт от нового к старому. Два
     cf-worker-мержа подряд — у ПЕРВОГО свой зелёный прогон deploy-worker.yml,
@@ -7395,7 +7390,10 @@ def test_deploy_evidence_matches_own_merge_commit_not_next_merge(monkeypatch):
     `next(r for r in runs if created_at >= merged_at)` брал первый по списку
     (самый новый), то есть чужой красный прогон ВТОРОГО мержа, и задача
     первого никогда бы не закрылась. Правильная улика — head_sha прогона
-    равен merge_commit_sha самого PR."""
+    равен merge_commit_sha самого PR.
+
+    Мок `sch.urllib.request.urlopen` здесь мёртв (та же находка ai-ревью
+    #542, что у соседних тестов выше) — настоящий сокет `health_server`."""
     pr_first = merged_pull(
         177, PR_177_BODY, "67b23c9fb1bd43984c3a734bed569f0ae01a8d3c",
         "2026-09-03T10:00:00Z", merge_commit_sha="1111111111111111111111111111111111merge")
@@ -7415,8 +7413,8 @@ def test_deploy_evidence_matches_own_merge_commit_not_next_merge(monkeypatch):
         ]},
     })
     patch_gh(monkeypatch, fake)
-    monkeypatch.setattr(sch, "DSH_EDGE_URL", "https://dsh-edge.mytab0r.workers.dev")
-    monkeypatch.setattr(sch.urllib.request, "urlopen", _fake_urlopen(200))
+    port = health_server.server_address[1]
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", f"http://127.0.0.1:{port}")
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     posted = []
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
@@ -7517,12 +7515,19 @@ def test_accept_merged_tasks_does_not_close_on_red_dsh_edge_deploy_prod_form(mon
     assert posted and "результат не достигнут" in posted[0][1]
 
 
-def test_accept_merged_tasks_closes_on_green_dsh_edge_deploy_and_health(monkeypatch):
+def test_accept_merged_tasks_closes_on_green_dsh_edge_deploy_and_health(health_server, monkeypatch):
     """Симметрично cf-worker-ветке: зелёный deploy-dsh-edge.yml (канарейка
     прода/ingest/e2e — шаги того же джоба) + /api/health=200 → задача
     закрыта. Прод-форма PR #528 (см. фикстуры выше), только прогон подставлен
     зелёным (DEPLOY_DSH_EDGE_RUN_FOR_PR528_GREEN), чтобы проверить обратную
-    сторону того же живого случая."""
+    сторону того же живого случая.
+
+    Находка ai-ревью #542 (2026-09-12): мок `sch.urllib.request.urlopen`
+    мёртв — `_dsh_edge_health_status` ходит через `_morde_opener().open`, не
+    module-level `urlopen`, так что «зелёный» здесь был зелёным вне
+    зависимости от health-плеча улики (доказано мутацией: `status = 200`,
+    захардкоженный в `dsh_edge_deploy_evidence`, тест не красит). Настоящий
+    сокет `health_server` бьёт по реальному коду опенера."""
     fake = FakeGh({
         "pulls/528/files": files_payload(PR_528_FILES),
         "issues/518/comments": [],
@@ -7531,8 +7536,8 @@ def test_accept_merged_tasks_closes_on_green_dsh_edge_deploy_and_health(monkeypa
             "workflow_runs": [DEPLOY_DSH_EDGE_RUN_FOR_PR528_GREEN]},
     })
     patch_gh(monkeypatch, fake)
-    monkeypatch.setattr(sch, "DSH_EDGE_URL", "https://dsh-edge.mytab0r.workers.dev")
-    monkeypatch.setattr(sch.urllib.request, "urlopen", _fake_urlopen(200))
+    port = health_server.server_address[1]
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", f"http://127.0.0.1:{port}")
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     posted = []
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
