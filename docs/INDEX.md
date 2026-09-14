@@ -79,6 +79,7 @@
 - [0020. Номер ADR/research-документа не назначается вручную без арбитра](decisions/0020-decision-doc-numbering-guard.md)
 - [0021. Триаж застрявшего в конфликте PR: шесть измеримых величин](decisions/0021-stalled-pr-merge-conflict-triage.md)
 - [0022. Связывание контекста между каналами: три точечных приёма вместо общего носителя](decisions/0022-cross-channel-context-transfer.md)
+- [0023. Рецепт мутации — исполняемый opt-in формат, не текстовый линт](decisions/0023-mutation-recipe-execution-guard.md)
 - [0024. Триаж застрявшего PR: метод ADR 0021 не покрывал очередь — четыре дефекта и правки](decisions/0024-stalled-pr-triage-method-fix.md)
 
 ## Операционные процедуры
