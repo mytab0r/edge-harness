@@ -34,7 +34,7 @@ PR #1035 занял номер 0017, уже слитый в main другим AD
   - `collect_sources` — тонкая обвязка: спрашивает у `gh api`, какие PR
     сейчас открыты и на какую ветку указывают (только метаданные, без
     файлов PR), передаёт эти ссылки в `collect_sources_from_refs`.
-  - `cmd_check` красит ТОЛЬКО тот прогон, чья ветка реально участвует в
+  - `cmd_check` красит ТОЛЬКО тот прогон, чья ветка реально ВИНОВНА в
     найденной коллизии (`self_source_name`) — не любую коллизию, которая
     вообще где-то есть в очереди открытых PR. Живой случай, найденный живым
     прогоном на mytab0r/edge-harness (2026-09-13): PR #944 независимо занял
@@ -42,7 +42,10 @@ PR #1035 занял номер 0017, уже слитый в main другим AD
     красило бы `test` (обязательную проверку) у КАЖДОГО из 20+ посторонних
     открытых PR, не только у #944 — AGENTS.md, «тормоз без газа не
     принимается»: только виновник обязан чинить, остальные не блокируются
-    чужим долгом.
+    чужим долгом. «Реально участвует» ≠ «виновен» — для main это разные
+    условия (issue #1200): main виновен, только если у него самого сидит
+    дубль номера (`main_has_intra_duplicate`), не просто потому, что он
+    входит в множество участников коллизии.
 
 CLI:
   python scripts/lib/decision_numbering.py next docs/decisions
@@ -185,6 +188,25 @@ def format_violation(root: str, violation: dict) -> str:
         for occ in violation["occurrences"]
     )
     return f"{root}: номер {violation['number']} занят разными файлами — {parts}"
+
+
+def main_has_intra_duplicate(violation: dict) -> bool:
+    """True, если ВНУТРИ самого main реально сидит дубль номера — минимум ДВА
+    разных имени файла, каждое из которых пришло ИСКЛЮЧИТЕЛЬНО из main
+    (`sources == ["main"]`). Не то же самое, что `involved == {"main"}`
+    (блокирующая находка ai-review PR #1202): множество участников коллизии
+    может быть `{"main"}` при одном-единственном мэйн-файле — но также может
+    быть `{"main", "PR #N"}`, когда main НЕСЁТ настоящий дубль (два своих
+    файла под тем же номером — живой класс #1078, состояние «после слияния
+    двух независимо коллидировавших PR») И одновременно ещё висит открытый
+    сторонний PR с третьим файлом под тем же номером. Старое условие
+    (`involved != {"main"}`) в этом случае молчало — маскируя дубль ВНУТРИ
+    main ровно в тот момент, когда рядом гонка за номер самая активная.
+    Проверяем по `occurrences`, не по `involved`: у каждого имени файла своя
+    запись `sources`, и два разных имени, оба целиком из main, — и есть
+    дубль внутри main, независимо от того, сколько ещё сторонних источников
+    претендует на тот же номер."""
+    return sum(1 for occ in violation["occurrences"] if occ["sources"] == ["main"]) >= 2
 
 
 # ── IO: git (реальный fetch + ls-tree, без GitHub API) ───────────────────────
@@ -397,12 +419,18 @@ def cmd_check(repo: str, roots: list[str], cwd=None) -> tuple[list[str], str | N
     держит `0017-dsh-edge-pr-smoke-local-worker.md`, PR #944 независимо занял
     тот же номер другим именем — это долг PR #944, не main, но старое условие
     `self_name in involved` считало main виновным, потому что main тоже
-    входит в `involved` этой коллизии). main виновен ТОЛЬКО если коллизия
-    ВНУТРИ самого main (`involved == {"main"}` — два файла с одним номером
-    реально слились в main, единственный источник во всей коллизии). Тот же
-    приём независимо выбрал параллельный канал для номеров инвариантов
-    (`scripts/lib/invariant_numbering.py::cmd_check`, issue #904/PR #1201) —
-    сведено к одному решению, не два разных обхода одного класса.
+    входит в `involved` этой коллизии). main виновен ТОЛЬКО если ВНУТРИ
+    самого main реально сидит дубль — минимум два разных имени файла, оба
+    ИСКЛЮЧИТЕЛЬНО из main (`main_has_intra_duplicate`, см. её докстринг: НЕ
+    то же самое, что `involved == {"main"}` — блокирующая находка ai-review
+    PR #1202, множество участников остаётся `{"main", "PR #N"}`, даже когда
+    дубль сидит внутри main, а рядом просто ещё висит сторонний открытый PR
+    с третьим файлом под тем же номером). Тот же приём независимо выбрал
+    параллельный канал для номеров инвариантов
+    (`scripts/lib/invariant_numbering.py::cmd_check`, issue #904/PR #1201,
+    слит) — та же неточная форма `involved != {"main"}` живёт там СЕЙЧАС в
+    main (не поправлена этим PR — другой файл, не в объёме #1200), заведён
+    issue #1227.
 
     Возвращает `(строки_нарушений, self_name)` — второй элемент нужен ТОЛЬКО
     вызывающему коду (CLI `main`) для честного сообщения об успехе: «коллизий
@@ -418,14 +446,15 @@ def cmd_check(repo: str, roots: list[str], cwd=None) -> tuple[list[str], str | N
         width = NUMBERED_ROOTS[root]
         sources = collect_sources_from_refs(refs, root, width, cwd=cwd)
         for violation in find_number_collisions(sources):
-            involved = {src for occ in violation["occurrences"] for src in occ["sources"]}
             if self_name is None:
                 pass  # честный дефолт: не знаю self — показываю всё, не сужаю
             elif self_name == "main":
-                if involved != {"main"}:
+                if not main_has_intra_duplicate(violation):
                     continue
-            elif self_name not in involved:
-                continue
+            else:
+                involved = {src for occ in violation["occurrences"] for src in occ["sources"]}
+                if self_name not in involved:
+                    continue
             lines.append(format_violation(root, violation))
     return lines, self_name
 

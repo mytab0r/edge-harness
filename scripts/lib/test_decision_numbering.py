@@ -156,6 +156,42 @@ def test_find_number_collisions_flags_duplicate_within_a_single_source():
     }
 
 
+def test_main_has_intra_duplicate_true_for_two_main_only_filenames():
+    sources = {
+        "main": {"0017": [
+            "0017-a.md",
+            "0017-b.md",
+        ]},
+    }
+    violation = dn.find_number_collisions(sources)[0]
+    assert dn.main_has_intra_duplicate(violation) is True
+
+
+def test_main_has_intra_duplicate_false_when_involved_is_main_plus_foreign_pr_but_main_has_one_file():
+    """Блокирующая находка ai-review PR #1202, зеркально: `involved ==
+    {"main", "PR #N"}`, но main несёт РОВНО один файл под номером — долг
+    целиком на стороннем PR, main не виновен."""
+    sources = {
+        "main": {"0017": ["0017-a.md"]},
+        "PR #944": {"0017": ["0017-b.md"]},
+    }
+    violation = dn.find_number_collisions(sources)[0]
+    assert dn.main_has_intra_duplicate(violation) is False
+
+
+def test_main_has_intra_duplicate_true_even_with_a_foreign_pr_also_present():
+    """Ровно сценарий блокирующей находки: main несёт дубль (два своих
+    файла), И РЯДОМ ещё открытый сторонний PR с третьим файлом под тем же
+    номером — `involved == {"main", "PR #944"}`, но дубль внутри main
+    обязан быть найден независимо."""
+    sources = {
+        "main": {"0017": ["0017-a.md", "0017-b.md"]},
+        "PR #944": {"0017": ["0017-c.md"]},
+    }
+    violation = dn.find_number_collisions(sources)[0]
+    assert dn.main_has_intra_duplicate(violation) is True
+
+
 # ── Реальный git: bare "origin" + рабочий клон, как actions/checkout@v7 ─────
 
 
@@ -457,6 +493,7 @@ def test_cmd_check_reports_everything_when_branch_unknown(monkeypatch):
     lines, self_name = dn.cmd_check("owner/repo", ["docs/decisions"])
 
     assert len(lines) == 1  # честный дефолт «не знаю → покажи всё», не «не знаю → молчи»
+    assert self_name is None
 
 
 # ── cmd_check: main виновен только за коллизию ВНУТРИ main (issue #1200) ────
@@ -505,6 +542,33 @@ def test_cmd_check_blames_main_for_an_intra_main_duplicate(monkeypatch):
 
     assert self_name == "main"
     assert len(lines) == 1  # настоящий дубль ВНУТРИ main — main обязан покраснеть
+    assert "0017" in lines[0]
+
+
+def test_cmd_check_blames_main_for_intra_duplicate_even_with_a_foreign_pr_present(monkeypatch):
+    """Блокирующая находка ai-review PR #1202: `involved != {"main"}` молчал
+    в этом сценарии, потому что third-party PR тоже входит в `involved`
+    (`{"main", "PR #944"}` != `{"main"}` — условие ложно "не совпадает",
+    ветка пропускалась). Дубль ВНУТРИ main обязан красить main НЕЗАВИСИМО от
+    того, есть ли рядом ещё сторонний открытый PR с третьим файлом под тем
+    же номером."""
+    refs = {"main": "main", "PR #944": "agent/940-artifact-retention"}
+    sources = {
+        "main": {"0017": [
+            "0017-dsh-edge-pr-smoke-local-worker.md",
+            "0017-delayed-branch-deletion-not-delete-on-merge.md",
+        ]},
+        "PR #944": {"0017": ["0017-third-file.md"]},
+    }
+    monkeypatch.setattr(dn, "build_refs", lambda repo: refs)
+    monkeypatch.setattr(dn, "collect_sources_from_refs", lambda r, root, width, cwd=None: sources)
+    monkeypatch.delenv("GITHUB_HEAD_REF", raising=False)
+    monkeypatch.setenv("GITHUB_REF_NAME", "main")
+
+    lines, self_name = dn.cmd_check("owner/repo", ["docs/decisions"])
+
+    assert self_name == "main"
+    assert len(lines) == 1  # дубль внутри main не маскируется соседним чужим PR
     assert "0017" in lines[0]
 
 
