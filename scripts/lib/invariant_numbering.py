@@ -147,9 +147,17 @@ _CR_SPEC.loader.exec_module(check_result)  # type: ignore[union-attr]
 # Единственное место правды: какой файл несёт нумерованный реестр инвариантов.
 TARGET_PATH = "scripts/orchestra/repo_invariants.py"
 
-# Строка реестра: "  N. check_имя_функции — ..." или "  N. (retired) check_имя …".
-# Подтверждено на живом файле (18 записей, 2026-09-14) — см. докстринг выше.
-REGISTRY_ENTRY_RE = re.compile(r"^\s*(\d+)\.\s*(?:\(retired\)\s*)?(check_\w+)")
+# Строка реестра: "  N. check_имя_функции — ..." или "  N. (retired) check_имя …",
+# либо та же форма с именем функции, обёрнутым markdown-разметкой
+# (`check_имя`, **check_имя** — правдоподобная форма будущей записи: авторы
+# реестра уже перенумеровывали его руками под давлением мержа, находка
+# ai-review PR #1201, класс #891/#893 «гвардия слепнет молча при дрейфе
+# формата»). `[`*_]*` съедает разметку ДО имени функции; после — незначим,
+# `\w+` в самом имени останавливается на первом не-word символе (бэктике/
+# звёздочке) сам по себе.
+# Подтверждено на живом файле (18 записей, 2026-09-14, пин —
+# test_parse_registry_entries_pins_the_live_repo_invariants_registry).
+REGISTRY_ENTRY_RE = re.compile(r"^\s*(\d+)\.\s*(?:\(retired\)\s*)?[`*_]*(check_\w+)")
 
 
 def parse_registry_entries(text: str) -> dict[str, list[str]]:
@@ -220,6 +228,30 @@ def added_registry_entries(base_local_name: str, local_name: str, path: str, cwd
     return result
 
 
+def _parse_full_registry_or_die(local_name: str, content: str | None) -> dict[str, list[str]]:
+    """Полный (не diff) парс реестра ветки `local_name`. Пустой словарь при
+    НЕПУСТОМ содержимом файла — не легитимное «записей нет», а слепота
+    парсера к дрейфу формата (находка ai-review PR #1201, класс #891/#893
+    «гвардия слепнет молча»): реестр `repo_invariants.py` никогда не бывает
+    легитимно пуст, если файл существует. Раньше это тихо трактовалось как
+    «источник ничего не несёт» → отсутствие коллизии не отличить от
+    неспособности её увидеть — громкий отказ (`GitError`) вместо этого,
+    пойманный `check_invariant_number_collisions` в `check_result.unknown`.
+    `content is None` (файла нет на этом ref) остаётся легитимным «нечего
+    парсить» — путь мог законно отсутствовать."""
+    if content is None:
+        return {}
+    parsed = parse_registry_entries(content)
+    if not parsed:
+        raise dn.GitError(
+            f"{TARGET_PATH} на {local_name} прочитан ({len(content)} байт), "
+            "но REGISTRY_ENTRY_RE не нашёл ни одной записи реестра — формат "
+            "дрейфует или файл переехал, парсер слеп (issue #904, находка "
+            "ai-review PR #1201)"
+        )
+    return parsed
+
+
 def collect_sources_from_refs(refs: dict[str, str], path: str = TARGET_PATH, cwd=None) -> dict[str, dict[str, list[str]]]:
     """Реальный git: фетчит все `refs` (`dn.fetch_refs`), затем читает
     реестр каждого через `read_blob_at_ref`/`added_registry_entries`.
@@ -231,7 +263,7 @@ def collect_sources_from_refs(refs: dict[str, str], path: str = TARGET_PATH, cwd
     has_main = "main" in refs
     if has_main:
         content = read_blob_at_ref("main", path, cwd=cwd)
-        parsed = parse_registry_entries(content) if content is not None else {}
+        parsed = _parse_full_registry_or_die("main", content)
         if parsed:
             sources["main"] = parsed
     for local_name in refs:
@@ -241,7 +273,7 @@ def collect_sources_from_refs(refs: dict[str, str], path: str = TARGET_PATH, cwd
             parsed = added_registry_entries("main", local_name, path, cwd=cwd)
         else:
             content = read_blob_at_ref(local_name, path, cwd=cwd)
-            parsed = parse_registry_entries(content) if content is not None else {}
+            parsed = _parse_full_registry_or_die(local_name, content)
         if parsed:
             sources[local_name] = parsed
     return sources

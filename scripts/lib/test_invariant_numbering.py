@@ -46,6 +46,7 @@ _console_utf8_spec = importlib.util.spec_from_file_location(
 _console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))
 # --- конец console_utf8 bootstrap ---
 
+import re
 import subprocess
 
 import pytest
@@ -92,6 +93,61 @@ def test_parse_registry_entries_ignores_non_registry_numbered_lines():
         "  findings[12] = v12\n"
     )
     assert inv.parse_registry_entries(text) == {}
+
+
+def test_parse_registry_entries_tolerates_markdown_wrapping_around_the_function_name():
+    """Находка ai-review PR #1201: правдоподобная форма будущей записи — имя
+    функции обёрнуто бэктиками/жирным (авторы реестра уже перенумеровывали
+    его руками под давлением мержа, тот же риск дрейфа формата). Регэксп
+    обязан видеть запись, а не молчать (класс #891/#893)."""
+    text = (
+        "  19. `check_something_new` (#1) — обёрнуто бэктиками.\n"
+        "  20. **check_bold_wrap** (#2) — обёрнуто жирным.\n"
+    )
+    parsed = inv.parse_registry_entries(text)
+    assert parsed == {
+        "19": ["check_something_new"],
+        "20": ["check_bold_wrap"],
+    }
+
+
+def test_parse_registry_entries_pins_the_live_repo_invariants_registry():
+    """Пин к ЖИВОМУ scripts/orchestra/repo_invariants.py (находка ai-review
+    PR #1201): переименование функции реестра, дрейф формата строки реестра
+    ИЛИ появление незарегистрированной check_-функции верхнего уровня красит
+    этот тест, а не проходит молча (класс #891/#893, «гвардия слепнет молча
+    при дрейфе формата») — ровно тот прогон, который #904 обязан ловить.
+    `check_ai_failed_budget_exhausted` — под-проверка ВНУТРИ инварианта 3
+    (`check_stuck_review_gate`), не отдельный член реестра. Запись 2
+    отмечена (retired) — `check_free_task_count_mismatch` в реестре
+    остался, но def-а в файле больше нет."""
+    repo_root = Path(__file__).resolve().parents[2]
+    live_path = repo_root / inv.TARGET_PATH
+    text = live_path.read_text(encoding="utf-8")
+    parsed = inv.parse_registry_entries(text)
+
+    assert set(parsed) == {str(n) for n in range(1, 19)}, (
+        "диапазон номеров реестра изменился (см. docstring "
+        "scripts/orchestra/repo_invariants.py) — обнови range(1, 19) в этом "
+        "пине, ИЛИ REGISTRY_ENTRY_RE перестал видеть живую запись"
+    )
+
+    registry_functions = {name for names in parsed.values() for name in names}
+    defined_functions = set(re.findall(r"^def (check_\w+)\(", text, flags=re.MULTILINE))
+    NOT_A_REGISTRY_MEMBER = {"check_ai_failed_budget_exhausted"}
+    RETIRED_NOT_A_DEF = {"check_free_task_count_mismatch"}
+
+    assert registry_functions - defined_functions == RETIRED_NOT_A_DEF, (
+        "реестр ссылается на функцию, которой нет в файле (кроме известной "
+        "retired-записи) — либо переименовали def, не поправив реестр, либо "
+        "парсер прочитал не то"
+    )
+    assert defined_functions - registry_functions == NOT_A_REGISTRY_MEMBER, (
+        "в файле появилась НЕзарегистрированная check_-функция верхнего "
+        "уровня — либо забыли добавить её в реестр, либо это новый "
+        "не-член реестра (тогда назови его явно в NOT_A_REGISTRY_MEMBER "
+        "этого теста)"
+    )
 
 
 def test_find_number_collisions_reused_from_decision_numbering_same_number_same_function_is_fine():
@@ -321,6 +377,39 @@ def test_end_to_end_detects_live_904_collision_on_real_git(tmp_path):
     assert involved == {"PR #1061", "PR #1136"}
     # 20 (PR #1050) чист — единственный источник, коллизии нет.
     assert not any(v["number"] == "20" for v in violations)
+
+
+def build_origin_with_unreadable_main_registry(tmp_path) -> Path:
+    """main несёт непустой файл по `TARGET_PATH`, но ни одна строка не матчит
+    `REGISTRY_ENTRY_RE` (реестр переформатирован, например замена "N.
+    check_x" на "### check_x (N)") — раньше `collect_sources_from_refs` тихо
+    считал это «main без записей», и коллизия проходила в main незамеченной
+    (находка ai-review PR #1201, класс #891/#893). Теперь это обязан быть
+    громкий `GitError`, а не молчаливое «коллизий нет»."""
+    origin = tmp_path / "origin.git"
+    seed = tmp_path / "seed"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(origin)], check=True, capture_output=True)
+    subprocess.run(["git", "clone", str(origin), str(seed)], check=True, capture_output=True)
+    git("config", "user.email", "test@example.com", cwd=seed)
+    git("config", "user.name", "test", cwd=seed)
+    commit_file(
+        seed, inv.TARGET_PATH,
+        _module_stub("### check_reformatted (17)\n      не матчит REGISTRY_ENTRY_RE вовсе.\n"),
+        "main: реестр переформатирован, парсер слеп",
+    )
+    git("push", "-u", "origin", "main", cwd=seed)
+    return origin
+
+
+def test_collect_sources_from_refs_raises_loud_when_main_registry_is_unreadable(tmp_path):
+    origin = build_origin_with_unreadable_main_registry(tmp_path)
+    work = tmp_path / "work"
+    subprocess.run(["git", "clone", str(origin), str(work)], check=True, capture_output=True)
+    git("config", "user.email", "test@example.com", cwd=work)
+    git("config", "user.name", "test", cwd=work)
+
+    with pytest.raises(inv.dn.GitError, match="REGISTRY_ENTRY_RE"):
+        inv.collect_sources_from_refs({"main": "main"}, inv.TARGET_PATH, cwd=work)
 
 
 def test_collect_sources_from_refs_raises_git_error_on_unknown_branch(tmp_path):
