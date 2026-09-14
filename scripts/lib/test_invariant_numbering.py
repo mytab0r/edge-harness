@@ -126,9 +126,9 @@ def test_parse_registry_entries_pins_the_live_repo_invariants_registry():
     text = live_path.read_text(encoding="utf-8")
     parsed = inv.parse_registry_entries(text)
 
-    assert set(parsed) == {str(n) for n in range(1, 20)}, (
+    assert set(parsed) == {str(n) for n in range(1, 19)} | {"21"}, (
         "диапазон номеров реестра изменился (см. docstring "
-        "scripts/orchestra/repo_invariants.py) — обнови range(1, 20) в этом "
+        "scripts/orchestra/repo_invariants.py) — обнови множество в этом "
         "пине, ИЛИ REGISTRY_ENTRY_RE перестал видеть живую запись"
     )
 

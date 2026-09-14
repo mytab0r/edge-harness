@@ -311,7 +311,7 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
       вечный долг даёт одну эскалацию (#120 + Telegram), новая подделка
       меняет множество и даёт новую; владелец узнаёт о каждом новом эпизоде
       без спама на каждый пульс.
-  19. check_worker_run_long_running (#1160/#1141, живые прогоны worker.yml
+  21. check_worker_run_long_running (#1160/#1141, живые прогоны worker.yml
       34757182001/34801868104, 2026-09-13/14, ~5 часов каждый): текущий
       in_progress прогон worker.yml старше WORKER_RUN_LONG_RUNNING_MINUTES
       (200 мин, обоснование — комментарий у константы). Вторая поверхность
@@ -1990,7 +1990,7 @@ def check_recurring_worker_failure(repo: str) -> check_result.CheckResult:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Инвариант 19: единственный слот worker.yml занят одним прогоном дольше
+# Инвариант 21: единственный слот worker.yml занят одним прогоном дольше
 # разумного (#1160/#1141)
 # ══════════════════════════════════════════════════════════════════════════
 #
@@ -2034,7 +2034,9 @@ WORKER_RUN_LONG_RUNNING_MINUTES = 200
 
 
 def check_worker_run_long_running(repo: str, now: datetime) -> check_result.CheckResult:
-    """Инвариант 19 (#1160/#1141). Нарушение — самый свежий прогон
+    """Инвариант 21 (#1160/#1141; номер 19 уступлен по живой коллизии
+    #1061/#1260 — arbitration scripts/lib/invariant_numbering.py, инвариант
+    #21 = next_free_number на момент ренумерации). Нарушение — самый свежий прогон
     RECURRING_FAILURE_WORKFLOW (worker.yml) в статусе `in_progress` идёт
     дольше WORKER_RUN_LONG_RUNNING_MINUTES. Наблюдательный факт, не действие:
     отмену и освобождение аренды делает только scheduler.py::
@@ -3460,22 +3462,22 @@ def build_report(repo: str, now: datetime,
                 f"{AI_REWORK_NEVER_DISPATCHED_AFTER_MINUTES} мин без хотя бы одного "
                 "диспатча авто-доводки"
             )
-    v19 = check_worker_run_long_running(repo, now)
-    findings[19] = v19.violations
-    if v19.status == check_result.STATUS_UNKNOWN:
-        lines.append(f"{check_result.status_emoji(v19.status)} [19] не удалось "
-                      f"проверить длительность текущего {RECURRING_FAILURE_WORKFLOW}: {v19.reason}")
-    elif v19.violations:
-        item = v19.violations[0]
+    v21 = check_worker_run_long_running(repo, now)
+    findings[21] = v21.violations
+    if v21.status == check_result.STATUS_UNKNOWN:
+        lines.append(f"{check_result.status_emoji(v21.status)} [21] не удалось "
+                      f"проверить длительность текущего {RECURRING_FAILURE_WORKFLOW}: {v21.reason}")
+    elif v21.violations:
+        item = v21.violations[0]
         lines.append(
-            f"{check_result.status_emoji(check_result.STATUS_VIOLATION)} [19] "
+            f"{check_result.status_emoji(check_result.STATUS_VIOLATION)} [21] "
             f"прогон {RECURRING_FAILURE_WORKFLOW} #{item['run_id']} идёт "
             f"{item['age_minutes']} мин (порог {item['threshold_minutes']}, #1160/#1141) "
             f"— держит единственный слот воркера дольше нового ожидаемого легитимного "
             f"максимума, рипер (WORKER_STALL_MINUTES=295) сработает позже: {item['url']}"
         )
     else:
-        lines.append(f"💚 [19] {RECURRING_FAILURE_WORKFLOW} не занимает единственный "
+        lines.append(f"💚 [21] {RECURRING_FAILURE_WORKFLOW} не занимает единственный "
                       f"слот дольше {WORKER_RUN_LONG_RUNNING_MINUTES} мин (#1160/#1141)")
     return lines, findings
 
