@@ -25,11 +25,64 @@ spec.loader.exec_module(hr)  # type: ignore[union-attr]
 
 def rows_for(metric: str, values: list[float], start: date = date(2026, 8, 1)) -> list[dict]:
     """Снимки прод-формы: только интересующая метрика + дата, остальные поля
-    снимка не нужны классификатору (`row.get(metric)`, а не строгая схема)."""
-    return [
+    снимка не нужны классификатору (`row.get(metric)`, а не строгая схема).
+    `merge_throughput` несёт `merge_throughput_window_start` — маркер снимка,
+    посчитанного ПОСЛЕ фикса #1155 (`_is_reliable_sample`); тесты этого файла
+    моделируют ЗДОРОВУЮ историю нового формата, легаси-брак проверяется
+    отдельными тестами ниже, не этим хелпером."""
+    rows = [
         {"date": (start + timedelta(days=i)).isoformat(), metric: value}
         for i, value in enumerate(values)
     ]
+    if metric == "merge_throughput":
+        for row in rows:
+            row["merge_throughput_window_start"] = row["date"] + "T00:00:00+00:00"
+    return rows
+
+
+# ── Легаси-брак merge_throughput до фикса #1155 не поднимает baseline ────
+
+
+def test_legacy_merge_throughput_rows_without_window_marker_are_excluded():
+    """Прод-форма реальной истории `data/pipeline-health.jsonl` ДО фикса
+    #1155: пять снятых точек 09-10..09-14 (9, 0, 0, 0, 1) без
+    `merge_throughput_window_start` — брак измерения (окно «сегодня, с
+    полуночи»), не «метрика реально упала». `classify_metric` обязан их
+    отбросить целиком (не 0, не «нет данных» — «известно неверно»,
+    `_is_reliable_sample`), а не построить по ним ложно заниженный baseline,
+    который замаскировал бы реальную будущую просадку."""
+    rows = [
+        {"date": "2026-09-10", "merge_throughput": 9},
+        {"date": "2026-09-11", "merge_throughput": 0},
+        {"date": "2026-09-12", "merge_throughput": 0},
+        {"date": "2026-09-13", "merge_throughput": 0},
+        {"date": "2026-09-14", "merge_throughput": 1},
+    ]
+    c = hr.classify_metric(rows, "merge_throughput")
+    assert c.status == "insufficient_data"
+    assert "0" in c.reason  # 0 надёжных точек, все пять — легаси-брак
+
+
+def test_legacy_and_reliable_rows_mixed_only_reliable_count():
+    legacy = [
+        {"date": "2026-09-10", "merge_throughput": 0},
+        {"date": "2026-09-11", "merge_throughput": 0},
+    ]
+    reliable = rows_for("merge_throughput", [10, 10, 10, 10, 10],
+                        start=date(2026, 9, 12))
+    c = hr.classify_metric(legacy + reliable, "merge_throughput")
+    assert c.status != "insufficient_data"
+    assert c.baseline == 10
+
+
+def test_reliable_metric_other_than_merge_throughput_ignores_window_marker():
+    """`_is_reliable_sample` — правило ТОЛЬКО для `merge_throughput` (см.
+    докстринг); соседние метрики не несут `merge_throughput_window_start` и
+    этим не должны отбрасываться."""
+    rows = rows_for("worker_success_rate", [90] * hr.MIN_SAMPLES_FOR_BASELINE)
+    assert all("merge_throughput_window_start" not in row for row in rows)
+    c = hr.classify_metric(rows, "worker_success_rate")
+    assert c.status != "insufficient_data"
 
 
 # ── Честный третий исход: недостаточно данных ────────────────────────────
@@ -162,6 +215,7 @@ def test_classify_all_covers_every_metric_independently():
     for i in range(20):
         row = {"date": (start + timedelta(days=i)).isoformat()}
         row["merge_throughput"] = 10  # здоровая метрика
+        row["merge_throughput_window_start"] = row["date"] + "T00:00:00+00:00"
         # worker_success_rate отсутствует первые 10 дней — «нет данных»,
         # затем стабильна: недостаточно точек НЕ должно быть (10 >= 5)
         if i >= 10:
