@@ -14,6 +14,27 @@ GH_SHIM_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 gh_shim_install() { # $1 — рабочий каталог для шима (создаётся, обычно $WORK/gh-shim)
   local shim_dir=$1 real_gh src resolved
+
+  # ИДЕМПОТЕНТНОСТЬ / ЗАЩИТА ОТ ДВОЙНОЙ УСТАНОВКИ (находка ревью PR #596,
+  # оба раунда): если PATH УЖЕ указывает на шим в этом же shim_dir (повторный
+  # вызов без промежуточного снятия шима из PATH — например будущий
+  # рефакторинг task.sh, зовущий gh_shim_install дважды), `real_gh="$(type -P
+  # gh)"` НИЖЕ нашёл бы сам шим и записал бы его путь в GH_SHIM_REAL_GH — все
+  # дальнейшие вызовы `exec "$GH_SHIM_REAL_GH" "$@"` ушли бы в бесконечный
+  # self-exec loop, а дверь scripts/git/pr-create (тоже читающая эту
+  # переменную) отклоняла бы саму себя. Ловим это ДО того, как real_gh
+  # переопределён: если шим уже в PATH и старый GH_SHIM_REAL_GH валиден —
+  # повторный вызов не более чем no-op; если шим в PATH, а GH_SHIM_REAL_GH
+  # потерян/сломан — громкий отказ, не тихая порча переменной.
+  if [ "$(type -P gh 2>/dev/null || true)" = "$shim_dir/gh" ]; then
+    if [ -n "${GH_SHIM_REAL_GH:-}" ] && [ -x "${GH_SHIM_REAL_GH:-}" ] && [ "$GH_SHIM_REAL_GH" != "$shim_dir/gh" ]; then
+      echo "gh-shim: уже установлен ($shim_dir/gh) — повторный вызов gh_shim_install пропущен (идемпотентно)"
+      return 0
+    fi
+    echo "::error::gh-shim: PATH уже указывает на $shim_dir/gh, но GH_SHIM_REAL_GH не задан валидно (\"${GH_SHIM_REAL_GH:-<пусто>}\") — повторная установка молча записала бы путь шима как «настоящий gh» (self-exec loop); чинить вызывающего (не звать gh_shim_install дважды без причины), не игнорировать" >&2
+    return 1
+  fi
+
   # `type -P` — ПРИНУДИТЕЛЬНЫЙ поиск по PATH, в отличие от `command -v`
   # игнорирует функции/алиасы шелла (bash отдаёт функции приоритет над PATH
   # для голого слова `gh`): scripts/lib/test/dsh-clients.smoke.sh стабит `gh`
