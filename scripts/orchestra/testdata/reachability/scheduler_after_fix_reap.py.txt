@@ -1,0 +1,111 @@
+# Дословный фрагмент scripts/orchestra/scheduler.py на коммите 405d2e51
+# (PR #1089, ПОСЛЕ фикса «тишина решает первой, возраст — только фоллбэк
+# недоступности») — вендорится по той же причине, что и before-фикстура
+# рядом (issue #1172, случай 1): коммит живёт на ветке PR, не в main.
+WORKER_STALL_MINUTES = 295
+WORKER_SILENCE_MINUTES = 150
+
+def reap_stalled_worker_run(
+    repo: str, now: datetime, pool: list[dict], pulls: list[dict],
+) -> tuple[list[str], list[str]]:
+    """Разряжает находку stalled_worker_run (#815) — теперь ДВУМЯ признаками
+    (#1085), не только возрастом: отменяет зависший прогон (best-effort — сам
+    гейт worker_runs_active уже не блокирует диспатч независимо от исхода
+    отмены) и освобождает его задачу СРАЗУ, не дожидаясь обычных 24ч
+    reap_stale/claim_task.collect_stale — иначе задача осталась бы занятой
+    почти сутки после того, как сам факт зависания уже установлен.
+
+    Приоритет между двумя ножами (находка ai-review PR #1089, дважды —
+    первая разводка гейтила саму проверку тишины возрастом ≥150, из-за чего
+    тишина физически не могла сработать раньше 2×порога=300-й минуты, то
+    есть НИКОГДА раньше возрастного потолка 295; см. разбор у
+    WORKER_SILENCE_MINUTES выше):
+      1. Тишина сессии harness-<N> — ГЛАВНЫЙ нож, когда доступен. Задача
+         резолвится (_stalled_run_task_number) КАЖДЫЙ пульс с первого, не с
+         возраста ≥150: без коррелированной задачи проверять нечего, но сама
+         попытка коррелировать не гейтится возрастом. Пока признак доступен:
+         сессия растёт (или это первое наблюдение) → прогон жив, возрастной
+         потолок НЕ применяется вовсе, сколько бы прогон ни шёл (до жёсткой
+         стены GitHub, timeout-minutes самого job'а — её этот код не
+         контролирует и не обязан); сессия не растёт WORKER_SILENCE_MINUTES
+         подряд → завис, решение принято раньше возрастного потолка.
+      2. Возраст (WORKER_STALL_MINUTES) — ФОЛЛБЭК на случай, когда признак
+         тишины НЕДОСТУПЕН: задача не коррелирована (адресный прогон на PR
+         с уже открытым PR, либо аренда сгорела до следа), морда/сеть/
+         маркеры отказали. Честная деградация (AGENTS.md, «алерт не
+         гадает») — решение остаётся на прежнем, медленном, но надёжном
+         пороге, названном явно в тексте действия, а не молчаливым
+         предположением «жив».
+
+    Задача, арендованная прогоном, определяется структурным признаком (не
+    парсингом прозы, класс которого запрещён AGENTS.md): среди открытых
+    незаблокированных назначенных задач без открытого PR (тот же критерий,
+    что уже применяет reap_stale) берётся та, чьё событие timeline `assigned`
+    не старше момента старта прогона — task.sh берёт аренду в первые секунды
+    job'а (см. п.4 playbook), задолго до тяжёлой DSH-работы."""
+    observations: list[str] = []
+    actions: list[str] = []
+    run = _active_worker_run(repo)
+    if run is None:
+        return observations, actions
+    run_id = run["id"]
+    started = run.get("run_started_at") or run.get("created_at")
+    start = parse_time(started)
+    age_minutes = minutes_between(start, now)
+
+    task_number = _stalled_run_task_number(repo, pool, pulls, start)
+    reason = None
+    if task_number is not None:
+        silence_reason, observation = _worker_silence_reason(repo, run_id, task_number, now)
+        if observation is not None:
+            observations.append(observation)
+            if _run_is_stalled(run, now):
+                reason = (
+                    f"{int(age_minutes)} мин без завершения, возраст, порог "
+                    f"{WORKER_STALL_MINUTES} мин (признак тишины недоступен: {observation})"
+                )
+        elif silence_reason is not None:
+            reason = silence_reason
+        # else: оба None — сессия подтверждённо жива, возрастной потолок не
+        # применяется (см. докстринг и WORKER_SILENCE_MINUTES выше).
+    elif _run_is_stalled(run, now):
+        reason = (
+            f"{int(age_minutes)} мин без завершения, возраст, порог {WORKER_STALL_MINUTES} мин "
+            "(задача не определена — тишину проверить нечем)"
+        )
+    if reason is None:
+        return observations, actions
+
+    try:
+        gh("-X", "POST", f"repos/{repo}/actions/runs/{run_id}/cancel")
+        cancel_note = "отменён"
+    except RuntimeError as error:
+        cancel_note = f"отменить не удалось: {error}"
+    if task_number is not None:
+        release_note = claim_task.release_full(repo, task_number)
+        pool_issue = next((i for i in pool if i["number"] == task_number), None)
+        if pool_issue is not None:
+            pool_issue["assignees"] = []
+        try:
+            gh(
+                "-X", "POST", f"repos/{repo}/issues/{task_number}/comments",
+                "-f", "body=" + (
+                    f"♻️ Прогон worker.yml (run {run_id}) завис ({reason}) — оркестратор счёл его "
+                    f"зависшим, отменил ({cancel_note}) и снял аренду ({release_note}). Задача "
+                    "возвращена в пул: python3 scripts/lib/claim_task.py claim "
+                    f"{task_number} (#121, #815, #1085)."
+                ),
+            )
+        except RuntimeError as error:
+            print(f"::warning::след о снятии аренды #{task_number} не оставлен: {error}",
+                  file=sys.stderr)
+        actions.append(
+            f"🧟 worker run {run_id} завис ({reason}) — {cancel_note}; задача #{task_number} "
+            f"освобождена ({release_note})"
+        )
+    else:
+        actions.append(
+            f"🧟 worker run {run_id} завис ({reason}) — {cancel_note}; арендованная им задача "
+            "не определена (см. лог прогона вручную)"
+        )
+    return observations, actions

@@ -1,0 +1,110 @@
+# Дословные фрагменты cf-worker/src/harness.ts на коммите a414098
+# (PR #1104, ДО фикса «честный текст алерта», ab7f2aa) — вендорятся, а не
+# читаются через `git show <sha>` в момент теста: до-фиксный коммит живёт на
+# ветке PR, не в main, и после мержа/ребейза точный sha не гарантирован
+# долгоживущим (issue #1172, случай 2). Заморожены как реальные прод-данные,
+# не пересказ (AGENTS.md, «тест кормит прод-форму, а не пересказ»).
+# Три фрагмента: место вызова #tickPulseAlert из #dispatchOrchestraTick,
+# сам метод #tickPulseAlert, функция текста алерта pulseAlertText.
+
+# ── 1/3: место вызова #tickPulseAlert (хвост #dispatchOrchestraTick) ──
+
+    // Живость пульса владельцу (issue #1103) — общий код для alarm() и
+    // scheduledTick() тем же приёмом, что и всё выше: одно место правды на
+    // тик, а не вторая копия у каждого вызывающего. lastPulse строим из уже
+    // посчитанных значений ЭТОГО тика (не второй SQL-раундтрип через
+    // #getStoredPulse — #recordPulse выше уже записала ровно это).
+    this.#tickPulseAlert(now, { ts: now, dispatch_ok: result.ok, detail, run_confirmed: runConfirmed });
+  }
+
+
+# ── 2/3: метод #tickPulseAlert ──
+
+  /**
+   * Живость пульса владельцу (issue #1103): единственный алерт, независимый
+   * от ЛЮБОГО workflow этого репозитория — тик, который его шлёт
+   * (#dispatchOrchestraTick), вызывается из alarm()/scheduledTick(),
+   * оба живут в Cloudflare-инфраструктуре (DO alarm, Cron Trigger), не в
+   * GitHub Actions. Существующий Python-сторож (pulse_guard.py::
+   * independent_pulse_check, issue #689) видит только СРАВНЕНИЕ независимого
+   * и событийного каналов и по построению не может сработать, если оба
+   * канала (и, значит, scheduler.py) не запускаются вовсе — ровно тот класс
+   * простоя, что случился 2026-09-13 (issue #1103). Этот алерт не читает
+   * GitHub API вообще (0 дополнительных вызовов/час — не может усугубить
+   * причину падения, если она в исчерпании квоты #1100), решение целиком
+   * из уже вычисленного pulseHealthy() (единственное место правды на
+   * «здоров ли пульс», не вторая копия порога).
+   *
+   * Переход, не каждый тик (storageReadyAlertDecision — прямое переиспользование
+   * решения перехода healthy↔unhealthy, семантика идентична, отдельной
+   * копии функции не заводим): один incident при первом нездоровом тике,
+   * один recovery при первом снова здоровом. Дедуп — по итогу ЗАПИСИ флага
+   * pulse_alert.alerted, тем же доводом, что у #tickStorageReadyAlert (чтение
+   * прошлого исхода падает вместе с самой аварией на исчерпании rows_read).
+   */
+  #tickPulseAlert(now: number, lastPulse: PulseStatus): void {
+    const healthy = pulseHealthy(now, lastPulse);
+    let dedupRowsWritten: number | null = null;
+    try {
+      dedupRowsWritten = this.#recordPulseAlertFlag(healthy);
+    } catch (error) {
+      console.error(
+        `pulse alert: запись дедуп-флага упала ` +
+          `(${error instanceof Error ? error.message : error}) — алерт этого тика пропущен, ` +
+          `первый удавшийся тик догонит`,
+      );
+      return;
+    }
+    if (!this.env.TELEGRAM_CHAT_ID) return; // «возможности нет» — алерту некуда идти
+    const decision = storageReadyAlertDecision(healthy, dedupRowsWritten);
+    if (decision === "incident") {
+      void this.#telegramApi("sendMessage", {
+        chat_id: this.env.TELEGRAM_CHAT_ID,
+        text: pulseAlertText(now, lastPulse),
+      });
+    } else if (decision === "recovery") {
+      void this.#telegramApi("sendMessage", {
+        chat_id: this.env.TELEGRAM_CHAT_ID,
+        text: "✅ edge-harness: пульс оркестратора снова в норме",
+      });
+    }
+  }
+
+
+# ── 3/3: функция pulseAlertText ──
+
+/**
+ * Текст алерта живости пульса владельцу (issue #1103). Единственный наблюдатель
+ * пульса, который не зависит вообще ни от одного workflow этого репозитория:
+ * тик, который его шлёт (#dispatchOrchestraTick, общий для alarm() и
+ * scheduledTick()), сам вызывается Cloudflare-инфраструктурой (DO alarm,
+ * Cron Trigger), а не GitHub Actions — он звонит и тогда, когда любой workflow
+ * (включая orchestra.yml целиком) не запускается вовсе. Причина в тексте —
+ * ФАКТ из уже вычисленного pulseHealthy()/pulseStale() (правило AGENTS.md
+ * «алерт не гадает»), не гипотеза: pulseStale() — единственная ветка
+ * unhealthy, где lastPulse.detail остаётся честным null (см. её докстринг),
+ * поэтому для неё отдельный самодостаточный текст без подстановки detail
+ * (тот же приём, что PULSE_STALE_TEMPLATE у фронта, app.js/ru.js); для
+ * остальных причин detail уже человекочитаем (pulseDetailForRecord).
+ * Каждый текст называет и газ (что уже делает самовосстановление, #689/#693/
+ * #713) и план (когда считать это неполадкой, требующей ручной проверки) —
+ * правило «алерт обязан кончаться планом».
+ */
+export function pulseAlertText(now: number, lastPulse: PulseStatus): string {
+  const minutes = Math.round((now - lastPulse.ts) / 60_000);
+  const retryMinutes = HEARTBEAT.selfOrchestrationMs / 60_000;
+  if (pulseStale(now, lastPulse)) {
+    return (
+      `🚨 edge-harness: пульс оркестратора не бьётся — тик не обновлялся ${minutes} мин ` +
+      `(порог ${(HEARTBEAT.selfOrchestrationMs * 2) / 60_000} мин). Самовосстановление уже в работе: ` +
+      `Cron Trigger (issue #693) проверяет каждые 5 мин и сам дёрнет dispatch. Если в течение часа не ` +
+      `придёт «пульс снова в норме» — проверь GH_DISPATCH_TOKEN и квоту GitHub API (rate_limit), а также ` +
+      `rows_written DO (/api/status).`
+    );
+  }
+  return (
+    `🚨 edge-harness: пульс оркестратора не бьётся: ${lastPulse.detail ?? "причина не записана"} ` +
+    `(${minutes} мин назад). alarm() пробует снова каждые ${retryMinutes} мин без ручного вмешательства. ` +
+    `Если в течение часа не придёт «пульс снова в норме» — проверь GH_DISPATCH_TOKEN и квоту GitHub API (rate_limit).`
+  );
+}
