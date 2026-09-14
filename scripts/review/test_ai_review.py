@@ -229,6 +229,41 @@ def test_findings_of_strips_verdict_and_tasks():
     assert "Тело." not in findings
 
 
+# ── Классификация класса дефекта в источнике (#1237) ──────────────────────────
+
+def test_findings_of_strips_class_lines_too():
+    # КЛАСС: <slug> — машинный трейлер находки п.1, не часть текста для
+    # человека в комментарии PR (снимается тем же приёмом, что строка ВЕРДИКТ).
+    answer = (
+        "1. Блокирует мерж: недостижимая ветка X.\n"
+        "КЛАСС: недостижимый-механизм\n"
+        "ВЕРДИКТ: rework"
+    )
+    findings = ai.findings_of(answer)
+    assert "1. Блокирует мерж: недостижимая ветка X." in findings
+    assert "КЛАСС" not in findings
+
+
+def test_build_comment_adds_class_line_only_when_named():
+    signal_named = ai.defect_classes.classify(
+        "Находка.\nКЛАСС: недостижимый-механизм\nВЕРДИКТ: rework")
+    body = ai.build_comment(140, "abc", "rework", "Находка.", [], class_signal=signal_named)
+    facts_lines = [line for line in body.splitlines() if line.startswith("class:")]
+    assert facts_lines == ["class: known=недостижимый-механизм"]
+
+
+def test_build_comment_omits_class_line_when_not_named():
+    signal_absent = ai.defect_classes.classify("Находка без класса.\nВЕРДИКТ: rework")
+    body = ai.build_comment(140, "abc", "rework", "Находка без класса.", [], class_signal=signal_absent)
+    assert "class:" not in body
+
+
+def test_build_comment_without_class_signal_backward_compat():
+    # Старые вызовы (без class_signal) — прежнее поведение, никакой строки class:.
+    body = ai.build_comment(140, "abc", "approve", "Ок.", [])
+    assert "class:" not in body
+
+
 # ── Третья категория находок: блок ЗАМЕЧАНИЕ (#462) ───────────────────────────
 
 def test_findings_of_strips_remark_blocks_too():
@@ -579,6 +614,9 @@ def test_gather_fails_on_missing_placeholder(monkeypatch, tmp_path):
         if path.startswith("repos/o/r/actions/workflows/ai-review.yml/runs"):
             # other_active_ai_review_runs вызывает этот эндпоинт — возвращаем пустой список
             return []
+        if path.startswith(f"repos/o/r/issues/{ai.defect_classes.DEFECT_CLASS_TRACKER_ISSUE}/comments"):
+            # #1237: кандидаты классов дефектов — пустой список, тест не о словаре
+            return []
         raise AssertionError(f"unexpected gh call: {path}")
 
     monkeypatch.setattr(ai, "gh", fake_gh)
@@ -783,6 +821,12 @@ class _FakeCompleted:
 
 def _fake_gh_pull(sha="76913bd001", ref="forge/runner-bridge-v0.1.2"):
     def fake_gh(url: str):
+        # cmd_gather (#1237) читает кандидатов классов дефектов (issue #1238)
+        # ПОСЛЕ основного PR-запроса — только на нормальном пути (диффы
+        # пустого файла возвращаются раньше, до построения промпта, и этот
+        # вызов туда не долетает); пустой список — честный «кандидатов нет».
+        if url.startswith(f"repos/o/r/issues/{ai.defect_classes.DEFECT_CLASS_TRACKER_ISSUE}/comments"):
+            return []
         assert url == "repos/o/r/pulls/658"
         return {"title": "chore(plugins): обновить runner-bridge до v0.1.2",
                 "head": {"sha": sha, "ref": ref},
@@ -1839,6 +1883,51 @@ def test_cmd_verdict_posts_failure_status_on_rework(monkeypatch, tmp_path):
     status_calls = _status_calls(run_gh_calls)
     assert len(status_calls) == 1
     assert "state=failure" in " ".join(status_calls[0])
+
+
+# ── Классификация класса дефекта — end-to-end через cmd_verdict (#1237) ──────
+
+def test_cmd_verdict_records_new_candidate_marker_on_tracker_issue(monkeypatch, tmp_path):
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+    fake_gh, _ = _fake_gh_verdict("deadbeef", "deadbeef", files, [])
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    answer = "1. Блокирует мерж: новая находка.\nКЛАСС: совсем-новый-класс\nВЕРДИКТ: rework"
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, answer))
+
+    assert rc == 0
+    tracker = f"repos/o/r/issues/{ai.defect_classes.DEFECT_CLASS_TRACKER_ISSUE}/comments"
+    marker_calls = [c for c in run_gh_calls if tracker in c]
+    assert len(marker_calls) == 1, run_gh_calls
+    assert "slug=совсем-новый-класс pr=294" in " ".join(marker_calls[0])
+
+
+def test_cmd_verdict_known_class_does_not_touch_tracker_issue():
+    # known-класс (уже в реестре) — не кандидат, маркер не пишется: только
+    # НОВЫЕ slug'и копятся в issue #1238 (см. defect_classes.classify).
+    signal = ai.defect_classes.classify(
+        "Находка.\nКЛАСС: недостижимый-механизм\nВЕРДИКТ: rework")
+    assert signal.state == ai.defect_classes.STATE_KNOWN
+    assert signal.candidates == ()
+
+
+def test_cmd_verdict_no_class_line_posts_warning_on_rework(monkeypatch, tmp_path, capsys):
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+    fake_gh, _ = _fake_gh_verdict("deadbeef", "deadbeef", files, [])
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: None)
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, "1. Блокирует мерж: старая форма ответа.\nВЕРДИКТ: rework"))
+
+    assert rc == 0  # обратная совместимость — отсутствие КЛАСС не error (#1237 п.8)
+    out = capsys.readouterr().out
+    assert "без единой строки КЛАСС" in out
 
 
 # ── Размерный гейт на уровне cmd_verdict (#939, мандат владельца 2026-09-11):
