@@ -56,22 +56,35 @@ export function isExpected(finding) {
  * следующий клик («Settings»), а видимое сообщение об отказе называло
  * СЛЕДСТВИЕ («кнопка не найдена/не кликнулась»), а не причину.
  *
- * Вместо фиксированной паузы ждём ФАКТ: саму кнопку «Continue» в состоянии
- * `hidden` — это тот же узел дерева, что закрывающий диалог/маска тура
- * размонтирует вместе с собой, и ждать его не требует хрупкого селектора по
- * хешу CSS-модуля маски (см. заголовок файла — то же обоснование, что и для
- * отказа от хардкода классов вкладок). Не найден вовсе (`count() === 0`) —
- * тура не было, закрывать нечего.
+ * Третья рука той же гонки (#1070, находка ai-review PR #1070): мгновенный
+ * снимок `count() === 0` неотличим от «тур ещё не смонтировался» — оба
+ * реальных вызывающих (smoke.mjs, pr-check.mjs) открывают свежий контекст
+ * браузера на каждый прогон, «первый визит» там ВСЕГДА, поэтому
+ * `count() === 0` физически не может означать «возвращавшийся пользователь
+ * без тура». Вместо мгновенного снимка ждём факт появления с потолком
+ * (`appearTimeoutMs`) — не найден за этот срок, значит тура правда не было
+ * (или апстрим его вырезал), а не гонка с монтированием. В штатном случае
+ * (тур монтируется) ожидание резолвится сразу по факту появления, без
+ * добавленной задержки; цена таймаута ложится только на прогон без тура.
+ *
+ * Дальше — тот же факт закрытия, что и раньше: сама кнопка «Continue» в
+ * состоянии `hidden` — это тот же узел дерева, что закрывающий диалог/маска
+ * тура размонтирует вместе с собой, и ждать его не требует хрупкого
+ * селектора по хешу CSS-модуля маски (см. заголовок файла — то же
+ * обоснование, что и для отказа от хардкода классов вкладок).
  *
  * Кидает Error с точной причиной (клик не прошёл / тур не закрылся) —
  * вызывающий код оборачивает её в findings через throwWithFindings.
  *
  * @param {import('playwright-core').Locator} tourContinue
- * @param {{ clickTimeoutMs?: number, hideTimeoutMs?: number }} [opts]
+ * @param {{ appearTimeoutMs?: number, clickTimeoutMs?: number, hideTimeoutMs?: number }} [opts]
  * @returns {Promise<boolean>} true — тур был и закрыт; false — тура не было
  */
-export async function closeTourOverlay(tourContinue, { clickTimeoutMs = 5000, hideTimeoutMs = 5000 } = {}) {
-  if (await tourContinue.count() === 0) return false
+export async function closeTourOverlay(tourContinue, { appearTimeoutMs = 2000, clickTimeoutMs = 5000, hideTimeoutMs = 5000 } = {}) {
+  const appeared = await tourContinue
+    .waitFor({ state: 'visible', timeout: appearTimeoutMs })
+    .then(() => true, () => false)
+  if (!appeared) return false
 
   try {
     await tourContinue.click({ timeout: clickTimeoutMs })
