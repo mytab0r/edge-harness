@@ -115,14 +115,17 @@ head SHA не меняется, все обязательные workflow пол�
 Steady state (нет queued PR-прогонов старше порога) — 1 вызов `gh api` за
 пульс (список queued PR-прогонов). Кандидаты появляются — сверх того:
 
-- +1 вызов: список открытых PR;
-- до `MAX_ZOMBIE_CANDIDATES_PER_PULSE` вызовов числа job'ов (по одному на
-  проверяемый прогон, с коротким замыканием: одного подтверждённого зомби
-  на PR достаточно). Проверяются СТАРЕЙШИЕ кандидаты: `/actions/runs`
-  отдаёт список от свежих к старым (замер 2026-09-14: `created_at`
-  убывает с первой записи), усечение берёт хвост списка — при затяжном
-  сбое (>20 кандидатов пульс за пульсом) старейшие, самые критичные
-  зомби обслуживаются первыми, а не вытесняются свежими;
+- +1 вызов: список открытых PR (нужен ВСЕГДА, до потолка — находка ревью
+  PR #1212, круг 3: потолок теперь стоит ПОСЛЕ сопоставления кандидатов
+  с открытыми PR, а не до, иначе permanent-зомби закрытых/слитых PR
+  вытесняли из хвоста единственного зомби на открытом PR ещё до того, как
+  список открытых PR вообще был прочитан);
+- до `MAX_ZOMBIE_CANDIDATES_PER_PULSE` вызовов числа job'ов — по одному на
+  PR-кандидата, УЖЕ сопоставленного с открытым PR (с коротким замыканием:
+  одного подтверждённого зомби на PR достаточно). Потолок режет по
+  возрасту САМОГО СТАРОГО прогона внутри группы каждого PR-кандидата —
+  старейшие обслуживаются первыми, свежие не вытесняют более критичные
+  зависшие;
 - +1 вызов чтения маркеров в комментариях КАЖДОГО PR-кандидата (одна
   страница комментариев целиком; на длинной истории — несколько);
 - +1 вызов чтения маркеров в #120 на каждый PR-кандидат, чей собственный
@@ -134,7 +137,10 @@ Steady state (нет queued PR-прогонов старше порога) — 1
 `2 + MAX_ZOMBIE_CANDIDATES_PER_PULSE + 2·<число PR-кандидатов>` вызовов
 `gh api` (находка ревью PR #1212: первая версия считала только
 `2 + MAX_ZOMBIE_CANDIDATES_PER_PULSE` и не включала чтения маркеров),
-независимо от того, сколько PR реально открыто.
+независимо от того, сколько PR реально открыто. Список открытых PR
+(+1 вызов) больше не входит в счёт «до потолка» — он читается безусловно
+до потолка, поэтому формула верна и при сотнях сырых кандидатов, ни один
+из которых не относится к открытому PR.
 
 Запуск: python scripts/orchestra/zombie_run_watch.py run
 Тесты:  python -m pytest scripts/orchestra/test_zombie_run_watch.py -q
@@ -182,6 +188,22 @@ _RL_SPEC.loader.exec_module(review_labels)  # type: ignore[union-attr]
 ZOMBIE_AGE_MINUTES = 15
 MAX_ZOMBIE_CANDIDATES_PER_PULSE = 20
 
+# Находка ревью PR #1212 (круг 3): из восьми workflow с триггером
+# `pull_request` (codeql, dsh-edge-pr-smoke, orchestra, pr-review,
+# quota-watch, repo-ci, secret-scan, worker-ci) ТОЛЬКО `quota-watch.yml`
+# несёт РЕПОЗИТОРНУЮ (не per-PR) concurrency-группу с `cancel-in-progress:
+# false` (`group: quota-watch`, без `${{ github.event.pull_request.number
+# }}`) — прогон одного PR может легитимно стоять `queued` позади прогона
+# ДРУГОГО PR или собственного cron'а того же workflow сколь угодно долго
+# (замер 2026-09-14: живой `queued` run 34748469982 подтверждён как часть
+# ИЗВЕСТНОГО permanent-зомби батча #1088, не пойман случай самой
+# concurrency-очереди — но механизм группы теоретически это допускает, и
+# порог 15 минут его не отличает от настоящего зомби). `dsh-edge-pr-
+# smoke.yml` тоже несёт concurrency, но per-PR (`-${{ ...number }}`) и
+# `cancel-in-progress: true` — конкурирующий прогон ОТМЕНЯЕТСЯ, а не висит
+# `queued`, поэтому не создаёт этот класс отказа и не исключается.
+EXCLUDED_WORKFLOW_PATHS = frozenset({".github/workflows/quota-watch.yml"})
+
 REOPENED_MARKER_PREFIX = "[zombie-run-watch: переэмиссия "
 ESCALATION_MARKER_PREFIX = "[zombie-run-watch: эскалация "
 REOPEN_FAILED_MARKER_PREFIX = "[zombie-run-watch: reopen-не-удался "
@@ -195,10 +217,14 @@ def stale_candidates(runs: list[dict], now: datetime,
                      age_minutes: int = ZOMBIE_AGE_MINUTES) -> list[dict]:
     """Прогоны из уже отфильтрованного (`status=queued&event=pull_request`)
     списка, чей возраст по `created_at` >= порога — дорогой запрос числа
-    job'ов делаем только для них."""
+    job'ов делаем только для них. Исключены workflow из
+    `EXCLUDED_WORKFLOW_PATHS` (репозиторная concurrency-группа без
+    per-PR суффикса — легитимный queued-простой неотличим от зомби по
+    одному только возрасту, находка ревью PR #1212, круг 3)."""
     return [
         r for r in runs
         if r.get("status") == "queued"
+        and r.get("path") not in EXCLUDED_WORKFLOW_PATHS
         and minutes_between(parse_time(r["created_at"]), now) >= age_minutes
     ]
 
@@ -383,13 +409,14 @@ def zombie_run_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
             f"(всего queued PR-прогонов: {len(runs)})")
         return observations, actions
 
-    if len(candidates) > MAX_ZOMBIE_CANDIDATES_PER_PULSE:
-        observations.append(
-            f"⚠️ zombie-run-watch: кандидатов {len(candidates)}, проверяются старейшие "
-            f"{MAX_ZOMBIE_CANDIDATES_PER_PULSE} (потолок цены API за один пульс; "
-            "API отдаёт от свежих к старым — берём хвост)")
-        candidates = candidates[-MAX_ZOMBIE_CANDIDATES_PER_PULSE:]
-
+    # Найдено ревью PR #1212 (круг 3): потолок ЗДЕСЬ, до сопоставления с
+    # открытыми PR, резал по возрасту permanent-зомби ЗАКРЫТЫХ/слитых PR
+    # (они всегда старейшие — остаются queued навсегда, см. докстринг
+    # модуля) вперёд единственного зомби на ОТКРЫТОМ PR: тот вытеснялся из
+    # хвоста списка и до дорогой проверки job'ов не доходил вовсе.
+    # Сопоставление с открытыми PR — один дешёвый вызов (`pulls?state=open`)
+    # и чистая группировка в памяти, потолок стоит только на дорогой части
+    # ниже (число job'ов на кандидата).
     prs = review_labels.list_pages(f"repos/{repo}/pulls?state=open&per_page=100", gh)
     prs_by_branch = open_prs_by_branch(prs)
     grouped = group_candidates_by_pr(candidates, prs_by_branch)
@@ -401,7 +428,17 @@ def zombie_run_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
             "(устарели или PR уже закрыт/слит) — действие не требуется")
         return observations, actions
 
-    for pr_number, entry in sorted(grouped.items()):
+    entries = sorted(
+        grouped.items(),
+        key=lambda kv: min(parse_time(r["created_at"]) for r in kv[1]["runs"]))
+    if len(entries) > MAX_ZOMBIE_CANDIDATES_PER_PULSE:
+        observations.append(
+            f"⚠️ zombie-run-watch: PR-кандидатов {len(entries)} (уже сопоставлены с "
+            f"открытыми PR), проверяются старейшие {MAX_ZOMBIE_CANDIDATES_PER_PULSE} "
+            "(потолок цены дорогой проверки job'ов за один пульс)")
+        entries = entries[:MAX_ZOMBIE_CANDIDATES_PER_PULSE]
+
+    for pr_number, entry in entries:
         pr = entry["pr"]
         head_sha = (pr.get("head") or {}).get("sha") or ""
         sha8 = head_sha[:8]

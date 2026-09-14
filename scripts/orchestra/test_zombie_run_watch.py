@@ -189,6 +189,25 @@ def test_stale_candidates_ignores_non_queued():
     assert zrw.stale_candidates([completed], NOW) == []
 
 
+def test_stale_candidates_excludes_quota_watch_shared_concurrency_group():
+    """Находка ревью PR #1212 (круг 3): `quota-watch.yml` — единственный из
+    восьми PR-триггерных workflow с РЕПОЗИТОРНОЙ (не per-PR) concurrency-
+    группой и `cancel-in-progress: false` (`.github/workflows/quota-
+    watch.yml`, `group: quota-watch`) — прогон одного PR может легитимно
+    стоять `queued` за прогоном другого PR/cron'а того же workflow дольше
+    порога, что этот сторож не отличит от настоящего зомби по одному
+    только возрасту. Исключён из кандидатов по `path`."""
+    quota_watch_run = {**ZOMBIE_RUN_ORCHESTRA, "path": ".github/workflows/quota-watch.yml"}
+    assert zrw.stale_candidates([quota_watch_run], NOW) == []
+
+
+def test_stale_candidates_keeps_other_workflows_without_path_field():
+    """Прод-фикстуры без поля `path` (историческая форма) — фильтр не
+    ломает существующее поведение, `.get("path")` даёт `None`, не равный
+    ни одному пути из `EXCLUDED_WORKFLOW_PATHS`."""
+    assert zrw.stale_candidates([ZOMBIE_RUN_ORCHESTRA], NOW) == [ZOMBIE_RUN_ORCHESTRA]
+
+
 def test_runs_created_after_excludes_old_permanent_zombie():
     reopen_time = utc(2026, 9, 13, 12, 0)  # позже создания зомби-прогона
     assert zrw.runs_created_after([ZOMBIE_RUN_ORCHESTRA], reopen_time) == []
@@ -680,51 +699,71 @@ def test_set_pr_state_falls_back_to_gh_without_pat(monkeypatch):
     assert "state=closed" in calls[0]
 
 
-def test_candidate_cap_truncates_and_warns(monkeypatch):
-    many = [
+def test_candidate_cap_truncates_and_warns_when_matched_to_open_prs(monkeypatch):
+    """Потолок теперь режет PR-кандидатов, УЖЕ сопоставленных с открытыми
+    PR (находка ревью PR #1212, круг 3) — фикстура даёт 25 открытых PR,
+    каждый со своим зомби-прогоном, чтобы потолок сработал на реальных,
+    а не сырых кандидатах."""
+    many_runs = [
         {**HEALTHY_RUN, "id": 100 + i, "created_at": "2026-09-13T00:00:00Z",
-         "head_branch": f"branch-{i}"}
-        for i in range(25)
-    ]
-    fake = FakeGh({
-        "actions/runs?event=pull_request&status=queued": {"workflow_runs": many},
-        "pulls?state=open": [],
-    })
-    patch_gh(monkeypatch, fake)
-    observations, actions = zrw.zombie_run_watch(REPO, NOW)
-    assert any("потолок цены API" in o for o in observations)
-
-
-def test_candidate_cap_keeps_oldest_not_newest(monkeypatch):
-    """Мутация-гвардия чеклист-находки ревью PR #1212: `/actions/runs`
-    отдаёт от свежих к старым (замер 2026-09-14), поэтому усечение обязано
-    брать ХВОСТ списка — старейшие. Open PR соответствует только САМОМУ
-    старому прогону из 25 — при усечении с головы (новейшие) он вытеснялся
-    бы и газ никогда не дошёл бы до самого критичного зомби."""
-    many = [
-        {**HEALTHY_RUN, "id": 100 + i,
-         # свежие ПЕРВЫМИ (прод-порядок API): i=0 — новейший, i=24 — старейший
-         "created_at": f"2026-09-13T00:{59 - i:02d}:00Z",
          "head_branch": f"branch-{i}", "head_sha": f"{i:064d}"}
         for i in range(25)
     ]
-    oldest_pr = {
+    many_prs = [
+        {"number": 1300 + i, "state": "open", "head": {"ref": f"branch-{i}", "sha": f"{i:064d}"}}
+        for i in range(25)
+    ]
+    fake = FakeGh({
+        "actions/runs?event=pull_request&status=queued": {"workflow_runs": many_runs},
+        "pulls?state=open": many_prs,
+        "/comments": [],  # маркеры дедупа — ни одного PR-кандидата это не касается
+        f"issues/{pg.WATCHDOG_ISSUE}/comments": [],
+        "actions/runs/1": {"total_count": 0, "jobs": []},  # "1" ловит id 100..124 подстрокой
+        "-X PATCH": None,
+        "-X POST": None,
+    })
+    patch_gh(monkeypatch, fake)
+    observations, actions = zrw.zombie_run_watch(REPO, NOW)
+    assert any("PR-кандидатов 25" in o for o in observations)
+
+
+def test_candidate_cap_does_not_starve_open_pr_zombie_behind_permanent_zombies(monkeypatch):
+    """Живой класс отказа (находка ревью PR #1212, круг 3): 24 permanent-
+    зомби ЗАКРЫТЫХ/слитых PR (не сопоставляются ни с одним открытым PR —
+    остаются queued навсегда, см. докстринг модуля) плюс 1 настоящий зомби
+    на ОТКРЫТОМ PR #1300. Старая версия резала потолок ДО сопоставления с
+    открытыми PR — 24 несопоставимых кандидата съедали весь потолок в 20, и
+    единственный зомби на открытом PR никогда не доходил до дорогой
+    проверки job'ов (`actions == []` при живом зомби на открытом PR).
+    Правильное поведение: сопоставление с открытыми PR — БЕЗ потолка (это
+    дешёвая группировка в памяти), потолок режет только дорогую проверку
+    job'ов, и единственный реальный кандидат её проходит."""
+    permanent_zombies = [
+        {**HEALTHY_RUN, "id": 200 + i, "created_at": "2026-09-13T00:00:00Z",
+         "head_branch": f"closed-branch-{i}", "head_sha": f"c{i:063d}"}
+        for i in range(24)
+    ]
+    live_zombie = {**HEALTHY_RUN, "id": 999, "created_at": "2026-09-13T06:00:00Z",
+                   "head_branch": "branch-1300", "head_sha": f"{1300:064d}"}
+    open_pr = {
         "number": 1300, "state": "open",
-        "head": {"ref": "branch-24", "sha": f"{24:064d}"},
+        "head": {"ref": "branch-1300", "sha": f"{1300:064d}"},
     }
     fake = FakeGh({
-        "actions/runs?event=pull_request&status=queued": {"workflow_runs": many},
-        "pulls?state=open": [oldest_pr],
+        "actions/runs?event=pull_request&status=queued":
+            {"workflow_runs": permanent_zombies + [live_zombie]},
+        "pulls?state=open": [open_pr],
         "issues/1300/comments": [],
         f"issues/{pg.WATCHDOG_ISSUE}/comments": [],
-        "actions/runs/124/jobs": ZOMBIE_JOBS_EMPTY,
+        "actions/runs/999/jobs": ZOMBIE_JOBS_EMPTY,
         "-X POST": None,
         "-X PATCH": None,
     })
     patch_gh(monkeypatch, fake)
     observations, actions = zrw.zombie_run_watch(REPO, NOW)
-    assert any("потолок цены API" in o for o in observations)
-    assert any("переоткрыт" in a for a in actions)
+    assert any("переоткрыт" in a for a in actions), (
+        f"зомби открытого PR #1300 должен быть обслужен, а не вытеснен "
+        f"permanent-зомби закрытых PR; observations={observations} actions={actions}")
 
 
 if __name__ == "__main__":
