@@ -10,6 +10,22 @@ ref отклоняется кодом 422 (гонка двух claim'ов выи
 Порядок claim: сначала замок (защита), потом назначение assignee и комментарий
 в задачу (видимость — НЕ защита: все агенты работают под одним логином).
 
+Держатель замка (#1190): коммит замка несёт вторую строку `holder: <id>` —
+идентификатор КОНКРЕТНОГО прогона/дерева (`current_holder()` ниже), не
+логин-`actor` (тот один на всех агентов и ничего не различает). Это не то
+же самое, что отклонённая ранее (task-lease-claim, «Флаг несёт номер, не
+признак») идемпотентность по `actor`: там опасность была в том, что «этот
+же прогон взял тот же номер» неотличимо от «другой прогон под тем же логином
+только что взял тот же номер», раз идентификатором служит логин. `holder`
+эту путаницу не создаёт, потому что различает именно прогон/дерево, а не
+логин: повторный `claim()` С ТЕМ ЖЕ `holder` — идемпотентный успех (тот же
+процесс/дерево реально перезабирает своё), С ДРУГИМ `holder` — отказ,
+называющий держателя, а НЕИЗВЕСТНЫЙ держатель (замок старого формата без
+строки `holder:`) — честное третье состояние (отказ, но иначе
+сформулированный: держателя нельзя установить, а не «держит вот этот»).
+Живые замки старого формата (созданные до этого изменения) читаются без
+падения — `holder` для них просто `None`, что и даёт третье состояние.
+
 Отказ claim'а — нормальный исход («задача занята»), а не поломка: вызывающий
 код обязан завершиться зелёным no-op. Инфраструктурный сбой (сеть, права) —
 наоборот, громкий RuntimeError: «инструмент сломан» и «задача занята» лечатся
@@ -45,6 +61,7 @@ _console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_u
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -139,13 +156,66 @@ def lock_ref(task: int) -> str:
 
 
 class ClaimResult:
-    def __init__(self, claimed: bool, task: int, detail: str):
+    def __init__(self, claimed: bool, task: int, detail: str, holder: str | None = None):
         self.claimed = claimed
         self.task = task
         self.detail = detail
+        # Держатель ТЕКУЩЕГО замка (#1190): при claimed=True — свой (только
+        # что поставленный или переподтверждённый); при claimed=False — либо
+        # чужой (строка с ним) либо None (неизвестен: замок старого формата,
+        # без записи держателя — третье состояние, см. claim()).
+        self.holder = holder
 
     def __repr__(self):
-        return f"ClaimResult(claimed={self.claimed}, task={self.task}, detail={self.detail!r})"
+        return (f"ClaimResult(claimed={self.claimed}, task={self.task}, "
+                f"holder={self.holder!r}, detail={self.detail!r})")
+
+
+# ── Идентификатор держателя замка (#1190) ────────────────────────────────────
+# Держатель — не логин (actor, один на всех агентов), а конкретный прогон/
+# дерево. Приоритет источников, от самого явного к самому дешёвому запасному:
+#   1) CLAIM_HOLDER — явное значение (тесты, ручное указание, будущие каналы,
+#      которым нужен собственный расчёт identity);
+#   2) GITHUB_RUN_ID — в CI прогон job'а уникален (worker/hands, каждый запуск
+#      воркфлоу получает новый run id — разные прогоны НЕ склеиваются в одного
+#      держателя, ровно то различение, которого не хватало #121: «этот же
+#      прогон» против «другой прогон под тем же логином»);
+#   3) абсолютный путь текущего рабочего каталога — вне CI (task-branch,
+#      локальный/внешний агент): по правилу «одно дерево — один агент»
+#      (AGENTS.md, .githooks/pre-commit) путь рабочего дерева уже и есть
+#      устойчивый идентификатор канала — тот же агент, тот же worktree,
+#      повторный вызов из него же обязан читаться как «свой»;
+#   4) hostname:pid — честный запасной рубеж, если ни CI, ни различимый cwd
+#      недоступны (интерактивный вызов CLI без окружения выше); НЕ идемпотентен
+#      между вызовами (pid меняется), но это и не обещание — просто не падает.
+_CLAIM_HOLDER_ENV = "CLAIM_HOLDER"
+
+
+def current_holder() -> str:
+    holder = os.environ.get(_CLAIM_HOLDER_ENV)
+    if holder:
+        return holder
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    if run_id:
+        return f"run:{run_id}"
+    try:
+        cwd = os.getcwd()
+    except OSError:
+        cwd = None
+    if cwd:
+        return f"tree:{cwd}"
+    return f"proc:{socket.gethostname()}:{os.getpid()}"
+
+
+_HOLDER_RE = re.compile(r"^holder: (.+)$", re.MULTILINE)
+
+
+def _parse_holder(message: str) -> str | None:
+    """Держатель из тела коммита замка. None — замок старого формата (#1190:
+    создан до этого изменения, строки `holder:` не несёт) — честно «неизвестен»,
+    не выдумывается и не приравнивается ни к своему, ни к чужому."""
+    match = _HOLDER_RE.search(message or "")
+    return match.group(1).strip() if match else None
 
 
 def task_of_ref(ref: str) -> int | None:
@@ -172,8 +242,27 @@ def is_stale(commit_date: str | datetime, now: datetime,
 # ── Claim / release ──────────────────────────────────────────────────────────────
 
 
+def _lock_state(repo: str, task: int) -> tuple[bool, str | None]:
+    """(существует ли замок, держатель или None). None-держатель при
+    exists=True — замок старого формата (создан до #1190, без строки
+    `holder:`) — третье состояние, вызывающий (claim/release) решает сам, что
+    с ним делать. Один GET единичного рефа + один GET коммита (не
+    `list_locks`/matching-refs — тому нужен весь список, здесь один номер)."""
+    try:
+        ref_obj = gh(f"repos/{repo}/git/ref/locks/task-{task}")
+    except GhError as error:
+        if _ref_missing(error):
+            return False, None
+        raise
+    if ref_obj is None:
+        return False, None
+    sha = ref_obj["object"]["sha"]
+    commit = gh(f"repos/{repo}/git/commits/{sha}")
+    return True, _parse_holder((commit or {}).get("message", ""))
+
+
 def claim(repo: str, task: int, actor: str, now: datetime | None = None,
-          via: str = "") -> ClaimResult:
+          via: str = "", holder: str | None = None) -> ClaimResult:
     """Атомарный захват задачи. Успех у ровно одного претендента; проигравший
     получает ClaimResult(claimed=False) и обязан закончиться зелёным no-op.
     Проигравший оставляет осиротевший коммит (ref на него не создан) — мусор
@@ -183,8 +272,13 @@ def claim(repo: str, task: int, actor: str, now: datetime | None = None,
     actor — назначаемый следом аккаунт, ОБЯЗАН быть валидным GitHub-логином
     (иначе назначение отклоняется и задача остаётся без исполнителя, а
     контракт PR требует назначение). via — свободная метка канала для следа
-    в задаче (логин у всех агентов один — различает каналы именно она)."""
+    в задаче (логин у всех агентов один — различает каналы именно она).
+    holder — идентификатор конкретного прогона/дерева (#1190, по умолчанию
+    `current_holder()`): при отказе позволяет отличить свой повторный claim
+    (идемпотентный успех) от чужого (именной отказ) от неизвестного (третье
+    состояние — замок старого формата)."""
     now = now or datetime.now(timezone.utc)
+    holder = holder or current_holder()
     ref = lock_ref(task)
     # Проверка на входе (не гвардия постфактум): закрытая задача не должна
     # снова уходить в аренду — иначе воркер/hands начинают работу над тем,
@@ -212,11 +306,16 @@ def claim(repo: str, task: int, actor: str, now: datetime | None = None,
         return ClaimResult(claimed=False, task=task,
                            detail=f"задача #{task} ждёт решения владельца (label waiting:owner) — аренда не выдана")
     # Замок указывает на собственный коммит: его date — время аренды (TTL).
+    # Вторая строка тела коммита несёт держателя (#1190) — не в первой строке
+    # со свободным текстом (там уже есть actor/via, парсить пришлось бы
+    # неоднозначно), а отдельной строкой `holder: <id>` с простым якорным
+    # regex'ом (_HOLDER_RE) без риска зацепить чужую подстроку.
     base = gh(f"repos/{repo}/commits/main")
     commit = gh(
         "-X", "POST", f"repos/{repo}/git/commits",
         "-f", f"message=lock: task #{task} claimed by {actor} at "
-              f"{now.isoformat(timespec='seconds')} (ttl {LOCK_TTL_HOURS}h)",
+              f"{now.isoformat(timespec='seconds')} (ttl {LOCK_TTL_HOURS}h)\n"
+              f"holder: {holder}",
         "-f", f"tree={base['commit']['tree']['sha']}",
         "-f", f"parents[]={base['sha']}",
     )
@@ -224,21 +323,42 @@ def claim(repo: str, task: int, actor: str, now: datetime | None = None,
         gh("-X", "POST", f"repos/{repo}/git/refs",
            "-f", f"ref={ref}", "-f", f"sha={commit['sha']}")
     except GhError as error:
-        # «Reference already exists» — замок уже стоит, отказ аренды. Прочие 422
+        # «Reference already exists» — замок уже стоит. Прочие 422
         # (validation_failed и т.п.) — поломка, а не «занято»: различаем по
         # тексту, симметрично _ref_missing() у release (класс #124-соседний:
         # один HTTP-код у GitHub отвечает за разные состояния).
         if error.status == 422 and "already exists" in str(error).lower():
-            return ClaimResult(claimed=False, task=task,
-                               detail=f"задача #{task} уже занята (замок {ref})")
+            _, existing_holder = _lock_state(repo, task)
+            if existing_holder == holder:
+                # Свой же держатель перезабирает (#1190): идемпотентный
+                # успех БЕЗ снятия и пересоздания замка — тот же процесс/
+                # дерево реально продолжает держать то, что уже держал.
+                return ClaimResult(
+                    claimed=True, task=task, holder=holder,
+                    detail=f"замок {ref} уже держит этот же держатель ({holder}) — "
+                           "переаренда идемпотентна, замок не тронут")
+            if existing_holder is None:
+                # Третье состояние: держателя нельзя установить (замок
+                # старого формата без строки `holder:`, созданный до #1190,
+                # или сам ref пропал между 422 и этим чтением). НЕ молчаливый
+                # успех и НЕ обычный именной отказ — безопасный дефолт: отказ,
+                # честно называющий причину неопределённости.
+                return ClaimResult(
+                    claimed=False, task=task, holder=None,
+                    detail=f"задача #{task} занята замком {ref}, но держатель неизвестен "
+                           "(замок старого формата без записи держателя, либо гонка чтения) — "
+                           "отказ безопасен по умолчанию, снимать чужой замок вслепую нельзя")
+            return ClaimResult(
+                claimed=False, task=task, holder=existing_holder,
+                detail=f"задача #{task} уже занята держателем {existing_holder} (замок {ref})")
         raise
     # Замок стоит — мы владельцы. Видимость: назначение и след в задаче.
     # Сбой видимости замок не отменяет (откат хуже отсутствия комментария),
     # но и не глотается: warning уходит в лог job'а.
     _visibility(repo, task, actor, f"🔒 Аренда задачи: `{actor}` держит замок `{ref}` "
-                                  f"(TTL {LOCK_TTL_HOURS} ч по коммиту замка)."
+                                  f"(TTL {LOCK_TTL_HOURS} ч по коммиту замка, держатель `{holder}`)."
                                   + (f" Канал: {via}." if via else ""))
-    return ClaimResult(claimed=True, task=task, detail=f"замок {ref} установлен")
+    return ClaimResult(claimed=True, task=task, holder=holder, detail=f"замок {ref} установлен (держатель {holder})")
 
 
 def _visibility(repo: str, task: int, actor: str, text: str) -> None:
@@ -254,8 +374,33 @@ def _visibility(repo: str, task: int, actor: str, text: str) -> None:
             print(f"::warning::видимость аренды #{task} неполная: {error}", file=sys.stderr)
 
 
-def release(repo: str, task: int) -> str:
+class ForeignLockError(RuntimeError):
+    """Снятие отказано (#1190): вызывающий назвал СВОЙ holder, но текущий
+    замок принадлежит другому (или неизвестному) держателю — вслепую снимать
+    чужой/неопределённый замок нельзя (живой случай #1190: канал снял чужой
+    замок, приняв его за свой, и оставил задачу без лока вовсе). Отдельный
+    класс, не GhError: это не сбой сети/сервера, а отказ по правилу владения —
+    вызывающий код (CLI) обязан отличать его от инфраструктурной поломки."""
+
+
+def release(repo: str, task: int, holder: str | None = None, force: bool = False) -> str:
     """Снять замок. Идемпотентно: отсутствующий замок — не ошибка.
+
+    holder=None (умолчание, поведение НЕ меняется #1190) — форс-снятие без
+    проверки владения: путь для решений, авторитетных независимо от того, кто
+    держит (после слияния PR — работа завершена; TTL-сборщик — замок протух
+    по времени). Оба вызывающих (scheduler.py) продолжают звать `release(repo,
+    task)` без изменений.
+
+    holder=<id>, force=False (путь CLI `release <N>`, #1190) — снятие ТОЛЬКО
+    если текущий замок держит именно этот holder; иначе `ForeignLockError`
+    (чужой держатель назван в сообщении) или, если держателя не установить
+    (замок старого формата), тот же класс с честной формулировкой
+    неопределённости — оба случая одинаково отказывают, разнится только текст.
+    Это и есть газ для «тормоза»: раньше единственным действием при путанице
+    было слепое снятие (класс #1190), теперь оно проверяемо безопасно по
+    умолчанию, а `force=True` — явный обход для того, кто уверен, что имеет
+    право (тот же контракт, что и `--force` у CLI: обход поимённый, не тихий).
 
     GitHub REST на DELETE несуществующего ref отвечает НЕ одним кодом:
     исторически документирован 404, но реально (проверено прогоном orchestra
@@ -263,6 +408,22 @@ def release(repo: str, task: int) -> str:
     один и тот же класс «рефа нет»; различать их нужно по семантике сообщения,
     а не по одному зашитому статусу, иначе withstand real-world ответа не будет.
     403/500 и прочие статусы — настоящая поломка, пробрасываются дальше."""
+    if holder is not None and not force:
+        exists, existing_holder = _lock_state(repo, task)
+        if existing_holder is not None and existing_holder != holder:
+            raise ForeignLockError(
+                f"замок task-{task} принадлежит держателю {existing_holder}, не тебе ({holder}) — "
+                f"снятие отказано; уверен, что можно снять — вызови с force=True")
+        if exists and existing_holder is None:
+            # Замок ЕСТЬ, но держателя не установить (замок старого формата
+            # без строки `holder:`) — третье состояние, то же, что у claim():
+            # безопасный дефолт — отказ, не молчаливое снятие вслепую.
+            # Рефа вообще нет — идемпотентный DELETE ниже сам скажет
+            # «отсутствовал», сюда доходить не нужно.
+            raise ForeignLockError(
+                f"замок task-{task} существует, но держатель неизвестен "
+                "(замок старого формата без записи держателя) — "
+                "снятие отказано по умолчанию; уверен, что можно снять — вызови с force=True")
     try:
         gh("-X", "DELETE", f"repos/{repo}/git/refs/locks/task-{task}")
     except WriteGateSkipped:
@@ -399,9 +560,11 @@ def current_actor() -> str:
 
 
 def main(argv: list[str]) -> int:
-    usage = ("использование: claim_task.py claim <N> | release <N> | release-full <N> "
-             "| status | locks (locks — номера задач под замком через пробел, для "
-             "выбора пула; release-full — снять и замок, и назначение, #422)")
+    usage = ("использование: claim_task.py claim <N> | release <N> [--force] | "
+             "release-full <N> | status | locks (locks — номера задач под замком через "
+             "пробел, для выбора пула; release-full — снять и замок, и назначение, #422; "
+             "release без --force снимает только СВОЙ замок (#1190, held по current_holder()) "
+             "— чужой/неизвестный держатель отказывает, назвав держателя; --force — явный обход)")
     if len(argv) < 2:
         print(f"::error::{usage}", file=sys.stderr)
         return EXIT_ERROR
@@ -411,14 +574,36 @@ def main(argv: list[str]) -> int:
         return EXIT_ERROR
     command = argv[1]
     try:
-        if command in ("claim", "release") and len(argv) == 3 and argv[2].isdigit():
+        if command == "claim" and len(argv) == 3 and argv[2].isdigit():
             task = int(argv[2])
-            if command == "claim":
-                result = claim(repo, task, current_actor(),
-                               via=os.environ.get("CLAIM_VIA", ""))
-                print(result.detail)
-                return EXIT_OK if result.claimed else EXIT_BUSY
-            print(release(repo, task))
+            result = claim(repo, task, current_actor(),
+                           via=os.environ.get("CLAIM_VIA", ""))
+            print(result.detail)
+            return EXIT_OK if result.claimed else EXIT_BUSY
+        if command == "release" and len(argv) in (3, 4) and argv[2].isdigit():
+            task = int(argv[2])
+            if len(argv) == 4 and argv[3] != "--force":
+                print(f"::error::{usage}", file=sys.stderr)
+                return EXIT_ERROR
+            force = len(argv) == 4
+            # Без --force (#1190): CLI проверяет владение — только СВОЙ
+            # держатель (current_holder()) снимает замок молча; чужой/
+            # неизвестный держатель отказывает громко, названным исходом
+            # (ForeignLockError), а не тихим снятием вслепую (класс #1190:
+            # раньше единственным действием было снять чужой замок, приняв
+            # его за свой). --force — явный обход, старое поведение без
+            # проверки (release_merged/release_full/collect_stale его не
+            # используют — они зовут release()/release_full() напрямую, а
+            # не через этот CLI-путь, поведение для них не меняется).
+            try:
+                if force:
+                    detail = release(repo, task)
+                else:
+                    detail = release(repo, task, holder=current_holder())
+            except ForeignLockError as error:
+                print(f"::error::{error}", file=sys.stderr)
+                return EXIT_BUSY
+            print(detail)
             return EXIT_OK
         if command == "release-full" and len(argv) == 3 and argv[2].isdigit():
             print(release_full(repo, int(argv[2])))
@@ -432,7 +617,11 @@ def main(argv: list[str]) -> int:
                 date = lock_commit_date(repo, lock["sha"])
                 age = lock_age_hours(date, now)
                 state = "ПРОТУХ" if is_stale(date, now) else "жив"
-                print(f"{lock['ref']}  {lock['sha'][:12]}  {age:.1f} ч  [{state}]")
+                # Держатель (#1190): NEIZVESTEN явно называет старый формат,
+                # не выдаёт пустую строку, которую легко принять за «свой».
+                commit = gh(f"repos/{repo}/git/commits/{lock['sha']}")
+                holder = _parse_holder((commit or {}).get("message", "")) or "НЕИЗВЕСТЕН (старый формат)"
+                print(f"{lock['ref']}  {lock['sha'][:12]}  {age:.1f} ч  [{state}]  держатель: {holder}")
             return EXIT_OK
     except RuntimeError as error:
         print(f"::error::claim_task: {error}", file=sys.stderr)
