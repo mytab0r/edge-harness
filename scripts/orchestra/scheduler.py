@@ -275,6 +275,18 @@ _rc_spec = importlib.util.spec_from_file_location(
 review_checklist = importlib.util.module_from_spec(_rc_spec)
 _rc_spec.loader.exec_module(review_checklist)
 
+# Реестр незакрытых находок ревью, ключ — файл (#1262, объединяет #1217) —
+# одно место правды в lib, общее с scripts/review/ai_review.py: тот читает
+# реестр при сборке промпта (contents: read хватает) и разбирает
+# НАХОДКА-ЗАКРЫТА из ответа модели в факт шапки комментария; ТОЛЬКО этот
+# модуль — единственная точка мутации самого реестра (после_merge здесь,
+# contents: write есть у orchestra.yml целиком, у job'а ai-review verdict —
+# нет, #939 не возвращает issues: write и подавно не даёт contents: write).
+_rf_spec = importlib.util.spec_from_file_location(
+    "review_findings", Path(__file__).resolve().parents[1] / "lib" / "review_findings.py")
+review_findings = importlib.util.module_from_spec(_rf_spec)
+_rf_spec.loader.exec_module(review_findings)
+
 # Единственное место правды на заведение issue пула (#526): без него labels
 # без `task` собирались бы копией той же проверки, что уже есть у
 # file_tasks.py/stall_detector.py/upstream_drift.py — вместо этого все
@@ -2413,45 +2425,49 @@ def after_merge(
         archive_lines, hard_failure = archive_runner_sessions(task_numbers)
         actions += archive_lines
         hard_failure = hard_failure or note_hard_failure
-    # Чеклист некритичных замечаний ревью (#462, третья категория находок):
-    # незакрытые пункты НЕ блокировали слияние (иначе некритичное стало бы
-    # критичным и вернуло бы конвейер к вечным кругам, тот же класс решения,
-    # что у review:large) и НЕ теряются молча — ОДНА задача-хвост со ссылкой
-    # на PR, не issue на каждый пункт. `pull.get("body")` (не отдельный
-    # перезапрос) — тело PR несёт чеклист уже с момента ai:ok (гейт слияния
-    # требует его до того, как PR вообще попадёт в очередь на слияние), а не
-    # изменяется в промежутке между списком PR и этим моментом.
+    # Реестр незакрытых находок ревью, ключ файл (#1262, объединяет #1217):
+    # незакрытые пункты чеклиста НЕ блокировали слияние (иначе некритичное
+    # стало бы критичным, тот же класс решения, что у review:large) и не
+    # теряются молча — но носитель СМЕНИЛСЯ: раньше здесь заводилась ОДНА
+    # задача-хвост пула («Хвост чеклиста ревью PR #N», create_pool_issue);
+    # замер 2026-09-14 (#1262) — 110 таких задач открыты, 0 когда-либо взято
+    # в работу (пул — самый дефицитный ресурс, не носитель для находки ценой
+    # в одну строку). Эта правка НЕ зовёт create_pool_issue для хвоста
+    # вовсе — гвардия test_scheduler.py::
+    # test_after_merge_never_calls_create_pool_issue_for_review_findings
+    # красит мутацией (верни вызов — тест покраснеет, доказано исполнением,
+    # см. MUTATION-PROOF в теле теста).
+    #
+    # `pull.get("body")` (не отдельный перезапрос) — тело PR несёт и чеклист,
+    # и маркер закрытых находок уже с момента ai:ok (гейт слияния требует их
+    # до того, как PR вообще попадёт в очередь на слияние), а не изменяется
+    # в промежутке между списком PR и этим моментом. resolved_ids — маркер
+    # `<!-- ai-review:resolved-findings:... -->` в теле PR
+    # (review_findings.merge_resolved_marker пишет его при вердикте) — не
+    # сетевой запрос: ai_review.py::cmd_verdict сам реестр не пишет
+    # (contents: read у job'а verdict, не write, #939), только маркер в
+    # теле — мутация реестра происходит здесь, в единственной точке записи.
     try:
-        unresolved = review_checklist.unresolved_items(pull.get("body") or "")
-        if unresolved:
-            tail_title = review_checklist.tail_issue_title(number)
-            open_titles = {
-                issue["title"]
-                for issue in review_labels.list_pages(
-                    # Литерал через место правды кодирования — тот же класс
-                    # #938: двоеточия в `task` сегодня нет, завтрашняя метка
-                    # с двоеточием сломалась бы здесь молча.
-                    f"repos/{repo}/issues?state=open&labels="
-                    f"{review_labels.label_query_value(TASK_LABEL)}&per_page=100", gh)
-                if "pull_request" not in issue
-            }
-            if tail_title in open_titles:
-                observations.append(
-                    f"ℹ️ хвост чеклиста PR #{number}: задача уже заведена (идемпотентность по заголовку)")
-            else:
-                created = pool_issue.create_pool_issue(
-                    gh, repo, tail_title,
-                    review_checklist.tail_issue_body(repo, number, unresolved),
-                    ["task"],
-                )
+        unresolved = review_checklist.unresolved_findings(pull.get("body") or "")
+        resolved_ids = review_findings.parse_resolved_marker(pull.get("body") or "")
+        if unresolved or resolved_ids:
+            result = review_findings.sync_after_merge(
+                gh, repo, number, unresolved, resolved_ids,
+                datetime.now(timezone.utc).isoformat())
+            if result["added"] or result["closed"]:
                 actions.append(
-                    f"📋 хвост чеклиста PR #{number}: заведена #{created['number']} "
-                    f"({len(unresolved)} незакрытых пунктов)")
+                    f"📋 реестр находок PR #{number}: +{len(result['added'])} "
+                    f"открыто, -{len(result['closed'])} закрыто "
+                    f"({result['skipped']} пунктов без ФАЙЛ не перенесены)")
+            elif result["skipped"]:
+                observations.append(
+                    f"ℹ️ реестр находок PR #{number}: {result['skipped']} незакрытых "
+                    "пунктов без ФАЙЛ — остались только в чеклисте PR")
     except RuntimeError as error:
         # Мерж уже состоялся — недоступность GitHub здесь не откатывает его,
         # но и не молчит: видимое ⚠️ в отчёте, тот же приём, что у release
         # замка/напоминания выше в этой функции.
-        observations.append(f"⚠️ хвост чеклиста PR #{number} не заведён: {error}")
+        observations.append(f"⚠️ реестр находок PR #{number} не обновлён: {error}")
     remaining_observations, remaining_actions = update_remaining_pulls(repo, pull["number"], other_pulls or [])
     observations += remaining_observations
     actions += remaining_actions
