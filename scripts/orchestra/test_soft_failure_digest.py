@@ -222,7 +222,12 @@ def test_step_display_name_uses_name_or_falls_back_to_run_uses():
     assert sfd.step_display_name({}) == "?"
 
 
-def test_load_conditional_steps_only_collects_steps_with_explicit_if(tmp_path):
+def test_load_workflow_layout_only_collects_steps_with_explicit_if(tmp_path):
+    """Шестой круг ревью PR #1136: `load_conditional_steps` был мёртвым
+    дублем этой функции в прод-пути (`collect_window` реально вызывает
+    `load_workflow_layout`) — тест перенесён на прод-путь, чтобы живая
+    гвардия ниже (`test_load_workflow_layout_real_deploy_workflow_names_
+    rollback_step`) проверяла ТУ ЖЕ функцию, что использует канал B."""
     workflow_text = """
 jobs:
   deploy:
@@ -240,21 +245,27 @@ jobs:
 """
     path = tmp_path / "deploy-dsh-edge.yml"
     path.write_text(workflow_text, encoding="utf-8")
-    result = sfd.load_conditional_steps(path)
-    assert result == {"deploy": {"Автооткат прода"}}
+    result = sfd.load_workflow_layout(path)
+    assert result["deploy"]["conditional"] == {"Автооткат прода"}
+    assert result["other"]["conditional"] == set()
 
 
-def test_load_conditional_steps_missing_file_returns_empty(tmp_path):
-    assert sfd.load_conditional_steps(tmp_path / "nope.yml") == {}
+def test_load_workflow_layout_missing_file_returns_empty(tmp_path):
+    assert sfd.load_workflow_layout(tmp_path / "nope.yml") == {}
 
 
-def test_load_conditional_steps_real_deploy_workflow_names_rollback_step():
+def test_load_workflow_layout_real_deploy_workflow_names_rollback_step():
     """Живая гвардия: реальный `.github/workflows/deploy-dsh-edge.yml`
     обязан по-прежнему нести явный `if:` на шаге автооткота — иначе канал B
-    (см. `collect_window`) молча перестаёт видеть finding #1 issue #1121."""
+    (см. `collect_window`) молча перестаёт видеть finding #1 issue #1121.
+    Проверяет ПРОД-путь (`load_workflow_layout`, вызывается из
+    `collect_window`), не отдельный неиспользуемый парсер (находка ревью
+    PR #1136, круг 6: до этой правки гвардия проверяла
+    `load_conditional_steps`, мёртвый в прод-пути дубль — поломка
+    настоящего `load_workflow_layout` прошла бы мимо неё молча)."""
     path = sfd.REPO_ROOT / ".github" / "workflows" / "deploy-dsh-edge.yml"
-    result = sfd.load_conditional_steps(path)
-    assert "Автооткат прода при красной канарейке/смоуке" in result.get("deploy", set())
+    result = sfd.load_workflow_layout(path)
+    assert "Автооткат прода при красной канарейке/смоуке" in result.get("deploy", {}).get("conditional", set())
 
 
 def test_add_step_occurrences_only_for_conditional_steps():

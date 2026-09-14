@@ -2867,7 +2867,7 @@ def check_pipeline_status_marker_impersonation(comments: list[dict]) -> list[dic
 # одинаково), значение — МЕХАНИЗМ, который читает красный исход шага.
 # Запись вида «читателя нет» внести нельзя — инвариант существует ровно для
 # того, чтобы такое состояние было невозможно молча. Честная оговорка
-# (см. докстринг инварианта 19): правдивость текста машиной не проверяется —
+# (см. докстринг инварианта 20): правдивость текста машиной не проверяется —
 # её держит ревью.
 CONTINUE_ON_ERROR_READERS: dict[tuple[str, str], str] = {
     ("deploy-worker.yml", "Автооткат прода при красной канарейке"):
@@ -2977,7 +2977,7 @@ def check_continue_on_error_readers(workflows_dir: Path) -> list[dict]:
                     continue
                 step_name = digest.step_display_name(step)
                 if name in digest.DIGEST_WORKFLOWS:
-                    continue  # читатель — дайджест (канал A/B), докстринг инварианта 19
+                    continue  # читатель — дайджест (канал A/B), докстринг инварианта 20
                 if CONTINUE_ON_ERROR_READERS.get((name, step_name)):
                     continue  # читатель объявлен в реестре
                 violations.append({"kind": "no-reader", "workflow": name,

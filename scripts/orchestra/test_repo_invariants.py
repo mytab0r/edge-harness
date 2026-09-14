@@ -4097,7 +4097,13 @@ def test_registered_reader_keys_match_real_workflows():
             if not isinstance(job, dict):
                 continue
             for step in (job.get("steps") or []):
-                if isinstance(step, dict) and step.get("continue-on-error") is True:
+                # Некритичная находка ревью PR #1136 (шестой круг): буквальный
+                # `is True` не видит формы, которые сама проверка
+                # (`_continue_on_error_active`) уже признаёт активной
+                # маскировкой (`"${{ … }}"`, `'true'` в кавычках) — гвардия
+                # антипротухания реестра иначе объявляла бы ЗАРЕГИСТРИРОВАННУЮ
+                # запись «протухшей» ложно.
+                if isinstance(step, dict) and ri._continue_on_error_active(step.get("continue-on-error")):
                     real_keys.add((path.name, digest.step_display_name(step)))
     for key in ri.CONTINUE_ON_ERROR_READERS:
         assert key in real_keys, (
@@ -4120,5 +4126,5 @@ def test_live_debt_snapshot_known_violations():
         ("plugin-forge.yml", "plugin_status → failed (если форж упал)"),
     }
     assert found == expected, (
-        f"замер долга инварианта 19 уехал: {sorted(found ^ expected)} — "
+        f"замер долга инварианта 20 уехал: {sorted(found ^ expected)} — "
         "обнови ожидание осознанно (новый шаг без читателя или шаг получил читателя)")
