@@ -2583,6 +2583,34 @@ WORKER_SILENCE_MINUTES = 150
 # подтверждённого роста).
 WORKER_PROGRESS_MARKER_PREFIX = "[прогресс воркера: run "
 
+# Находка ai-review PR #1089 (третий раунд, блокирующая): «маркера для этого
+# run_id не найдено» — двузначно. Либо это ГЕНУИННО первое наблюдение
+# (прогон только что получил коррелированную задачу — законная база), либо
+# маркер СУЩЕСТВОВАЛ, но выпал из окна чтения (`all_issue_comments(...,
+# max_pages=3)` — последние ~300 комментариев #120): PATCH обновляет
+# `updated_at`, но не поднимает комментарий в хвост списка, и если после
+# создания маркера в #120 пришло ≥300 чужих комментариев (живой темп при
+# инциденте #1100 — 114 дублей одного маркера, то есть >100/час уже
+# случалось), маркер этого run_id больше не виден. Старый код трактовал
+# «не найдено» ВСЕГДА как первое (безопасное) наблюдение — писал НОВЫЙ
+# базовый маркер и возвращал «подтверждённо жив», что ОДНОВРЕМЕННО обнуляло
+# часы тишины (новый маркер) И снимало возрастной потолок («жив») — зависший
+# прогон с выпавшим маркером не ловился НИ ОДНИМ из двух ножей, строго хуже
+# прежнего (возрастного-only) поведения.
+#
+# Различение: если прогону уже ЗАВЕДОМО было о чем писать маркер (он старше
+# одного цикла пульсов) и маркера всё равно нет — это подозрительно
+# (выпадение из окна, а не факт «прогон только что начался»), деградация,
+# не «жив». WORKER_SILENCE_BASELINE_GRACE_MINUTES = 30 — 2 интервала пульса
+# orchestra (cron */15, `.github/workflows/orchestra.yml`) с запасом на один
+# пропущенный/задержанный тик: reap_stalled_worker_run резолвит задачу и
+# зовёт это наблюдение с САМОГО ПЕРВОГО пульса, у которого есть
+# коррелированная задача (см. правку раунда 1), значит легитимная база
+# обязана появиться уже на первом-втором пульсе — 30 минут кладёт запас,
+# не удлиняя реальное окно обнаружения тишины (150 мин) сколько-нибудь
+# заметно.
+WORKER_SILENCE_BASELINE_GRACE_MINUTES = 30
+
 
 def _session_progress_tip(session_id: str) -> tuple[int | None, str | None]:
     """Максимальный `seq` хвоста сессии `harness-<N>` в морде dsh-edge
@@ -2629,7 +2657,7 @@ def _session_progress_tip(session_id: str) -> tuple[int | None, str | None]:
 
 
 def _worker_silence_reason(
-    repo: str, run_id: int, task_number: int, now: datetime,
+    repo: str, run_id: int, task_number: int, now: datetime, run_age_minutes: float,
 ) -> tuple[str | None, str | None]:
     """Признак тишины (#1085) для ОДНОГО прогона/задачи: сессия
     `harness-<task_number>` не пишет новых событий WORKER_SILENCE_MINUTES
@@ -2639,16 +2667,25 @@ def _worker_silence_reason(
     WORKER_SILENCE_MINUTES, и тишина не могла бы сработать раньше 2×порога,
     то есть позже возрастного потолка.
 
+    `run_age_minutes` — возраст ПРОГОНА (не маркера), нужен ТОЛЬКО чтобы
+    отличить «маркера нет, потому что прогон только начался» (легитимная
+    база) от «маркера нет, хотя прогон уже достаточно стар, чтобы он
+    существовал» (подозрительно — выпал из окна чтения, см.
+    WORKER_SILENCE_BASELINE_GRACE_MINUTES) — второе НЕ считается
+    подтверждением жизни (третий раунд ai-review PR #1089).
+
     Возвращает (reason, observation):
       - `reason` не None → прогон признан зависшим по тишине;
       - `observation` не None → признак недоступен в этом пульсе (сеть,
-        логин, маркеры, повреждённый маркер) — строка для отчёта, решение
-        остаётся за возрастным порогом (см. reap_stalled_worker_run).
-    Оба None → сессия ПОДТВЕРЖДЁННО жива (seq вырос либо это первое
-    наблюдение за этим run_id — базовая точка, сравнивать пока не с чем):
-    вызывающий обязан НЕ применять возрастной потолок в этом случае — растёт
-    сессия, растёт и допустимый возраст (до жёсткой стены GitHub, которую
-    контролирует не этот код, а timeout-minutes самого job'а)."""
+        логин, маркеры, повреждённый или пропавший маркер) — строка для
+        отчёта, решение остаётся за возрастным порогом (см.
+        reap_stalled_worker_run).
+    Оба None → сессия ПОДТВЕРЖДЁННО жива (seq вырос либо это ГЕНУИННО первое
+    наблюдение за этим run_id — прогон младше WORKER_SILENCE_BASELINE_GRACE_
+    MINUTES, базовая точка, сравнивать пока не с чем): вызывающий обязан НЕ
+    применять возрастной потолок в этом случае — растёт сессия, растёт и
+    допустимый возраст (до жёсткой стены GitHub, которую контролирует не
+    этот код, а timeout-minutes самого job'а)."""
     session_id = f"harness-{task_number}"
     seq, error = _session_progress_tip(session_id)
     if error is not None:
@@ -2666,6 +2703,18 @@ def _worker_silence_reason(
         )
     own = [comment for comment in comments if (comment.get("body") or "").startswith(marker_prefix)]
     if not own:
+        if run_age_minutes >= WORKER_SILENCE_BASELINE_GRACE_MINUTES:
+            # Прогон уже достаточно стар, чтобы маркер обязан был появиться
+            # раньше (см. WORKER_SILENCE_BASELINE_GRACE_MINUTES) — отсутствие
+            # НЕ трактуется как «жив», это подозрение на выпадение из окна
+            # чтения (находка ai-review PR #1089, раунд 3): решение остаётся
+            # на возрастном пороге, а не молчаливое «жив».
+            return None, (
+                f"⚠️ маркер прогресса воркера в #{WATCHDOG_ISSUE} не найден при возрасте "
+                f"{int(run_age_minutes)} мин (ожидалась база раньше — либо не была "
+                "записана, либо выпала из окна последних комментариев) — решение "
+                "остаётся на возрастном пороге"
+            )
         try:
             post_issue_comment(repo, WATCHDOG_ISSUE, f"{marker_prefix}seq={seq}]")
         except RuntimeError as error:
@@ -2859,7 +2908,7 @@ def reap_stalled_worker_run(
     task_number = _stalled_run_task_number(repo, pool, pulls, start)
     reason = None
     if task_number is not None:
-        silence_reason, observation = _worker_silence_reason(repo, run_id, task_number, now)
+        silence_reason, observation = _worker_silence_reason(repo, run_id, task_number, now, age_minutes)
         if observation is not None:
             observations.append(observation)
             if _run_is_stalled(run, now):

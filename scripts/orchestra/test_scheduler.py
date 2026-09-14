@@ -5597,7 +5597,9 @@ def test_worker_silence_reason_first_observation_posts_baseline_marker(monkeypat
         "repos/mytab0r/edge-harness/issues/120": {"comments": 0},
     })
     patch_gh(monkeypatch, fake)
-    reason, observation = sch._worker_silence_reason(REPO, 999, 1085, utc(2026, 9, 13, 8, 0))
+    # Возраст 5 мин — заведомо младше WORKER_SILENCE_BASELINE_GRACE_MINUTES
+    # (30): генуинное первое наблюдение, база пишется без вопросов.
+    reason, observation = sch._worker_silence_reason(REPO, 999, 1085, utc(2026, 9, 13, 8, 0), 5)
     assert reason is None
     assert observation is None
     assert any(c.startswith("-X POST") and "issues/120/comments" in c for c in fake.calls)
@@ -5618,7 +5620,7 @@ def test_worker_silence_reason_seq_growth_is_not_stalled_and_updates_marker(monk
         "repos/mytab0r/edge-harness/issues/120": {"comments": 1},  # #1100: метаданные ДО страниц
     })
     patch_gh(monkeypatch, fake)
-    reason, observation = sch._worker_silence_reason(REPO, 999, 1085, utc(2026, 9, 13, 8, 0))
+    reason, observation = sch._worker_silence_reason(REPO, 999, 1085, utc(2026, 9, 13, 8, 0), 160)
     assert reason is None
     assert observation is None
     assert any(c.startswith("-X PATCH") and "issues/comments/555" in c for c in fake.calls)
@@ -5635,7 +5637,7 @@ def test_worker_silence_reason_unchanged_seq_under_threshold_is_not_stalled(monk
         "repos/mytab0r/edge-harness/issues/120": {"comments": 1},  # #1100: метаданные ДО страниц
     })
     patch_gh(monkeypatch, fake)
-    reason, observation = sch._worker_silence_reason(REPO, 999, 1085, utc(2026, 9, 13, 8, 0))
+    reason, observation = sch._worker_silence_reason(REPO, 999, 1085, utc(2026, 9, 13, 8, 0), 160)
     assert reason is None
     assert observation is None
     assert not any(c.startswith("-X POST") for c in fake.calls)  # без изменений — лишний маркер не пишем
@@ -5651,7 +5653,7 @@ def test_worker_silence_reason_unchanged_seq_past_threshold_is_stalled(monkeypat
         "repos/mytab0r/edge-harness/issues/120": {"comments": 1},  # #1100: метаданные ДО страниц
     })
     patch_gh(monkeypatch, fake)
-    reason, observation = sch._worker_silence_reason(REPO, 999, 1085, utc(2026, 9, 13, 8, 0))
+    reason, observation = sch._worker_silence_reason(REPO, 999, 1085, utc(2026, 9, 13, 8, 0), 180)
     assert observation is None
     assert reason is not None
     assert "harness-1085" in reason and "seq=10" in reason and "тишина" in reason
@@ -5661,7 +5663,7 @@ def test_worker_silence_reason_session_progress_unavailable_degrades_to_observat
     monkeypatch.setattr(sch, "_session_progress_tip", lambda session_id: (None, "морда недоступна: сеть"))
     fake = FakeGh({})
     patch_gh(monkeypatch, fake)
-    reason, observation = sch._worker_silence_reason(REPO, 999, 1085, utc(2026, 9, 13, 8, 0))
+    reason, observation = sch._worker_silence_reason(REPO, 999, 1085, utc(2026, 9, 13, 8, 0), 5)
     assert reason is None
     assert observation is not None and "недоступен" in observation
     assert fake.calls == []  # признак недоступен — WATCHDOG_ISSUE даже не читаем
@@ -5673,9 +5675,33 @@ def test_worker_silence_reason_marker_read_failure_degrades_to_observation(monke
     monkeypatch.setattr(sch, "_session_progress_tip", lambda session_id: (10, None))
     fake = FakeGh({"repos/mytab0r/edge-harness/issues/120": RuntimeError("gh api ...: HTTP 500")})
     patch_gh(monkeypatch, fake)
-    reason, observation = sch._worker_silence_reason(REPO, 999, 1085, utc(2026, 9, 13, 8, 0))
+    reason, observation = sch._worker_silence_reason(REPO, 999, 1085, utc(2026, 9, 13, 8, 0), 5)
     assert reason is None
     assert observation is not None and "не прочитаны" in observation
+
+
+def test_worker_silence_reason_missing_marker_past_grace_degrades_not_alive(monkeypatch):
+    # Находка ai-review PR #1089 (раунд 3, блокирующая): маркер, СУЩЕСТВОВАВШИЙ
+    # раньше, но выпавший из окна max_pages=3 (шторм других комментариев в
+    # #120 — живой темп #1100, 114 дублей), НЕ должен читаться как «генуинное
+    # первое наблюдение» — старый код писал бы НОВЫЙ базовый маркер и
+    # возвращал «подтверждённо жив», обнуляя часы тишины И снимая возрастной
+    # потолок одновременно. Возраст прогона (200 мин) заведомо старше
+    # WORKER_SILENCE_BASELINE_GRACE_MINUTES (30) — маркер обязан был уже
+    # существовать; раз его нет в окне — деградация, не «жив».
+    monkeypatch.setattr(sch, "_session_progress_tip", lambda session_id: (10, None))
+    fake = FakeGh({
+        "issues/120/comments?per_page=100": [],  # окно последних страниц — маркера в нём нет
+        "repos/mytab0r/edge-harness/issues/120": {"comments": 400},  # но #120 давно вырос за окно
+    })
+    patch_gh(monkeypatch, fake)
+    reason, observation = sch._worker_silence_reason(REPO, 999, 1085, utc(2026, 9, 13, 8, 0), 200)
+    assert reason is None
+    assert observation is not None and "не найден" in observation and "200" in observation
+    assert not any(c.startswith("-X POST") for c in fake.calls), (
+        "подозрительное отсутствие маркера не должно порождать НОВУЮ базу — "
+        "это смаскировало бы факт деградации как «жив»"
+    )
 
 
 # ── reap_stalled_worker_run x тишина (#1085): ловит зависание РАНЬШЕ возраста ─────

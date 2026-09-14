@@ -205,11 +205,14 @@ def test_case1_mutated_gate_form_must_not_give_reachable(label, gate_line):
     assert verdict.status == "unreachable", f"форма «{label}»: {verdict.detail}"
 
 
-def test_case1_no_false_positive_on_current_worktree_scheduler():
-    """На текущем main/рабочем дереве этой пары констант ещё нет вовсе (PR
-    #1089, задача #1085, не влит на момент этого PR) — guard обязан сказать
-    "not_applicable" (проверка не выполнялась), а НЕ "reachable" (что было
-    бы враньём — по факту пары constants нет)."""
+def test_case1_live_worktree_scheduler_stays_reachable():
+    """#1085 (PR #1089) уже несёт пару WORKER_SILENCE_MINUTES/WORKER_STALL_
+    MINUTES в живом scheduler.py этого дерева (заменяет прежнюю "not_
+    applicable"-версию теста, писавшуюся ДО того, как #1089 довели фиксом —
+    см. историю этого файла) — живая регрессионная гвардия: КАЖДЫЙ пульс
+    резолвит task_number без возрастного гейта (round 1 фикса #1089), поэтому
+    вердикт обязан оставаться "reachable" с тем же min=WORKER_SILENCE_MINUTES
+    (150), не откатываться к "unreachable" (300, находка ai-review) молча."""
     live_path = REPO_ROOT / "scripts" / "orchestra" / "scheduler.py"
     source = live_path.read_text(encoding="utf-8")
     verdict = rg.check_gate_then_duration_pair(
@@ -219,10 +222,11 @@ def test_case1_no_false_positive_on_current_worktree_scheduler():
         fast_const="WORKER_SILENCE_MINUTES",
         slow_const="WORKER_STALL_MINUTES",
     )
-    assert verdict.status == "not_applicable", (
-        f"неожиданно {verdict.status} — если #1089 уже влит, обнови фикстуру/тест "
-        f"(constants теперь есть в живом scheduler.py): {verdict.detail}"
+    assert verdict.status == "reachable", (
+        f"неожиданно {verdict.status} (не 'reachable') — регресс класса issue #1172 "
+        f"на живом scheduler.py этого PR: {verdict.detail}"
     )
+    assert verdict.min_reachable_minutes == 150.0, verdict.detail
 
 
 # ── Случай 3 (issue #1172): dsh-ci.sh, INVALID_API_KEY как стоп-класс ───────

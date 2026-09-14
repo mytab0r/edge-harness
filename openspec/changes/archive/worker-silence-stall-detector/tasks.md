@@ -26,6 +26,12 @@
       база пишется с раннего пульса, не с 150-й минуты).
 - [x] `scripts/lib/test_pagination_guard.py::ALLOWED_SINGLE_PAGE_CALLS` —
       запись для `_active_worker_run` (вынесен из `stalled_worker_run`).
+- [x] `scheduler.py::_worker_silence_reason`/`WORKER_SILENCE_BASELINE_
+      GRACE_MINUTES` — «маркера нет» отличает генуинное первое наблюдение
+      (прогон младше 30 мин) от подозрительного отсутствия (прогон старше,
+      маркер выпал из окна `max_pages` под шторм других комментариев #120)
+      — второе НЕ подтверждает жизнь, деградация к возрастному порогу
+      (найдено ai-review PR #1089, третий раунд, блокирующая находка).
 - [x] Дельта-спека `specs/journal-tasks-hands/spec.md`.
 - [x] `python -m pytest scripts/orchestra/test_scheduler.py scripts/lib/test_pagination_guard.py -q` — зелёные.
 
