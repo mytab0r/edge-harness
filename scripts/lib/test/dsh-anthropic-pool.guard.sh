@@ -830,9 +830,16 @@ EOF
 dsh: SERVER: 503 {"type":"error","error":{"type":"pool_unavailable","message":"No Anthropic account is available","retryAt":null,"reason":"unknown","accounts":[]}}
 EOF
   # Прод-форма ДО патча #1192 (живой прогон 34792555573 — ровно этот текст) —
-  # поле reason отсутствует физически, не пустая строка.
+  # тело pool_unavailable ЕСТЬ, поле reason отсутствует физически.
   cat >"$WORK18/err_no_reason.txt" <<'EOF'
 dsh: SERVER: 503 {"type":"error","error":{"type":"pool_unavailable","message":"No Anthropic account is available","retryAt":1789345764948}}
+EOF
+  # Отказ пула СОВСЕМ ДРУГОЙ природы (таймаут до локального прокси) — тела
+  # pool_unavailable в stderr нет вовсе. Находка ai-review PR #1193: сообщение
+  # не имеет права утверждать «поле reason отсутствует В ОТВЕТЕ ПУЛА», если
+  # само тело pool_unavailable не было замечено вовсе — это разные факты.
+  cat >"$WORK18/err_unrelated.txt" <<'EOF'
+dsh: connect ECONNREFUSED 127.0.0.1:47291
 EOF
 
   note_auth=$(dsh_pool_unavailable_owner_note "$WORK18/err_auth.txt")
@@ -840,12 +847,14 @@ EOF
   note_network=$(dsh_pool_unavailable_owner_note "$WORK18/err_network.txt")
   note_unknown=$(dsh_pool_unavailable_owner_note "$WORK18/err_unknown.txt")
   note_no_reason=$(dsh_pool_unavailable_owner_note "$WORK18/err_no_reason.txt")
+  note_unrelated=$(dsh_pool_unavailable_owner_note "$WORK18/err_unrelated.txt")
 
   echo "18) auth_rejected: $note_auth"
   echo "18) rate_limited:  $note_rate"
   echo "18) network_error: $note_network"
   echo "18) unknown:       $note_unknown"
   echo "18) без reason:    $note_no_reason"
+  echo "18) не пул вовсе:  $note_unrelated"
 
   [[ "$note_auth" == *"владелец нужен"* ]] || { echo "::error::18) auth_rejected обязан назвать «владелец нужен»: $note_auth" >&2; exit 1; }
   [[ "$note_auth" == *"ANTHROPIC_OAUTH_1"* && "$note_auth" == *"ANTHROPIC_OAUTH_2"* ]] || { echo "::error::18) auth_rejected обязан назвать имена секретов на перевыпуск: $note_auth" >&2; exit 1; }
@@ -859,6 +868,14 @@ EOF
   # наугад.
   [[ "$note_no_reason" == *"не классифицирована"* ]] || { echo "::error::18) без поля reason (прод-форма ДО патча) сообщение обязано признать пробел, не угадывать: $note_no_reason" >&2; exit 1; }
   [[ "$note_no_reason" != *"владелец нужен"* && "$note_no_reason" != *"владелец НЕ нужен"* ]] || { echo "::error::18) без поля reason сообщение НЕ должно утверждать о владельце ни в одну сторону (это и есть гадание) — $note_no_reason" >&2; exit 1; }
+  [[ "$note_no_reason" == *"тело pool_unavailable есть"* ]] || { echo "::error::18) без поля reason (тело pool_unavailable ЕСТЬ) сообщение обязано это отличать от «тела вовсе не было»: $note_no_reason" >&2; exit 1; }
+  # Отказ пула другой природы — тела pool_unavailable в stderr нет вовсе;
+  # сообщение НЕ должно утверждать «поле reason отсутствует В ОТВЕТЕ ПУЛА»
+  # (это факт, который в этом случае не проверялся — ai-review PR #1193).
+  [[ "$note_unrelated" == *"не классифицирована"* ]] || { echo "::error::18) без тела pool_unavailable сообщение обязано признать пробел, не угадывать: $note_unrelated" >&2; exit 1; }
+  [[ "$note_unrelated" != *"владелец нужен"* && "$note_unrelated" != *"владелец НЕ нужен"* ]] || { echo "::error::18) без тела pool_unavailable сообщение НЕ должно утверждать о владельце ни в одну сторону — $note_unrelated" >&2; exit 1; }
+  [[ "$note_unrelated" == *"pool_unavailable в stderr не найдено"* ]] || { echo "::error::18) без тела pool_unavailable сообщение обязано назвать именно ЭТОТ факт (не «поле reason отсутствует В ответе», которого не было): $note_unrelated" >&2; exit 1; }
+  [ "$note_unrelated" != "$note_no_reason" ] || { echo "::error::18) «тела нет вовсе» и «тело есть, поля reason нет» дали ОДИНАКОВЫЙ текст — разные факты, разные сообщения" >&2; exit 1; }
 ) || fail "18) dsh_pool_unavailable_owner_note не различает исходы либо гадает при отсутствии reason"
 echo "GUARD(anthropic-pool): 18) dsh_pool_unavailable_owner_note — пять исходов различены буквально, без reason — честный пробел, не гадание — ок (#1192)"
 

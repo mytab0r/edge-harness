@@ -1582,8 +1582,16 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
 #   reason=unknown/поле отсутствует — плагин сам не смог классифицировать,
 #     либо патч не применился/апстрим сменил форму — так и сказано, без
 #     подстановки одной из трёх гипотез выше вместо честного пробела.
+#
+# Отказ пула МОЖЕТ вообще не быть отказом `pool_unavailable` (таймаут,
+# ошибка соединения с локальным прокси, что угодно другое) — сообщение
+# «поле reason отсутствует» иначе утверждало бы факт (тело pool_unavailable
+# было и не несло reason), который в этом случае не проверялся: сначала
+# смотрим, есть ли в stderr вообще тело `pool_unavailable`, и только тогда
+# говорим про отсутствующее поле — иначе честно называем, что тела не нашли.
 dsh_pool_unavailable_owner_note() { # err_file
-  local err_file=$1 pool_reason pool_retry_at retry_note note
+  local err_file=$1 pool_reason pool_retry_at retry_note note has_body=0
+  grep -q '"type":"pool_unavailable"' "$err_file" 2>/dev/null && has_body=1
   pool_reason=$(grep -oE '"reason":"[a-z_]+"' "$err_file" 2>/dev/null | head -1 | sed -E 's/.*"reason":"([a-z_]+)".*/\1/') || pool_reason=""
   case "$pool_reason" in
     auth_rejected)
@@ -1604,7 +1612,11 @@ dsh_pool_unavailable_owner_note() { # err_file
       note="причина не установлена: ни один аккаунт пула не получил ответ от Anthropic в этом процессе (не подтверждено, нужен ли владелец)"
       ;;
     "")
-      note="причина не классифицирована — поле reason отсутствует в ответе пула (патч classifyPoolUnavailable не применился либо форма pool_unavailable изменилась), не подтверждено, нужен ли владелец"
+      if [ "$has_body" = 1 ]; then
+        note="причина не классифицирована — тело pool_unavailable есть, но без поля reason (патч classifyPoolUnavailable не применился либо форма ответа изменилась), не подтверждено, нужен ли владелец"
+      else
+        note="причина не классифицирована — тело pool_unavailable в stderr не найдено (отказ пула, возможно, по другой причине), не подтверждено, нужен ли владелец"
+      fi
       ;;
     *)
       note="причина не распознана (reason='$pool_reason', неизвестный класс) — не подтверждено, нужен ли владелец"
