@@ -557,11 +557,16 @@ def should_run_ai_review(current_labels, stored_fingerprint: str | None,
 # фактически ответившего, и даты сброса опробованных — читает
 # scheduler.py::trigger_ai_review, чтобы не жечь авто-повтор (#196) вслепую
 # в ту же квоту. reason — тег причины verdict=error (#431, см.
-# FAILURE_REASON_* выше). Разбор останавливается на первой пустой строке,
-# чтобы проза/фенсы ниже не притворялись фактами (см. header_facts). Одно
-# место правды — раньше жило только в ai_review.py, check_pr.py читало бы
-# вторую копию regex.
-FACT_RE = re.compile(r"^(pr|head|reviewer|diff|provider|reset-at|reason):\s*(.+)$")
+# FAILURE_REASON_* выше). class — состояние+slug'и классификации дефекта
+# (#1237: `class: candidate=slug1,slug2` либо `class: known=slug`) — читает
+# defect_classes.recent_candidate_stats (issue #1255): репозиторий-широкий
+# срез комментариев-вердиктов теперь единственный носитель кандидатов, факт
+# `class:` в ЭТОЙ шапке — то же место правды, что уже парсит его же ai_review.
+# build_comment пишет строку, а не второй сериализатор рядом. Разбор
+# останавливается на первой пустой строке, чтобы проза/фенсы ниже не
+# притворялись фактами (см. header_facts). Одно место правды — раньше жило
+# только в ai_review.py, check_pr.py читало бы вторую копию regex.
+FACT_RE = re.compile(r"^(pr|head|reviewer|diff|provider|reset-at|reason|class):\s*(.+)$")
 
 
 def transport_failed(dsh_rc: str) -> bool:
