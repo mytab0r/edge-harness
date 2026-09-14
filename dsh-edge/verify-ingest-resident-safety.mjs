@@ -107,11 +107,17 @@ export function assertNoUnconditionalDispose(body) {
 
 /**
  * Assemble a real, executable TypeScript module out of the extracted method
- * plus a minimal stub harness, and run the two-batch ingest scenario that
- * reproduces the live incident. Returns the outcome of both batches so the
- * test can assert on it; never swallows a scenario-setup error.
+ * plus a minimal stub harness, and run a THREE-batch ingest scenario (kept the
+ * name `runTwoBatchIngestScenario` from #1163 — the third batch, #1161, only
+ * strengthens the same call, it does not change what the function proves)
+ * against the SAME session. Returns the outcome of all three batches plus
+ * `coldLoads` so the test can assert on both the #1163 correctness property
+ * (no dead resident) and the #1161 cost property (the O(full-history) load
+ * this fix collapses into a per-session, not per-call, cost — issue #1161's
+ * dominant `rows_read` contributor, docs/research/20-cloudflare-free.md
+ * "Причина цены ≈427 rows_read/событие"). Never swallows a scenario-setup error.
  * @param {string} patch - full unified diff text (defaults to the real patch on disk).
- * @returns {Promise<{batch1: {appended: number}, batch2Error: string|undefined, disposeCalls: number}>}
+ * @returns {Promise<{batch1: {appended: number}, batch2Error: string|undefined, batch3Error: string|undefined, disposeCalls: number, coldLoads: number}>}
  */
 export async function runTwoBatchIngestScenario(patch = readFileSync(patchPath, 'utf8')) {
   const methodBody = extractPatchMethod(patch, 'async appendHarnessEvents(')
@@ -149,6 +155,18 @@ function normalizeHarnessIngestEvent(raw: any, baseTurn: number) {
 class ResidentStubStore {
   residents = new Map<string, any>()
   disposeCalls = 0
+  // #1161: this is the counter that ties #1163's dispose-safety fix to the
+  // rows_read claim — a "cold load" here stands in for the real
+  // do-session-persistence.ts::eventRows(id, 0) full-history SELECT that
+  // upstream's own resident cache now pays AT MOST ONCE per sessionId per DO
+  // activation (docs/research/11-dsh-edge.md, "resident agents"), not once
+  // per ingest call as it did before 0.14.0. If a future change to this patch
+  // (or to the upstream lifetime around it) makes appendHarnessEvents open a
+  // FRESH session/handle per call again — same effect as the pre-#1163
+  // per-batch dispose(), just via a different code path — this counter grows
+  // past 1 across repeated batches to the SAME session and the assertion
+  // below goes red.
+  coldLoads = 0
   context = { agentDefaultModel: { currentSelection: () => ({ model: 'stub-model' }) } }
   async services() {
     return { persistence: new DurableObjectSessionPersistence(), sessions: { flush: async (_session: any) => {} } }
@@ -159,6 +177,7 @@ class ResidentStubStore {
   async openAgentForTurn(id: string, _model: string) {
     let handle = this.residents.get(id)
     if (handle === undefined) {
+      this.coldLoads += 1
       const session = {
         seq: 1,
         log: [] as Array<{ type: string; data: unknown }>,
@@ -206,7 +225,24 @@ export async function scenario() {
   } catch (error) {
     batch2Error = error instanceof Error ? error.message : String(error)
   }
-  return { batch1, batch2, batch2Error, disposeCalls: store.disposeCalls }
+  // #1161: a third batch to the SAME session — one repeat is not enough to
+  // tell "paid once" from "paid every other call"; a third call still
+  // hitting the resident (coldLoads staying at 1) is the minimum needed to
+  // distinguish those two.
+  let batch3: { appended: number } | undefined
+  let batch3Error: string | undefined
+  try {
+    batch3 = await store.appendHarnessEvents(sessionId, [
+      { type: 'turn/start', data: { turn: 1 } },
+      { type: 'turn/end', data: { turn: 1 } },
+    ])
+  } catch (error) {
+    batch3Error = error instanceof Error ? error.message : String(error)
+  }
+  return {
+    batch1, batch2, batch2Error, batch3, batch3Error,
+    disposeCalls: store.disposeCalls, coldLoads: store.coldLoads,
+  }
 }
 `
   const dir = mkdtempSync(join(tmpdir(), 'dsh-edge-ingest-resident-'))
