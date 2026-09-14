@@ -280,6 +280,34 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
       вечный долг даёт одну эскалацию (#120 + Telegram), новая подделка
       меняет множество и даёт новую; владелец узнаёт о каждом новом эпизоде
       без спама на каждый пульс.
+  19. check_ci_failure_closed_but_main_red (issue #925) — ci-failure задача
+      закрыта за окно CI_FAILURE_RESOLVED_WINDOW_HOURS, а последний
+      ПОКАЗАТЕЛЬНЫЙ прогон её workflow на main красный. «Показательный» =
+      head_sha — предок main прямо сейчас (критерий
+      scripts/lib/ci_run_on_main.py: GitHub Compare API, identical/behind —
+      предок; ahead/diverged — прогон ветки-кандидата, чей исход о main не
+      доказывает ничего) И вердикт из того же красного списка, каким
+      failure_watch распознал исходный отказ
+      (pulse_guard.FAILURE_WATCH_RUN_CONCLUSIONS); queued/in_progress и
+      cancelled/skipped не краснят и не оправдывают — «не success» не равно
+      «красный» (находка ai-review PR #1061). Номер 17 занят параллельным
+      PR #1076 (задача #1041) — номера стабильные ID (см. запись 18). Живой
+      случай: три подряд «зелёных» прогона deploy-worker.yml
+      (2026-09-12T00:06–00:17Z) были workflow_dispatch на agent/678-*
+      (Compare → diverged), а последний прогон push'а в main
+      (2026-09-11T14:24Z, слияние PR #943) — красный: критерий готовности
+      ci-failure задачи («следующий прогон зелёный») сам не различает, ГДЕ
+      прогон был зелёным. Compare-опрос — best-effort по кандидату (тот же
+      приём, что у 15): сбой одного sha — строка ⚠️ «статус НЕИЗВЕСТЕН»,
+      не падение всего отчёта и не «здоров»; обход останавливается на
+      первом найденном предке main — дальше старее, для выбора последнего
+      показательного прогона не нужно. Эскалирующий (ESCALATING_
+      INVARIANTS) — газ общий и автоматический: escalate_if_new
+      дедуплицирует по множеству нарушителей, само нарушение уходит, когда
+      workflow на main зелёный, либо окно 24ч отводит закрытие в прошлое.
+      Наблюдательный, не в CI_GATING: нарушение про СОСТОЯНИЕ main (чужой
+      красный прогон), гейтить им произвольный PR — красить чужой пуш за
+      чужой инцидент.
 
 Расписание: главный канал — периодический шаг orchestra.yml (cron */15 мин),
 он же вызывает escalate() для всех эскалирующих инвариантов — реестр
@@ -345,7 +373,7 @@ import importlib.util
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -446,6 +474,15 @@ _MR_SPEC = importlib.util.spec_from_file_location(
     "merge_reactions", REPO_ROOT / "scripts" / "lib" / "merge_reactions.py")
 merge_reactions = importlib.util.module_from_spec(_MR_SPEC)
 _MR_SPEC.loader.exec_module(merge_reactions)  # type: ignore[union-attr]
+
+# ci_run_on_main.latest_run_on_main — одно место правды на вопрос «прогон
+# workflow относится к состоянию, которое реально живёт в main, а не к
+# ветке-кандидату» (issue #925, инвариант 19 ниже). Второй копией того же
+# сравнения `head_sha` с main эту проверку здесь не заводим.
+_CROM_SPEC = importlib.util.spec_from_file_location(
+    "ci_run_on_main", REPO_ROOT / "scripts" / "lib" / "ci_run_on_main.py")
+ci_run_on_main = importlib.util.module_from_spec(_CROM_SPEC)
+_CROM_SPEC.loader.exec_module(ci_run_on_main)  # type: ignore[union-attr]
 
 TASK_LABEL = "task"
 OPENSPEC_CHANGES = REPO_ROOT / "openspec" / "changes"
@@ -2470,6 +2507,196 @@ def check_pipeline_status_marker_impersonation(comments: list[dict]) -> list[dic
     return sorted(violations, key=lambda item: item["created_at"] or "")
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# Инвариант 19 (issue #925): ci-failure задача закрыта, а последний
+# показательный прогон её workflow НА MAIN всё ещё красный
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Живой случай, из-за которого этот инвариант заведён: три подряд «зелёных»
+# прогона deploy-worker.yml (2026-09-12T00:06–00:17Z) были workflow_dispatch
+# на ветке agent/678-rows-written-namespace — НЕ предок main (GitHub Compare
+# API: status=diverged); последний прогон, реально триггернутый push'ем в
+# main (2026-09-11T14:24Z, слияние PR #943), — красный
+# («worker-configuration.d.ts устарел»). Критерий готовности ci-failure
+# задачи («следующий прогон workflow на этом коде зелёный», см.
+# pulse_guard.failure_watch_task_body) не различает эти два случая — кто-то,
+# доверившийся трём зелёным прогонам НЕ глядя на ветку, закрыл бы issue #925
+# вслепую, хотя main всё ещё красный. Этот инвариант — газ на такую ошибку:
+# если ci-failure задача всё-таки закрыта недавно, а по данным
+# ci_run_on_main последний показательный прогон её workflow на main красный
+# (head_sha — предок main И вердикт в красном списке
+# FAILURE_WATCH_RUN_CONCLUSIONS, см. докстринг check_...) — нарушение,
+# независимо от того, сколько прогонов ветки-кандидата были зелёными.
+# Номер 17 занят параллельным PR #1076 (задача #1041) — номера стабильные
+# ID, два параллельных PR не должны претендовать на один (та же причина,
+# по которой main пропустил 17 в записи 18 докстринга модуля).
+#
+# Окно — как у большинства «суточных» порогов этого файла (FAILURE_WATCH_
+# DAILY_CAP/STALL_DAILY_CAP): интересует СВЕЖЕЕ закрытие, не вся история
+# ci-failure задач репозитория — вопрос «эту закрыли правильно?», а не
+# «когда-либо была расхождение».
+CI_FAILURE_RESOLVED_WINDOW_HOURS = 24
+
+_CI_FAILURE_WORKFLOW_RE = re.compile(r"^## Цель\n`([^`]+)`", re.MULTILINE)
+
+
+def _ci_failure_workflow(body: str) -> str | None:
+    """Имя workflow из тела ci-failure задачи — первая строка раздела «Цель»
+    (см. pulse_guard.failure_watch_task_body: `` `{workflow}` (job
+    «{job_name}») перестаёт падать...``). Не пересказ, а разбор
+    ДОСЛОВНОГО формата, который сама же failure_watch и печатает."""
+    match = _CI_FAILURE_WORKFLOW_RE.search(body)
+    return match.group(1) if match else None
+
+
+def check_ci_failure_closed_but_main_red(
+    closed_issues: list[dict], runs_by_workflow: dict[str, list[dict]],
+    head_sha_on_main: dict[str, bool],
+) -> list[dict]:
+    """Инвариант 19. Чистая функция над уже прочитанными данными — сетевой
+    Compare API-вызов (ci_run_on_main.run_is_on_main) уже отработал в IO
+    (fetch_head_sha_on_main ниже), здесь только словарь bool (тот же приём,
+    что у остальных check_* этого файла, докстринг модуля: «без сети»).
+
+    `closed_issues` — закрытые issues с меткой pulse_guard.FAILURE_WATCH_LABEL
+    (см. fetch_recently_closed_ci_failure_issues ниже), уже отфильтрованы по
+    CI_FAILURE_RESOLVED_WINDOW_HOURS вызывающим кодом.
+    `runs_by_workflow` — {имя workflow: сырые прогоны (от нового к старому,
+    порядок GitHub)}, по одному обходу на каждый РАЗЛИЧНЫЙ workflow среди
+    closed_issues.
+    `head_sha_on_main` — {head_sha: предок ли main прямо сейчас} для каждого
+    head_sha, встреченного в runs_by_workflow до точки остановки обхода (см.
+    fetch_head_sha_on_main: отсутствующая запись читается как «не относится
+    к main» — для sha СТАРШЕ найденного предка это правда, а новее предка
+    проверенно-не-предков записи есть всегда).
+
+    Задача без разбираемого имени workflow (старый формат тела, ручное
+    редактирование) — пропускается молча, это не предмет этого инварианта.
+    Workflow, для которого среди runs_by_workflow нет ни одного прогона,
+    относящегося к main прямо сейчас, — тоже пропускается: судить не о чем
+    (не «предполагаем зелёный»), а не нарушение.
+
+    Кандидат — последний ПОКАЗАТЕЛЬНЫЙ прогон на main: `status ==
+    "completed"` и `conclusion` либо success, либо в красном списке
+    pulse_guard.FAILURE_WATCH_RUN_CONCLUSIONS (failure/timed_out — ТОТ ЖЕ
+    список, которым failure_watch распознал красный и завёл ci-failure
+    задачу: одно место правды о том, что такое «красный прогон»).
+    «Не success» не равно «красный» (находка ai-review PR #1061): queued/
+    in_progress (conclusion=None) краснят ложным 🚨 «на main = None» на
+    полтакта после каждого рядового мержа, cancelled/skipped вообще не
+    вердикт о состоянии — и те и другие пропускаются при выборе кандидата,
+    судит последний завершённый показательный. Прогоны без статуса/вывода
+    (неполная запись API) — не кандидаты."""
+    violations = []
+    for issue in closed_issues:
+        body = issue.get("body") or ""
+        workflow = _ci_failure_workflow(body)
+        if not workflow:
+            continue
+        runs = runs_by_workflow.get(workflow)
+        if not runs:
+            continue
+        run = next(
+            (r for r in runs
+             if r.get("status") == "completed"
+             and (r.get("conclusion") == "success"
+                  or r.get("conclusion") in pulse_guard.FAILURE_WATCH_RUN_CONCLUSIONS)
+             and head_sha_on_main.get(r.get("head_sha"), False)),
+            None,
+        )
+        if run is None or run.get("conclusion") == "success":
+            continue
+        violations.append({
+            "issue": issue["number"],
+            "title": issue.get("title", ""),
+            "workflow": workflow,
+            "closed_at": issue.get("closed_at"),
+            "run_conclusion": run.get("conclusion"),
+            "run_url": run.get("html_url"),
+            "run_head_sha": run.get("head_sha"),
+        })
+    return violations
+
+
+def fetch_recently_closed_ci_failure_issues(
+    repo: str, now: datetime, window_hours: float = CI_FAILURE_RESOLVED_WINDOW_HOURS,
+) -> list[dict]:
+    """Закрытые issues с меткой pulse_guard.FAILURE_WATCH_LABEL, чей
+    closed_at не старше window_hours — сырой вход для
+    check_ci_failure_closed_but_main_red.
+
+    `review_labels.list_pages` — одно место правды и на обход страниц
+    (класс #308: сырая первая страница молча теряла бы хвост после первой
+    сотни закрытых ci-failure задач за всё время), и на fail loud при
+    неожиданной форме ответа (дефект #120A: dict/None от вторичного
+    рейт-лимита не читается как «страниц больше нет»). `label_query_value`
+    (issue #938) — метка с `-` не несёт `:`, но гвардия
+    test_label_query_encoding_guard.py требует кодирования КАЖДОЙ
+    подстановки `labels=`, не только тех, что сейчас содержат опасный
+    символ, — второе место, забывшее это сделать, находит именно она."""
+    cutoff = now - timedelta(hours=window_hours)
+    issues = review_labels.list_pages(
+        f"repos/{repo}/issues?state=closed"
+        f"&labels={review_labels.label_query_value(pulse_guard.FAILURE_WATCH_LABEL)}"
+        f"&per_page=100", gh)
+    return [
+        issue for issue in issues
+        if "pull_request" not in issue and issue.get("closed_at")
+        and parse_time(issue["closed_at"]) >= cutoff
+    ]
+
+
+def fetch_runs_by_workflow(repo: str, workflows: set[str], per_page: int = 100) -> dict[str, list[dict]]:
+    """{имя workflow: recent_runs(...)} — один обход на РАЗЛИЧНЫЙ workflow
+    (не событийный фильтр: нужны и push, и workflow_dispatch прогоны, чтобы
+    последующая проверка предка main могла отличить их по head_sha, а не по
+    event — живой случай #925, три «зелёных» были event=workflow_dispatch)."""
+    return {workflow: pulse_guard.recent_runs(repo, workflow, per_page=per_page) for workflow in workflows}
+
+
+def fetch_head_sha_on_main(
+    repo: str, runs_by_workflow: dict[str, list[dict]],
+) -> tuple[dict[str, bool], list[dict]]:
+    """{head_sha: предок ли main прямо сейчас} + список непроверенных sha —
+    для каждого РАЗЛИЧНОГО head_sha, встреченного в runs_by_workflow.
+
+    Обход — по прогонам КАЖДОГО workflow от нового к старому (порядок
+    GitHub) с остановкой на первом найденном предке main: всё старее его
+    для выбора «последнего показательного прогона на main» не нужно, так
+    типичный случай укладывается в 1–5 Compare-вызовов вместо ~100 (веерный
+    опрос всех head_sha из top-100 прогонов). sha кэшируется между
+    workflow: один и тот же коммит не спрашивается дважды.
+
+    Каждый Compare-вызов изолирован — тот же приём best-effort, что у
+    инварианта 15 (находка ai-review PR #1061): RuntimeError на ОДНОМ sha
+    (сеть, 403 secondary rate limit на серии вызовов, 404 на sha,
+    переставший резолвиться после форс-пуша) НЕ роняет весь build_report —
+    прежде он краснил бы обязательную проверку каждого открытого PR в
+    repo-ci до вытеснения sha из окна, а в orchestra глушил бы ВСЕ
+    эскалации (run_escalations не вызывается после упавшего build_report).
+    Сбой попадает во второй элемент возврата как {"sha", "error"}:
+    build_report печатает его строкой ⚠️ — статус НЕИЗВЕСТЕН, не «не на
+    main» и не «здоров». Единственное место сетевого вызова для инварианта
+    19 — check_ci_failure_closed_but_main_red его не делает (см. её
+    докстринг)."""
+    on_main: dict[str, bool] = {}
+    unchecked: list[dict] = []
+    for runs in runs_by_workflow.values():
+        for run in runs:  # GitHub отдаёт от нового к старому
+            sha = run.get("head_sha")
+            if not sha or sha in on_main:
+                continue
+            try:
+                verdict = ci_run_on_main.run_is_on_main(repo, sha, gh)
+            except RuntimeError as error:
+                unchecked.append({"sha": sha, "error": str(error)})
+                continue
+            on_main[sha] = verdict
+            if verdict:
+                break  # дальше только старее найденного предка main
+    return on_main, unchecked
+
+
 def build_report(repo: str, now: datetime,
                   check_branch_protection: bool = False,
                   check_declared_deps: bool = True) -> tuple[list[str], dict[int, list]]:
@@ -2822,6 +3049,38 @@ def build_report(repo: str, now: datetime,
             "опубликованы токеном job'а"
         )
 
+    closed_ci_failure = fetch_recently_closed_ci_failure_issues(repo, now)
+    workflows = {w for w in (_ci_failure_workflow(i.get("body") or "") for i in closed_ci_failure) if w}
+    runs_by_workflow = fetch_runs_by_workflow(repo, workflows) if workflows else {}
+    head_sha_on_main, unchecked19 = (
+        fetch_head_sha_on_main(repo, runs_by_workflow) if runs_by_workflow else ({}, []))
+    v19 = check_ci_failure_closed_but_main_red(closed_ci_failure, runs_by_workflow, head_sha_on_main)
+    findings[19] = v19
+    if v19:
+        lines.append(f"🚨 [19] {len(v19)} ci-failure задач закрыты, а последний "
+                      "показательный прогон их workflow НА MAIN всё ещё красный "
+                      "(issue #925 — критерий «следующий прогон зелёный» не отличал "
+                      "main от ветки-кандидата):")
+        for item in v19:
+            lines.append(
+                f"   — #{item['issue']} «{item['title']}» закрыта {item['closed_at']}, "
+                f"{item['workflow']} на main = {item['run_conclusion']} — {item['run_url']}"
+            )
+    elif not unchecked19:
+        lines.append(f"💚 [19] нет ci-failure задач, закрытых за последние "
+                      f"{CI_FAILURE_RESOLVED_WINDOW_HOURS}ч при красном прогоне их "
+                      "workflow на main")
+    if unchecked19:
+        # Тот же приём best-effort, что у 15 выше (находка ai-review PR #1061):
+        # непроверенное обязано быть ВИДНО непроверенным — не 💚 «здоров» и
+        # не 🚨 «красный» (AGENTS.md, «Алерт не гадает»).
+        lines.append(
+            f"⚠️ [19] {len(unchecked19)} прогон(ов) не удалось отнести к main "
+            "(сеть/квота) — статус НЕИЗВЕСТЕН, это не подтверждение здоровья:"
+        )
+        for item in unchecked19:
+            lines.append(f"   — head_sha={item['sha'][:8]} — {item['error']}")
+
     return lines, findings
 
 
@@ -2879,7 +3138,16 @@ def summary(lines: list[str]) -> None:
 # Газ общий и автоматический: escalate_if_new дедуплицирует по множеству id
 # нарушителей (вечный долг — одна эскалация, новая подделка — новая), ручного
 # снятия не требует.
-ESCALATING_INVARIANTS = (1, 3, 12, 15, 16, 18)
+# 19 в списке — поставленная задача (#925, находка ai-review PR #1061):
+# ci-failure задачу закрыли, а последний показательный прогон её workflow на
+# main всё ещё красный («зелёный» прогон ветки-кандидата состоянием main не
+# доказывает ничего) — детектор без потребителя не ловит ничего, нарушение
+# жило бы только строкой отчёта. Газ тот же общий и автоматический:
+# escalate_if_new дедуплицирует по множеству нарушителей, а нарушение уходит
+# само, когда workflow на main зелёный, либо окно
+# CI_FAILURE_RESOLVED_WINDOW_HOURS отводит закрытие в прошлое; ручного
+# снятия не требует.
+ESCALATING_INVARIANTS = (1, 3, 12, 15, 16, 18, 19)
 
 
 def escalate_if_new(repo: str, invariant_id: int, marker_key: str, text: str) -> str | None:
@@ -3022,6 +3290,31 @@ def run_escalations(repo: str, findings: dict[int, list]) -> list[str]:
         result = escalate_if_new(repo, 18, key, text)
         if result:
             lines.append(f"📣 инвариант 18 эскалирован: {result}")
+    if findings.get(19):
+        v19 = findings[19]
+        # key — задача + доказавший красноту head_sha: та же закрытая задача
+        # при новом красном прогоне main — новое состояние, новая эскалация.
+        key = ",".join(f"#{i['issue']}@{(i['run_head_sha'] or '')[:8]}" for i in v19)
+        details = "\n".join(
+            f"— #{i['issue']} «{i['title']}» закрыта {i['closed_at']}: "
+            f"{i['workflow']} на main последний показательный прогон "
+            f"{i['run_conclusion']} — {i['run_url']}"
+            for i in v19
+        )
+        text = (
+            "🚨 edge-harness: инвариант 19 (ci-failure задачу закрыли, а "
+            "последний показательный прогон её workflow на main красный, "
+            f"issue #925) — {len(v19)} таких задач:\n{details}\n"
+            "Критерий готовности ci-failure задачи («следующий прогон "
+            "зелёный») не различает, ГДЕ прогон был зелёным (живой случай: "
+            "три success workflow_dispatch на ветке-кандидате при красном "
+            "последнем прогоне push'а в main). Закрытую задачу не "
+            "переоткрывают (#369) — заведи новую узкую ci-failure задачу "
+            "или добей зелёным прогоном этого workflow на main."
+        )
+        result = escalate_if_new(repo, 19, key, text)
+        if result:
+            lines.append(f"📣 инвариант 19 эскалирован: {result}")
     return lines
 
 

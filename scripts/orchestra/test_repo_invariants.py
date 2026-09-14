@@ -213,12 +213,21 @@ class FakeGh:
     был бы обязан завести собственный маршрут issues/120/comments, хотя ни
     фантомная пауза конвейера, ни WIP-гейт — не их предмет; тест, которому
     нужны конкретные маркеры, переопределяет этот маршрут явно (уже так
-    делают тесты #196/#220 выше)."""
+    делают тесты #196/#220 выше).
+
+    Запасной маршрут для закрытых ci-failure задач (инвариант 19, #925):
+    здоровый дефолт — пустой список (ни одна ci-failure задача не закрыта за
+    окно CI_FAILURE_RESOLVED_WINDOW_HOURS). Пустой список останавливает
+    build_report ДО обхода workflow_runs/compare — ни один из этих запросов
+    не нужен, если закрытых задач нет вовсе (см. build_report: workflows/
+    runs_by_workflow/head_sha_on_main вычисляются лениво, только если
+    closed_ci_failure непуст)."""
     _DEFAULT_ROUTES = {
         "actions/workflows/ai-review.yml/runs": {"workflow_runs": []},
         "contents/docs/research/data/pipeline-health.jsonl": RuntimeError(
             "gh api repos/o/r/contents/...: HTTP 404: Not Found"),
         "issues/120/comments": [],
+        "issues?state=closed&labels=ci-failure": [],
     }
 
     def __init__(self, routes):
@@ -3500,3 +3509,311 @@ def test_run_escalations_invariant_18_key_stays_compact(monkeypatch):
     ri.run_escalations("mytab0r/edge-harness", {18: many_plus_one})
     assert len(seen_markers) == 2
     assert seen_markers[0] != seen_markers[1]  # новый состав — новая эскалация
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Инвариант 19 (issue #925): ci-failure задача закрыта, а последний прогон
+# её workflow НА MAIN всё ещё красный
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def ci_failure_task_body(workflow: str, job_name: str = "deploy") -> str:
+    """Тело в ТОЧНО том формате, что печатает
+    pulse_guard.failure_watch_task_body — не пересказ (AGENTS.md «тест
+    кормит прод-форму данных»)."""
+    return ri.pulse_guard.failure_watch_task_body(
+        workflow, job_name, fact="worker-configuration.d.ts устарел",
+        run_url="https://x/1", fingerprint="fp", steps="Типы актуальны?")
+
+
+def closed_ci_failure_issue(number, workflow, closed_at):
+    return {
+        "number": number,
+        "title": f"CI: {workflow} падает — deploy",
+        "body": ci_failure_task_body(workflow),
+        "closed_at": closed_at,
+    }
+
+
+def workflow_run(head_sha, conclusion, html_url="https://x/run", status="completed"):
+    """Прод-форма записи workflow run: у завершённого прогона GitHub всегда
+    отдаёт status="completed" — инвариант 19 читает это поле при выборе
+    показательного кандидата, поэтому фикстура несёт его явно."""
+    return {"head_sha": head_sha, "conclusion": conclusion, "html_url": html_url,
+            "status": status}
+
+
+LIVE_MAIN_HEAD = "490ccacd5e80f57b7ef8f98d04c4aa69beccdebc"
+LIVE_BRANCH_HEAD = "53135c4e27b894e9cc23b0d8e5c78d62d73b01ad"
+
+
+def test_check_ci_failure_closed_but_main_red_flags_live_case_925():
+    """Живой случай #925 буквально: закрытая ci-failure задача про
+    deploy-worker.yml, среди прогонов — два «зелёных» на ветке-кандидате
+    (не предок main) и один красный, реально относящийся к main. Инвариант
+    обязан найти именно красный прогон main, а не «есть зелёный — здоров»."""
+    closed = [closed_ci_failure_issue(925, "deploy-worker.yml", "2026-09-12T00:20:00Z")]
+    runs_by_workflow = {
+        "deploy-worker.yml": [
+            workflow_run(LIVE_BRANCH_HEAD, "success", "https://x/branch"),
+            workflow_run(LIVE_MAIN_HEAD, "failure", "https://x/main"),
+        ],
+    }
+    head_sha_on_main = {LIVE_BRANCH_HEAD: False, LIVE_MAIN_HEAD: True}
+    violations = ri.check_ci_failure_closed_but_main_red(closed, runs_by_workflow, head_sha_on_main)
+    assert violations == [{
+        "issue": 925,
+        "title": "CI: deploy-worker.yml падает — deploy",
+        "workflow": "deploy-worker.yml",
+        "closed_at": "2026-09-12T00:20:00Z",
+        "run_conclusion": "failure",
+        "run_url": "https://x/main",
+        "run_head_sha": LIVE_MAIN_HEAD,
+    }]
+
+
+def test_check_ci_failure_closed_but_main_red_silent_when_main_run_green():
+    closed = [closed_ci_failure_issue(1, "worker.yml", "2026-09-12T00:20:00Z")]
+    runs_by_workflow = {"worker.yml": [workflow_run(LIVE_MAIN_HEAD, "success")]}
+    head_sha_on_main = {LIVE_MAIN_HEAD: True}
+    assert ri.check_ci_failure_closed_but_main_red(closed, runs_by_workflow, head_sha_on_main) == []
+
+
+def test_check_ci_failure_closed_but_main_red_silent_when_no_run_on_main_yet():
+    """Ни один прогон в известном списке не относится к main прямо сейчас —
+    судить не о чем (не «предполагаем зелёный»)."""
+    closed = [closed_ci_failure_issue(1, "worker.yml", "2026-09-12T00:20:00Z")]
+    runs_by_workflow = {"worker.yml": [workflow_run(LIVE_BRANCH_HEAD, "success")]}
+    head_sha_on_main = {LIVE_BRANCH_HEAD: False}
+    assert ri.check_ci_failure_closed_but_main_red(closed, runs_by_workflow, head_sha_on_main) == []
+
+
+def test_check_ci_failure_closed_but_main_red_mutation_proof_ignoring_ancestry():
+    """Доказательство мутацией класса #925: подмени критерий на «первый
+    success в списке, неважно чей head_sha» (ровно ошибка, которую этот
+    инвариант ловит) — на живой фикстуре выше это вернуло бы «здоров»
+    (первый в списке — success на ветке), хотя main красный. Здесь —
+    прямое сравнение двух критериев на одних и тех же данных."""
+    runs = [workflow_run(LIVE_BRANCH_HEAD, "success"), workflow_run(LIVE_MAIN_HEAD, "failure")]
+    naive_first_success = next((r for r in runs if r["conclusion"] == "success"), None)
+    assert naive_first_success["head_sha"] == LIVE_BRANCH_HEAD  # наивный критерий ошибается
+
+    closed = [closed_ci_failure_issue(925, "deploy-worker.yml", "2026-09-12T00:20:00Z")]
+    head_sha_on_main = {LIVE_BRANCH_HEAD: False, LIVE_MAIN_HEAD: True}
+    violations = ri.check_ci_failure_closed_but_main_red(
+        closed, {"deploy-worker.yml": runs}, head_sha_on_main)
+    assert len(violations) == 1  # правильный критерий не обманулся веткой
+
+
+def test_check_ci_failure_closed_but_main_red_silent_when_workflow_unparseable():
+    closed = [{"number": 1, "title": "старый формат", "body": "текст без раздела Цель",
+               "closed_at": "2026-09-12T00:20:00Z"}]
+    assert ri.check_ci_failure_closed_but_main_red(closed, {}, {}) == []
+
+
+def test_fetch_recently_closed_ci_failure_issues_filters_by_window(monkeypatch):
+    fresh = closed_ci_failure_issue(1, "worker.yml", "2026-09-12T00:00:00Z")
+    stale = closed_ci_failure_issue(2, "worker.yml", "2026-08-01T00:00:00Z")
+    fake = FakeGh({"issues?state=closed&labels=ci-failure": [fresh, stale]})
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 12, 12, 0)
+    result = ri.fetch_recently_closed_ci_failure_issues(REPO, now)
+    assert [i["number"] for i in result] == [1]
+
+
+def test_build_report_wires_invariant_19(monkeypatch):
+    """Интеграция build_report: закрытая ci-failure задача + опрос
+    workflow_runs + Compare API дают нарушение в findings[19] и строку
+    отчёта с [19]."""
+    closed = [closed_ci_failure_issue(925, "deploy-worker.yml", "2026-09-12T00:20:00Z")]
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": [],
+        "graphql": graphql_pool_page(),
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+        "search/issues": {"items": []},
+        "issues?state=closed&labels=ci-failure": closed,
+        "actions/workflows/deploy-worker.yml/runs":
+            {"workflow_runs": [workflow_run(LIVE_BRANCH_HEAD, "success", "https://x/branch"),
+                                workflow_run(LIVE_MAIN_HEAD, "failure", "https://x/main")]},
+        f"compare/main...{LIVE_BRANCH_HEAD}": {"status": "diverged", "ahead_by": 4, "behind_by": 21},
+        f"compare/main...{LIVE_MAIN_HEAD}": {"status": "behind", "ahead_by": 0, "behind_by": 25},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    now = utc(2026, 9, 12, 12, 0)
+    lines, findings = ri.build_report(REPO, now)
+    assert findings[19] == [{
+        "issue": 925,
+        "title": "CI: deploy-worker.yml падает — deploy",
+        "workflow": "deploy-worker.yml",
+        "closed_at": "2026-09-12T00:20:00Z",
+        "run_conclusion": "failure",
+        "run_url": "https://x/main",
+        "run_head_sha": LIVE_MAIN_HEAD,
+    }]
+    assert any("🚨" in line and "[19]" in line for line in lines)
+
+
+def test_build_report_invariant_19_silent_on_healthy_snapshot():
+    """Пустой список закрытых ci-failure задач (дефолт FakeGh._DEFAULT_ROUTES)
+    — инвариант молчит, ни workflow_runs, ни compare не запрашиваются
+    (см. идейно тот же холостой ход, что и у остальных инвариантов)."""
+    assert ri.check_ci_failure_closed_but_main_red([], {}, {}) == []
+
+
+def test_check_ci_failure_closed_but_main_red_in_progress_is_not_red():
+    """«Не success» не равно «красный» (находка ai-review PR #1061):
+    незавершённый прогон на main (conclusion=None при in_progress) не краснит
+    и не оправдывает — судит последний завершённый показательный. Наивный
+    критерий «любой не success — нарушение» дал бы 🚨 «на main = None» на
+    полтакта после каждого рядового мержа в cf-worker; здесь под running
+    стоит завершённый красный — нарушение честно указывает на НЕГО."""
+    closed = [closed_ci_failure_issue(925, "deploy-worker.yml", "2026-09-12T00:20:00Z")]
+    runs_by_workflow = {"deploy-worker.yml": [
+        workflow_run(LIVE_MAIN_HEAD, None, "https://x/running", status="in_progress"),
+        workflow_run(LIVE_BRANCH_HEAD, "failure", "https://x/older-red"),
+    ]}
+    head_sha_on_main = {LIVE_MAIN_HEAD: True, LIVE_BRANCH_HEAD: True}
+    violations = ri.check_ci_failure_closed_but_main_red(closed, runs_by_workflow, head_sha_on_main)
+    assert len(violations) == 1
+    assert violations[0]["run_conclusion"] == "failure"
+    assert violations[0]["run_url"] == "https://x/older-red"
+
+
+def test_check_ci_failure_closed_but_main_red_in_progress_over_green_is_silent():
+    """Тот же фильтр, здоровый исход: последний завершённый показательный на
+    main зелёный, свежее него идёт незавершённый прогон — тишина, а не
+    «на main = None»."""
+    closed = [closed_ci_failure_issue(1, "worker.yml", "2026-09-12T00:20:00Z")]
+    runs_by_workflow = {"worker.yml": [
+        workflow_run(LIVE_MAIN_HEAD, None, status="in_progress"),
+        workflow_run(LIVE_BRANCH_HEAD, "success"),
+    ]}
+    head_sha_on_main = {LIVE_MAIN_HEAD: True, LIVE_BRANCH_HEAD: True}
+    assert ri.check_ci_failure_closed_but_main_red(closed, runs_by_workflow, head_sha_on_main) == []
+
+
+def test_check_ci_failure_closed_but_main_red_cancelled_does_not_judge():
+    """cancelled/skipped — не вердикт о состоянии main: «не success» не равно
+    «красный» (находка ai-review PR #1061). Единственный завершённый прогон
+    на main — cancelled: судить не о чем, не нарушение и не «предполагаем
+    зелёный»."""
+    closed = [closed_ci_failure_issue(1, "worker.yml", "2026-09-12T00:20:00Z")]
+    runs_by_workflow = {"worker.yml": [workflow_run(LIVE_MAIN_HEAD, "cancelled")]}
+    assert ri.check_ci_failure_closed_but_main_red(
+        closed, runs_by_workflow, {LIVE_MAIN_HEAD: True}) == []
+
+
+def test_check_ci_failure_closed_but_main_red_timed_out_is_red():
+    """timed_out — красный по тому же списку, каким failure_watch распознал
+    исходный отказ (pulse_guard.FAILURE_WATCH_RUN_CONCLUSIONS — одно место
+    правды о том, что такое «красный прогон», не вторая копия)."""
+    closed = [closed_ci_failure_issue(1, "worker.yml", "2026-09-12T00:20:00Z")]
+    runs_by_workflow = {"worker.yml": [workflow_run(LIVE_MAIN_HEAD, "timed_out")]}
+    violations = ri.check_ci_failure_closed_but_main_red(
+        closed, runs_by_workflow, {LIVE_MAIN_HEAD: True})
+    assert len(violations) == 1
+    assert violations[0]["run_conclusion"] == "timed_out"
+
+
+def test_fetch_head_sha_on_main_stops_at_first_main_ancestor(monkeypatch):
+    """Остановка обхода на первом найденном предке main: всё старее его для
+    выбора последнего показательного прогона не нужно. Маршрута для
+    OLDER_MAIN_HEAD в FakeGh НЕТ — его Compare-вызов поднял бы AssertionError
+    «нет маршрута» и тест покраснел бы: структурное доказательство, что
+    веерного опроса всех head_sha больше нет (1–5 вызовов вместо ~100)."""
+    older_main = "1111111111111111111111111111111111111111"
+    runs_by_workflow = {"deploy-worker.yml": [
+        workflow_run(LIVE_BRANCH_HEAD, "success"),
+        workflow_run(LIVE_MAIN_HEAD, "failure"),
+        workflow_run(older_main, "success"),
+    ]}
+    fake = FakeGh({
+        f"compare/main...{LIVE_BRANCH_HEAD}": {"status": "diverged", "ahead_by": 4, "behind_by": 21},
+        f"compare/main...{LIVE_MAIN_HEAD}": {"status": "behind", "ahead_by": 0, "behind_by": 25},
+    })
+    patch_gh(monkeypatch, fake)
+    on_main, unchecked = ri.fetch_head_sha_on_main(REPO, runs_by_workflow)
+    assert on_main == {LIVE_BRANCH_HEAD: False, LIVE_MAIN_HEAD: True}
+    assert unchecked == []
+    assert not any(older_main in call for call in fake.calls)  # старее предка не спрашивали
+
+
+def test_fetch_head_sha_on_main_survives_one_candidate_failure_as_unchecked(monkeypatch):
+    """Изоляция кандидата (находка ai-review PR #1061): RuntimeError на ОДНОМ
+    sha (сеть/квота/404) не роняет весь опрос и не превращается ни в «не на
+    main», ни в исключение поверх build_report — попадает в unchecked со
+    своей ошибкой, а обход продолжается со следующим, более старым прогоном."""
+    runs_by_workflow = {"deploy-worker.yml": [
+        workflow_run(LIVE_BRANCH_HEAD, "success"),
+        workflow_run(LIVE_MAIN_HEAD, "failure"),
+    ]}
+    fake = FakeGh({
+        f"compare/main...{LIVE_BRANCH_HEAD}":
+            RuntimeError("gh api repos/o/r/compare: HTTP 403 (rate limit)"),
+        f"compare/main...{LIVE_MAIN_HEAD}": {"status": "behind", "ahead_by": 0, "behind_by": 25},
+    })
+    patch_gh(monkeypatch, fake)
+    on_main, unchecked = ri.fetch_head_sha_on_main(REPO, runs_by_workflow)
+    assert on_main == {LIVE_MAIN_HEAD: True}  # сбойный sha НЕ читается как False
+    assert unchecked == [{"sha": LIVE_BRANCH_HEAD,
+                          "error": "gh api repos/o/r/compare: HTTP 403 (rate limit)"}]
+
+
+def test_build_report_invariant_19_unchecked_is_visible_not_green(monkeypatch):
+    """Unchecked в отчёте — ВИДЕН строкой ⚠️ и НЕ читается «здоров»: 💚 [19]
+    при непроверенных прогонах не печатается (тот же приём, что у 15,
+    находка ревью PR #956)."""
+    closed = [closed_ci_failure_issue(1, "deploy-worker.yml", "2026-09-12T00:20:00Z")]
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": [],
+        "graphql": graphql_pool_page(),
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+        "search/issues": {"items": []},
+        "issues?state=closed&labels=ci-failure": closed,
+        "actions/workflows/deploy-worker.yml/runs":
+            {"workflow_runs": [workflow_run(LIVE_BRANCH_HEAD, "success"),
+                                workflow_run(LIVE_MAIN_HEAD, "success")]},
+        f"compare/main...{LIVE_BRANCH_HEAD}":
+            RuntimeError("gh api repos/o/r/compare: HTTP 403 (rate limit)"),
+        f"compare/main...{LIVE_MAIN_HEAD}": {"status": "behind", "ahead_by": 0, "behind_by": 25},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    lines, findings = ri.build_report(REPO, utc(2026, 9, 12, 12, 0))
+    assert findings[19] == []  # последний показательный на main зелёный
+    assert any("⚠️" in line and "[19]" in line for line in lines)
+    assert not any("💚 [19]" in line for line in lines)
+
+
+def test_run_escalations_wires_invariant_19_with_fact_not_guess(monkeypatch):
+    """Детектор без потребителя не ловит ничего (находка ai-review PR #1061):
+    нарушение инварианта 19 эскалируется в канал владельца (#120 + Telegram),
+    текст несёт ФАКТ (задача, workflow, вывод, URL), а не гипотезу."""
+    calls = []
+
+    monkeypatch.setattr(ri, "issue_marker_times", lambda repo, issue, marker: [])
+    monkeypatch.setattr(ri, "escalate", lambda repo, issue, text: calls.append(text) or "отправлено")
+
+    findings = {19: [{
+        "issue": 925, "title": "CI: deploy-worker.yml падает — deploy",
+        "workflow": "deploy-worker.yml", "closed_at": "2026-09-12T00:20:00Z",
+        "run_conclusion": "failure", "run_url": "https://x/main",
+        "run_head_sha": LIVE_MAIN_HEAD,
+    }]}
+    lines = ri.run_escalations("mytab0r/edge-harness", findings)
+    assert len(calls) == 1
+    assert "deploy-worker.yml" in calls[0] and "failure" in calls[0] and "#925" in calls[0]
+    assert any("инвариант 19" in line for line in lines)
+
+
+def test_ci_failure_closed_but_main_red_is_escalating_not_gating():
+    # Наблюдательный по построению (тот же принцип, что 1/5/9/10/12/14):
+    # нарушение про СОСТОЯНИЕ main (чужой красный прогон), а не про дифф
+    # PR — гейтить им чужой пуш значило бы красить main за чужой инцидент.
+    assert 19 not in ri.CI_GATING
+    assert 19 in ri.ESCALATING_INVARIANTS
