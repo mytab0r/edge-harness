@@ -796,7 +796,7 @@ for (const [label, got, want] of checks) {
   if (!ok) failed = true
 }
 if (failed) process.exit(1)
-console.log('OK: classifyPoolUnavailable — все шесть классов различены верно, auth_rejected приоритетнее rate_limited')
+console.log(`OK: classifyPoolUnavailable — все ${checks.length} проверок прошли, 4 класса (auth_rejected/rate_limited/network_error/unknown) различены верно, auth_rejected приоритетнее rate_limited`)
 CLASSIFY_MJS
   CLASSIFY_LOG="$FIXTURE_ROOT/classify.log"
   if ! node "$EXTRACT_DIR/lib/classify-check.mjs" >"$CLASSIFY_LOG" 2>&1; then

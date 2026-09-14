@@ -1589,16 +1589,30 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
 # было и не несло reason), который в этом случае не проверялся: сначала
 # смотрим, есть ли в stderr вообще тело `pool_unavailable`, и только тогда
 # говорим про отсутствующее поле — иначе честно называем, что тела не нашли.
+#
+# `reason` вырезается ИЗ ТЕЛА pool_unavailable, не из всего err_file целиком
+# (находка ai-review PR #1193, третий раунд): stderr может нести и чужой,
+# не относящийся к пулу JSON/текст со СВОИМ полем `reason` — поиск по всему
+# файлу подобрал бы его, приписав пулу чужой факт. `pool_body` — подстрока
+# ОТ `"type":"pool_unavailable"` до конца этой же строки (прод-форма — один
+# `dsh: SERVER: 503 {...}` на строку, `tr` схлопывает многострочный err_file
+# в одну строку ДО вырезки, тем же приёмом, что уже применяет `pool_err_note`
+# в вызывающей функции), `reason`/`retryAt` читаются только из неё.
 dsh_pool_unavailable_owner_note() { # err_file
-  local err_file=$1 pool_reason pool_retry_at retry_note note has_body=0
-  grep -q '"type":"pool_unavailable"' "$err_file" 2>/dev/null && has_body=1
-  pool_reason=$(grep -oE '"reason":"[a-z_]+"' "$err_file" 2>/dev/null | head -1 | sed -E 's/.*"reason":"([a-z_]+)".*/\1/') || pool_reason=""
+  local err_file=$1 pool_reason pool_retry_at retry_note note has_body=0 pool_body
+  pool_body=$(tr '\n' ' ' <"$err_file" 2>/dev/null | grep -oE '"type":"pool_unavailable".*' | tail -1) || pool_body=""
+  if [ -n "$pool_body" ]; then
+    has_body=1
+    pool_reason=$(printf '%s' "$pool_body" | grep -oE '"reason":"[a-z_]+"' | head -1 | sed -E 's/.*"reason":"([a-z_]+)".*/\1/') || pool_reason=""
+  else
+    pool_reason=""
+  fi
   case "$pool_reason" in
     auth_rejected)
       note="ПРИЧИНА: аккаунт(ы) пула отвергнуты Anthropic (401/403) — нужен перевыпуск секретов ${ANTHROPIC_OAUTH_ACCOUNT_SECRETS[*]}, владелец нужен"
       ;;
     rate_limited)
-      pool_retry_at=$(grep -oE '"retryAt":[0-9]+' "$err_file" 2>/dev/null | head -1 | grep -oE '[0-9]+') || pool_retry_at=""
+      pool_retry_at=$(printf '%s' "$pool_body" | grep -oE '"retryAt":[0-9]+' | head -1 | grep -oE '[0-9]+') || pool_retry_at=""
       retry_note=""
       if [ -n "$pool_retry_at" ]; then
         retry_note=", ретрай ~$(jq -nr --argjson ms "$pool_retry_at" '($ms/1000)|gmtime|strftime("%Y-%m-%d %H:%M:%SZ")' 2>/dev/null || printf '%s' "$pool_retry_at")"

@@ -177,6 +177,45 @@ return account` ложно И при отсутствующем `expiresAt`, И 
       401 от Anthropic, не на каждый запрос долгоживущего токена без
       `expiresAt`. Fail loud без секретов не проверяется здесь же.
 
+## Доработка (#1192, живой инцидент, прогон worker.yml 34792555573, 2026-09-14)
+
+Живой прогон (00:23Z, уже с фиксом #1130): пул честно перебрал все аккаунты
+за 17с и ответил `pool_unavailable` — агрегатом «ни один аккаунт не
+доступен», без причины. Тот же текст получился бы и при 401/403 (креды
+отвергнуты Anthropic, нужен перевыпуск секретов ВЛАДЕЛЬЦЕМ), и при 429
+(лимит, само пройдёт), хотя `account.lastStatus` уже нёс нужный код — см.
+design.md, «pool_unavailable — причина отказа (#1192)».
+
+- [x] 26. Патч 4 плагина (три точечные правки разом, см. spec.md, ADDED
+      (#1130), пункт 4): `lib/pool.js::classifyPoolUnavailable(accounts)` —
+      чистая функция без сети/файлов, классы `auth_rejected`/`rate_limited`/
+      `network_error`/`unknown` по `lastStatus`/`lastError`, приоритет у
+      `auth_rejected`; `lib/index.js` — import + вызов в else-ветке
+      `forward()`, `reason`/`accounts` в JSON-теле `pool_unavailable`.
+- [x] 27. `scripts/lib/dsh-ci.sh::dsh_pool_unavailable_owner_note` — читает
+      `reason` ИЗ ТЕЛА `pool_unavailable` (не из всего `err_file` — чужой
+      JSON со своим `reason` не должен быть принят за причину отказа пула),
+      формулирует владельцу разный текст на каждый класс; поле/тело
+      отсутствует — честный пробел («не классифицирована»), без подстановки
+      гипотезы. Подключена в `dsh_run_with_pool_then_chain`, откат на
+      цепочку не меняется.
+- [x] 28. Гвардия `scripts/lib/test/dsh-anthropic-pool.guard.sh`, секции
+      15-19: happy path патча 4 на прод-форме, мутация (искажённая форма
+      else-ветки → `PATCH_MARKER_NOT_FOUND`, атомарность), поведенческое
+      доказательство `classifyPoolUnavailable` через node-импорт патченного
+      `pool.js`, пять исходов `dsh_pool_unavailable_owner_note` на
+      прод-форме stderr (включая «тела pool_unavailable нет вовсе»),
+      сквозной `dsh_run_with_pool_then_chain`.
+- [x] 29. `docs/research/32-claude-oauth-provider.md` — дополнение
+      «2026-09-14 (#1192)»; `design.md` — раздел «pool_unavailable —
+      причина отказа (#1192)»; `spec.md` — ADDED (#1130), пункт 4 патча +
+      требование к `dsh_run_with_pool_then_chain`.
+- [ ] 30. Живая проверка (после мержа, требует реальных секретов владельца
+      или живого отказа пула) — по логу видно поле `reason` в ответе
+      `pool_unavailable` и владельческий факт («владелец нужен»/«владелец НЕ
+      нужен») в `::warning::`. Fail loud без живого отказа не проверяется
+      здесь же — тот же класс ограничения, что у задачи 25 выше.
+
 ## Закрывающая проверка (после этого PR, требует секретов владельца)
 
 - [ ] Владелец кладёт `ANTHROPIC_OAUTH_1`/`ANTHROPIC_OAUTH_2`
