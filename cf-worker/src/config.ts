@@ -18,6 +18,11 @@ export const LIMITS = {
   payloadMaxChars: 8192,
   /** Сколько последних задач отдаёт список. */
   tasksListMax: 100,
+  /** Снимок состояния задача/PR (#1287, orchestrator-core-v2, ходячий скелет):
+   *  сколько строк отдаёт список GET /api/tasks-snapshot|/api/pr-snapshot.
+   *  Population на момент проекта — около 136 сущностей (design.md §3.3);
+   *  запас x1.5, не безлимит — тот же приём, что tasksListMax выше. */
+  snapshotsListMax: 200,
   /** Watchdog (issue #7): задача в статусе dispatched дольше этого порога без
    *  heartbeat — ненормальное состояние, морда показывает предупреждение.
    *  Медиана старта 8.3 с (ADR 0003), хвост ничем не ограничен — порог щедрый. */
