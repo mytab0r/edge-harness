@@ -54,9 +54,12 @@ LABELS.md`, класс «обе стороны дописывают РАЗНУЮ
 
 Любое сомнение (файл не .py/.md, конфликтующая сторона пуста, `ast.parse`
 падает, имена/ключи пересекаются, хотя бы ОДИН из нескольких unmerged-файлов
-PR не проходит) — ПОЛНЫЙ отказ, ни один файл PR не трогается (частичного
-разрешения нет: либо решаем ВСЮ пачку unmerged-путей одного PR, либо не
-трогаем НИЧЕГО — оставшийся конфликт уходит агентскому пути как раньше).
+PR не проходит) — ПОЛНЫЙ отказ, ни один файл PR не попадает в `git add`
+(частичного разрешения нет: либо решаем ВСЮ пачку unmerged-путей одного PR,
+либо не трогаем НИЧЕГО — оставшийся конфликт уходит агентскому пути как
+раньше). Каждая причина отказа печатается в лог job'а одной строкой, включая
+хвост вывода pytest, — отказ не имеет права быть неотличимым от «не наш
+класс» (находка ai-review PR #1033).
 
 Верификация ПЕРЕД тем, как вызывающий код (mechanical_rebase.py) продолжит
 рёбейз (`git rebase --continue`) — обязательное требование задания:
@@ -64,7 +67,7 @@ PR не проходит) — ПОЛНЫЙ отказ, ни один файл PR
 2. pytest соседнего test_<name>.py (или самого файла, если это уже test_*.py)
    для каждого затронутого .py файла — единственный источник объективного
    «работает» после сшивки; провал теста = такой же отказ, как провал
-   ast.parse (см. try_resolve).
+   ast.parse, с напечатанной причиной (см. try_resolve, _refuse).
 
 Тесты: python -m pytest scripts/orchestra/test_additive_conflict_merge.py -q
 """
@@ -248,28 +251,50 @@ def _test_targets_for(repo_dir, resolved_py_paths: list) -> list[str]:
     return targets
 
 
+def _refuse(reason: str) -> None:
+    """Печатает причину отказа ОДНОЙ строкой в лог job'а и возвращает None
+    (находка ai-review PR #1033, замечание из чеклиста: «отказ верификации
+    неотличим от „не наш класс“ и невидим в логе» — рычаг мог бы молча
+    мертветь в проде, как те самые 0/12 замера; в т.ч. «No module named
+    pytest» — workflow pytest не ставит, и провал запуска pytest обязан быть
+    виден именно как провал запуска, не как «не аддитивный конфликт»)."""
+    print(f"::warning::additive_conflict_merge: отказываюсь сводить — штатный "
+          f"агентский путь продолжит. Причина: {reason}")
+    return None
+
+
 def try_resolve(repo_dir, unmerged_paths: list[str]) -> list[str] | None:
     """Пытается механически свести ВСЕ unmerged_paths как аддитивные
     вставки. Возвращает список путей (относительно repo_dir), которые
     записаны на диск и готовы к `git add`, либо `None` — если хотя бы один
     файл/хунк не прошёл проверку безопасности, `ast.parse` полного файла или
     pytest затронутых тестов (частичного применения нет: либо решаем всю
-    пачку, либо не трогаем НИЧЕГО — файлы на диске в этом случае НЕ
-    изменяются вовсе, вызывающий код (mechanical_rebase.attempt_rebase)
-    делает `git rebase --abort`, который и так вернёт чистое дерево)."""
+    пачку, либо не трогаем НИЧЕГО). Каждая причина отказа печатается в лог
+    одной строкой (`_refuse`), включая хвост вывода pytest.
+
+    Честный контракт по состоянию диска на отказе (находка ai-review
+    PR #1033, прежняя формулировка противоречила поведению): отказ ДО записи
+    (неподдержанный файл/небезопасный хунк/провал ast.parse) не трогает файлы
+    вовсе; отказ ПОСЛЕ записи (провал pytest) оставляет файлы УЖЕ СЛИТЫМИ на
+    диске. В обоих случаях вызывающий код (mechanical_rebase.attempt_rebase)
+    делает `git rebase --abort`, который и восстанавливает рабочее дерево
+    целиком, — второй, независимой точки отката здесь не заводится, но
+    читать диск между `try_resolve → None` и `--abort` без учёта этого
+    нельзя."""
     plans: dict = {}
     for rel in unmerged_paths:
         path = repo_dir / rel
         suffix = path.suffix
         if suffix not in SUPPORTED_SUFFIXES:
-            return None
+            return _refuse(f"{rel}: тип файла {suffix or '(без расширения)'} "
+                           "не поддержан (только .py/.md)")
         try:
             text = path.read_text(encoding="utf-8")
         except OSError:
-            return None  # файл отсутствует (rename/delete-конфликт) — не наш класс
-        resolved, _reason = resolve_file_text(text, suffix)
+            return _refuse(f"{rel}: файл не читается (rename/delete-конфликт?) — не наш класс")
+        resolved, reason = resolve_file_text(text, suffix)
         if resolved is None:
-            return None
+            return _refuse(f"{rel}: {reason}")
         plans[path] = resolved
 
     # Полная верификация синтаксиса .py ДО единой записи на диск (задание:
@@ -279,8 +304,9 @@ def try_resolve(repo_dir, unmerged_paths: list[str]) -> list[str] | None:
         if path.suffix == ".py":
             try:
                 ast.parse(resolved)
-            except SyntaxError:
-                return None
+            except SyntaxError as error:
+                return _refuse(f"{path.name}: итоговый файл не разбирается "
+                               f"ast.parse'ом целиком: {error}")
 
     for path, resolved in plans.items():
         path.write_text(resolved, encoding="utf-8")
@@ -296,7 +322,21 @@ def try_resolve(repo_dir, unmerged_paths: list[str]) -> list[str] | None:
             # Верификация провалилась — НЕ откатываем файлы руками: вызывающий
             # код (attempt_rebase) в любом случае делает `git rebase --abort`
             # на отказе, который восстанавливает рабочее дерево целиком —
-            # второй, независимой точки отката здесь не заводим.
-            return None
+            # второй, независимой точки отката здесь не заводим. Но отказ
+            # обязан быть видимым и различимым (см. _refuse): печатаем хвост
+            # вывода pytest одной строкой — «No module named pytest»,
+            # красный тест или падение сбора — это РАЗНЫЕ причины, а не
+            # обезличенный «не наш класс».
+            tail = " ⏎ ".join(
+                line.strip() for line in (result.stdout or "").strip().splitlines()[-5:]
+                if line.strip()
+            )
+            stderr_tail = (result.stderr or "").strip().splitlines()
+            tail += (f" ⏎ stderr: {stderr_tail[-1].strip()}" if stderr_tail else "")
+            return _refuse(
+                f"pytest {' '.join(test_targets)} упал rc={result.returncode} "
+                f"(файлы оставлены слитыми на диске, откат — git rebase --abort "
+                f"вызывающего): {tail}"
+            )
 
     return [str(path.relative_to(repo_dir)) for path in plans]

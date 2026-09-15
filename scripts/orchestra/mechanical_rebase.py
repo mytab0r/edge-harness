@@ -78,12 +78,18 @@ WORKER_GIT_STEP_MARKER в scheduler.py):
   - "worker-running"     — issue #764, требование 2, СУЖЕНО issue #1032: не
                             двигаем head, если активный `in_progress`-прогон
                             worker.yml несёт CLAIM_VIA-след ИМЕННО задачи
-                            этого PR (worker_blocks_pr/active_worker_runs —
-                            единственный воркер физически может пушить только
-                            в СВОЮ ветку в данный момент, не в любую
-                            конфликтную), ЛИБО активный прогон ещё `queued`
-                            (атрибуция невозможна — claim ещё не мог
-                            случиться, см. блок-комментарий у active_worker_runs);
+                            этого PR (worker_blocks_pr — единственный воркер
+                            физически может пушить только в СВОЮ ветку в
+                            данный момент, не в любую конфликтную), ЛИБО
+                            активный прогон ещё `queued` (атрибуция
+                            невозможна — claim ещё не мог случиться), ЛИБО
+                            он `in_progress` без следа, но МОЛОЖЕ порога
+                            sch.WORKER_CLAIM_TRACE_GRACE_MINUTES (след
+                            появляется в первые минуты job'а, не в первую
+                            секунду статуса; находка ai-review PR #1033,
+                            требование 2 — без этого окна гейт молча
+                            разрешал самый опасный случай), — см.
+                            блок-комментарий у worker_blocks_pr;
                             без этого гейта механический force-with-lease мог
                             бы уехать НАД коммитами агента и сжечь его
                             единственную засчитанную попытку
@@ -161,6 +167,18 @@ import scheduler as sch  # noqa: E402 — после sys.path выше, тот �
 import additive_conflict_merge  # noqa: E402 — тот же приём, свой модуль этого же каталога
 
 review_labels = sch.review_labels  # уже загруженный scheduler'ом модуль — не грузим второй раз
+
+# Загрузка по пути файла (issue #897) — тот же приём, что console_utf8 bootstrap
+# выше и сам guard_step_translator.py уже применяют (в scripts/lib нет
+# __init__.py). Регистрация в sys.modules ДО exec_module: модуль несёт
+# @dataclass на отложенных аннотациях (см. его же докстринг _load_sibling) —
+# без регистрации импорт падает AttributeError на Python 3.11.
+_gst_spec = importlib.util.spec_from_file_location(
+    "guard_step_translator", _DIR.parent / "lib" / "guard_step_translator.py"
+)
+guard_step_translator = importlib.util.module_from_spec(_gst_spec)
+sys.modules["guard_step_translator"] = guard_step_translator
+_gst_spec.loader.exec_module(guard_step_translator)  # type: ignore[union-attr]
 
 
 class GitError(RuntimeError):
@@ -303,6 +321,88 @@ def push_rebased(repo_dir: Path, head_ref: str) -> None:
     run_git(["push", "--force-with-lease", "origin", f"{head_ref}:{head_ref}"], repo_dir)
 
 
+def migrate_guard_steps_if_needed(repo_dir: Path) -> str | None:
+    """После УСПЕШНОГО механического ребейза (attempt_rebase → "resolved"),
+    ДО push_rebased (issue #897): git применяет патч контекстно и ничего не
+    знает про каталог гвардий `scripts/ci/guards/` (#749/#771) — PR,
+    добавивший рукописный шаг ДО #771, сводится без конфликта, но
+    `ci_guard_registration_guard.py` красит CI этого же PR сразу после
+    ребейза (живой замер issue #897: PR #890/#895, 14 открытых PR/20 шагов
+    на дату замера). `guard_step_translator.translate_repo_ci` переносит всё,
+    что умеет, детерминированно; результат коммитится ОТДЕЛЬНЫМ коммитом
+    поверх уже перебазированной ветки — `push_rebased` пушит его вместе с
+    остальными.
+
+    Не блокирует push резолвнутого PR: перенос — УЛУЧШЕНИЕ, не условие
+    "resolved" (attempt_rebase уже решил структурный вопрос конфликта).
+    Ничего не нашлось — None, тихо (не находка, TranslationResult.migrated
+    пуст — не тормоз без газа, это норма для подавляющего большинства PR).
+    Нашёлся неразбираемый шаг ИЛИ упал ЛЮБОЙ этап переноса (находка ревью
+    PR #902 и её вторая итерация на этом же PR): `git rebase` мог оставить
+    repo-ci.yml с текстуальным конфликтным маркером/повреждением (тогда
+    `yaml.safe_load` бросает `yaml.YAMLError`, не `UnsupportedStepError`);
+    запись файла каталога теоретически может упасть `OSError` (заполненный
+    диск раннера); а git-фаза `add`/`commit` может упасть `GitError`
+    (наследник RuntimeError от run_git) — до второй итерации правки она
+    стояла ВНЕ try, и `GitError` от `git commit` вылетал в `process_pull`
+    как RuntimeError: тот возвращал "infra-error", `push_rebased` НЕ
+    вызывался, и УСПЕШНО перебазированная ветка переставала пушиться вовсе
+    — ровно то ухудшение исхода "resolved", которое этот докстринг
+    отрицает. Поэтому ВЕСЬ перенос (трансляция + git add + git commit)
+    стоит под ОДНИМ `try/except Exception`, а не только
+    `UnsupportedStepError`/`yaml.YAMLError`/`OSError`: любое другое
+    исключение здесь тоже убило бы ВЕСЬ проход `run()` (остаток очереди не
+    обрабатывается). PR всё равно пушится КАК ЕСТЬ (тот же исход, что и до
+    этой правки; недозакоммиченные файлы переноса в рабочем дереве в push
+    не попадают и вытираются `ensure_clean_repo` следующего PR очереди),
+    CI после push покажет ту же красную гвардию, но уже с точной
+    инструкцией газа (см. ci_guard_registration_guard.py::check_no_undeclared_step)
+    — фикс ухудшить исход "resolved" не может, только упростить его для
+    человека.
+
+    Ветка/дерево без `.github/workflows/repo-ci.yml` вовсе (например,
+    синтетические git-фикстуры тестов этого модуля, которым файл гвардий не
+    предмет проверки) — None БЕЗ вызова translate_repo_ci: физически нечего
+    переносить, это не находка транслятора (guard_step_names читает файл
+    безусловно и бросил бы FileNotFoundError, если бы не эта проверка).
+
+    История этой функции в #1032: первая итерация PR случайно стёрла её
+    вместе со всем переносом #897 при переписывании модуля (находка
+    ai-review PR #1033, требование 1 — скрытая регрессия чужого фикса,
+    молча оставлявшая `translate_repo_ci` без единого продового вызывающего);
+    восстановлена дословно — с новым циклом аддитивного сведения совместима:
+    вызывается после attempt_rebase (в т.ч. "resolved-additive" — конфликтные
+    файлы уже сведены, repo-ci.yml среди них мог быть), до push_rebased."""
+    if not (repo_dir / ".github" / "workflows" / "repo-ci.yml").exists():
+        return None
+    try:
+        result = guard_step_translator.translate_repo_ci(repo_dir)
+        if not result.migrated:
+            return None
+        rel_paths = [str(p.relative_to(repo_dir)) for p in result.changed_paths]
+        run_git(["add", "--", *rel_paths], repo_dir)
+        names = ", ".join(m.step_name for m in result.migrated)
+        run_git(
+            ["commit", "-m", f"перенос рукописных шагов гвардии в каталог (#897): {names}"],
+            repo_dir,
+        )
+    except guard_step_translator.UnsupportedStepError as error:
+        return f"перенос рукописных шагов гвардии в каталог не выполнен: {error}"
+    except Exception as error:
+        # Находка ревью PR #902 и её вторая итерация: ЛЮБОЙ сбой переноса —
+        # yaml.YAMLError/OSError от трансляции, GitError от git add/commit —
+        # не должен вылетать наружу process_pull/run(): незапойманное
+        # исключение превращает "resolved" в "infra-error" (push_rebased не
+        # вызван, ветка не запушена) и убивает весь проход по очереди, хотя
+        # докстринг обещает, что перенос не может ухудшить уже решённый
+        # исход "resolved".
+        return (
+            "перенос рукописных шагов гвардии в каталог упал сбоем ("
+            f"{type(error).__name__}), не находкой транслятора: {error}"
+        )
+    return None
+
+
 def _same_repo_agent_branch(repo: str, pull: dict) -> bool:
     """issue #764, находка ревью, требование 4: репозиторий публичный, PR из
     форка возможен — `head.ref` без проверки `head.repo.full_name` может
@@ -348,66 +448,65 @@ def conflict_queue(repo: str, pulls: list[dict]) -> list[dict]:
 # with-lease поверх коммитов, которые в этот момент пушит агент) реальна
 # ТОЛЬКО для ТОЙ ОДНОЙ ветки, не для остальных 18.
 #
-# Причина исходного репо-wide решения (см. старый комментарий, снятый этой
-# правкой) была честной: точная привязка «прогон именно по задаче ЭТОГО PR»
-# стоит лишний сетевой вызов на PR очереди. Эта правка платит эту цену ТОЛЬКО
-# когда воркер вообще активен (иначе — 0 дополнительных вызовов, тот же
-# быстрый путь, что раньше): task_ref.resolve_pr_task(pull) — вычисление
-# ЛОКАЛЬНОЕ (regex по имени ветки, без сети), а sch.run_claimed_task(repo,
-# task_number, run_id) — тот же готовый снаряд, которым scheduler.py уже
-# сопоставляет прогон ↔ задача (CLAIM_VIA-след в комментариях issue,
-# claim_task.claim пишет его в первые секунды job'а, задолго до реальной
-# git-работы — см. reap_stalled_worker_run.__doc__): если СЕЙЧАС активный
-# прогон НЕ несёт следа аренды именно ЭТОЙ задачи — значит воркер занят
-# ДРУГИМ PR, и force-with-lease над веткой ЭТОГО PR безопасен.
+# Причина исходного репо-wide решения была честной (см. design.md активного
+# чейнджа mechanical-conflict-rebase, «Гонка с агентским путём», где развилка
+# теперь пересмотрена с этим замером): точная привязка «прогон именно по
+# задаче ЭТОГО PR» стоит лишний сетевой вызов на PR очереди. Эта правка
+# платит эту цену ТОЛЬКО когда воркер вообще активен (иначе — 0 дополнительных
+# вызовов, тот же быстрый путь, что раньше): task_ref.resolve_pr_task(pull) —
+# вычисление ЛОКАЛЬНОЕ (regex по имени ветки, без сети), а
+# sch.run_claimed_task(repo, task_number, run_id) — тот же готовый снаряд,
+# которым scheduler.py уже сопоставляет прогон ↔ задача (CLAIM_VIA-след в
+# комментариях issue, claim_task.claim пишет его в первые секунды job'а,
+# задолго до реальной git-работы — см. reap_stalled_worker_run.__doc__).
 #
-# `queued` (в отличие от `in_progress`) НЕ сужается: прогон, ещё стоящий в
-# очереди концюренси-группы, не успел выполнить claim_task.claim (это первые
-# секунды САМОГО job'а, который ещё не стартовал) — CLAIM_VIA-следа в issue
-# для него физически нет, атрибуция невозможна ни при каком запросе. Это НЕ
-# дыра: пока прогон queued, он ничего не пушил и не мог — блокировка ВСЕЙ
-# очереди в этом (редком) случае — тот же консервативный, безопасный отказ,
-# что был раньше, не регрессия.
-def active_worker_runs(repo: str, now: "datetime") -> tuple[list[int], bool]:
-    """(id'ы незавидших активных `in_progress`-прогонов worker.yml, есть ли
-    хотя бы один `queued`) — тот же фетч и тот же порог зависания
-    (sch._run_is_stalled/WORKER_STALL_MINUTES, issue #815, одно место
-    правды), что sch.worker_runs_active, но возвращает RUN ID'ы вместо
-    готового булева «занято», чтобы worker_blocks_pr ниже мог узнать, ЧЬЮ
-    задачу обслуживает конкретный активный прогон."""
-    in_progress_ids: list[int] = []
-    any_queued = False
-    for status in ("in_progress", "queued"):
-        payload = sch.gh(
-            f"repos/{repo}/actions/workflows/{sch.WORKER_WORKFLOW}/runs?status={status}&per_page=1"
-        ) or {}
-        runs = payload.get("workflow_runs") or []
-        if not runs:
-            continue
-        if status == "in_progress":
-            in_progress_ids = [r["id"] for r in runs if not sch._run_is_stalled(r, now)]
-        else:
-            any_queued = True
-    return in_progress_ids, any_queued
-
-
-def worker_blocks_pr(repo: str, pull: dict, in_progress_ids: list[int], any_queued: bool) -> bool:
+# ОКНО МОЛОДОГО ПРОГОНА (находка ai-review PR #1033, требование 2): CLAIM_VIA-
+# след появляется в задаче НЕ в первые секунды статуса in_progress — до
+# claim_task.claim прогон проходит выборку пула, dup-гардию, квоту и
+# PAT-авторизацию (десятки секунд-минуты, см. докстринг
+# sch.WORKER_CLAIM_TRACE_GRACE_MINUTES). in_progress-прогон БЕЗ следа МЛАДШЕ
+# порога блокирует КОНСЕРВАТИВНО (эпистемически тот же случай, что `queued`:
+# атрибуции ещё нет — а он у первой итерации этого гейта молча разрешался,
+# заново открывая окно #764 ровно на том классе PR — конфликтных, — которые
+# dispatch_conflict_rework и диспатчит). Тормоз с газом: отказ самоосвобождается,
+# когда прогон завершился ИЛИ перешагнул порог (дальше решает след); оба пути
+# короче следующего 15-минутного такта.
+#
+# `queued` НЕ сужается вовсе: прогон, ещё стоящий в очереди концюренси-группы,
+# не успел выполнить claim_task.claim — CLAIM_VIA-следа для него физически нет,
+# атрибуция невозможна ни при каком запросе. Пока прогон queued, он ничего не
+# пушил и не мог — блокировка ВСЕЙ очереди в этом (редком) случае — тот же
+# консервативный, безопасный отказ, не регрессия.
+def worker_blocks_pr(repo: str, pull: dict, active_runs: list[dict], now: "datetime") -> bool:
     """True — этому PR НЕЛЬЗЯ двигать head в этом проходе (см. блок-комментарий
-    выше). `any_queued` блокирует безусловно (атрибуция невозможна — см.
-    комментарий выше). Иначе — блокирует, только если активный `in_progress`
-    прогон несёт CLAIM_VIA-след ИМЕННО задачи этого PR (sch.run_claimed_task);
-    ветка PR без резолвящейся задачи (task_ref.resolve_pr_task вернул None —
-    не должно случаться: conflict_queue уже фильтрует agent/-ветки через
-    _same_repo_agent_branch, но не гадаем при расхождении) — консервативный
+    выше). Порядок проверки от дешёвого к дорогому: queued (локально) →
+    возраст прогона (локально, sch.run_age_minutes) → CLAIM_VIA-след (сетевой
+    вызов на каждую задачу, только для прогонов старше порога). `active_runs` —
+    прод-форма из sch.active_worker_runs (единственное место правды фетча,
+    находка ai-review PR #1033: дублированный фетч-цикл здесь расходился бы
+    с scheduler тихо). Ветка PR без резолвящейся задачи (task_ref.resolve_pr_task
+    вернул None — не должно случаться: conflict_queue уже фильтрует agent/-ветки
+    через _same_repo_agent_branch, но не гадаем при расхождении) и прогон с
+    нечитаемым id/возрастом (не прод-форма ответа GitHub) — консервативный
     блок, не тихое разрешение."""
-    if any_queued:
-        return True
-    if not in_progress_ids:
+    if not active_runs:
+        return False
+    if any((run.get("status") or "") == "queued" for run in active_runs):
+        return True  # атрибуция невозможна — claim ещё не мог случиться
+    in_progress = [run for run in active_runs if (run.get("status") or "") == "in_progress"]
+    if not in_progress:
         return False
     task_number = sch.task_ref.resolve_pr_task(pull)
     if task_number is None:
         return True
-    return any(sch.run_claimed_task(repo, task_number, run_id) for run_id in in_progress_ids)
+    for run in in_progress:
+        run_id = run.get("id")
+        age = sch.run_age_minutes(run, now)
+        if run_id is None or age is None or age < sch.WORKER_CLAIM_TRACE_GRACE_MINUTES:
+            return True  # молод (или нечитаемая прод-форма): след мог ещё не появиться
+        if sch.run_claimed_task(repo, task_number, run_id):
+            return True
+    return False
 
 
 def process_pull(repo: str, pull: dict, repo_dir: Path) -> str:
@@ -417,8 +516,9 @@ def process_pull(repo: str, pull: dict, repo_dir: Path) -> str:
     if not head_ref:
         return "infra-error: PR без head.ref"
     try:
-        in_progress_ids, any_queued = active_worker_runs(repo, datetime.now(timezone.utc))
-        if worker_blocks_pr(repo, pull, in_progress_ids, any_queued):
+        now = datetime.now(timezone.utc)
+        active_runs = sch.active_worker_runs(repo, now)
+        if worker_blocks_pr(repo, pull, active_runs, now):
             return "worker-running"
         running = review_labels.other_active_ai_review_runs(
             repo, number, exclude_run_id=None, gh_func=sch.gh)
@@ -427,6 +527,15 @@ def process_pull(repo: str, pull: dict, repo_dir: Path) -> str:
         outcome = attempt_rebase(repo_dir, head_ref)
         if outcome == "conflict":
             return "conflict"
+        # issue #897, восстановлено после случайной потери в первой итерации
+        # #1032 (находка ai-review PR #1033, требование 1): перенос рукописных
+        # шагов гвардии в каталог — ПОСЛЕ attempt_rebase (оба исхода
+        # "resolved"/"resolved-additive" — working tree на перебазированной
+        # ветке), ДО push_rebased; сбой переноса исход не ухудшает (см.
+        # докстринг migrate_guard_steps_if_needed).
+        warning = migrate_guard_steps_if_needed(repo_dir)
+        if warning:
+            print(f"::warning::PR #{number}: {warning}")
         push_rebased(repo_dir, head_ref)
         return outcome  # "resolved" или "resolved-additive"
     except RuntimeError as error:
@@ -476,8 +585,8 @@ def run(repo: str, repo_dir: Path) -> tuple[list[str], dict[int, str]]:
             worker_busy += 1
             lines.append(
                 f"⏸️ PR #{number}: воркер (worker.yml) активен над ЭТОЙ ЖЕ задачей "
-                "(или прогон ещё queued, атрибуция невозможна) — head не двигаю в "
-                "этом проходе, чтобы не сжечь агентскую попытку (#764)"
+                "(либо прогон ещё queued/молод — атрибуции ещё нет) — head не "
+                "двигаю в этом проходе, чтобы не сжечь агентскую попытку (#764)"
             )
         else:
             failed += 1

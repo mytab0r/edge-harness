@@ -299,6 +299,58 @@ def test_try_resolve_returns_none_when_file_missing(tmp_path):
     assert acm.try_resolve(tmp_path, ["does_not_exist.py"]) is None
 
 
+def test_try_resolve_prints_refusal_reason_to_job_log(tmp_path, capsys):
+    """Отказ не имеет права быть невидимым в логе job'а (находка ai-review
+    PR #1033, замечание из чеклиста: «отказ верификации неотличим от „не наш
+    класс“ и невидим в логе» — рычаг мог бы молча мертветь в проде, как те
+    самые 0/12 замера). Причина обязана прийти одной строкой с ::warning::,
+    с именем файла и конкретикой отказа.
+
+    Мутация: сделай _refuse пустышкой (return None без print) — тест краснеет
+    на первом assert, при этом ВСЕ прочие тесты этого файла остаются
+    зелёными: print не влияет ни на один возвращаемый результат."""
+    target = tmp_path / "widget.py"
+    _write_conflicted_py(target)
+    colliding = tmp_path / "collides.py"
+    colliding.write_text(
+        "<<<<<<< HEAD\nCOLLIDES = 1\n=======\nCOLLIDES = 2\n>>>>>>> branch\n",
+        encoding="utf-8",
+    )
+
+    result = acm.try_resolve(tmp_path, ["widget.py", "collides.py"])
+
+    assert result is None
+    out = capsys.readouterr().out
+    assert "::warning::" in out
+    assert "отказываюсь" in out
+    assert "collides.py" in out          # какой файл отказан
+    assert "COLLIDES" in out             # почему (совпадение имени верхнего уровня)
+    warning_line = next(line for line in out.splitlines() if "::warning::" in line)
+    assert "COLLIDES" in warning_line    # причина и правда в той же строке
+
+
+def test_try_resolve_prints_pytest_tail_when_verification_fails(tmp_path, capsys):
+    """Провал верификации обязан называть СВОЮ причину, включая хвост вывода
+    pytest одной строкой — «No module named pytest», красный тест и падение
+    сбора — разные причины с разными лекарствами, а не обезличенный отказ
+    (тот же находка ai-review PR #1033)."""
+    target = tmp_path / "widget.py"
+    _write_conflicted_py(target)
+    (tmp_path / "test_widget.py").write_text(
+        "def test_always_fails():\n    assert False\n", encoding="utf-8"
+    )
+
+    result = acm.try_resolve(tmp_path, ["widget.py"])
+
+    assert result is None
+    warning_line = next(
+        line for line in capsys.readouterr().out.splitlines() if "::warning::" in line
+    )
+    assert "pytest" in warning_line
+    assert "rc=" in warning_line
+    assert "test_always_fails" in warning_line or "failed" in warning_line
+
+
 # ── Прод-форма: реальный git rebase, реальный конфликт ───────────────────
 
 
