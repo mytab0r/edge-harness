@@ -106,16 +106,6 @@ jobs:
           # пропускается с ⚠️ в отчёте, слияния это не блокирует.
           DSH_EDGE_URL: ${{ vars.DSH_EDGE_URL }}
           DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
-          # Снимок состояния задача/PR (#1287, orchestrator-core-v2, ходячий
-          # скелет, tasks.md Этап 0): ТЕ ЖЕ секреты, что worker.yml уже
-          # использует для POST /api/heartbeat (design.md §7.1 — ноль новых
-          # секретов, ноль новой инфраструктуры) — оркестратор сегодня не
-          # имел канала к СОБСТВЕННОМУ edge-harness DO вовсе (§7.1, факт 3,
-          # grep до этого change — ноль совпадений в этом файле). Не заданы —
-          # write_walking_skeleton_snapshot честно печатает причину в лог
-          # прогона и не блокирует слияния (best-effort).
-          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
-          HARNESS_URL: ${{ vars.HARNESS_URL }}
         run: python scripts/orchestra/scheduler.py
 
       # Инварианты состояния репозитория (#244): состояние дрейфует БЕЗ

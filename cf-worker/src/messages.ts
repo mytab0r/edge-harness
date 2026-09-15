@@ -36,11 +36,6 @@ const MESSAGES = {
     need_message_id: "Нужно целое положительное поле message_id",
     need_claimed_ts: "Нужно целое поле claimed_ts — эхо client_payload.claimed_ts из dispatch'а",
     need_issue_fields: "Без error нужны issue_number (целое > 0) и issue_url",
-    // Снимок наблюдаемого состояния задача/PR (#1287, orchestrator-core-v2).
-    need_number: "Нужен целый номер сущности (число)",
-    need_repo: "Нужно поле repo (или GH_REPO по умолчанию)",
-    need_stage: "Нужно непустое строковое поле stage",
-    snapshot_not_found: "Снимок {repo}#{number} не найден",
   },
 } as const;
 

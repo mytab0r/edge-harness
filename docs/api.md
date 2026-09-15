@@ -31,26 +31,6 @@ POST — задача в очередь + repository_dispatch (без GH_DISPATC
 
 Отметка живости рук {job_id, task_id?}. Первая отметка задачи фиксирует latency_ms.
 
-## `GET/POST /api/tasks-snapshot`
-
-Снимок наблюдаемого состояния задач (#1287, orchestrator-core-v2, ходячий скелет). GET — список (LIMITS.snapshotsListMax строк, по updated_ts DESC). POST {repo, number, stage, flags} — пишет ТОЛЬКО реконсилятор (scripts/orchestra/scheduler.py); edge-triggered — запись в SQLite происходит только если stage/flags изменились относительно сохранённой строки (design.md §3.1/§3.4), ответ {written: boolean} различает оба случая явно.
-
-## `GET /api/tasks-snapshot/`
-
-Один снимок задачи по номеру (?repo= — иначе GH_REPO по умолчанию).
-
-Остаток пути после `/api/tasks-snapshot/` — параметр.
-
-## `GET/POST /api/pr-snapshot`
-
-Снимок наблюдаемого состояния PR (#1287, orchestrator-core-v2, ходячий скелет) — тот же контракт, что taskSnapshots, для сущности PR.
-
-## `GET /api/pr-snapshot/`
-
-Один снимок PR по номеру (?repo= — иначе GH_REPO по умолчанию).
-
-Остаток пути после `/api/pr-snapshot/` — параметр.
-
 ## `POST/DELETE /api/session`
 
 Вход браузера: POST обменивает Authorization: Bearer <HANDS_TOKEN> на подписанную сессионную куку (HttpOnly, SameSite=Strict, Secure, TTL в src/config.ts); DELETE сбрасывает куку. Job продолжает ходить Bearer'ом; токен в query (?token=) отклоняется кодом 400 query_token_removed.
