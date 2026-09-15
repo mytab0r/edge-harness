@@ -405,7 +405,9 @@ def dependabot_alert_watch(repo: str, now: datetime) -> tuple:
         title = alert_task_title(alert)
         body = alert_task_body(alert)
         try:
-            created = pool_issue.create_pool_issue(gh, repo, title, body, ["task", DEPENDABOT_ALERT_LABEL])
+            created = pool_issue.create_pool_issue(
+                gh, repo, title, body, ["task", DEPENDABOT_ALERT_LABEL],
+                producer="dependabot-alert-watch")
         except RuntimeError as error:
             observations.append(f"⚠️ dependabot-alert-watch: алерт #{number} не заведён ({error})")
             continue

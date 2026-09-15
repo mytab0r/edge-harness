@@ -2442,7 +2442,7 @@ def after_merge(
                 created = pool_issue.create_pool_issue(
                     gh, repo, tail_title,
                     review_checklist.tail_issue_body(repo, number, unresolved),
-                    ["task"],
+                    ["task"], producer="checklist-tail",
                 )
                 actions.append(
                     f"📋 хвост чеклиста PR #{number}: заведена #{created['number']} "
@@ -4761,7 +4761,7 @@ def _create_task_replacement(repo: str, pull: dict, task_number: int) -> int:
         f"{pull.get('body') or '_тело PR пустое_'}"
     )
     result = pool_issue.create_pool_issue(
-        gh, repo, title, body, [TASK_LABEL, AUTO_LABEL])
+        gh, repo, title, body, [TASK_LABEL, AUTO_LABEL], producer="task-replacement")
     return result["number"]
 
 

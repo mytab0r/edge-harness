@@ -376,7 +376,7 @@ def create_bump_issue(repo: str, decision: dict) -> int:
     )
     created = pool_issue.create_pool_issue(
         pulse_guard.gh, repo, f"dsh-edge: пин апстрима отстаёт от {tag_name}", body,
-        ["task", "area:worker"],
+        ["task", "area:worker"], producer="upstream-drift",
     )
     return created["number"]
 

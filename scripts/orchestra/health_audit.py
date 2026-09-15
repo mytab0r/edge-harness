@@ -229,7 +229,8 @@ def run_self_audit(repo: str, classifications: list[health_regression.Classifica
         body = render_body(fp, c, snapshot_ref)
         title = f"Регрессия здоровья конвейера: {c.label}"
         result = pool_issue.create_pool_issue(pulse_guard.gh, repo, title, body,
-                                              [TASK_LABEL, SELF_AUDIT_LABEL])
+                                              [TASK_LABEL, SELF_AUDIT_LABEL],
+                                              producer="health-audit")
         created_today += 1
         number = result["number"]
         report.append(f"🆕 задача #{number} заведена само-аудитом по {fp}")

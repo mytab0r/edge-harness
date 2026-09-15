@@ -489,7 +489,8 @@ def run_watch(repo: str, now: datetime) -> list[str]:
         title = f"Регрессия worker_success_rate после слияния ({now.strftime('%Y-%m-%d %H:%M')} UTC)"
         body = render_body(verdict, suspects, truncated)
         result = pool_issue.create_pool_issue(pulse_guard.gh, repo, title, body,
-                                              [TASK_LABEL, PROCESS_LABEL])
+                                              [TASK_LABEL, PROCESS_LABEL],
+                                              producer="merge-health-watch")
         number = result["number"]
         report.append(f"🆕 задача #{number} заведена")
 

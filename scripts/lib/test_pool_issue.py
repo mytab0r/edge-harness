@@ -37,32 +37,77 @@ class RecordingGh:
 def test_missing_task_label_never_calls_gh():
     gh = RecordingGh()
     with pytest.raises(RuntimeError, match="task"):
-        pool_issue.create_pool_issue(gh, "o/r", "title", "body", ["white-spot"])
+        pool_issue.create_pool_issue(gh, "o/r", "title", "body", ["white-spot"], producer="x")
     assert gh.calls == []
 
 
 def test_empty_labels_never_calls_gh():
     gh = RecordingGh()
     with pytest.raises(RuntimeError, match="task"):
-        pool_issue.create_pool_issue(gh, "o/r", "title", "body", [])
+        pool_issue.create_pool_issue(gh, "o/r", "title", "body", [], producer="x")
     assert gh.calls == []
 
 
 def test_task_label_present_calls_gh_with_post_issues():
     gh = RecordingGh()
-    created = pool_issue.create_pool_issue(gh, "o/r", "title", "body text", ["task"])
+    created = pool_issue.create_pool_issue(
+        gh, "o/r", "title", "body text", ["task"], producer="stall-detector")
     assert created["number"] == 999
     assert len(gh.calls) == 1
     args = gh.calls[0]
     assert args[:3] == ("-X", "POST", "repos/o/r/issues")
     assert "-f" in args and "title=title" in args
-    assert "body=body text" in args
     assert "labels[]=task" in args
+    body_arg = next(a for a in args if a.startswith("body="))
+    assert body_arg == (
+        "body=<!-- pool-issue-producer: stall-detector -->\nbody text")
 
 
 def test_multiple_labels_all_forwarded():
     gh = RecordingGh()
-    pool_issue.create_pool_issue(gh, "o/r", "t", "b", ["task", "white-spot"])
+    pool_issue.create_pool_issue(gh, "o/r", "t", "b", ["task", "white-spot"], producer="review-findings")
     args = gh.calls[0]
     assert "labels[]=task" in args
     assert "labels[]=white-spot" in args
+
+
+# ── Маркер производителя (issue #1277) ──────────────────────────────────────
+
+def test_missing_producer_never_calls_gh():
+    gh = RecordingGh()
+    with pytest.raises(RuntimeError, match="producer"):
+        pool_issue.create_pool_issue(gh, "o/r", "t", "b", ["task"], producer="")
+    assert gh.calls == []
+
+
+def test_invalid_producer_never_calls_gh():
+    gh = RecordingGh()
+    with pytest.raises(RuntimeError, match="producer"):
+        pool_issue.create_pool_issue(gh, "o/r", "t", "b", ["task"], producer="Not Valid!")
+    assert gh.calls == []
+
+
+def test_producer_marker_prepended_to_body():
+    gh = RecordingGh()
+    pool_issue.create_pool_issue(gh, "o/r", "t", "исходное тело", ["task"], producer="upstream-drift")
+    args = gh.calls[0]
+    body_arg = next(a for a in args if a.startswith("body="))
+    assert body_arg == "body=<!-- pool-issue-producer: upstream-drift -->\nисходное тело"
+
+
+def test_extract_producer_round_trips():
+    body = f"{pool_issue.producer_marker('failure-watch')}\nостальное тело\nещё строка"
+    assert pool_issue.extract_producer(body) == "failure-watch"
+
+
+def test_extract_producer_none_when_absent():
+    assert pool_issue.extract_producer("обычное тело без маркера") is None
+    assert pool_issue.extract_producer(None) is None
+    assert pool_issue.extract_producer("") is None
+
+
+def test_extract_producer_ignores_manually_edited_lookalike_text():
+    # Честная граница (докстринг модуля): текст, ПОХОЖИЙ на маркер, но не
+    # являющийся HTML-комментарием, не распознаётся — только точная форма,
+    # которую сама create_pool_issue пишет.
+    assert pool_issue.extract_producer("pool-issue-producer: failure-watch (без <!-- -->)") is None

@@ -2488,7 +2488,8 @@ def failure_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
                 # вне pool_issue.py» ловит обход — красный чек прогона
                 # 34049072989 на этом PR).
                 created = pool_issue.create_pool_issue(
-                    gh, repo, title, body, ["task", FAILURE_WATCH_LABEL])
+                    gh, repo, title, body, ["task", FAILURE_WATCH_LABEL],
+                    producer="failure-watch")
             except RuntimeError as error:
                 observations.append(
                     f"⚠️ failure-watch {workflow} (job «{job_name}»): задача по дефекту не заведена ({error})")
