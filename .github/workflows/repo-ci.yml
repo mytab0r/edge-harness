@@ -266,6 +266,14 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/orchestra/test_scheduler.py -q
 
+      # Снимок наблюдаемого состояния задача/PR (#1287, orchestrator-core-v2,
+      # tasks.md Этап 0, ходячий скелет): build_observed_pr/build_observed_task
+      # на реальных фикстурах (gh api pulls/1290, issues/1287), edge-triggered
+      # запись гейтится тем же _guard_raw_subprocess_write, что update_branch.
+      # Каталог гвардий (#749): scripts/ci/guards/snapshot-walking-skeleton-guard.sh,
+      # перебирается шагом «Каталог гвардий scripts/ci/guards — перебор (#749)»
+      # ниже, без рукописного шага здесь.
+
       # Механический git rebase PR с меткой conflict без LLM-агента (#762) —
       # прод-форма: настоящий git (bare-репозиторий), FakeGh для GitHub API.
       - name: Тесты механического ребейза конфликтных PR
