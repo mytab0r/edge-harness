@@ -51,7 +51,8 @@
 # последней попытки — единственный сигнал, различающий «транспорт упал» от
 # «дсш вернул текст»; смотри verdict в ai_review.py), $AI_WORK/
 # failure_reason.txt (пусто на успехе/обычном транспортном отказе;
-# quota_exhausted | rate_limit_retry_budget_exceeded | all_providers_exhausted
+# quota_exhausted | rate_limit_retry_budget_exceeded | all_providers_exhausted |
+# chain_budget_exhausted (#1160)
 # иначе), $AI_WORK/chain_provider.txt (имя провайдера, ответившего успехом,
 # пусто на отказе), $AI_WORK/chain_reset_hint.txt (даты сброса опробованных
 # провайдеров, «имя: дата; …» — пусто, если ни один не назвал дату).

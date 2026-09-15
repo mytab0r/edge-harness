@@ -666,6 +666,11 @@ jobs:
       - name: Smoke цепочки LLM-провайдеров (#727)
         run: bash scripts/lib/test/dsh-provider-chain.smoke.sh
 
+      # Гвардия класса «зависший вызов агента держит единственный слот
+      # воркера часами» (#1160/#1141) — в каталоге гвардий (#749):
+      # scripts/ci/guards/dsh-chain-budget-guard.sh, не рукописный шаг
+      # здесь (та же регистрация данными, что и у соседних гвардий).
+
       # Гвардия критерия успеха воркера (#876) — в каталоге гвардий (#749):
       # scripts/ci/guards/worker-success-gate-guard.sh, не рукописный шаг
       # здесь (ALLOWLIST-ratchet ci_guard_registration_guard.py не даёт

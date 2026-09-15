@@ -409,7 +409,8 @@ def error_reason(answer: str, dsh_rc: str, failure_reason: str = "",
                 "ставь approve) — автор PR не получил бы ни одного сигнала, "
                 "что чинить (#210)")
     # empty_diff/diff_source_mismatch/all_providers_exhausted (#658/#687/#727)
-    # — причины БЕЗ обращения к модели вовсе (cmd_gather решил их заранее) или
+    # и chain_budget_exhausted (#1160) — причины БЕЗ обращения к модели вовсе
+    # (cmd_gather решил их заранее) или
     # вне оси quota/rate-limit/transport/contract, которую делит review_labels.
     # reason_tag (#431) — тег их не различает и не обязан: остаются
     # литералами failure_reason здесь, до делегирования тегу ниже.
@@ -436,6 +437,19 @@ def error_reason(answer: str, dsh_rc: str, failure_reason: str = "",
                 f"(код возврата {dsh_rc}), ближайший сброс: {when} — действие: "
                 "ждать сброса вне CI, либо добавить нового провайдера в "
                 "vars.DSH_PROVIDER_CHAIN (docs/runbooks/switch-llm-provider.md)")
+    if failure_reason == "chain_budget_exhausted":
+        # #1160/#1141: суммарный wall-clock бюджет цепочки (DSH_CHAIN_TOTAL_
+        # BUDGET_SECS) исчерпан ДО конца списка — попытки честно ограничены
+        # по времени, зависанием это не является; без явной ветки незнакомый
+        # тег падал бы в FAILURE_REASON_TRANSPORT (review_labels.reason_tag,
+        # rc!=0) и «суммарный бюджет исчерпан» терялся бы за общей формулой
+        # «ошибка транспорта» (алерт не гадает: данные различимы — различи).
+        return (f"ревью не состоялось — суммарный wall-clock бюджет цепочки "
+                f"провайдеров исчерпан до конца списка (код возврата {dsh_rc}, "
+                f"#1160/#1141) — попытки честно ограничены по времени, это не "
+                f"зависание; повтор внутри этого прогона не поможет, действие: "
+                f"следующий прогон, либо пересмотр цепочки/бюджета "
+                f"(docs/runbooks/switch-llm-provider.md)")
     # Оставшаяся ось (quota/rate-limit/transport/contract) — ЕДИНСТВЕННО
     # через review_labels.reason_tag (находка ревью #439, см. докстринг выше).
     tag = review_labels.reason_tag(dsh_rc, failure_reason)
@@ -1464,7 +1478,8 @@ def main() -> int:
     # теряет уточнение причины (см. transport_failed: пусто → не транспорт).
     verdict.add_argument("--dsh-rc", default="")
     # Тег причины из $AI_WORK/failure_reason.txt (ai_dsh.sh, #419): quota_exhausted
-    # | rate_limit_retry_budget_exceeded | all_providers_exhausted (#727) | пусто.
+    # | rate_limit_retry_budget_exceeded | all_providers_exhausted (#727) |
+    # chain_budget_exhausted (#1160) | пусто.
     # Необязателен по той же причине, что и --dsh-rc — ручной запуск без него
     # просто теряет уточнение.
     verdict.add_argument("--failure-reason", default="")

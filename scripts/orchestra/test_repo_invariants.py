@@ -2022,6 +2022,82 @@ def test_recurring_worker_failure_skips_multiple_pending_runs_mid_streak(monkeyp
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# Инвариант 21: единственный слот worker.yml занят одним прогоном дольше
+# разумного (#1160/#1141)
+# ══════════════════════════════════════════════════════════════════════════
+
+def in_progress_run(run_id, run_started_at):
+    return {
+        "id": run_id,
+        "conclusion": None,
+        "run_started_at": run_started_at,
+        "html_url": f"https://github.com/{REPO}/actions/runs/{run_id}",
+    }
+
+
+def test_worker_run_long_running_violation_over_threshold(monkeypatch):
+    # Живой класс #1160/#1141: прогон идёт дольше WORKER_RUN_LONG_RUNNING_MINUTES
+    # (200) — здесь 210 мин, чуть за порогом.
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs?status=in_progress&per_page=1": {
+            "workflow_runs": [in_progress_run(1, "2026-09-14T03:13:39Z")],
+        },
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 14, 6, 43, 39)  # +210 мин от run_started_at
+    result = ri.check_worker_run_long_running(REPO, now)
+    assert result.status == ri.check_result.STATUS_VIOLATION
+    assert len(result.violations) == 1
+    assert result.violations[0]["run_id"] == 1
+    assert result.violations[0]["age_minutes"] == 210
+    assert result.violations[0]["threshold_minutes"] == ri.WORKER_RUN_LONG_RUNNING_MINUTES
+
+
+def test_worker_run_long_running_ok_under_threshold(monkeypatch):
+    # Типичный здоровый прогон (замер 2026-09-14: 18-105 мин) — молчит.
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs?status=in_progress&per_page=1": {
+            "workflow_runs": [in_progress_run(2, "2026-09-14T03:13:39Z")],
+        },
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 14, 4, 58, 39)  # +105 мин
+    assert ri.check_worker_run_long_running(REPO, now) == ri.check_result.ok()
+
+
+def test_worker_run_long_running_ok_when_no_run_in_progress(monkeypatch):
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs?status=in_progress&per_page=1": {
+            "workflow_runs": [],
+        },
+    })
+    patch_gh(monkeypatch, fake)
+    assert ri.check_worker_run_long_running(REPO, utc(2026, 9, 14, 12, 0, 0)) == ri.check_result.ok()
+
+
+def test_worker_run_long_running_unknown_when_transport_fails(monkeypatch):
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("HTTP 503")
+    monkeypatch.setattr(ri.pulse_guard, "gh", boom)
+    result = ri.check_worker_run_long_running(REPO, utc(2026, 9, 14, 12, 0, 0))
+    assert result.status == ri.check_result.STATUS_UNKNOWN
+    assert "недоступен" in result.reason
+
+
+def test_worker_run_long_running_unknown_on_missing_timestamp(monkeypatch):
+    # Прод-форма без run_started_at/created_at — не гадаем, называем факт.
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs?status=in_progress&per_page=1": {
+            "workflow_runs": [{"id": 3, "conclusion": None, "html_url": "https://x"}],
+        },
+    })
+    patch_gh(monkeypatch, fake)
+    result = ri.check_worker_run_long_running(REPO, utc(2026, 9, 14, 12, 0, 0))
+    assert result.status == ri.check_result.STATUS_UNKNOWN
+    assert "#3" in result.reason
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # Холостой ход: здоровый снимок — 0 нарушений, 0 мутирующих вызовов
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -2687,6 +2763,17 @@ def test_assert_check_result_invariants_not_gated_or_escalated_passes_on_real_co
     # синтетике ниже: сегодняшние CI_GATING/ESCALATING_INVARIANTS обязаны
     # проходить эту проверку молча.
     ri.assert_check_result_invariants_not_gated_or_escalated(ri.CI_GATING, ri.ESCALATING_INVARIANTS)
+
+
+def test_invariant_21_is_in_check_result_migrated_registry():
+    # #1160: перенумерация 19 -> 21 (живая коллизия номера, arbitration
+    # invariant_numbering.py) обязана была доехать и до реестра
+    # CHECK_RESULT_MIGRATED_INVARIANTS — оставленный бы там 19 (номера в
+    # дереве нет) делал объявленную «наблюдательность» 21 незащищённой:
+    # добавь 21 в CI_GATING — unknown() коллапсировал бы в findings=[21]=[]
+    # молча. Мутация: вернуть 19/убрать 21 — тест краснеет.
+    assert 21 in ri.CHECK_RESULT_MIGRATED_INVARIANTS
+    assert 19 not in ri.CHECK_RESULT_MIGRATED_INVARIANTS
 
 
 def test_assert_check_result_invariants_raises_if_migrated_invariant_added_to_ci_gating():
