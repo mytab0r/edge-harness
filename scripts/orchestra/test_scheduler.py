@@ -568,6 +568,109 @@ def test_after_merge_appends_session_note_before_archiving(monkeypatch):
     assert order == ["note", "archive"]
 
 
+def test_after_merge_records_hard_failure_fact_for_final_alert(monkeypatch):
+    # Дефект живого алерта 2026-09-12 (issue #120, "архив сессии раннера
+    # сломан"): текст отсылал читателя «см. отчёт этого прогона orchestra
+    # выше», хотя факт (номер задачи, session_id, сырое тело ошибки RPC) уже
+    # был посчитан archive_runner_sessions. after_merge обязан скопировать
+    # этот факт в _MERGE_SESHARD..._FACTS (см. merge_session_hard_failure_
+    # alert_text ниже) — не пересобирать текст заново.
+    sch.reset_merge_session_hard_failure_facts()
+    merged = pull(9, ref="agent/91-x", pr_body="#91")
+
+    def fake_gh(*args):
+        joined = " ".join(args)
+        if joined in ("repos/o/r/pulls/9/files?per_page=100&page=1",
+                      "repos/o/r/pulls/9/files?per_page=100&page=2"):
+            return []
+        if joined == "repos/o/r/issues/91":
+            return {**issue(91, assignees=("mytab0r",), title="т"), "state": "open"}
+        if joined.startswith("-X POST repos/o/r/issues/") and "/comments" in joined:
+            return None
+        raise AssertionError(f"нет маршрута для: {joined}")
+
+    monkeypatch.setattr(sch, "gh", fake_gh)
+    monkeypatch.setattr(sch, "recent_runs", lambda *a, **k: [])
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    monkeypatch.setattr(sch, "append_session_notes", lambda notes: ([], False))
+    fact = "🚨 #91: сессия harness-91 не заархивирована (возможность сломана): RPC boom"
+    monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([fact], True))
+
+    observations, actions, archive_hard_failure, note_hard_failure = sch.after_merge("o/r", merged, [])
+
+    assert archive_hard_failure is True and note_hard_failure is False
+    assert sch._MERGE_SESSION_ARCHIVE_FAILURE_FACTS == [fact]
+
+
+def test_merge_session_hard_failure_alert_text_names_facts_and_gas(monkeypatch, tmp_path):
+    # "Алерт не гадает" (AGENTS.md): текст обязан нести дословный факт и
+    # НАЗВАННЫЙ газ (issue #940 / PR #944), не «см. отчёт этого прогона
+    # orchestra выше», на который у получателя Telegram-алерта нет доступа.
+    # Статус sweep («слит или нет») код определяет САМ (находка ai-ревью
+    # #1053: «сверь `gh pr view 944`» перекладывала работу на получателя, у
+    # которого нет gh под рукой) — проверяем ОБЕ ветки мутацией пути.
+    sch.reset_merge_session_hard_failure_facts()
+    fact = "🚨 #91: сессия harness-91 не заархивирована (возможность сломана): RPC boom"
+    sch._MERGE_SESSION_ARCHIVE_FAILURE_FACTS.append(fact)
+
+    # Ветка «sweep ещё не в main»: газ назван с адресом и условием появления.
+    monkeypatch.setattr(sch, "_SESSION_ORPHAN_SWEEP_PATH", tmp_path / "session_orphan_sweep.py")
+    text_absent = sch.merge_session_hard_failure_alert_text(True, False, False, [])
+    assert fact in text_absent  # дословный факт, не пересказ
+    assert "см. отчёт этого прогона orchestra выше" not in text_absent  # старая ложь про доступный лог
+    assert "#944" in text_absent and "session_orphan_sweep" in text_absent  # назван газ с адресом
+    assert "сверь" not in text_absent  # сверка не перекладывается на получателя
+    assert "workspace.archiveSession" in text_absent  # назван газ ДО слияния #944
+
+    # Ветка «sweep уже в main» (#944 слит): факт определён кодом, не просьба.
+    sweep_file = tmp_path / "session_orphan_sweep.py"
+    sweep_file.write_text("# sweep\n", encoding="utf-8")
+    monkeypatch.setattr(sch, "_SESSION_ORPHAN_SWEEP_PATH", sweep_file)
+    text_present = sch.merge_session_hard_failure_alert_text(True, False, False, [])
+    assert fact in text_present
+    assert "session_orphan_sweep" in text_present
+    assert "уже в коде этого прогона" in text_present  # факт, а не «сверь сам»
+    assert "сверь" not in text_present
+    # Мутация: верни в текст «сверь `gh pr view 944 …`» — оба assert'а про
+    # «сверь» выше покраснеют.
+
+
+def test_merge_session_hard_failure_alert_text_stall_names_own_fact(monkeypatch):
+    sch.reset_merge_session_hard_failure_facts()
+    stall_fact = "🚨 детектор простоя (#201) не отработал (возможность сломана, не отсутствует): auth required"
+
+    text = sch.merge_session_hard_failure_alert_text(False, False, True, [stall_fact])
+
+    assert stall_fact in text
+    assert "детектор простоя сломан" in text
+
+
+def test_merge_session_hard_failure_alert_text_notes_failure_honest_gas(monkeypatch):
+    # Находка ai-ревью #1053, второй круг (блокирующая находка 2): один текст
+    # «После мержа PR архивация… + sweep уберёт сироту» ВРАЛ случаю «сломалась
+    # только заметка» — мержа могло не быть вовсе (путь unhealthy_pulls —
+    # возврат задачи в пул), сироты нет, sweep «по статусу задачи» живую
+    # сессию открытой задачи не тронет, а при «заметка не дописалась, архив
+    # удался» сессия уже заархивирована. Текст заметочного сбоя обязан:
+    # не утверждать мерж, называть потерю безвозвратной, звать ЧЕСТНЫЙ газ
+    # (ручная дописка тем же ingest-запросом, адрес контракта) — не сироту
+    # и не sweep.
+    sch.reset_merge_session_hard_failure_facts()
+    note_fact = "🚨 #50: лог итогов не дописан в сессию harness-50 (возможность сломана): HTTP 500: morde backend down"
+    sch._MERGE_SESSION_NOTE_FAILURE_FACTS.append(note_fact)
+
+    text = sch.merge_session_hard_failure_alert_text(False, True, False, [])
+
+    assert note_fact in text  # дословный факт
+    assert "Мерж не откатывается" not in text  # мержа могло не быть — не утверждаем
+    assert "сирот" not in text and "sweep" not in text  # чужой газ заметочному сбою не звать
+    assert "автоматической повторной дозаписи НЕТ" in text  # честный пробел, не «следующий прогон допишет»
+    assert "/api/sessions/<session_id>/ingest" in text  # адрес ручной дописки
+    assert "дозапись заметки-итога сломан" in text  # статус называет СВОЙ вид сбоя
+    # Мутация: склей флаги (заметочный текст по archive-ветке) — assert'ы про
+    # «Мерж не откатывается»/«сирот»/sweep краснеют.
+
+
 def test_after_merge_skips_session_note_when_no_task_numbers(monkeypatch):
     # Гвардия холостого хода: PR без задач пула (упоминание чужой/несуществующей
     # задачи в прозе) не должен даже пытаться дописать заметку — append_session_notes
@@ -613,7 +716,7 @@ def test_accept_merged_tasks_ok_close_appends_session_note(monkeypatch):
         "-X PATCH repos/o/r/issues/320": {},
         "task-320": "🔓 замок task-320 снят",
     }))
-    observations, actions, hard = sch.accept_merged_tasks(
+    observations, actions, hard, note_hard = sch.accept_merged_tasks(
         "o/r", [task], {320: merged_pr}, utc(2026, 9, 2, 0, 0), open_pulls_list=[])
     assert hard is False
     assert captured["notes"] == [(320, "✅ Задача #320 закрыта приёмкой (script): тесты зелёные.")]
@@ -637,10 +740,42 @@ def test_accept_merged_tasks_fail_appends_session_note(monkeypatch):
         "-X DELETE repos/o/r/issues/321/assignees": {},
         "task-321": "🔓 замок task-321 снят",
     }))
-    observations, actions, hard = sch.accept_merged_tasks(
+    observations, actions, hard, note_hard = sch.accept_merged_tasks(
         "o/r", [task], {321: merged_pr}, utc(2026, 9, 2, 0, 0), open_pulls_list=[])
     assert hard is False
     assert captured["notes"] == [(321, "♻️ Задача #321 не закрыта приёмкой (script) — тест провален.")]
+
+
+def test_accept_merged_tasks_note_hard_failure_records_fact_and_splits_flags(monkeypatch):
+    # Блокирующая находка ai-ревью #1053 (второй круг, находка 1): приёмка —
+    # ТРЕТЬЕ место вызова append_session_notes, и класс «🚨-строка живёт только
+    # в отчёте прогона, Telegram молчит» обязан быть закрыт здесь же — после
+    # after_merge и unhealthy_pulls. И флаг заметок НЕ склеивается с флагом
+    # улик: склейка переименовала бы сбой проверки улик (а он эскалирован
+    # per-task внутри) в «заметка не удалась» финального алерта — у них разные
+    # текст и газ. Мутация: убери _record_merge_session_hard_failure_facts
+    # в accept_merged_tasks или верни склейку флагов — тест краснеет.
+    sch.reset_merge_session_hard_failure_facts()
+    task = issue(322, title="т")
+    merged_pr = pull(9, pr_body="#322")
+    merged_pr["merged_at"] = "2026-09-01T00:00:00Z"
+    merged_pr["head"] = {"sha": "deadbeef"}
+    note_fact = "🚨 #322: лог итогов не дописан в сессию harness-322 (возможность сломана): HTTP 500: morde backend down"
+    monkeypatch.setattr(sch, "append_session_notes", lambda notes: ([note_fact], True))
+    monkeypatch.setattr(sch, "classify_acceptance", lambda filenames: sch.ACCEPT_SCRIPT)
+    monkeypatch.setattr(sch, "script_evidence", lambda repo, sha: ("ok", "тесты зелёные"))
+    patch_gh(monkeypatch, FakeGh({
+        "repos/o/r/pulls/9/files": [],
+        "issues/322/comments": [],
+        "-X PATCH repos/o/r/issues/322": {},
+        "task-322": "🔓 замок task-322 снят",
+    }))
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(
+        "o/r", [task], {322: merged_pr}, utc(2026, 9, 2, 0, 0), open_pulls_list=[])
+    # Улика получена (задача закрыта) — её флаг False; сломана ТОЛЬКО заметка.
+    assert hard_failure is False and note_hard_failure is True
+    assert sch._MERGE_SESSION_NOTE_FAILURE_FACTS == [note_fact]  # дословный факт, не пересказ
+    assert sch._MERGE_SESSION_ARCHIVE_FAILURE_FACTS == []  # архив тут не звался — чужой бакет пуст
 
 
 def test_unhealthy_pulls_appends_session_note(monkeypatch):
@@ -657,7 +792,7 @@ def test_unhealthy_pulls_appends_session_note(monkeypatch):
         "-X POST repos/o/r/issues/50/comments": {},
         "task-50": "🔓 замок task-50 снят",
     }))
-    lines = sch.unhealthy_pulls("o/r", utc(2026, 9, 2, 12, 0), [p], pool=[task])
+    lines, _hard = sch.unhealthy_pulls("o/r", utc(2026, 9, 2, 12, 0), [p], pool=[task])
     assert any("возвращена в пул" in line for line in lines)
     assert captured["notes"] == [(50, f"♻️ Задача #50 возвращена в пул: PR #9 нездоров (метка {sch.review_labels.AI_CHANGES}).")]
 
@@ -671,7 +806,7 @@ def test_unhealthy_pulls_calls_append_session_notes_with_empty_list_when_queue_e
         sch, "append_session_notes",
         lambda notes: (captured.setdefault("notes", notes) and []) or ([], False),
     )
-    lines = sch.unhealthy_pulls("o/r", utc(2026, 9, 2, 12, 0), [], pool=[])
+    lines, _hard = sch.unhealthy_pulls("o/r", utc(2026, 9, 2, 12, 0), [], pool=[])
     assert lines == []
     assert captured["notes"] == []
 
@@ -694,10 +829,10 @@ def test_main_exits_nonzero_and_escalates_on_archive_hard_failure(monkeypatch):
     monkeypatch.setattr(sch, "reap_stalled_worker_run", lambda repo, now, pool, pulls: ([], []))
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
-    monkeypatch.setattr(sch, "unhealthy_pulls", lambda repo, now, pulls, *, pool=None: [])
-    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], ["✅ PR #1 слит"], True, pulls))
+    monkeypatch.setattr(sch, "unhealthy_pulls", lambda repo, now, pulls, *, pool=None: ([], False))
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], ["✅ PR #1 слит"], True, False, pulls))
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
-    monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False))
+    monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False, False))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], True))
     monkeypatch.setattr(sch, "wip_gate", lambda repo, now, pulls, pool, dispatch_allowed: ([], [], True))
     monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool, *, wip_allowed, pulls: ([], []))
@@ -734,15 +869,15 @@ def test_main_exits_nonzero_and_escalates_on_stall_hard_failure(monkeypatch):
     monkeypatch.setattr(sch, "reap_stalled_worker_run", lambda repo, now, pool, pulls: ([], []))
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
-    monkeypatch.setattr(sch, "unhealthy_pulls", lambda repo, now, pulls, *, pool=None: [])
-    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], ["✅ PR #1 слит"], False, pulls))
+    monkeypatch.setattr(sch, "unhealthy_pulls", lambda repo, now, pulls, *, pool=None: ([], False))
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], ["✅ PR #1 слит"], False, False, pulls))
     monkeypatch.setattr(sch, "trigger_ai_review", lambda repo, now, pulls: ([], []))
     monkeypatch.setattr(sch, "stale_ready_pulls", lambda repo, now, pulls: [])
     monkeypatch.setattr(sch, "reject_reopened_tasks", lambda repo, pool: [])
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
     monkeypatch.setattr(
         sch, "accept_merged_tasks",
-        lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False))
+        lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False, False))
     monkeypatch.setattr(sch, "mark_stale_unclaimed", lambda repo, now, pool: [])
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], True))
     monkeypatch.setattr(sch, "wip_gate", lambda repo, now, pulls, pool, dispatch_allowed: ([], [], True))
@@ -771,6 +906,165 @@ def test_main_exits_nonzero_and_escalates_on_stall_hard_failure(monkeypatch):
     )
 
 
+def test_main_exits_nonzero_and_alerts_fact_when_unhealthy_pulls_notes_hard_fail(monkeypatch):
+    # Хвост ai-ревью #1053: unhealthy_pulls брала append_session_notes и
+    # ВЫБРАСЫВАЛА её жёсткий сбой — 🚨-строка жила только в отчёте прогона
+    # (зелёного), Telegram молчал; тот же класс «сигнал есть, но его никто
+    # не увидит», что этот PR закрывает для after_merge/accept_merged_tasks.
+    # Здесь ВСЁ по-настоящему на этом пути: настоящий unhealthy_pulls,
+    # настоящий append_session_notes, RPC морды падает НЕ по «сессии нет»
+    # (прод-форма ошибки доезжает в алерт дословно). Мутация: выбрось флаг
+    # в unhealthy_pulls или убери OR в main() — тест краснеет (code == 0,
+    # escalated пуст).
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "independent_pulse_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
+    monkeypatch.setattr(sch, "failure_watch", lambda repo, now: ([], []))
+    task = issue(50)
+    p = pull(9, labels=(sch.review_labels.AI_CHANGES,), updated_at="2026-09-02T00:00:00Z",
+             pr_body="#50", ref="agent/50-x")
+    monkeypatch.setattr(sch, "open_pulls", lambda repo: [p])
+    monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
+    monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls, merged=None, *, pool=None: [])
+    monkeypatch.setattr(sch, "reap_stalled_worker_run", lambda repo, now, pool, pulls: ([], []))
+    monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
+    monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
+    monkeypatch.setattr(sch, "open_task_issues", lambda repo: [task])
+    # Морда сломана на дозаписи заметок: логин ОК, ingest падает жёстким сбоем.
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_morde_opener", lambda: object())
+    monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
+
+    def boom_ingest(opener, session_id, events):
+        raise RuntimeError("HTTP 500: morde backend down")
+
+    monkeypatch.setattr(sch, "_morde_ingest", boom_ingest)
+    patch_gh(monkeypatch, FakeGh({
+        "-X DELETE repos/o/r/issues/50/assignees": {},
+        "-X POST repos/o/r/issues/50/comments": {},
+        "task-50": "🔓 замок task-50 снят",
+    }))
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, False, pulls))
+    monkeypatch.setattr(sch, "trigger_ai_review", lambda repo, now, pulls: ([], []))
+    monkeypatch.setattr(sch, "stuck_large_ok_pulls", lambda repo, pulls: ([], []))
+    monkeypatch.setattr(sch, "stale_ready_pulls", lambda repo, now, pulls: [])
+    monkeypatch.setattr(sch, "reject_reopened_tasks", lambda repo, pool: [])
+    monkeypatch.setattr(
+        sch, "accept_merged_tasks",
+        lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False, False))
+    monkeypatch.setattr(sch, "mark_stale_unclaimed", lambda repo, now, pool: [])
+    # Диспатч закрыт — расшивка/доводка/воркер в этом тесте не предмет.
+    monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], False))
+    monkeypatch.setattr(sch, "wip_gate", lambda repo, now, pulls, pool, dispatch_allowed: ([], [], False))
+    monkeypatch.setattr(sch, "detect_and_act", lambda repo, now, lines, run_url=None: [])
+    monkeypatch.setattr(sch, "escalate_stale_auto_tasks", lambda repo, now: [])
+    monkeypatch.setattr(sch, "groom_auto_tasks", lambda repo, now, lines: [])
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue, text: escalated.append((repo, issue, text)) or "ок")
+    saved = []
+    monkeypatch.setattr(sch, "summary", lambda lines: saved.append(list(lines)))
+
+    code = sch.main()
+
+    assert code == 1  # жёсткий сбой заметок на пути unhealthy_pulls красит прогон
+    assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
+    alert = escalated[0][2]
+    assert "#50" in alert and "harness-50" in alert  # факт: номер задачи и session_id
+    assert "HTTP 500: morde backend down" in alert  # дословное тело ошибки RPC
+    assert "Газ:" in alert  # газ назван, не «до ручного разбора» без газа
+    # 🚨-строка дошла и до отчёта прогона (видимый результат, не только алерт).
+    assert saved and any("harness-50" in line for line in saved[0])
+
+
+def test_main_exits_nonzero_and_alerts_fact_when_accept_notes_hard_fail(monkeypatch):
+    # Блокирующая находка ai-ревью #1053 (второй круг), проводка: жёсткий сбой
+    # заметок на пути ПРИЁМКИ (третье место append_session_notes) обязан
+    # доезжать до того же финального алерта и красного кода. И текст —
+    # ЗАМЕТОЧНЫЙ, не «После мержа PR… не сирота/sweep: приёмка закрывает уже
+    # слитую задачу без нового мержа, сироты нет, sweep живую сессию открытой
+    # (закрытой приёмкой — тоже не сироты по его правилу) задачи не трогает.
+    # Здесь ВСЁ по-настоящему: настоящая accept_merged_tasks и
+    # append_session_notes, RPC морды падает НЕ по «сессии нет» (прод-форма
+    # ошибки доезжает в алерт дословно). Мутация: убери
+    # accept_note_hard_failure из OR в main() — code == 0, escalated пуст;
+    # склей флаги заметок с флагом улик — алерт назвал бы сбой не тем именем.
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "independent_pulse_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
+    monkeypatch.setattr(sch, "failure_watch", lambda repo, now: ([], []))
+    monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
+    monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls, merged=None, *, pool=None: [])
+    monkeypatch.setattr(sch, "reap_stalled_worker_run", lambda repo, now, pool, pulls: ([], []))
+    monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
+    monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
+    monkeypatch.setattr(sch, "unhealthy_pulls", lambda repo, now, pulls, *, pool=None: ([], False))
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, False, pulls))
+    monkeypatch.setattr(sch, "trigger_ai_review", lambda repo, now, pulls: ([], []))
+    monkeypatch.setattr(sch, "stuck_large_ok_pulls", lambda repo, pulls: ([], []))
+    monkeypatch.setattr(sch, "stale_ready_pulls", lambda repo, now, pulls: [])
+    monkeypatch.setattr(sch, "reject_reopened_tasks", lambda repo, pool: [])
+    monkeypatch.setattr(sch, "mark_stale_unclaimed", lambda repo, now, pool: [])
+    # Диспатч закрыт — расшивка/доводка/воркер в этом тесте не предмет.
+    monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], False))
+    monkeypatch.setattr(sch, "wip_gate", lambda repo, now, pulls, pool, dispatch_allowed: ([], [], False))
+    monkeypatch.setattr(sch, "detect_and_act", lambda repo, now, lines, run_url=None: [])
+    monkeypatch.setattr(sch, "escalate_stale_auto_tasks", lambda repo, now: [])
+    monkeypatch.setattr(sch, "groom_auto_tasks", lambda repo, now, lines: [])
+    # Слитый PR задачи #78 с зелёной уликой (script): приёмка закроет задачу,
+    # attempted заметка-итог упрётся в сломанную морду.
+    task = issue(78, title="т")
+    merged_pr = pull(9, pr_body="#78")
+    merged_pr["merged_at"] = "2026-09-01T00:00:00Z"
+    merged_pr["head"] = {"sha": "deadbeef"}
+    monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [merged_pr])
+    monkeypatch.setattr(sch, "merged_pr_map", lambda pulls: {78: merged_pr})
+    monkeypatch.setattr(sch, "open_task_issues", lambda repo: [task])
+    monkeypatch.setattr(sch, "classify_acceptance", lambda filenames: sch.ACCEPT_SCRIPT)
+    monkeypatch.setattr(sch, "script_evidence", lambda repo, sha: ("ok", "тесты зелёные"))
+    patch_gh(monkeypatch, FakeGh({
+        "repos/o/r/pulls/9/files": [],
+        "issues/78/comments": [],
+        "-X POST repos/o/r/issues/78/comments": {},
+        "-X PATCH repos/o/r/issues/78": {},
+    }))
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    # Морда сломана на дозаписи заметок: логин ОК, ingest падает жёстким сбоем.
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_morde_opener", lambda: object())
+    monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
+
+    def boom_ingest(opener, session_id, events):
+        raise RuntimeError("HTTP 500: morde backend down")
+
+    monkeypatch.setattr(sch, "_morde_ingest", boom_ingest)
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    saved = []
+    monkeypatch.setattr(sch, "summary", lambda lines: saved.append(list(lines)))
+
+    code = sch.main()
+
+    assert code == 1  # жёсткий сбой заметок на пути приёмки красит прогон
+    assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
+    alert = escalated[0][2]
+    assert "#78" in alert and "harness-78" in alert  # факт: номер задачи и session_id
+    assert "HTTP 500: morde backend down" in alert  # дословное тело ошибки RPC
+    # Текст заметочного сбоя, не архивного: мержа на этом пути не было,
+    # сироты нет — чужой текст и чужой газ здесь были бы ложью.
+    assert "Мерж не откатывается" not in alert
+    assert "сирот" not in alert and "sweep" not in alert
+    assert "автоматической повторной дозаписи НЕТ" in alert  # честный пробел
+    assert "/api/sessions/<session_id>/ingest" in alert  # адрес ручной дописки
+    # 🚨-строка дошла и до отчёта прогона (видимый результат, не только алерт).
+    assert saved and any("harness-78" in line for line in saved[0])
+
+
 def test_main_stays_green_when_archive_ok(monkeypatch):
     monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
     monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
@@ -786,9 +1080,9 @@ def test_main_stays_green_when_archive_ok(monkeypatch):
     monkeypatch.setattr(sch, "reap_stalled_worker_run", lambda repo, now, pool, pulls: ([], []))
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
-    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], ["✅ PR #1 слит"], False, pulls))
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], ["✅ PR #1 слит"], False, False, pulls))
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
-    monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False))
+    monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False, False))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], True))
     monkeypatch.setattr(sch, "wip_gate", lambda repo, now, pulls, pool, dispatch_allowed: ([], [], True))
     monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool, *, wip_allowed, pulls: ([], []))
@@ -817,11 +1111,11 @@ def test_main_exits_nonzero_when_acceptance_hard_failure(monkeypatch):
     monkeypatch.setattr(sch, "reap_stalled_worker_run", lambda repo, now, pool, pulls: ([], []))
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
-    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, pulls))
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, False, pulls))
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
     monkeypatch.setattr(
         sch, "accept_merged_tasks",
-        lambda repo, pool, merged, now=None, open_pulls_list=None: ([], ["🚨 #227: улика не проверена"], True))
+        lambda repo, pool, merged, now=None, open_pulls_list=None: ([], ["🚨 #227: улика не проверена"], True, False))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], True))
     monkeypatch.setattr(sch, "wip_gate", lambda repo, now, pulls, pool, dispatch_allowed: ([], [], True))
     monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool, *, wip_allowed, pulls: ([], []))
@@ -1872,7 +2166,7 @@ def test_unhealthy_pulls_returns_task_on_red_required_check(monkeypatch):
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
 
     now = utc(2026, 9, 2, 12, 0)  # 180 мин > порог 120
-    lines = sch.unhealthy_pulls(REPO, now, [p], pool=[task])
+    lines, _hard = sch.unhealthy_pulls(REPO, now, [p], pool=[task])
 
     assert any("assignees" in c and "-X DELETE" in c for c in fake.calls)
     assert any("возвращена в пул" in line and "201" in line for line in lines)
@@ -1895,7 +2189,7 @@ def test_unhealthy_pulls_returns_task_on_ai_changes_requested(monkeypatch):
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: "ok")
 
     now = utc(2026, 9, 2, 12, 0)
-    lines = sch.unhealthy_pulls(REPO, now, [p], pool=[task])
+    lines, _hard = sch.unhealthy_pulls(REPO, now, [p], pool=[task])
     assert any("ai:changes-requested" in line for line in lines)
 
 
@@ -1915,7 +2209,7 @@ def test_unhealthy_pulls_detects_task_via_branch_without_body_number(monkeypatch
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
 
     now = utc(2026, 9, 2, 12, 0)  # 180 мин > порог 120
-    lines = sch.unhealthy_pulls(REPO, now, [p], pool=[task])
+    lines, _hard = sch.unhealthy_pulls(REPO, now, [p], pool=[task])
 
     assert any("возвращена в пул" in line and "221" in line for line in lines)
 
@@ -1931,7 +2225,7 @@ def test_unhealthy_pulls_silent_before_threshold(monkeypatch):
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("рано — не пишем"))
 
     now = utc(2026, 9, 2, 12, 0)  # 30 мин < порог 120
-    lines = sch.unhealthy_pulls(REPO, now, [p], pool=[task])
+    lines, _hard = sch.unhealthy_pulls(REPO, now, [p], pool=[task])
     assert lines == []
     assert not any("-X DELETE" in c for c in fake.calls)
 
@@ -1945,7 +2239,7 @@ def test_unhealthy_pulls_silent_when_pr_green(monkeypatch):
     })
     patch_gh(monkeypatch, fake)
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("PR здоров — не пишем"))
-    lines = sch.unhealthy_pulls(REPO, utc(2026, 9, 2, 12, 0), [p], pool=[task])
+    lines, _hard = sch.unhealthy_pulls(REPO, utc(2026, 9, 2, 12, 0), [p], pool=[task])
     assert lines == []
 
 
@@ -1958,7 +2252,7 @@ def test_unhealthy_pulls_idempotent_after_release_no_assignee(monkeypatch):
     fake = FakeGh({})
     patch_gh(monkeypatch, fake)
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("не назначена — не трогаем"))
-    lines = sch.unhealthy_pulls(REPO, utc(2026, 9, 2, 12, 0), [p], pool=[task])
+    lines, _hard = sch.unhealthy_pulls(REPO, utc(2026, 9, 2, 12, 0), [p], pool=[task])
     assert lines == []
     # issue без assignees отфильтрован ДО чтения check-runs/мутирующих вызовов —
     # снимок пула дан параметром (#443), ни одного HTTP-вызова не требуется.
@@ -1973,7 +2267,7 @@ def test_unhealthy_pulls_skips_conflict_labeled_pr(monkeypatch):
     fake = FakeGh({})
     patch_gh(monkeypatch, fake)
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("conflict — не наш класс"))
-    lines = sch.unhealthy_pulls(REPO, utc(2026, 9, 2, 12, 0), [p], pool=[task])
+    lines, _hard = sch.unhealthy_pulls(REPO, utc(2026, 9, 2, 12, 0), [p], pool=[task])
     assert lines == []
     assert not any("check-runs" in c for c in fake.calls)
 
@@ -1990,7 +2284,7 @@ def test_unhealthy_pulls_skips_blocked_labeled_issue(monkeypatch):
     fake = FakeGh({})
     patch_gh(monkeypatch, fake)
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("blocked — газ только у владельца"))
-    lines = sch.unhealthy_pulls(REPO, utc(2026, 9, 2, 12, 0), [p], pool=[task])
+    lines, _hard = sch.unhealthy_pulls(REPO, utc(2026, 9, 2, 12, 0), [p], pool=[task])
     assert lines == []
     assert not any("check-runs" in c for c in fake.calls)
 
@@ -2030,7 +2324,7 @@ def test_unhealthy_pulls_does_not_release_foreign_task_mentioned_in_prod_pr_body
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail(
         "#90 чужая для PR #181 (собственная задача — #179 по ветке) — трогать нельзя"))
     now = utc(2026, 9, 2, 12, 0)  # 180 мин > порог 120 — было бы «нездоров достаточно долго»
-    lines = sch.unhealthy_pulls(REPO, now, [pr_181], pool=[task_90])
+    lines, _hard = sch.unhealthy_pulls(REPO, now, [pr_181], pool=[task_90])
     assert lines == []
     assert not any("-X DELETE" in c for c in fake.calls)
     assert task_90["assignees"] == [{"login": "mytab0r"}]  # аренда цела
@@ -2049,7 +2343,7 @@ def test_unhealthy_pulls_releases_own_task_of_same_prod_pr_via_branch(monkeypatc
     patch_post_issue_comment(monkeypatch, lambda *a: None)
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     now = utc(2026, 9, 2, 12, 0)
-    lines = sch.unhealthy_pulls(REPO, now, [pr_181], pool=[task_179])
+    lines, _hard = sch.unhealthy_pulls(REPO, now, [pr_181], pool=[task_179])
     assert any("возвращена в пул" in line and "179" in line for line in lines)
     assert task_179["assignees"] == []
 
@@ -2069,7 +2363,7 @@ def test_unhealthy_pulls_ignores_pr_without_agent_branch_even_with_prose_mention
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail(
         "PR без agent-ветки не сопоставлен ни с какой задачей — трогать нечего"))
     now = utc(2026, 9, 2, 12, 0)
-    lines = sch.unhealthy_pulls(REPO, now, [pr_no_branch], pool=[task_90])
+    lines, _hard = sch.unhealthy_pulls(REPO, now, [pr_no_branch], pool=[task_90])
     assert lines == []
     assert task_90["assignees"] == [{"login": "mytab0r"}]
 
@@ -2515,9 +2809,9 @@ def test_update_branch_skips_when_ai_review_running_for_pr(monkeypatch):
     patch_gh(monkeypatch, fake)
     monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
 
-    observations, actions, hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
+    observations, actions, archive_hard_failure, note_hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
 
-    assert not hard_failure
+    assert not archive_hard_failure and not note_hard_failure
     assert merged_number is None
     assert updated is False
     assert not any("update-branch" in c for c in fake.calls)
@@ -2629,9 +2923,9 @@ def test_merge_queue_behind_not_close_to_merge_skips_without_update(monkeypatch)
     fake = FakeGh({"pulls/2/update-branch": None, "pulls/2": {"mergeable_state": "behind"}})
     patch_gh(monkeypatch, fake)
 
-    observations, actions, hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
+    observations, actions, archive_hard_failure, note_hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
 
-    assert not hard_failure
+    assert not archive_hard_failure and not note_hard_failure
     assert merged_number is None
     assert updated is False
     assert not any("update-branch" in c for c in fake.calls)
@@ -2644,9 +2938,9 @@ def test_merge_queue_behind_close_to_merge_updates(monkeypatch):
     patch_gh(monkeypatch, fake)
     monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
 
-    observations, actions, hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
+    observations, actions, archive_hard_failure, note_hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
 
-    assert not hard_failure
+    assert not archive_hard_failure and not note_hard_failure
     assert merged_number is None
     assert updated is True
     assert any("pulls/2/update-branch" in c for c in fake.calls)
@@ -2659,9 +2953,9 @@ def test_merge_queue_behind_conflict_updates_even_without_verdicts(monkeypatch):
     patch_gh(monkeypatch, fake)
     monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
 
-    observations, actions, hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
+    observations, actions, archive_hard_failure, note_hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
 
-    assert not hard_failure
+    assert not archive_hard_failure and not note_hard_failure
     assert merged_number is None
     assert updated is True
     assert any("pulls/2/update-branch" in c for c in fake.calls)
@@ -2687,9 +2981,9 @@ def test_merge_queue_two_behind_prs_share_one_update_branch_budget(monkeypatch):
     patch_gh(monkeypatch, fake)
     monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
 
-    observations, actions, hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
+    observations, actions, archive_hard_failure, note_hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
 
-    assert not hard_failure
+    assert not archive_hard_failure and not note_hard_failure
     assert merged_number is None
     assert updated is True
     update_calls = [c for c in fake.calls if "update-branch" in c]
@@ -2716,9 +3010,9 @@ def test_merge_queue_two_behind_prs_stop_at_budget_exhausted(monkeypatch):
     patch_gh(monkeypatch, fake)
     monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
 
-    observations, actions, hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
+    observations, actions, archive_hard_failure, note_hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
 
-    assert not hard_failure
+    assert not archive_hard_failure and not note_hard_failure
     assert merged_number is None
     assert updated is True
     update_calls = [c for c in fake.calls if "update-branch" in c]
@@ -2874,9 +3168,9 @@ def test_merge_queue_behind_network_error_reported_not_raised(monkeypatch):
     patch_gh(monkeypatch, fake)
     monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
 
-    observations, actions, hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)  # не должно кинуть исключение
+    observations, actions, archive_hard_failure, note_hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)  # не должно кинуть исключение
 
-    assert not hard_failure
+    assert not archive_hard_failure and not note_hard_failure
     assert merged_number is None
     assert updated is True
     update_calls = [c for c in fake.calls if "update-branch" in c]
@@ -2904,9 +3198,9 @@ def test_merge_queue_clean_state_without_ai_ok_not_merged(monkeypatch):
     })
     patch_gh(monkeypatch, fake)
 
-    observations, actions, hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
+    observations, actions, archive_hard_failure, note_hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
 
-    assert not hard_failure
+    assert not archive_hard_failure and not note_hard_failure
     assert merged_number is None
     assert updated is False
     assert not any(c.startswith("-X PUT") and "/merge" in c for c in fake.calls)
@@ -2953,11 +3247,11 @@ def test_merge_queue_merges_review_large_with_large_ok_prod_form(monkeypatch):
     # Предмет теста — решение merge_queue (гейт меток + агрегация чеков), не
     # проводка after_merge (архив/deploy/release задачи) — та разобрана
     # отдельными тестами after_merge_* ниже в этом файле.
-    monkeypatch.setattr(sch, "after_merge", lambda repo, pull, others, merge_sha=None: ([], [], False))
+    monkeypatch.setattr(sch, "after_merge", lambda repo, pull, others, merge_sha=None: ([], [], False, False))
 
-    observations, actions, hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
+    observations, actions, archive_hard_failure, note_hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
 
-    assert not hard_failure
+    assert not archive_hard_failure and not note_hard_failure
     assert merged_number == 333
     assert any(c.startswith("-X PUT") and "pulls/333/merge" in c for c in fake.calls)
     assert any("слит" in line and "#333" in line for line in actions)
@@ -2979,9 +3273,9 @@ def test_merge_loop_merges_multiple_prs_in_one_run(monkeypatch):
     (каждый прогресс был слиянием, а не обновлением ветки)."""
     calls = []
     results = [
-        ([], ["✅ PR #1 слит (squash)"], False, 1, True),
-        ([], ["✅ PR #2 слит (squash)"], False, 2, True),
-        (["⏸️ очередь пуста"], [], False, None, False),
+        ([], ["✅ PR #1 слит (squash)"], False, False, 1, True),
+        ([], ["✅ PR #2 слит (squash)"], False, False, 2, True),
+        (["⏸️ очередь пуста"], [], False, False, None, False),
     ]
 
     def fake_merge_queue(repo, pulls):
@@ -2993,9 +3287,9 @@ def test_merge_loop_merges_multiple_prs_in_one_run(monkeypatch):
     slept = []
     monkeypatch.setattr(sch.time, "sleep", lambda s: slept.append(s))
 
-    observations, actions, hard_failure, final_pulls = sch.merge_loop(REPO, [])
+    observations, actions, archive_hard_failure, note_hard_failure, final_pulls = sch.merge_loop(REPO, [])
 
-    assert not hard_failure
+    assert not archive_hard_failure and not note_hard_failure
     assert len(calls) == 3
     assert not slept, "прогресс был только слияниями — ждать было нечего"
     assert any("2 PR слито" in line for line in (observations + actions))
@@ -3014,7 +3308,7 @@ def test_merge_loop_stops_at_max_merges_cap(monkeypatch):
         calls.append(1)
         if len(calls) > sch.MERGE_LOOP_MAX_MERGES + 5:
             raise AssertionError("цикл слияний не останавливается на потолке — уходит в бесконечность")
-        return ([], [f"✅ PR #{len(calls)} слит (squash)"], False, len(calls), True)
+        return ([], [f"✅ PR #{len(calls)} слит (squash)"], False, False, len(calls), True)
 
     monkeypatch.setattr(sch, "merge_queue", fake_merge_queue)
     monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
@@ -3023,9 +3317,9 @@ def test_merge_loop_stops_at_max_merges_cap(monkeypatch):
         lambda s: pytest.fail("не должен ждать — каждый проход сливал, прогресс всегда был мержем"),
     )
 
-    observations, actions, hard_failure, final_pulls = sch.merge_loop(REPO, [])
+    observations, actions, archive_hard_failure, note_hard_failure, final_pulls = sch.merge_loop(REPO, [])
 
-    assert not hard_failure
+    assert not archive_hard_failure and not note_hard_failure
     assert len(calls) == sch.MERGE_LOOP_MAX_MERGES, "цикл обязан остановиться ровно на потолке слияний"
     assert any(f"{sch.MERGE_LOOP_MAX_MERGES} PR слито" in line for line in (observations + actions))
     assert final_pulls == []
@@ -3042,7 +3336,7 @@ def test_merge_loop_stops_immediately_without_progress(monkeypatch):
 
     def fake_merge_queue(repo, pulls):
         calls.append(1)
-        return (["⏸️ #1 — нет вердикта ai:ok"], [], False, None, False)
+        return (["⏸️ #1 — нет вердикта ai:ok"], [], False, False, None, False)
 
     monkeypatch.setattr(sch, "merge_queue", fake_merge_queue)
     monkeypatch.setattr(
@@ -3050,9 +3344,9 @@ def test_merge_loop_stops_immediately_without_progress(monkeypatch):
         lambda repo: (_ for _ in ()).throw(AssertionError("без прогресса open_pulls звать не за чем")))
     monkeypatch.setattr(sch.time, "sleep", lambda s: pytest.fail("нечего ждать — прогресса не было"))
 
-    observations, actions, hard_failure, final_pulls = sch.merge_loop(REPO, sentinel_pulls)
+    observations, actions, archive_hard_failure, note_hard_failure, final_pulls = sch.merge_loop(REPO, sentinel_pulls)
 
-    assert not hard_failure
+    assert not archive_hard_failure and not note_hard_failure
     assert len(calls) == 1, "без прогресса цикл обязан остановиться после первого прохода"
     # (#443) без прогресса — исходный снимок возвращается как есть, второй
     # open_pulls() не нужен: ничего не изменилось со времени вызова merge_loop.
@@ -3067,8 +3361,8 @@ def test_merge_loop_waits_after_branch_update_before_retry(monkeypatch):
     не по бесконечному опросу."""
     calls = []
     results = [
-        ([], ["🔄 #1 обновлён из main"], False, None, True),
-        (["⏸️ #1 — behind main, checks ещё не готовы"], [], False, None, False),
+        ([], ["🔄 #1 обновлён из main"], False, False, None, True),
+        (["⏸️ #1 — behind main, checks ещё не готовы"], [], False, False, None, False),
     ]
 
     def fake_merge_queue(repo, pulls):
@@ -3080,9 +3374,9 @@ def test_merge_loop_waits_after_branch_update_before_retry(monkeypatch):
     slept = []
     monkeypatch.setattr(sch.time, "sleep", lambda s: slept.append(s))
 
-    observations, actions, hard_failure, final_pulls = sch.merge_loop(REPO, [])
+    observations, actions, archive_hard_failure, note_hard_failure, final_pulls = sch.merge_loop(REPO, [])
 
-    assert not hard_failure
+    assert not archive_hard_failure and not note_hard_failure
     assert len(calls) == 2
     assert slept == [sch.MERGE_LOOP_POLL_SECONDS]
     assert final_pulls == []  # обновление ветки — прогресс, снимок перечитан после паузы
@@ -3226,7 +3520,10 @@ def test_dispatch_conflict_rework_escalates_after_budget_exhausted(monkeypatch):
         "compare/basesha...main": {"files": files_payload(["b.py", "c.py"])},
         # Находка ревью PR #478: эскалация перепроверяет актуальный
         # mergeable_state (не доверяет только метке) — здесь он подтверждён.
-        "pulls/560": {"mergeable_state": "dirty"},
+        # state:"open" — иначе исход 3 (#1029) счёл бы PR закрытым и отложил
+        # эскалацию (закрытие между снимком pulls и перепроверкой — предмет
+        # эскалации исчез бы сам).
+        "pulls/560": {"mergeable_state": "dirty", "state": "open"},
         # Единственная попытка уже ЗАВЕРШИЛАСЬ (не в in_progress/queued) —
         # иначе эскалация обязана подождать (см. соседний тест "ещё идёт").
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
@@ -3264,8 +3561,116 @@ def test_dispatch_conflict_rework_escalates_after_budget_exhausted(monkeypatch):
     assert "conclusion='success'" in escalated[0][2]  # факт, не диагноз
     # больше не утверждаем диагноз как решённый факт — только гипотеза наравне с другими
     assert "main и PR правят одно и то же по-разному" not in escalated[0][2]
+    # Второй заход того же правила (находка ai-ревью #1053): success-ветка не
+    # утверждает «ребейз не разрешил конфликт» — причину из двух фактов
+    # (прогон успешен + mergeable_state dirty) отсюда не вывести, честный
+    # пробел назван прямо. Мутация: верни старую формулировку — оба assert'а
+    # ниже краснеют (диагноз снова в тексте, пробел снова не назван).
+    assert "не разрешил конфликт" not in escalated[0][2]
+    assert "не различить" in escalated[0][2]
+    # Чеклист ai-ревью #1053: «посмотреть лог последнего прогона» обязан нести
+    # АДРЕС прогона, а не посылать искать вручную (в фикстуре html_url нет —
+    # код строит канонический вид по id, тот же адрес прогона).
+    # Мутация: убери адрес из текста эскалации — assert краснеет.
+    assert "actions/runs/34011108934" in escalated[0][2]
     assert any("исчерпана" in line and "#560" in line for line in actions)
     assert task["assignees"] != []  # эскалация не трогает задачу
+
+
+def test_dispatch_conflict_rework_retries_instead_of_escalating_when_run_failed_after_git_step(monkeypatch):
+    # Живой случай #1029 (задача #224, эскалация 2026-09-12 19:56): единственная
+    # ЗАСЧИТАННАЯ попытка (git-шаг достигнут — attempts=1=CONFLICT_REWORK_MAX_
+    # ATTEMPTS) сама завершилась conclusion='failure' (push/сеть/деплой морды
+    # ПОСЛЕ git-шага, не обязательно неразрешённый конфликт) — старый код
+    # эскалировал безусловно, приложив только conclusion как ТЕКСТ, не как
+    # РЕШЕНИЕ. Ирония живого случая: PR #1029 слился через 37 минут после этой
+    # эскалации — она была ложной тревогой по определению. Тот же приём, что
+    # #1030 дал dispatch_ai_review_rework (issue #1027): классификатор уже
+    # есть (FAILURE_CONCLUSIONS), не второй — используем его и здесь.
+    #
+    # Мутация: убери ветку `run_conclusion in FAILURE_CONCLUSIONS` (вернись к
+    # безусловной эскалации) — этот тест покраснеет (escalated стало бы
+    # непустым, dispatched — False).
+    task = issue(224, assignees=("mytab0r",))
+    p = pull(1029, labels=["conflict"], ref="agent/224-slug", base_sha="basesha")
+    fake = FakeGh({
+        "issues/1029/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-12T18:00:00Z"},
+        ],
+        "issues/120/comments?per_page=100": [],
+        "pulls/1029": {"mergeable_state": "dirty", "state": "open"},
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        # Единственная попытка дошла до git-шага (attempts=1), но САМ прогон
+        # в целом завершился conclusion='failure' — ровно текст живого алерта.
+        "workflows/worker.yml/runs?per_page=10": {"workflow_runs": [
+            {"id": 34090000001, "conclusion": "failure", "created_at": "2026-09-12T19:00:00Z"},
+        ]},
+        f"{REPO}/issues/224/comments?per_page": [
+            {"created_at": "2026-09-12T19:01:00Z",
+             "body": "🔒 Аренда задачи: `mytab0r` держит замок `refs/locks/task-224` "
+                     "(TTL 24 ч по коммиту замка). Канал: worker run 34090000001."},
+            {"created_at": "2026-09-12T19:02:00Z",
+             "body": "🤖 [worker: git-шаг] worker run 34090000001"},
+        ],
+        "issues/224/assignees": None,
+        "workflows/worker.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    escalated = []
+    posted = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+
+    observations, actions, dispatched = sch.dispatch_conflict_rework(REPO, [p], pool=[task])
+
+    assert dispatched is True
+    assert escalated == []  # живой случай #1029: алерт не должен был уйти вовсе
+    dispatch_calls = [c for c in fake.calls if "worker.yml/dispatches" in c]
+    assert len(dispatch_calls) == 1
+    assert "inputs[task]=224" in dispatch_calls[0]
+    # Дробь не врёт: attempts уже 1/1, но это НЕ вторая настоящая попытка —
+    # "2/1" была бы ложью (та же находка чеклиста, что PR #1030).
+    assert posted and "2/1" not in posted[0][1] and "не в счёт" in posted[0][1]
+    assert any("не в счёт эскалации" in line for line in observations)
+    assert task["assignees"] == []
+
+
+def test_dispatch_conflict_rework_skips_escalation_when_pr_already_closed(monkeypatch):
+    # Исход 3 (#1027/#1029, тот же приём, что dispatch_ai_review_rework после
+    # #1030): PR закрылся/слился между снимком `pulls` и перепроверкой —
+    # эскалировать «остаётся dirty» больше не на чем, предмет исчез сам.
+    task = issue(474, assignees=("mytab0r",))
+    p = pull(560, labels=["conflict"], ref="agent/474-conflict-auto-rebase", base_sha="basesha")
+    fake = FakeGh({
+        "issues/560/timeline?per_page=100": [
+            {"event": "labeled", "label": {"name": "conflict"}, "created_at": "2026-09-05T00:00:00Z"},
+        ],
+        "issues/120/comments?per_page=100": [],
+        "pulls/560": {"mergeable_state": "dirty", "state": "closed"},
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        f"{REPO}/issues/474/comments?per_page": [
+            {"created_at": "2026-09-06T09:01:00Z",
+             "body": "Канал: worker run 34011108934."},
+            {"created_at": "2026-09-06T09:05:00Z",
+             "body": "🤖 [worker: git-шаг] worker run 34011108934"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("PR уже закрыт — эскалировать не на чем"))
+    monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("PR закрыт — задачу не трогаем"))
+
+    observations, actions, dispatched = sch.dispatch_conflict_rework(REPO, [p], pool=[task])
+
+    assert dispatched is False
+    assert actions == []
+    assert any("PR закрыт" in line and "#560" in line for line in observations)
+    # решение принято по одному уже прочитанному объекту `single` — второго
+    # вызова pulls/560 или чтения mergeable_state этим тестом не проверяем,
+    # но файлы PR/main (второй платный запрос) точно не читаем зря.
+    assert not any("pulls/560/files" in c or "compare/" in c for c in fake.calls)
 
 
 def test_dispatch_conflict_rework_dispatches_again_after_budget_reset_marker(monkeypatch):
@@ -3406,7 +3811,7 @@ def test_dispatch_conflict_rework_escalation_text_admits_unattributed_run(monkey
         "issues/120/comments?per_page=100": [],
         "pulls/560/files": files_payload([]),
         "compare/basesha...main": {"files": files_payload([])},
-        "pulls/560": {"mergeable_state": "dirty"},
+        "pulls/560": {"mergeable_state": "dirty", "state": "open"},
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
         # В окне только чужой прогон 901: попытка (333→900) туда не попала.
@@ -3428,6 +3833,9 @@ def test_dispatch_conflict_rework_escalation_text_admits_unattributed_run(monkey
 
     assert escalated and "не атрибутирован" in escalated[0][2]
     assert "main и PR правят одно и то же по-разному" not in escalated[0][2]
+    # Атрибутации нет — адресовать нечего, кроме всего workflow: адрес списка
+    # прогонов worker.yml всё равно назван (не «ищи лог вручную»).
+    assert "actions/workflows/worker.yml" in escalated[0][2]
 
 
 def test_dispatch_conflict_rework_holds_escalation_when_mergeable_state_unconfirmed(monkeypatch):
@@ -3455,7 +3863,7 @@ def test_dispatch_conflict_rework_holds_escalation_when_mergeable_state_unconfir
              "body": "🤖 [worker: git-шаг] worker run 34011108934"},
         ],
         "issues/120/comments?per_page=100": [],
-        "pulls/560": {"mergeable_state": None},
+        "pulls/560": {"mergeable_state": None, "state": "open"},
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("mergeable_state не подтверждён — рано эскалировать"))
@@ -4336,10 +4744,10 @@ def test_main_skips_generic_worker_dispatch_when_conflict_rework_already_dispatc
     monkeypatch.setattr(sch, "reap_stalled_worker_run", lambda repo, now, pool, pulls: ([], []))
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
-    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, pulls))
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, False, pulls))
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
     monkeypatch.setattr(sch, "accept_merged_tasks",
-                         lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False))
+                         lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False, False))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], True))
     monkeypatch.setattr(sch, "mark_stale_unclaimed", lambda repo, now, pool: [])
     # Детектор простоя (#201) — не предмет этого теста, но main() зовёт его
@@ -4636,7 +5044,7 @@ def test_after_merge_notifies_telegram_about_merge_once(monkeypatch):
         sch, "send_telegram",
         lambda text, as_html=False: sent.append((text, as_html)) or True)
 
-    observations, actions, hard_failure = sch.after_merge("o/r", merged, [])
+    observations, actions, archive_hard_failure, note_hard_failure = sch.after_merge("o/r", merged, [])
 
     assert len(sent) == 1, "один PR — одно сообщение, а не по одному на задачу"
     text, as_html = sent[0]
@@ -4645,7 +5053,7 @@ def test_after_merge_notifies_telegram_about_merge_once(monkeypatch):
     assert '<a href="https://github.com/o/r/issues/78">#78</a>' in text
     assert '<a href="https://github.com/o/r/pull/163">#163</a>' in text
     assert "Отчёт врёт &amp; &lt;молчит&gt;" in text      # заголовок ушёл экранированным
-    assert hard_failure is False
+    assert archive_hard_failure is False and note_hard_failure is False
     assert any("Telegram" in line and "доставлено" in line for line in (observations + actions))
 
 
@@ -4718,10 +5126,10 @@ def test_after_merge_without_own_branch_task_sends_nothing(monkeypatch):
         sch, "send_telegram",
         lambda text, as_html=False: sent.append(text) or True)
 
-    observations, actions, hard_failure = sch.after_merge("o/r", merged, [])
+    observations, actions, archive_hard_failure, note_hard_failure = sch.after_merge("o/r", merged, [])
 
     assert sent == [], "нет объявленной задачи — нет и «выполнена» в канале"
-    assert hard_failure is False
+    assert archive_hard_failure is False and note_hard_failure is False
     assert not any("Telegram" in line and "доставлено" in line for line in (observations + actions))
 
 
@@ -4748,9 +5156,9 @@ def test_after_merge_telegram_miss_is_loud_but_not_fatal(monkeypatch):
     monkeypatch.setattr(sch, "send_telegram", lambda text, as_html=False: False)
     monkeypatch.setattr(sch, "update_remaining_pulls", lambda repo, merged_number, others: ([], []))
 
-    observations, actions, hard_failure = sch.after_merge("o/r", merged, [])
+    observations, actions, archive_hard_failure, note_hard_failure = sch.after_merge("o/r", merged, [])
 
-    assert hard_failure is False
+    assert archive_hard_failure is False and note_hard_failure is False
     assert any("⚠️" in line and "Telegram" in line for line in (observations + actions))
 
 
@@ -4791,9 +5199,9 @@ def test_after_merge_dispatches_dsh_edge_deploy(monkeypatch):
     })
     monkeypatch.setattr(sch, "gh", fake)
     monkeypatch.setattr(sch, "update_remaining_pulls", lambda repo, merged_number, others: ([], []))
-    observations, actions, hard_failure = sch.after_merge(REPO, merged, [], merge_sha="dbe8c9956d")
+    observations, actions, archive_hard_failure, note_hard_failure = sch.after_merge(REPO, merged, [], merge_sha="dbe8c9956d")
 
-    assert hard_failure is False
+    assert archive_hard_failure is False and note_hard_failure is False
     dispatched = [c for c in fake.calls if c.startswith("-X POST") and "/dispatches" in c]
     assert any("deploy-dsh-edge.yml/dispatches" in c for c in dispatched)
     assert any("repo-ci.yml/dispatches" in c for c in dispatched)
@@ -4816,9 +5224,9 @@ def test_after_merge_skips_dsh_edge_deploy_for_other_paths(monkeypatch):
     })
     monkeypatch.setattr(sch, "gh", fake)
     monkeypatch.setattr(sch, "update_remaining_pulls", lambda repo, merged_number, others: ([], []))
-    observations, actions, hard_failure = sch.after_merge(REPO, merged, [], merge_sha="sha78merge")
+    observations, actions, archive_hard_failure, note_hard_failure = sch.after_merge(REPO, merged, [], merge_sha="sha78merge")
 
-    assert hard_failure is False
+    assert archive_hard_failure is False and note_hard_failure is False
     dispatched = [c for c in fake.calls if c.startswith("-X POST") and "/dispatches" in c]
     assert not any("deploy-dsh-edge.yml/dispatches" in c for c in dispatched)
     assert not any("deploy-worker.yml/dispatches" in c for c in dispatched)
@@ -4851,9 +5259,9 @@ def test_after_merge_missing_merge_sha_is_observed_not_raised(monkeypatch):
     })
     monkeypatch.setattr(sch, "gh", fake)
     monkeypatch.setattr(sch, "update_remaining_pulls", lambda repo, merged_number, others: ([], []))
-    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+    observations, actions, archive_hard_failure, note_hard_failure = sch.after_merge(REPO, merged, [])
 
-    assert hard_failure is False
+    assert archive_hard_failure is False and note_hard_failure is False
     assert any("реакция на мерж" in line and "не выполнена" in line for line in observations)
     assert not any(c.startswith("-X POST") and "/dispatches" in c for c in fake.calls)
 
@@ -4978,9 +5386,9 @@ def test_after_merge_files_tail_issue_for_unresolved_checklist(monkeypatch):
     monkeypatch.setattr(sch, "gh", fake)
     monkeypatch.setattr(sch, "update_remaining_pulls", lambda *a, **k: ([], []))
 
-    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+    observations, actions, archive_hard_failure, note_hard_failure = sch.after_merge(REPO, merged, [])
 
-    assert hard_failure is False
+    assert archive_hard_failure is False and note_hard_failure is False
     assert any("#900" in line and "2" in line for line in actions)
     posts = [c for c in fake.calls if c.startswith("-X POST") and f"repos/{REPO}/issues " in c]
     assert len(posts) == 1
@@ -4998,9 +5406,9 @@ def test_after_merge_no_checklist_no_tail_issue(monkeypatch):
     monkeypatch.setattr(sch, "gh", fake)
     monkeypatch.setattr(sch, "update_remaining_pulls", lambda *a, **k: ([], []))
 
-    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+    observations, actions, archive_hard_failure, note_hard_failure = sch.after_merge(REPO, merged, [])
 
-    assert hard_failure is False
+    assert archive_hard_failure is False and note_hard_failure is False
     assert not any("хвост чеклиста" in line for line in observations + actions)
 
 
@@ -5016,9 +5424,9 @@ def test_after_merge_tail_issue_idempotent_by_title(monkeypatch):
     monkeypatch.setattr(sch, "gh", fake)
     monkeypatch.setattr(sch, "update_remaining_pulls", lambda *a, **k: ([], []))
 
-    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+    observations, actions, archive_hard_failure, note_hard_failure = sch.after_merge(REPO, merged, [])
 
-    assert hard_failure is False
+    assert archive_hard_failure is False and note_hard_failure is False
     posts = [c for c in fake.calls if c.startswith("-X POST") and f"repos/{REPO}/issues " in c]
     assert posts == []
     assert any("уже заведена" in line for line in observations)
@@ -5104,9 +5512,9 @@ def test_after_merge_resume_series_by_merge_posts_marker(monkeypatch):
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
 
-    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+    observations, actions, archive_hard_failure, note_hard_failure = sch.after_merge(REPO, merged, [])
 
-    assert hard_failure is False
+    assert archive_hard_failure is False and note_hard_failure is False
     # видимый результат: маркер реально лежит в #120 с нужным содержимым
     assert len(store) == 1
     assert f"{pg.RESUME_MARKER} #163]" in store[0]["body"]     # токен для gate и дедупа
@@ -5134,9 +5542,9 @@ def test_after_merge_resume_skips_when_merge_predates_red_run(monkeypatch):
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
 
-    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+    observations, actions, archive_hard_failure, note_hard_failure = sch.after_merge(REPO, merged, [])
 
-    assert hard_failure is False
+    assert archive_hard_failure is False and note_hard_failure is False
     assert not any("сброшена мержем" in line for line in actions + observations)
 
 
@@ -5162,9 +5570,9 @@ def test_after_merge_resume_skips_when_series_closed(monkeypatch):
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
 
-    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+    observations, actions, archive_hard_failure, note_hard_failure = sch.after_merge(REPO, merged, [])
 
-    assert hard_failure is False
+    assert archive_hard_failure is False and note_hard_failure is False
     assert not any("сброшена мержем" in line for line in actions + observations)
 
 
@@ -5190,9 +5598,9 @@ def test_after_merge_resume_skips_without_claim_trace(monkeypatch):
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
 
-    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+    observations, actions, archive_hard_failure, note_hard_failure = sch.after_merge(REPO, merged, [])
 
-    assert hard_failure is False
+    assert archive_hard_failure is False and note_hard_failure is False
     assert not any("сброшена мержем" in line for line in actions + observations)
 
 
@@ -5218,9 +5626,9 @@ def test_after_merge_resume_dedupes_by_pr_marker(monkeypatch):
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
 
-    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+    observations, actions, archive_hard_failure, note_hard_failure = sch.after_merge(REPO, merged, [])
 
-    assert hard_failure is False
+    assert archive_hard_failure is False and note_hard_failure is False
     assert not any("сброшена мержем" in line for line in actions + observations)
 
 
@@ -5249,9 +5657,9 @@ def test_after_merge_resume_does_not_claim_reset_when_marker_not_posted(monkeypa
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
 
-    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+    observations, actions, archive_hard_failure, note_hard_failure = sch.after_merge(REPO, merged, [])
 
-    assert hard_failure is False
+    assert archive_hard_failure is False and note_hard_failure is False
     assert not any("сброшена мержем" in line for line in actions + observations), \
         "без маркера в #120 серия не снята — отчёт не утверждает сброс"
     assert any("НЕ снята" in line and "#163" in line for line in actions + observations)
@@ -5272,10 +5680,12 @@ def test_run_claimed_task_matches_own_run_not_prefix(monkeypatch):
     assert sch.run_claimed_task(REPO, 217, 999) is False
 
 
-def test_last_worker_run_conclusion_returns_attributed_run(monkeypatch):
+def test_last_worker_run_returns_attributed_run_whole(monkeypatch):
     # #478: dispatch_conflict_rework называет conclusion атрибутированного
     # прогона в тексте эскалации, не гадает — здесь проверяется сам источник
-    # факта отдельно от сборки текста.
+    # факта отдельно от сборки текста. Источник возвращает прогон ЦЕЛИКОМ
+    # (conclusion И адрес html_url для текста эскалации, чеклист ai-ревью
+    # #1053), не одно поле.
     fake = FakeGh({
         "workflows/worker.yml/runs?per_page=10": {"workflow_runs": [
             # #217 упоминает только "worker run 34011108934" (CLAIM_TRACE_BODY) —
@@ -5288,10 +5698,12 @@ def test_last_worker_run_conclusion_returns_attributed_run(monkeypatch):
             {"created_at": "2026-09-06T04:17:30Z", "body": CLAIM_TRACE_BODY}],
     })
     patch_gh(monkeypatch, fake)
-    assert sch.last_worker_run_conclusion(REPO, 217) == "failure"
+    run = sch.last_worker_run(REPO, 217)
+    assert run["conclusion"] == "failure"
+    assert run["id"] == 34011108934
 
 
-def test_last_worker_run_conclusion_none_when_unattributed(monkeypatch):
+def test_last_worker_run_none_when_unattributed(monkeypatch):
     fake = FakeGh({
         "workflows/worker.yml/runs?per_page=10": {"workflow_runs": [
             {"id": 1, "conclusion": "success"},
@@ -5299,7 +5711,19 @@ def test_last_worker_run_conclusion_none_when_unattributed(monkeypatch):
         f"{REPO}/issues/217/comments?per_page": [],
     })
     patch_gh(monkeypatch, fake)
-    assert sch.last_worker_run_conclusion(REPO, 217) is None
+    assert sch.last_worker_run(REPO, 217) is None
+
+
+def test_run_log_url_falls_back_from_html_url_to_canonical_and_workflow(monkeypatch):
+    # Чеклист ai-ревью #1053: адрес лога в эскалации обязан быть РЕАЛЬНЫМ.
+    # Приоритет: html_url из API → канонический вид по id (тот же прогон) →
+    # без прогона — список прогонов workflow'а. Мутация: верни «ищи лог
+    # вручную» без адреса — тест краснеет.
+    run = {"id": 42, "html_url": "https://github.com/o/r/actions/runs/42"}
+    assert sch.run_log_url("o/r", run) == "https://github.com/o/r/actions/runs/42"
+    assert sch.run_log_url("o/r", {"id": 42}) == "https://github.com/o/r/actions/runs/42"
+    assert (sch.run_log_url("o/r", None)
+            == "https://github.com/o/r/actions/workflows/worker.yml")
 
 
 def test_task_sh_composes_claim_via_worker_run_format():
@@ -5332,7 +5756,7 @@ def test_unhealthy_pulls_noop_on_empty_queue(monkeypatch):
     fake = FakeGh({})
     patch_gh(monkeypatch, fake)
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("пустая очередь — писать некуда"))
-    lines = sch.unhealthy_pulls(REPO, utc(2026, 9, 2, 12, 0), [], pool=[])
+    lines, _hard = sch.unhealthy_pulls(REPO, utc(2026, 9, 2, 12, 0), [], pool=[])
     assert lines == []
     assert fake.mutating_calls() == []
     assert fake.calls == []
@@ -6714,14 +7138,14 @@ def test_main_still_dispatches_worker_for_rework_when_wip_gate_closed(monkeypatc
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
     live_pulls = [{"marker": "same snapshot merge_loop produced"}]
-    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, live_pulls))
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, False, live_pulls))
     monkeypatch.setattr(sch, "trigger_ai_review", lambda repo, now, pulls: ([], []))
     # Разблокировка застрявших ai:ok+review:large без large-ok (#939) — не
     # предмет этого теста: снимок здесь маркер-заглушка без labels[].
     monkeypatch.setattr(sch, "stuck_large_ok_pulls", lambda repo, pulls: ([], []))
     monkeypatch.setattr(sch, "stale_ready_pulls", lambda repo, now, pulls: [])
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [issue(89, assignees=())])
-    monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False))
+    monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False, False))
     monkeypatch.setattr(sch, "mark_stale_unclaimed", lambda repo, now, pool: [])
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], True))
     # Расшивка конфликтов (#474) — не предмет теста: её цикл читает labels[]
@@ -6782,9 +7206,9 @@ def test_main_skips_worker_dispatch_while_fuse_paused(monkeypatch):
     monkeypatch.setattr(sch, "reap_stalled_worker_run", lambda repo, now, pool, pulls: ([], []))
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
-    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, pulls))
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, False, pulls))
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [issue(89, assignees=())])
-    monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False))
+    monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False, False))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: (["⏸️ пауза диспатча"], [], False))
     wip_seen = []
     monkeypatch.setattr(
@@ -7456,8 +7880,8 @@ def test_main_closes_reopened_task_before_acceptance_sees_it(monkeypatch):
     # open_task_issues сама) — стаб оставлен просто чтобы не тянуть в тест её
     # внутреннюю логику (pulls тут всегда пуст, реальная реализация тоже
     # вернула бы []); сигнатура обязана принимать pool, иначе main() упадёт.
-    monkeypatch.setattr(sch, "unhealthy_pulls", lambda repo, now, pulls, *, pool=None: [])
-    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, pulls))
+    monkeypatch.setattr(sch, "unhealthy_pulls", lambda repo, now, pulls, *, pool=None: ([], False))
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, False, pulls))
     monkeypatch.setattr(sch, "trigger_ai_review", lambda repo, now, pulls: ([], []))
     monkeypatch.setattr(sch, "stale_ready_pulls", lambda repo, now, pulls: [])
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], True))
@@ -7498,7 +7922,7 @@ def test_main_closes_reopened_task_before_acceptance_sees_it(monkeypatch):
 
     def fake_accept(repo, pool, merged, now=None, *, open_pulls_list=None):
         accept_calls.append([i["number"] for i in pool])
-        return [], [], False
+        return [], [], False, False
 
     monkeypatch.setattr(sch, "accept_merged_tasks", fake_accept)
 
@@ -7543,7 +7967,7 @@ def test_accept_merged_tasks_closes_on_green_deploy_and_health(health_server, mo
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
 
     pool = [issue(21, assignees=("mytab0r",))]
-    observations, actions, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: PR177}, open_pulls_list=[])
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(REPO, pool, {21: PR177}, open_pulls_list=[])
 
     assert hard_failure is False
     assert any("закрыта приёмкой" in line and "#21" in line for line in (observations + actions))
@@ -7577,7 +8001,7 @@ def test_accept_merged_tasks_skips_close_when_second_pr_still_open(health_server
     still_open = pull(325, pr_body="#21\n\nвторой PR по этой задаче, работа продолжается",
                        ref="agent/21-second-pr")
     pool = [issue(21, assignees=("mytab0r",))]
-    observations, actions, hard_failure = sch.accept_merged_tasks(
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(
         REPO, pool, {21: PR177}, open_pulls_list=[still_open])
 
     assert hard_failure is False
@@ -7624,7 +8048,7 @@ def test_deploy_evidence_matches_own_merge_commit_not_next_merge(health_server, 
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
 
     pool = [issue(21, assignees=("mytab0r",))]
-    observations, actions, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: pr_first}, open_pulls_list=[])
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(REPO, pool, {21: pr_first}, open_pulls_list=[])
 
     assert hard_failure is False
     assert any("закрыта приёмкой" in line and "#21" in line for line in (observations + actions))
@@ -7679,7 +8103,7 @@ def test_accept_merged_tasks_reads_all_pages_of_pr_files(monkeypatch):
     pr = merged_pull(999, "#21\n\nПравка cf-worker/worker.js среди сотни прочих файлов",
                       "headsha999", "2026-09-04T10:00:00Z")
     pool = [issue(21, assignees=("mytab0r",))]
-    observations, actions, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: pr}, open_pulls_list=[])
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(REPO, pool, {21: pr}, open_pulls_list=[])
 
     assert hard_failure is False
     assert any("закрыта приёмкой (deploy)" in line and "#21" in line for line in (observations + actions))
@@ -7709,7 +8133,7 @@ def test_accept_merged_tasks_does_not_close_on_red_dsh_edge_deploy_prod_form(mon
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
 
     pool = [issue(518, assignees=("mytab0r",))]
-    observations, actions, hard_failure = sch.accept_merged_tasks(
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(
         REPO, pool, {518: PR528}, open_pulls_list=[])
 
     assert hard_failure is False
@@ -7747,7 +8171,7 @@ def test_accept_merged_tasks_closes_on_green_dsh_edge_deploy_and_health(health_s
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
 
     pool = [issue(518, assignees=("mytab0r",))]
-    observations, actions, hard_failure = sch.accept_merged_tasks(
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(
         REPO, pool, {518: PR528}, open_pulls_list=[])
 
     assert hard_failure is False
@@ -7933,9 +8357,12 @@ def test_accept_merged_tasks_health_timeout_is_hard_failure_not_a_crash(hanging_
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("жёсткий сбой не пишет обычный комментарий в задачу"))
 
     pool = [issue(21, assignees=("mytab0r",))]
-    observations, actions, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: PR177}, open_pulls_list=[])
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(REPO, pool, {21: PR177}, open_pulls_list=[])
 
     assert hard_failure is True
+    # Находка ai-ревью #1053 (второй круг): сбой УЛИКИ не переименовывается в
+    # заметочный — заметки здесь успешны, их флаг обязан остаться False.
+    assert note_hard_failure is False
     assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
     assert not any(call.startswith(("-X PATCH", "-X DELETE")) for call in fake.calls)
 
@@ -7958,7 +8385,7 @@ def test_accept_merged_tasks_does_not_close_on_red_deploy(monkeypatch):
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
 
     pool = [issue(21, assignees=("mytab0r",))]
-    observations, actions, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: PR177}, open_pulls_list=[])
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(REPO, pool, {21: PR177}, open_pulls_list=[])
 
     assert hard_failure is False
     assert any("не закрыта" in line and "#21" in line for line in (observations + actions))
@@ -7981,7 +8408,7 @@ def test_accept_merged_tasks_closes_on_green_check_runs(monkeypatch):
     patch_post_issue_comment(monkeypatch, lambda *a: None)
 
     pool = [issue(18, assignees=("mytab0r",))]
-    observations, actions, hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138}, open_pulls_list=[])
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138}, open_pulls_list=[])
 
     assert hard_failure is False
     assert any("закрыта приёмкой" in line and "#18" in line for line in (observations + actions))
@@ -8005,7 +8432,7 @@ def test_accept_merged_tasks_does_not_close_on_red_check_run(monkeypatch):
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
 
     pool = [issue(18, assignees=("mytab0r",))]
-    observations, actions, hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138}, open_pulls_list=[])
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138}, open_pulls_list=[])
 
     assert hard_failure is False
     assert any("провалена" in line and "#18" in line for line in (observations + actions))
@@ -8059,7 +8486,7 @@ def test_accept_merged_tasks_closes_when_stale_rerun_failure_superseded_by_succe
     patch_post_issue_comment(monkeypatch, lambda *a: None)
 
     pool = [issue(18, assignees=("mytab0r",))]
-    observations, actions, hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138}, open_pulls_list=[])
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138}, open_pulls_list=[])
 
     assert hard_failure is False
     assert any("закрыта приёмкой" in line and "#18" in line for line in (observations + actions))
@@ -8117,7 +8544,7 @@ def test_accept_merged_tasks_closes_docs_only_with_no_observable_result(monkeypa
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
 
     pool = [issue(78, assignees=("mytab0r",))]
-    observations, actions, hard_failure = sch.accept_merged_tasks(REPO, pool, {78: PR163}, open_pulls_list=[])
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(REPO, pool, {78: PR163}, open_pulls_list=[])
 
     assert hard_failure is False
     assert any("закрыта приёмкой" in line and "#78" in line for line in (observations + actions))
@@ -8145,7 +8572,7 @@ def test_accept_merged_tasks_does_not_close_docs_when_file_missing_from_main(mon
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
 
     pool = [issue(78, assignees=("mytab0r",))]
-    observations, actions, hard_failure = sch.accept_merged_tasks(REPO, pool, {78: PR163}, open_pulls_list=[])
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(REPO, pool, {78: PR163}, open_pulls_list=[])
 
     assert hard_failure is False
     assert not any(call.startswith("-X PATCH") for call in fake.calls)
@@ -8178,7 +8605,7 @@ def test_accept_merged_tasks_closes_docs_when_pr_only_removes_files(monkeypatch)
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
 
     pool = [issue(78, assignees=("mytab0r",))]
-    observations, actions, hard_failure = sch.accept_merged_tasks(REPO, pool, {78: archive_pr}, open_pulls_list=[])
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(REPO, pool, {78: archive_pr}, open_pulls_list=[])
 
     assert hard_failure is False
     assert any("закрыта приёмкой" in line and "#78" in line for line in (observations + actions))
@@ -8206,7 +8633,7 @@ def test_accept_merged_tasks_docs_missing_escalates_on_non_404_error(monkeypatch
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("сбой инструмента не пишет обычный комментарий"))
 
     pool = [issue(78, assignees=("mytab0r",))]
-    observations, actions, hard_failure = sch.accept_merged_tasks(REPO, pool, {78: PR163}, open_pulls_list=[])
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(REPO, pool, {78: PR163}, open_pulls_list=[])
 
     assert hard_failure is True
     assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
@@ -8233,7 +8660,7 @@ def test_accept_merged_tasks_escalates_hard_failure_without_touching_task(monkey
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("жёсткий сбой не пишет обычный комментарий в задачу"))
 
     pool = [issue(21, assignees=("mytab0r",))]
-    observations, actions, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: PR177}, open_pulls_list=[])
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(REPO, pool, {21: PR177}, open_pulls_list=[])
 
     assert hard_failure is True
     assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
@@ -8263,7 +8690,7 @@ def test_accept_merged_tasks_hard_failure_escalation_is_idempotent(monkeypatch):
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("жёсткий сбой не пишет обычный комментарий в задачу"))
 
     pool = [issue(21, assignees=("mytab0r",))]
-    observations, actions, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: PR177}, open_pulls_list=[])
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(REPO, pool, {21: PR177}, open_pulls_list=[])
 
     assert hard_failure is True
     assert any("уже эскалировано" in line and "#21" in line for line in (observations + actions))
@@ -8287,7 +8714,7 @@ def test_accept_merged_tasks_stays_quiet_when_pending_within_threshold(monkeypat
     pr = merged_pull(177, PR_177_BODY, "sha", merged_at.isoformat().replace("+00:00", "Z"))
     pool = [issue(21, assignees=("mytab0r",))]
 
-    observations, actions, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: pr}, now, open_pulls_list=[])
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(REPO, pool, {21: pr}, now, open_pulls_list=[])
 
     assert hard_failure is False
     # #456: «улика ещё не готова» ничего не меняет — наблюдение, не действие.
@@ -8316,7 +8743,7 @@ def test_accept_merged_tasks_escalates_when_pending_past_threshold(monkeypatch):
     pr = merged_pull(177, PR_177_BODY, "sha", merged_at.isoformat().replace("+00:00", "Z"))
     pool = [issue(21, assignees=("mytab0r",))]
 
-    observations, actions, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: pr}, now, open_pulls_list=[])
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(REPO, pool, {21: pr}, now, open_pulls_list=[])
 
     assert hard_failure is True
     assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
@@ -8342,7 +8769,7 @@ def test_accept_merged_tasks_pending_escalation_is_idempotent(monkeypatch):
     pr = merged_pull(177, PR_177_BODY, "sha", merged_at.isoformat().replace("+00:00", "Z"))
     pool = [issue(21, assignees=("mytab0r",))]
 
-    observations, actions, hard_failure = sch.accept_merged_tasks(REPO, pool, {21: pr}, now, open_pulls_list=[])
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(REPO, pool, {21: pr}, now, open_pulls_list=[])
 
     assert hard_failure is False
     assert any("уже эскалировано" in line and "#21" in line for line in (observations + actions))
@@ -8360,7 +8787,7 @@ def test_accept_merged_tasks_is_idempotent_after_fail_marker_posted(monkeypatch)
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("не должен писать повторно"))
 
     pool = [issue(18, assignees=())]  # уже без исполнителя — как после первого провала
-    observations, actions, hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138}, open_pulls_list=[])
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138}, open_pulls_list=[])
 
     assert hard_failure is False
     assert (observations + actions) == []
@@ -8385,7 +8812,7 @@ def test_accept_merged_tasks_fail_retries_cleanup_when_assignee_stuck(monkeypatc
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
 
     pool = [issue(18, assignees=("mytab0r",))]  # снятие assignee в прошлый раз не завершилось
-    observations, actions, hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138}, open_pulls_list=[])
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138}, open_pulls_list=[])
 
     assert hard_failure is False
     assert any(c.startswith(f"-X DELETE repos/{REPO}/issues/18/assignees") for c in fake.calls)
@@ -8419,7 +8846,7 @@ def test_accept_merged_tasks_ok_close_failure_does_not_stop_the_rest(monkeypatch
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
 
     pool = [issue(18, assignees=("mytab0r",)), issue(78, assignees=("mytab0r",))]
-    observations, actions, hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138, 78: PR163}, open_pulls_list=[])
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138, 78: PR163}, open_pulls_list=[])
 
     assert any("#18" in line and "закрытие приёмкой не завершено" in line for line in (observations + actions))
     assert not any(call.startswith(f"-X PATCH repos/{REPO}/issues/18") for call in fake.calls)
@@ -8454,7 +8881,7 @@ def test_accept_merged_tasks_fail_comment_failure_does_not_stop_the_rest(monkeyp
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
 
     pool = [issue(18, assignees=("mytab0r",)), issue(78, assignees=("mytab0r",))]
-    observations, actions, hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138, 78: PR163}, open_pulls_list=[])
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138, 78: PR163}, open_pulls_list=[])
 
     assert any("#18" in line and "отметка провала приёмки не завершена" in line for line in (observations + actions))
     assert not any(call.startswith(f"-X DELETE repos/{REPO}/issues/18") for call in fake.calls)
@@ -8476,7 +8903,7 @@ def test_accept_merged_tasks_never_closes_watchdog_issue(monkeypatch):
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
 
     pool = [issue(sch.WATCHDOG_ISSUE, assignees=())]
-    observations, actions, hard_failure = sch.accept_merged_tasks(REPO, pool, {sch.WATCHDOG_ISSUE: pr126}, open_pulls_list=[])
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(REPO, pool, {sch.WATCHDOG_ISSUE: pr126}, open_pulls_list=[])
 
     assert hard_failure is False
     assert (observations + actions) == []
@@ -8493,7 +8920,7 @@ def test_accept_merged_tasks_zero_calls_when_no_task_has_merged_pr(monkeypatch):
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("не должен писать"))
 
     pool = [issue(999, assignees=("mytab0r",)), issue(1000, assignees=())]
-    observations, actions, hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138}, open_pulls_list=[])  # #18 не в пуле
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(REPO, pool, {18: PR138}, open_pulls_list=[])  # #18 не в пуле
 
     assert (observations + actions) == []
     assert hard_failure is False
@@ -8681,7 +9108,7 @@ def test_accept_merged_tasks_does_not_close_when_body_has_partial_disclaimer(mon
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
 
     pool = [issue(number, assignees=("mytab0r",))]
-    observations, actions, hard_failure = sch.accept_merged_tasks(REPO, pool, {number: pr}, open_pulls_list=[])
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(REPO, pool, {number: pr}, open_pulls_list=[])
 
     assert hard_failure is False
     assert not any(f"#{number}" in line and "закрыта приёмкой" in line for line in (observations + actions))
@@ -8711,7 +9138,7 @@ def test_accept_merged_tasks_partial_disclaimer_removed_closes_as_before(monkeyp
     patch_post_issue_comment(monkeypatch, lambda *a: None)
 
     pool = [issue(297, assignees=("mytab0r",))]
-    observations, actions, hard_failure = sch.accept_merged_tasks(REPO, pool, {297: pr}, open_pulls_list=[])
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(REPO, pool, {297: pr}, open_pulls_list=[])
 
     assert hard_failure is False
     assert any("закрыта приёмкой" in line and "#297" in line for line in (observations + actions))
@@ -8731,7 +9158,7 @@ def test_accept_merged_tasks_partial_disclaimer_is_idempotent(monkeypatch):
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("не должен писать повторно"))
 
     pool = [issue(297, assignees=())]
-    observations, actions, hard_failure = sch.accept_merged_tasks(REPO, pool, {297: pr}, open_pulls_list=[])
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(REPO, pool, {297: pr}, open_pulls_list=[])
 
     assert hard_failure is False
     assert (observations + actions) == []
@@ -8756,7 +9183,7 @@ def test_accept_merged_tasks_partial_disclaimer_retries_cleanup_when_assignee_st
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
 
     pool = [issue(297, assignees=("mytab0r",))]
-    observations, actions, hard_failure = sch.accept_merged_tasks(REPO, pool, {297: pr}, open_pulls_list=[])
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(REPO, pool, {297: pr}, open_pulls_list=[])
 
     assert hard_failure is False
     assert any(c.startswith(f"-X DELETE repos/{REPO}/issues/297/assignees") for c in fake.calls)
@@ -8795,7 +9222,7 @@ def test_accept_merged_tasks_never_closes_epic(monkeypatch):
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("эпик не комментируется приёмкой"))
 
     pool = [issue(115, assignees=(), title="ЭПИК: интеграции внешних систем")]
-    observations, actions, hard_failure = sch.accept_merged_tasks(REPO, pool, {115: pr}, open_pulls_list=[])
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(REPO, pool, {115: pr}, open_pulls_list=[])
 
     assert hard_failure is False
     assert (observations + actions) == []
@@ -8816,7 +9243,7 @@ def test_accept_merged_tasks_marks_epic_completed_when_all_sub_issues_closed(mon
 
     pool = [issue(77, assignees=(), title="ЭПИК: интеграции внешних систем",
                   sub_issues_summary={"total": 8, "completed": 8})]
-    observations, actions, hard_failure = sch.accept_merged_tasks(REPO, pool, {77: pr}, open_pulls_list=[])
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(REPO, pool, {77: pr}, open_pulls_list=[])
 
     assert hard_failure is False
     assert not any(call.startswith(("-X PATCH", "-X DELETE")) for call in fake.calls)
@@ -8839,7 +9266,7 @@ def test_accept_merged_tasks_epic_completed_marker_is_idempotent(monkeypatch):
 
     pool = [issue(77, assignees=(), title="ЭПИК: интеграции внешних систем",
                   sub_issues_summary={"total": 8, "completed": 8})]
-    observations, actions, hard_failure = sch.accept_merged_tasks(REPO, pool, {77: pr}, open_pulls_list=[])
+    observations, actions, hard_failure, note_hard_failure = sch.accept_merged_tasks(REPO, pool, {77: pr}, open_pulls_list=[])
 
     assert hard_failure is False
     assert (observations + actions) == []
