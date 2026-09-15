@@ -501,6 +501,21 @@ export function createRefreshCoordinator({ readAccount, writeAccount, refreshTok
   }
 }
 POOL_JS
+  # accounts.js — ТОЧНАЯ копия importAccount из релизного ассета: #1311
+  # (патч 6) снимает в ней требование refreshToken, и без этого файла патч
+  # отказал бы на фикстуре громко, а не молча (проверено: отказ выглядит как
+  # «lib/accounts.js не найден»).
+  cat >"$dir/lib/accounts.js" <<'ACCOUNTS_JS'
+export function importAccount(id, source) {
+  const json = JSON.parse(fs.readFileSync(source, 'utf8'))
+  const oauth = json.claudeAiOauth || json.oauth
+  if (!oauth?.accessToken || !oauth?.refreshToken) throw new Error('Source has no usable claudeAiOauth credentials')
+  writeAccount(id, { id, oauth })
+  const config = readConfig()
+  if (!config.accounts.some((a) => a.id === id)) config.accounts.push({ id, enabled: true, weight: 1 })
+  writeConfig(config)
+}
+ACCOUNTS_JS
 }
 
 (
@@ -1192,5 +1207,284 @@ echo "GUARD(anthropic-pool): 24) прошлое retryAt пять подряд ->
   [ "$(wc -l <"$POOL_RETRY_CALL_LOG")" = "2" ] || { echo "::error::25) пул обязан быть вызван РОВНО дважды (разбор + повтор): $(cat "$POOL_RETRY_CALL_LOG")" >&2; exit 1; }
 ) || fail "25) тело pool_unavailable среди чужих JSON-строк до/после не разбирается"
 echo "GUARD(anthropic-pool): 25) многострочный stderr (шум до/после тела) -> retryAt разобран, пул повторён — ок (блокер ai-review PR #1292, раунд 2)"
+
+# ── 26) #1310: поаккаунтная разбивка (`accounts`, добавлена #1192 ради
+#      различения «какой ключ живой») ДОХОДИТ ДО ЛОГА. Живой дефект: текстовый
+#      хвост режется до 200 символов (#1067) и обрывается ровно на
+#      `"accounts":[{"id":"anthropic-1","c` — прогоны worker.yml 34942030597
+#      (2026-09-15T08:04:16Z) и 35010410097 (19:28:38Z). Тело здесь —
+#      ДОСЛОВНАЯ прод-форма второго из них, дополненная полем accounts в том
+#      виде, в каком его пишет патченный плагин (сценарий 17 выше доказывает
+#      этот вид отдельно). Мутация: убери pool_accounts_note из сообщения —
+#      предупреждение снова расскажет «rate_limited», не сказав, что именно
+#      anthropic-2 в этом процессе не пробовался ни разу.
+(
+  export DSH_ANTHROPIC_POOL_ACTIVE=1
+  export SMOKE_MODE_primary_model=ok
+  rm -f "$CHAIN_CALLED_MARK"; : >"$ANSWER"; : >"$ERR"
+  dsh() {
+    case "${1:-}" in
+      --profile)
+        if grep -q 'provider: anthropic-pool' "$HOME/.dsh/profiles/headless/cordis.patch.yml" 2>/dev/null; then
+          echo 'dsh: RATE_LIMIT: 503 {"type":"error","error":{"type":"pool_unavailable","message":"No Anthropic account is available","retryAt":0,"reason":"rate_limited","accounts":[{"id":"anthropic-1","class":"rate_limited","lastStatus":429,"cooldownUntil":1789500803738},{"id":"anthropic-2","class":"unknown","lastStatus":null,"cooldownUntil":null}]}}' >&2
+          return 1
+        else
+          touch "$CHAIN_CALLED_MARK"; echo "smoke: ответ от $DEEPSEEK_MODEL"; return 0
+        fi ;;
+      *) echo "::error::SMOKE(26): dsh-заглушка не знает вызов: $*" >&2; return 99 ;;
+    esac
+  }
+  export -f dsh
+  POOL_LOG26="$WORK/pool-warning-26.txt"
+  DSH_RATE_LIMIT_MAX_WAIT_SECS=0 dsh_run_with_pool_then_chain "$ANSWER" "$ERR" "промпт smoke" >"$POOL_LOG26" 2>&1
+  [ "$DSH_RUN_RC" = "0" ] || { echo "::error::26) ожидался успех после отката на цепочку, получено rc=$DSH_RUN_RC: $(cat "$POOL_LOG26")" >&2; exit 1; }
+  grep -q "аккаунты: anthropic-1: rate_limited (HTTP 429)" "$POOL_LOG26" \
+    || { echo "::error::26) разбивка по аккаунтам не доехала до лога — ровно тот дефект, ради которого #1192 клал accounts в тело: $(cat "$POOL_LOG26")" >&2; exit 1; }
+  grep -q "anthropic-2: unknown" "$POOL_LOG26" \
+    || { echo "::error::26) ВТОРОЙ аккаунт обязан быть назван: агрегат reason=rate_limited верен и когда второй ключ не пробовался вовсе: $(cat "$POOL_LOG26")" >&2; exit 1; }
+) || fail "26) поаккаунтная разбивка пула не доехала до лога"
+echo "GUARD(anthropic-pool): 26) accounts[] из тела pool_unavailable доходит до лога целиком — видно, какой из двух ключей живой (#1310) — ок"
+
+# ── 27) #1310: разбивки нет в теле (плагин без патча #1192 / старая форма) —
+#      честный пробел, не выдуманный факт и не падение.
+NO_ACC_ERR="$WORK/err-27.txt"
+printf '%s\n' 'dsh: SERVER: 503 {"type":"error","error":{"type":"pool_unavailable","message":"No Anthropic account is available","retryAt":null}}' >"$NO_ACC_ERR"
+[ -z "$(dsh_pool_accounts_note "$NO_ACC_ERR")" ] \
+  || fail "27) тела без accounts обязано давать ПУСТО, а не выдуманную разбивку: $(dsh_pool_accounts_note "$NO_ACC_ERR")"
+printf '%s\n' 'dsh: TRANSPORT: connection refused' >"$NO_ACC_ERR"
+[ -z "$(dsh_pool_accounts_note "$NO_ACC_ERR")" ] \
+  || fail "27) отказ вообще без тела pool_unavailable обязан давать ПУСТО"
+echo "GUARD(anthropic-pool): 27) нет accounts в теле -> честный пробел, не выдуманный факт (#1310) — ок"
+
+# ── 28) #1311: предполётная проверка называет КАЖДЫЙ аккаунт по имени и по
+#      факту, а не одним агрегатом. Поведенческая, с настоящим HTTP-сервером
+#      на loopback: фикстура-«плагин» несёт те же КОНСТАНТЫ в той же форме,
+#      что настоящий lib/index.js (константы проверка читает оттуда, а не
+#      дублирует у себя), поэтому её эндпоинты указывают на этот сервер.
+#      Сценарий воспроизводит ровно живую ситуацию 2026-09-15: один аккаунт
+#      под квотой (429), второй выбывает на рефреше (Anthropic ротирует
+#      refreshToken, снимок в секрете отстал), третий живой.
+PREFLIGHT_WORK="$(mktemp -d)"
+PKG="$PREFLIGHT_WORK/package"
+mkdir -p "$PKG/lib"
+cat >"$PREFLIGHT_WORK/server.mjs" <<'SERVER'
+import http from 'node:http'
+import fs from 'node:fs'
+const server = http.createServer(async (req, res) => {
+  if (req.method === 'POST' && req.url.startsWith('/oauth/token')) {
+    const chunks = []; for await (const c of req) chunks.push(c)
+    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+    if (body.refresh_token === 'refresh-live') {
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify({ access_token: 'access-fresh', refresh_token: 'refresh-live-2', expires_in: 3600 }))
+      return
+    }
+    // Прод-форма отказа ротированного/отозванного refresh-токена.
+    res.statusCode = 400; res.setHeader('content-type', 'application/json')
+    res.end(JSON.stringify({ error: 'invalid_grant' })); return
+  }
+  if (req.url.startsWith('/v1/models')) {
+    const auth = req.headers.authorization || ''
+    if (auth === 'Bearer access-quota') {
+      res.statusCode = 429
+      res.setHeader('anthropic-ratelimit-unified-5h-reset', String(Math.floor(Date.now() / 1000) + 285))
+      res.end('{}'); return
+    }
+    if (auth === 'Bearer access-fresh') { res.setHeader('content-type', 'application/json'); res.end('{"data":[]}'); return }
+    res.statusCode = 401; res.end('{}'); return
+  }
+  res.statusCode = 404; res.end('{}')
+})
+server.listen(0, '127.0.0.1', () => fs.writeFileSync(process.argv[2], String(server.address().port)))
+SERVER
+PORT_FILE="$PREFLIGHT_WORK/port.txt"
+node "$PREFLIGHT_WORK/server.mjs" "$PORT_FILE" &
+PREFLIGHT_SERVER_PID=$!
+trap 'kill "$PREFLIGHT_SERVER_PID" 2>/dev/null || true' EXIT
+# `command sleep` — в обход заглушки sleep(){ :; } в шапке этого файла:
+# здесь нужно НАСТОЯЩЕЕ ожидание старта процесса, а не мгновенный no-op.
+for _ in $(seq 1 50); do [ -s "$PORT_FILE" ] && break; command sleep 0.2; done
+[ -s "$PORT_FILE" ] || fail "28) фикстурный HTTP-сервер не поднялся"
+PREFLIGHT_PORT="$(cat "$PORT_FILE")"
+# Форма констант — ДОСЛОВНО как в lib/index.js плагина (см. constFromPlugin в
+# scripts/lib/anthropic_pool_preflight.mjs): это и есть предмет связи.
+{
+  printf "const API_BASE = 'http://127.0.0.1:%s'\n" "$PREFLIGHT_PORT"
+  printf "const TOKEN_URL = 'http://127.0.0.1:%s/oauth/token'\n" "$PREFLIGHT_PORT"
+  printf "const CLIENT_ID = 'test-client-id'\n"
+  printf "const OAUTH_BETAS = ['oauth-2025-04-20', 'claude-code-20250219']\n"
+} >"$PKG/lib/index.js"
+# Мини-реализация контракта accounts.js (readConfig/readAccount/writeAccount/
+# writeConfig над DSH_ANTHROPIC_POOL_DIR) — тот же формат файлов, что у
+# настоящего модуля, включая обёртку claudeAiOauth.
+cat >"$PKG/lib/accounts.js" <<'ACC'
+import fs from 'node:fs'
+import path from 'node:path'
+const dir = () => process.env.DSH_ANTHROPIC_POOL_DIR
+const cfg = () => path.join(dir(), 'pool.json')
+export function readConfig() {
+  try { return JSON.parse(fs.readFileSync(cfg(), 'utf8')) } catch { return { strategy: 'least-used', accounts: [] } }
+}
+export function writeConfig(config) { fs.writeFileSync(cfg(), JSON.stringify(config, null, 2) + '\n') }
+export function readAccount(id) {
+  const value = JSON.parse(fs.readFileSync(path.join(dir(), id + '.json'), 'utf8'))
+  const oauth = value.claudeAiOauth || value.oauth
+  if (!oauth) throw new Error(`No claudeAiOauth in account ${id}`)
+  return { id, oauth }
+}
+export function writeAccount(id, value) {
+  fs.writeFileSync(path.join(dir(), id + '.json'), JSON.stringify({ claudeAiOauth: value.oauth }, null, 2) + '\n')
+}
+ACC
+POOL_DIR="$PREFLIGHT_WORK/accounts"
+mkdir -p "$POOL_DIR"
+# anthropic-1: живой accessToken под квотой Anthropic (429) — expiresAt в
+# будущем, рефреш не нужен, до сети доходит сам токен.
+printf '%s\n' '{"claudeAiOauth":{"accessToken":"access-quota","refreshToken":"refresh-live","expiresAt":99999999999999}}' >"$POOL_DIR/anthropic-1.json"
+# anthropic-2: снимок отстал — refreshToken уже ротирован живой сессией.
+printf '%s\n' '{"claudeAiOauth":{"accessToken":"access-stale","refreshToken":"refresh-rotated-away","expiresAt":1}}' >"$POOL_DIR/anthropic-2.json"
+# anthropic-3: рефреш проходит, доступ живой.
+printf '%s\n' '{"claudeAiOauth":{"accessToken":"access-stale","refreshToken":"refresh-live","expiresAt":1}}' >"$POOL_DIR/anthropic-3.json"
+printf '%s\n' '{"strategy":"least-used","accounts":[{"id":"anthropic-1","enabled":true},{"id":"anthropic-2","enabled":true},{"id":"anthropic-3","enabled":true}]}' >"$POOL_DIR/pool.json"
+PRE_LOG="$PREFLIGHT_WORK/preflight.txt"
+DSH_ANTHROPIC_POOL_DIR="$POOL_DIR" node "$REPO/scripts/lib/anthropic_pool_preflight.mjs" "$PKG" >"$PRE_LOG" 2>&1 \
+  || fail "28) предполётная проверка обязана завершаться кодом 0 при любом исходе: $(cat "$PRE_LOG")"
+PRE_OUT="$(cat "$PRE_LOG")"
+grep -q "аккаунт anthropic-1: RATE_LIMITED" "$PRE_LOG" \
+  || fail "28) аккаунт под квотой обязан быть назван RATE_LIMITED поимённо: $PRE_OUT"
+grep -q "аккаунт anthropic-2: REFRESH_FAILED" "$PRE_LOG" \
+  || fail "28) выбывший на рефреше аккаунт обязан быть назван REFRESH_FAILED, а не утонуть в агрегате соседа (#1311): $PRE_OUT"
+grep -q "аккаунт anthropic-3: OK" "$PRE_LOG" \
+  || fail "28) живой аккаунт обязан быть назван пригодным: $PRE_OUT"
+grep -q "пригодных аккаунтов 1 из 3" "$PRE_LOG" || fail "28) сводка обязана называть числа: $PRE_OUT"
+grep -q "refresh-anthropic-pool.md" "$PRE_LOG" || fail "28) сообщение обязано назвать рунбук лечения (газ): $PRE_OUT"
+grep -q "ротирует refreshToken" "$PRE_LOG" || fail "28) сообщение обязано назвать частую ПРИЧИНУ, а не только факт: $PRE_OUT"
+for secret in access-quota access-stale refresh-live refresh-rotated-away access-fresh refresh-live-2; do
+  grep -q "$secret" "$PRE_LOG" && fail "28) значение токена ($secret) утекло в лог предполётной проверки: $PRE_OUT"
+done
+# Непригодные ПРЯМО СЕЙЧАС выключены на этот прогон; под квотой — НЕ выключен
+# (его cooldown пул посчитает сам, квота может отпустить в середине прогона).
+python3 - "$POOL_DIR/pool.json" <<'PYCHK' || fail "28) состояние pool.json после предполётной проверки неверно"
+import json, sys
+rows = {a["id"]: a.get("enabled", True) for a in json.load(open(sys.argv[1]))["accounts"]}
+assert rows["anthropic-2"] is False, rows
+assert rows["anthropic-1"] is True, rows
+assert rows["anthropic-3"] is True, rows
+PYCHK
+echo "GUARD(anthropic-pool): 28) предполётная проверка называет каждый аккаунт по имени и факту (квота / мёртвый refreshToken / живой), токены в лог не текут, непригодный выключен на прогон (#1311) — ок"
+
+# ── 29) #1311: форма констант плагина изменилась — проверка падает ГРОМКО, а
+#      не подставляет своё значение эндпоинта (тот же принцип, что у
+#      scripts/lib/patch_anthropic_pool_plugin.py).
+printf "%s\n" "const SOMETHING_ELSE = 'x'" >"$PKG/lib/index.js"
+if DSH_ANTHROPIC_POOL_DIR="$POOL_DIR" node "$REPO/scripts/lib/anthropic_pool_preflight.mjs" "$PKG" >"$PREFLIGHT_WORK/shape.txt" 2>&1; then
+  fail "29) изменившаяся форма констант плагина обязана валить проверку, а не молча подставлять свой эндпоинт: $(cat "$PREFLIGHT_WORK/shape.txt")"
+fi
+grep -q "PLUGIN_SHAPE_CHANGED" "$PREFLIGHT_WORK/shape.txt" \
+  || fail "29) отказ обязан называть класс PLUGIN_SHAPE_CHANGED: $(cat "$PREFLIGHT_WORK/shape.txt")"
+echo "GUARD(anthropic-pool): 29) форма констант плагина изменилась -> громкий отказ, не молчаливая подстановка (#1311) — ок"
+# Сервер фикстуры НЕ гасим здесь: сценарий 31 ниже ходит в него же (гасится
+# там). Ранее kill стоял тут, и 31 падал с NETWORK_ERROR — поймано прогоном.
+
+# ── 30) #1311, ПОВЕДЕНЧЕСКОЕ доказательство патчей 5/6: аккаунт с ОДНИМ
+#      долгоживущим токеном и БЕЗ refreshToken рабочий. До патча
+#      createRefreshCoordinator валил его ПЕРВОЙ же строкой («has no Claude
+#      OAuth credentials»), ДО всякой проверки срока — то есть такой токен
+#      отвергался на каждом запросе, падал в ветку catch forward() и выходил
+#      наружу агрегатом pool_unavailable, неотличимым от исчерпанной квоты
+#      соседа. Проверяются ОБА направления: без срока — работаем без рефреша;
+#      срок истёк и рефрешить нечем — отказ с ТОЧНЫМ текстом.
+(
+  FIXTURE_ROOT30="$(mktemp -d)"
+  EXTRACT30="$FIXTURE_ROOT30/anthropic-oauth-pool-extracted/package"
+  write_fixture_package "$EXTRACT30"
+  export DSH_ANTHROPIC_POOL_ACTIVE=1
+  export DSH_ANTHROPIC_POOL_EXTRACTED="$EXTRACT30"
+  export DSH_ANTHROPIC_POOL_PKG="$FIXTURE_ROOT30/original.tgz"
+  : >"$DSH_ANTHROPIC_POOL_PKG"
+  dsh_patch_anthropic_pool_plugin >/dev/null 2>&1 || { echo "::error::30) патч не применился к фикстуре" >&2; exit 1; }
+  cat >"$EXTRACT30/lib/norefresh-check.mjs" <<'NOREFRESH_MJS'
+import { createRefreshCoordinator } from './pool.js'
+
+function coordinatorFor(oauth, onRefresh) {
+  return createRefreshCoordinator({
+    readAccount: async (id) => ({ id, oauth }),
+    writeAccount: async () => {},
+    refreshToken: async () => { onRefresh(); return { access_token: 'NEW', expires_in: 3600 } },
+  })
+}
+
+// 1) Долгоживущий токен: есть accessToken, НЕТ refreshToken, НЕТ expiresAt.
+let refreshed = false
+const account = await coordinatorFor({ accessToken: 'long-lived' }, () => { refreshed = true })('acc')
+if (refreshed) { console.error('FAIL: рефреш случился, хотя рефрешить нечем и срок не объявлен'); process.exit(1) }
+if (account?.oauth?.accessToken !== 'long-lived') { console.error('FAIL: аккаунт не вернулся как есть'); process.exit(1) }
+
+// 2) Срок ИСТЁК по метке самого токена, а refreshToken нет — честный отказ с
+//    точным текстом, не общее «нет credentials».
+let message = ''
+try {
+  await coordinatorFor({ accessToken: 'stale', expiresAt: Date.now() - 1000 }, () => {})('acc')
+} catch (error) { message = String(error?.message || error) }
+if (!message.includes('expired') || !message.includes('refreshToken')) {
+  console.error(`FAIL: текст отказа не называет истёкший срок и отсутствие refreshToken: ${message}`); process.exit(1)
+}
+
+// 3) Нет accessToken — работать нечем, отказ остаётся.
+let noAccess = ''
+try { await coordinatorFor({ refreshToken: 'r' }, () => {})('acc') }
+catch (error) { noAccess = String(error?.message || error) }
+if (!noAccess.includes('access token')) { console.error(`FAIL: отсутствие accessToken обязано отвергаться: ${noAccess}`); process.exit(1) }
+
+console.log('OK: долгоживущий токен без refreshToken работает; истёкший без рефреша отвергается точным текстом; без accessToken — отказ')
+NOREFRESH_MJS
+  LOG30="$FIXTURE_ROOT30/norefresh.log"
+  if ! node "$EXTRACT30/lib/norefresh-check.mjs" >"$LOG30" 2>&1; then
+    { echo "::error::30) поведенческая проверка патча 5 провалилась:"; cat "$LOG30"; } >&2; exit 1
+  fi
+  cat "$LOG30"
+  # Патч 6: импорт такого секрета больше не отвергается.
+  grep -q "if (!oauth?.accessToken) throw new Error('Source has no claudeAiOauth.accessToken')" "$EXTRACT30/lib/accounts.js" \
+    || { echo "::error::30) патч 6 не снял требование refreshToken в importAccount" >&2; exit 1; }
+) || fail "30) долгоживущий токен без refreshToken не подтверждён поведенчески"
+echo "GUARD(anthropic-pool): 30) один долгоживущий токен без refreshToken — рабочий аккаунт, а не «нет credentials» (#1311) — ок"
+
+# ── 31) #1311: та же форма аккаунта в предполётной проверке. Регресс, который
+#      эта проверка обязана не допустить: превентивный рефреш при отсутствии
+#      expiresAt (класс #1130) — он пометил бы ЕДИНСТВЕННЫЙ рабочий токен как
+#      REFRESH_FAILED и выключил бы его на весь прогон.
+POOL_DIR31="$PREFLIGHT_WORK/accounts-31"
+mkdir -p "$POOL_DIR31"
+printf '%s\n' '{"claudeAiOauth":{"accessToken":"access-fresh"}}' >"$POOL_DIR31/anthropic-1.json"
+# anthropic-2 — та же форма «срок неизвестен», но refreshToken ЕСТЬ: именно
+# на ней виден класс #1130 в чистом виде. С превентивным рефрешем (мутация
+# `!oauth.expiresAt || …`) этот аккаунт был бы обновлён без нужды, сжигая
+# рефреш-цикл на каждом прогоне и ротируя токен владельца.
+printf '%s\n' '{"claudeAiOauth":{"accessToken":"access-fresh","refreshToken":"refresh-live"}}' >"$POOL_DIR31/anthropic-2.json"
+printf '%s\n' '{"strategy":"least-used","accounts":[{"id":"anthropic-1","enabled":true},{"id":"anthropic-2","enabled":true}]}' >"$POOL_DIR31/pool.json"
+{
+  printf "const API_BASE = 'http://127.0.0.1:%s'\n" "$PREFLIGHT_PORT"
+  printf "const TOKEN_URL = 'http://127.0.0.1:%s/oauth/token'\n" "$PREFLIGHT_PORT"
+  printf "const CLIENT_ID = 'test-client-id'\n"
+  printf "const OAUTH_BETAS = ['oauth-2025-04-20', 'claude-code-20250219']\n"
+} >"$PKG/lib/index.js"
+PRE_LOG31="$PREFLIGHT_WORK/preflight31.txt"
+DSH_ANTHROPIC_POOL_DIR="$POOL_DIR31" node "$REPO/scripts/lib/anthropic_pool_preflight.mjs" "$PKG" >"$PRE_LOG31" 2>&1 \
+  || fail "31) предполётная проверка обязана завершаться кодом 0: $(cat "$PRE_LOG31")"
+grep -q "аккаунт anthropic-1: OK" "$PRE_LOG31" \
+  || fail "31) долгоживущий токен без refreshToken обязан быть признан пригодным, а не REFRESH_FAILED (регресс класса #1130): $(cat "$PRE_LOG31")"
+grep -q "рефреш не требовался" "$PRE_LOG31" \
+  || fail "31) сообщение обязано называть, что рефреша не было (а не молчать): $(cat "$PRE_LOG31")"
+grep -q "аккаунт anthropic-2: OK — токен из секрета, рефреш не требовался" "$PRE_LOG31" \
+  || fail "31) аккаунт с refreshToken, но БЕЗ expiresAt не должен рефрешиться превентивно (класс #1130): $(cat "$PRE_LOG31")"
+grep -q "выключены на этот прогон" "$PRE_LOG31" \
+  && fail "31) рабочий аккаунт выключен предполётной проверкой — ровно тот регресс, ради которого этот сценарий: $(cat "$PRE_LOG31")"
+python3 - "$POOL_DIR31/pool.json" <<'PYCHK31' || fail "31) аккаунт обязан остаться enabled"
+import json, sys
+rows = {a["id"]: a.get("enabled", True) for a in json.load(open(sys.argv[1]))["accounts"]}
+assert rows["anthropic-1"] is True, rows
+PYCHK31
+echo "GUARD(anthropic-pool): 31) предполётная проверка НЕ рефрешит токен без expiresAt и не гасит единственный рабочий аккаунт (#1311, класс #1130) — ок"
+kill "$PREFLIGHT_SERVER_PID" 2>/dev/null || true
 
 echo "GUARD(anthropic-pool): быстрый провайдер Claude (#838), инвариант #860 «пул только в worker/hands» — гвардия зелёная"

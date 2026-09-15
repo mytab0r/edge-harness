@@ -45,10 +45,14 @@
       {
         "name": "NVIDIA-NIM-1",
         "base_url": "https://integrate.api.nvidia.com/v1",
-        "model": "deepseek-ai/deepseek-v4-pro-0813",
+        "models": [
+          "nvidia/nemotron-3-ultra-550b-a55b",
+          "nvidia/nemotron-3-super-120b-a12b",
+          "deepseek-ai/deepseek-v4-flash-0731"
+        ],
         "secret_env": "NVIDIA_NIM_1_API_KEY",
         "max_output_tokens": 16384,
-        "$comment": "#1062: 131072 не был подтверждён ничем (discovery #848 проверял этот id живым chat/completions с max_tokens=16, не 131072, scripts/measure/provider_latency.py:266) — реальный предел взят из OpenAPI-схемы build.nvidia.com/deepseek-ai/deepseek-v4-pro-0813 этой же модели: '\"max_tokens\":{\"default\":16384,...,\"maximum\":16384,...}' (проверено live-запросом 2026-09-13, схема playground'а NVIDIA для DeepSeek V4 Pro, поле reasoning_effort в том же объекте называет модель прямо)."
+        "$comment": "#1309 (мультимодельный фолбэк внутри одного аккаунта): список моделей ОДНОГО ключа по порядку — отказ, привязанный к id модели (410/404/UNKNOWN_MODEL), пробует следующую модель ЭТОГО ЖЕ ключа, а не тратит аккаунт. Прежний единственный id deepseek-ai/deepseek-v4-pro-0813 снят провайдером: HTTP 410 Gone на каждом обращении (живые прогоны worker.yml 34991038287 и 35010410097, 2026-09-15) и отсутствует в живом листинге https://integrate.api.nvidia.com/v1/models (публичный, без ключа, live-запрос 2026-09-15, 82 id). Все id ниже взяты из ТОГО ЖЕ листинга буква-в-букву и подтверждены в scripts/lib/confirmed-provider-models.json. max_output_tokens=16384 общий на запись — то же консервативное значение, что было до #1309 (#1062, схема OpenAPI build.nvidia.com для прежней модели этого же эндпоинта); отдельным живым chat/completions на КАЖДЫЙ id не проверялось — не подтверждено, но и не занижено относительно прежнего поведения. Порядок: ultra-550b первым — крупнейшая модель каталога."
       },
       {
         "name": "OpenRouter-1",
@@ -61,10 +65,14 @@
       {
         "name": "NVIDIA-NIM-2",
         "base_url": "https://integrate.api.nvidia.com/v1",
-        "model": "deepseek-ai/deepseek-v4-pro-0813",
+        "models": [
+          "nvidia/nemotron-3-super-120b-a12b",
+          "nvidia/nemotron-3-ultra-550b-a55b",
+          "deepseek-ai/deepseek-v4-flash-0731"
+        ],
         "secret_env": "NVIDIA_NIM_2_API_KEY",
         "max_output_tokens": 16384,
-        "$comment": "#1062: тот же id модели, что NVIDIA-NIM-1 — тот же подтверждённый предел 16384, см. её комментарий."
+        "$comment": "#1309 (мультимодельный фолбэк внутри одного аккаунта): список моделей ОДНОГО ключа по порядку — отказ, привязанный к id модели (410/404/UNKNOWN_MODEL), пробует следующую модель ЭТОГО ЖЕ ключа, а не тратит аккаунт. Прежний единственный id deepseek-ai/deepseek-v4-pro-0813 снят провайдером: HTTP 410 Gone на каждом обращении (живые прогоны worker.yml 34991038287 и 35010410097, 2026-09-15) и отсутствует в живом листинге https://integrate.api.nvidia.com/v1/models (публичный, без ключа, live-запрос 2026-09-15, 82 id). Все id ниже взяты из ТОГО ЖЕ листинга буква-в-букву и подтверждены в scripts/lib/confirmed-provider-models.json. max_output_tokens=16384 общий на запись — то же консервативное значение, что было до #1309 (#1062, схема OpenAPI build.nvidia.com для прежней модели этого же эндпоинта); отдельным живым chat/completions на КАЖДЫЙ id не проверялось — не подтверждено, но и не занижено относительно прежнего поведения. Порядок зеркальный к NVIDIA-NIM-1 (super-120b первым): два ключа не бьются в один id одновременно."
       }
     ]
   },
@@ -74,5 +82,5 @@
     "hands": "default-chain"
   },
   "generated_at": "2026-09-13T00:00:00Z",
-  "generated_by": "apply-agent (#857, openspec/changes/provider-quota-gating): GLM переставлен из хвоста (где его держал #848 из-за квоты 429 на момент замера латентности) в начало цепочки — безопасно только вместе с персистентным квота-гейтом этого же change (иначе каждый прогон после исчерпания квоты тратил бы первую попытку впустую). Добавлен ZAI/glm-5 (второй z.ai-аккаунт, ZAI_1_API_KEY) вторым — НЕ подтверждён реестром #737, безопасный no-op до живой сверки /v1/models. Остаток цепочки (OpenRouter/Ollama/NVIDIA-NIM) и его порядок — БЕЗ ИЗМЕНЕНИЙ, унаследован от #848 (discovery по измеренной латентности реального диффа-промпта, run 34415529070/34416264082): трогать эту часть не входило в задачу #857. #1062: все девять записей несли один и тот же непроверенный max_output_tokens=131072 — живой инцидент (прогон worker.yml 34730173870) показал, что для Ollama-* (nemotron-3-ultra, реальный предел 65536) это заведомо невалидный запрос; аудит по факту (live-ответ /v1/models, OpenAPI-схема build.nvidia.com) поправил Ollama-1/2/3 на 65536 и NVIDIA-NIM-1/2 на 16384, GLM/ZAI/OpenRouter-1/2 подтверждены как безопасные без изменений — см. $comment каждой записи. #1067 (2026-09-13): запись ZAI/glm-5 УДАЛЕНА — за ~24ч ежечасных прогонов worker.yml она НИ РАЗУ не прошла гейт `dsh_model_confirmed` (реестр confirmed-provider-models.json не несёт хэш 'glm-5', сверка требует живого GET /v1/models с ZAI_1_API_KEY, которого нет ни в этой сессии, ни в возможности запускать workflow вручную) — постоянный мёртвый груз: ни одной секунды не тратит (пропуск до вызова dsh), но даёт `::error::`-шум на КАЖДОМ прогоне и лишнюю запись N в бюджете DSH_TIMEOUT_SECS (#1067, см. worker.yml/task.sh). Если у кого-то есть доступ к ZAI_1_API_KEY — подтвердить id тем же способом, что discovery #848 подтвердил OpenRouter/Ollama/NVIDIA-NIM (docs/runbooks/switch-llm-provider.md, «Узнать точный id модели»), дописать hash в confirmed-provider-models.json и вернуть запись в чейн осознанным коммитом, не восстановлением этого."
+  "generated_by": "apply-agent (#857, openspec/changes/provider-quota-gating): GLM переставлен из хвоста (где его держал #848 из-за квоты 429 на момент замера латентности) в начало цепочки — безопасно только вместе с персистентным квота-гейтом этого же change (иначе каждый прогон после исчерпания квоты тратил бы первую попытку впустую). Добавлен ZAI/glm-5 (второй z.ai-аккаунт, ZAI_1_API_KEY) вторым — НЕ подтверждён реестром #737, безопасный no-op до живой сверки /v1/models. Остаток цепочки (OpenRouter/Ollama/NVIDIA-NIM) и его порядок — БЕЗ ИЗМЕНЕНИЙ, унаследован от #848 (discovery по измеренной латентности реального диффа-промпта, run 34415529070/34416264082): трогать эту часть не входило в задачу #857. #1062: все девять записей несли один и тот же непроверенный max_output_tokens=131072 — живой инцидент (прогон worker.yml 34730173870) показал, что для Ollama-* (nemotron-3-ultra, реальный предел 65536) это заведомо невалидный запрос; аудит по факту (live-ответ /v1/models, OpenAPI-схема build.nvidia.com) поправил Ollama-1/2/3 на 65536 и NVIDIA-NIM-1/2 на 16384, GLM/ZAI/OpenRouter-1/2 подтверждены как безопасные без изменений — см. $comment каждой записи. #1067 (2026-09-13): запись ZAI/glm-5 УДАЛЕНА — за ~24ч ежечасных прогонов worker.yml она НИ РАЗУ не прошла гейт `dsh_model_confirmed` (реестр confirmed-provider-models.json не несёт хэш 'glm-5', сверка требует живого GET /v1/models с ZAI_1_API_KEY, которого нет ни в этой сессии, ни в возможности запускать workflow вручную) — постоянный мёртвый груз: ни одной секунды не тратит (пропуск до вызова dsh), но даёт `::error::`-шум на КАЖДОМ прогоне и лишнюю запись N в бюджете DSH_TIMEOUT_SECS (#1067, см. worker.yml/task.sh). Если у кого-то есть доступ к ZAI_1_API_KEY — подтвердить id тем же способом, что discovery #848 подтвердил OpenRouter/Ollama/NVIDIA-NIM (docs/runbooks/switch-llm-provider.md, «Узнать точный id модели»), дописать hash в confirmed-provider-models.json и вернуть запись в чейн осознанным коммитом, не восстановлением этого. #1309 (2026-09-15): NVIDIA-NIM-1/2 переведены с единственного мёртвого id (HTTP 410 Gone, прогоны 34991038287/35010410097) на СПИСОК моделей одного ключа — новая ось фолбэка, ортогональная ротации аккаунтов: см. $comment каждой записи и scripts/lib/dsh-ci.sh::dsh_entry_model_candidates. Остальные записи (GLM/OpenRouter/Ollama) не тронуты — форма {model, max_output_tokens} читается тем же кодом без изменений."
 }
