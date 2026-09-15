@@ -131,16 +131,32 @@ for (const row of rows) {
     continue
   }
   const oauth = account.oauth || {}
-  const needsRefresh = !oauth.expiresAt || oauth.expiresAt - Date.now() <= 5 * 60 * 1000
+  // Рефреш — ТОЛЬКО когда сам токен объявил срок и срок близок/прошёл.
+  // ОТСУТСТВИЕ expiresAt значит «срок неизвестен», а НЕ «срок истёк»: это
+  // класс #1130 (живой прогон worker.yml 34753001158) — прежняя версия
+  // плагина рефрешила превентивно на каждый запрос для любого аккаунта без
+  // expiresAt, в том числе для ДОЛГОЖИВУЩЕГО токена владельца, которому
+  // рефреш не нужен вовсе и у которого refreshToken может отсутствовать
+  // физически. Условие здесь обязано совпадать с патченным
+  // pool.js::createRefreshCoordinator (patch_anthropic_pool_plugin.py,
+  // PATCH_POOL_SKIP_CONDITION) — иначе проверка «лечила» бы то, чего нет, и
+  // гасила рабочий аккаунт.
+  const needsRefresh = Boolean(oauth.expiresAt) && oauth.expiresAt - Date.now() <= 5 * 60 * 1000
   let token = oauth.accessToken
-  if (needsRefresh) {
-    if (!oauth.refreshToken) {
-      verdicts.push({ id: row.id, verdict: 'NO_REFRESH_TOKEN', detail: 'в секрете нет refreshToken', usable: false })
-      continue
-    }
+  if (!token) {
+    verdicts.push({ id: row.id, verdict: 'NO_ACCESS_TOKEN', detail: 'в секрете нет accessToken', usable: false })
+    continue
+  }
+  // Рефреш вообще возможен только когда ЕСТЬ чем: без refreshToken пробуем
+  // тот токен, что лежит в секрете. Это не «поломка секрета», а штатный
+  // случай долгоживущего токена (#1130); жив он или нет — решает проба ниже,
+  // а не наше предположение.
+  let refreshNote = 'токен из секрета, рефреш не требовался'
+  if (needsRefresh && oauth.refreshToken) {
     try {
       const next = await refresh(oauth.refreshToken)
       token = next.access_token
+      refreshNote = 'токен обновлён по refreshToken'
       account.oauth = {
         ...oauth,
         accessToken: next.access_token,
@@ -152,11 +168,13 @@ for (const row of rows) {
       verdicts.push({
         id: row.id,
         verdict: 'REFRESH_FAILED',
-        detail: `OAuth-рефреш отверг refreshToken (${error.httpStatus ? 'HTTP ' + error.httpStatus : String(error?.message || error).slice(0, 80)})`,
+        detail: `expiresAt истёк, и OAuth-рефреш отверг refreshToken (${error.httpStatus ? 'HTTP ' + error.httpStatus : String(error?.message || error).slice(0, 80)})`,
         usable: false,
       })
       continue
     }
+  } else if (needsRefresh) {
+    refreshNote = 'expiresAt истёк, refreshToken в секрете нет — проверяю тот токен, что есть'
   }
   try {
     const probe = await fetch(`${API_BASE}/v1/models?limit=1`, {
@@ -172,7 +190,7 @@ for (const row of rows) {
       verdicts.push({
         id: row.id,
         verdict: 'OK',
-        detail: (needsRefresh ? 'токен обновлён' : 'токен из секрета ещё жив')
+        detail: refreshNote
           + ', креды приняты Anthropic (квота на инференс этим запросом НЕ проверяется: /v1/models не инференс)',
         usable: true,
       })
@@ -194,7 +212,7 @@ for (const v of verdicts) console.log(`аккаунт ${v.id}: ${v.verdict} — 
 // Заведомо непригодные ПРЯМО СЕЙЧАС — выключить на этот прогон, чтобы пул не
 // тратил на них попытку. RATE_LIMITED не выключается: его cooldown пул
 // посчитает сам из заголовков, и квота может отпустить в середине прогона.
-const disable = new Set(verdicts.filter((v) => ['REFRESH_FAILED', 'AUTH_REJECTED', 'NO_REFRESH_TOKEN', 'BROKEN_FILE'].includes(v.verdict)).map((v) => v.id))
+const disable = new Set(verdicts.filter((v) => ['REFRESH_FAILED', 'AUTH_REJECTED', 'NO_ACCESS_TOKEN', 'BROKEN_FILE'].includes(v.verdict)).map((v) => v.id))
 if (disable.size) {
   const fresh = accounts.readConfig()
   for (const row of fresh.accounts || []) if (disable.has(row.id)) row.enabled = false
@@ -202,7 +220,7 @@ if (disable.size) {
   console.log(`выключены на этот прогон (эфемерный $HOME, следующий прогон проверит заново): ${[...disable].join(', ')}`)
 }
 
-const owner = verdicts.filter((v) => ['REFRESH_FAILED', 'AUTH_REJECTED', 'NO_REFRESH_TOKEN'].includes(v.verdict))
+const owner = verdicts.filter((v) => ['REFRESH_FAILED', 'AUTH_REJECTED', 'NO_ACCESS_TOKEN'].includes(v.verdict))
 if (usable === 0) {
   console.log('::warning::предполётная проверка пула: ни один аккаунт Claude не пригоден в этом прогоне — '
     + verdicts.map((v) => `${v.id}=${v.verdict}`).join(', ')

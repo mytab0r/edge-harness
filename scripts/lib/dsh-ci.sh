@@ -522,11 +522,24 @@ dsh_import_anthropic_accounts() {
       skipped=$((skipped + 1))
       continue
     fi
-    if ! jq -e '(.claudeAiOauth // .oauth // {}) as $o | (($o.accessToken // "") | length > 0) and (($o.refreshToken // "") | length > 0)' >/dev/null 2>&1 <<<"$value"; then
-      echo "::warning::секрет $secret_name — валидный JSON, но без claudeAiOauth.accessToken/refreshToken, аккаунт $account_id пропущен (#859)"
+    # #1311: обязателен ТОЛЬКО accessToken. refreshToken до этой правки был
+    # обязательным здесь, в bin/dsh-anthropic-pool.js (accounts.js плагина) и
+    # в pool.js — три гейта подряд отвергали долгоживущий токен без рефреша,
+    # хотя ровно такой токен работает (docs/research/32-claude-oauth-provider.md:
+    # llm-pi-ai держит `sk-ant-oat` Bearer'ом без всякого рефреша; #1130:
+    # «долгоживущий accessToken владельца, которому вообще не нужен рефреш»).
+    # Два нижних гейта снимают патчи 5/6 (patch_anthropic_pool_plugin.py),
+    # этот — здесь.
+    if ! jq -e '(.claudeAiOauth // .oauth // {}) as $o | ($o.accessToken // "") | length > 0' >/dev/null 2>&1 <<<"$value"; then
+      echo "::warning::секрет $secret_name — валидный JSON, но без claudeAiOauth.accessToken, аккаунт $account_id пропущен (#859/#1311)"
       unset "$secret_name"
       skipped=$((skipped + 1))
       continue
+    fi
+    if ! jq -e '(.claudeAiOauth // .oauth // {}) as $o | ($o.refreshToken // "") | length > 0' >/dev/null 2>&1 <<<"$value"; then
+      # Не отказ: факт называется, чтобы при будущем 401 было видно, что
+      # автоматического восстановления у этого аккаунта нет по построению.
+      echo "::notice::секрет $secret_name несёт accessToken без refreshToken — это рабочий случай долгоживущего токена (#1311); автоматического обновления у аккаунта $account_id не будет, при отказе доступа нужен новый токен от владельца"
     fi
 
     creds_file=$(mktemp)

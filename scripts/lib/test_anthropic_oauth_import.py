@@ -69,12 +69,20 @@ class LoadOAuth(unittest.TestCase):
             mod.load_oauth(src)
         self.assertIn("accessToken", str(cm.exception))
 
-    def test_missing_refresh_token_fails_loud(self):
-        bad = json.loads(json.dumps(FAKE_CREDENTIALS))
-        del bad["claudeAiOauth"]["refreshToken"]
-        src = _write(self.tmp, bad)
-        with self.assertRaises(mod.LoudError):
-            mod.load_oauth(src)
+    def test_missing_refresh_token_is_accepted(self):
+        # #1311: РАНЬШЕ здесь проверялся ОБРАТНЫЙ факт — отсутствие
+        # refreshToken валило импорт. Требование было скопировано из плагина
+        # (accounts.js), а само оно оказалось дефектом: долгоживущий токен без
+        # рефреша — рабочий случай (docs/research/32-claude-oauth-provider.md,
+        # #1130 «долгоживущий accessToken владельца, которому вообще не нужен
+        # рефреш»), и три гейта подряд физически не пускали его в пул.
+        # Требование снято здесь и патчами 5/6 в плагине.
+        ok = json.loads(json.dumps(FAKE_CREDENTIALS))
+        del ok["claudeAiOauth"]["refreshToken"]
+        src = _write(self.tmp, ok)
+        oauth = mod.load_oauth(src)
+        self.assertEqual(oauth["accessToken"], FAKE_ACCESS)
+        self.assertNotIn("refreshToken", oauth)
 
     def test_no_claude_oauth_fails_loud(self):
         src = _write(self.tmp, {"mcpOAuth": {"x": 1}})
@@ -125,7 +133,10 @@ FAKE_KROUTER = {
         _krouter_conn("apikey@x.com", priority=0, authType="apiKey"),   # не oauth — пропуск
         _krouter_conn("banned@x.com", priority=0, banned=True),          # бан — пропуск
         _krouter_conn("inactive@x.com", priority=0, active=False),       # неактив — пропуск
-        _krouter_conn("norefresh@x.com", priority=0, refresh=""),        # нет refresh — пропуск
+        # #1311: раньше строка ниже была «нет refresh — пропуск». Теперь такой
+        # аккаунт БЕРЁТСЯ (долгоживущий токен — рабочий случай), и как самый
+        # приоритетный (priority=0) встаёт первым.
+        _krouter_conn("norefresh@x.com", priority=0, refresh=""),
         _krouter_conn("gpt@x.com", priority=0, provider="codex"),        # не claude — пропуск
     ]
 }
@@ -143,7 +154,19 @@ class KrouterSource(unittest.TestCase):
 
     def test_filters_and_sorts_by_priority(self):
         accts = mod.krouter_claude_accounts(self.backup)
-        self.assertEqual([a["name"] for a in accts], ["first@x.com", "second@x.com"])
+        # #1311: norefresh@x.com больше НЕ отфильтровывается (см. комментарий у
+        # фикстуры) и по priority=0 идёт первым. Остальные фильтры — не oauth,
+        # бан, неактив, другой провайдер — работают как раньше.
+        self.assertEqual([a["name"] for a in accts],
+                         ["norefresh@x.com", "first@x.com", "second@x.com"])
+
+    def test_account_without_access_token_is_still_filtered(self):
+        # Обратная сторона #1311: снят ТОЛЬКО refreshToken. Запись без
+        # accessToken работать нечем, она по-прежнему пропускается.
+        backup = {"providerConnections": [_krouter_conn("noaccess@x.com", priority=0, access="")]}
+        src = _write(self.tmp, backup)
+        with self.assertRaises(mod.LoudError):
+            mod.krouter_claude_accounts(src)
 
     def test_conn_maps_scope_to_scopes_list(self):
         oauth = mod.krouter_conn_to_oauth(_krouter_conn("x", 1))
