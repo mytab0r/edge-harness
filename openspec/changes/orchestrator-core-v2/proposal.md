@@ -132,6 +132,16 @@ claim_task.py), cf-worker/src/harness.ts (новые таблицы/маршру
    openspec/changes/walking-skeleton/.
 ## Risks / unknowns
 
+- Разбор политики merge_queue/wip_gate НЕ единственный решающий слой,
+  требующий консолидации — самопроверка design.md, раздел 5.2 (issue
+  #1296, коммит 99b9ba8f), нашла, что четыре независимых диспетчера
+  scheduler.py (dispatch_conflict_rework, dispatch_ai_review_rework,
+  wip_gate, dispatch_worker) плюс эскалационные решатели pulse_guard.py
+  не были названы точками миграции вовсе — только их источники данных.
+  Исправлено новой точкой 17 (design.md, раздел 5.2.5) и Этапом 7.5
+  tasks.md (decide_pr/decide_pool); без этой правки признак завершения
+  (раздел 9) был бы достижим при живом, неконсолидированном решающем
+  слое.
 - CPU на инвокацию DO (10 мс, Free) для батч-записи снимка — измерено
   Этапом 0 (design.md, раздел 3.6, 2026-09-15): 0.0107-0.0127 мс/операцию
   на реальном workerd+SQLite (локально, не на задеплоенном edge), запас
