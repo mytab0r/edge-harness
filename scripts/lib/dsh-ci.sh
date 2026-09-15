@@ -1068,9 +1068,14 @@ dsh_require_provider_chain() { # [consumer_id]
 # Класс отказа → переход на следующего провайдера. failure_reason — уже
 # посчитанный dsh_run_with_retry (quota_exhausted/rate_limit_retry_budget_
 # exceeded/пусто); при пустом — второй, более грубый признак: буквальный
-# текст HTTP_404/EMPTY_RESPONSE/STREAM_CLOSED в stderr (прод-формы — «dsh:
-# HTTP_404: modelCode does not exist», scripts/lib/test/dsh-clients.smoke.sh;
-# «dsh: STREAM_CLOSED: SSE stream ended without [DONE]», #1084 ниже).
+# текст HTTP_404/EMPTY_RESPONSE/STREAM_CLOSED/HTTP_410 в stderr (прод-формы —
+# «dsh: HTTP_404: modelCode does not exist», scripts/lib/test/dsh-clients.smoke.sh;
+# «dsh: STREAM_CLOSED: SSE stream ended without [DONE]», #1084 ниже;
+# «dsh: HTTP_410: DeepSeek API error (HTTP 410)», #1289 ниже). Все переключают
+# (advance) — РЕШЕНИЕ одинаковое для транзиентных (404/пустой ответ/обрыв
+# потока) и терминальных (410) классов, различается только ЧЕСТНОСТЬ
+# сообщения: транзиентный класс может снова заработать сам, терминальный
+# (410) — нет, и сообщение обязано называть это прямо (#1289).
 #
 # #1084 (живой инцидент — прогон worker.yml 2026-09-13T09:39Z, задача #1055/
 # #1087): УМОЛЧАНИЕ этой функции ПЕРЕВЁРНУТО. До этой правки каждый НЕ
@@ -1187,8 +1192,8 @@ dsh_require_provider_chain() { # [consumer_id]
 # читают уже замаскированную переменную, второй копии redact на каждую
 # точку вывода не нужно (то же место правды, что redact() выше в этом
 # файле).
-dsh_chain_should_advance() { # err_file failure_reason rc
-  local err_file=$1 reason=$2 rc=$3
+dsh_chain_should_advance() { # err_file failure_reason rc [model]
+  local err_file=$1 reason=$2 rc=$3 model="${4:-}"
   case "$reason" in
     quota_exhausted|rate_limit_retry_budget_exceeded)
       DSH_CHAIN_CLASS_NOTE="$reason"
@@ -1208,6 +1213,38 @@ dsh_chain_should_advance() { # err_file failure_reason rc
   fi
   if grep -qE 'HTTP_404:|EMPTY_RESPONSE:' "$err_file"; then
     DSH_CHAIN_CLASS_NOTE="HTTP_404/EMPTY_RESPONSE в stderr"
+    return 0
+  fi
+  # #1289: живой инцидент — прогон worker.yml 34893177035 (тот же прогон, что
+  # #1288) — NVIDIA-NIM-1/2 отдали «dsh: HTTP_410: DeepSeek API error (HTTP
+  # 410)» дважды подряд, и это упало в общий «класс не распознан» ниже — то
+  # же РЕШЕНИЕ (переключаемся), что и для транспортных 404/EMPTY_RESPONSE
+  # выше, но ЧЕСТНОСТЬ сообщения другая: HTTP 410 Gone — не транзиентный сбой
+  # (как 404/пустой ответ/обрыв потока — те лечатся временем или следующим
+  # провайдером и МОГУТ снова заработать), а HTTP-семантически однозначный
+  # «ресурс безвозвратно удалён» — конкретный id МОДЕЛИ у конкретного
+  # провайдера снят и не появится снова сам по себе. Реестр подтверждённых id
+  # (confirmed-provider-models.json, #737) держит запись, доказанную живым
+  # вызовом НА МОМЕНТ проверки — 410 говорит, что факт устарел, не что
+  # проверка была ошибочной (AGENTS.md, «Утверждение... обязано нести
+  # адрес» — здесь наоборот, адрес был верным и перестал существовать).
+  #
+  # Что НЕ делает эта ветка (осознанно, см. PR #1289 body для полного
+  # обоснования): не убирает провайдера из cepочки автоматически, не пишет
+  # персистентное состояние (в отличие от dsh_provider_quota_gate_skip выше —
+  # у quota есть машинно-читаемая дата возврата из ответа провайдера, у 410
+  # такой даты нет и не будет никогда, «мёртв» — это не «до X», а вопрос,
+  # который решает только человек/discovery) и не запускает discovery сама
+  # (провайдер отдельного job'а, GITHUB_TOKEN текущего шага не несёт прав на
+  # workflow_dispatch, а сама верификация кандидата — это судящее действие
+  # с сетевыми вызовами по чужому API, не то, что должно происходить неявно
+  # внутри гейта ревью/воркера). Решение — переключаемся В ЭТОМ прогоне (как
+  # и раньше, поведение не меняется), но сообщение теперь ИМЕНУЕТ причину
+  # прямо и называет конкретное действие: не «попробую снова», а «нужен
+  # discovery» — тормоз без газа не пишется молча: здесь тормоза НЕТ (цепочка
+  # не останавливается), только более честная причина именно этого перехода.
+  if grep -qE 'HTTP_410:' "$err_file"; then
+    DSH_CHAIN_CLASS_NOTE="HTTP_410 Gone в stderr — терминальный отказ ЭТОГО провайдера${model:+ (модель '$model')}, не транзиент: ресурс безвозвратно удалён, повторный вызов того же id бессмыслен на ЛЮБОМ следующем прогоне, пока id не заменят; действие — запустить scripts/measure/provider_model_discovery.py (docs/runbooks/switch-llm-provider.md, «Узнать точный id модели») и обновить config/provider-usage.json + scripts/lib/confirmed-provider-models.json (#1289)"
     return 0
   fi
   # #1084: живой инцидент — прогон worker.yml 2026-09-13T09:39Z (задача
@@ -1527,7 +1564,7 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
     fi
     reset_hint=$(dsh_extract_reset_hint "$err_file")
     [ -n "$reset_hint" ] && DSH_CHAIN_RESET_HINT="${DSH_CHAIN_RESET_HINT:+$DSH_CHAIN_RESET_HINT; }$name: $reset_hint"
-    if dsh_chain_should_advance "$err_file" "$DSH_RUN_FAILURE_REASON" "$DSH_RUN_RC"; then
+    if dsh_chain_should_advance "$err_file" "$DSH_RUN_FAILURE_REASON" "$DSH_RUN_RC" "$model"; then
       echo "::warning::цепочка провайдеров: $name — rc=$DSH_RUN_RC, класс отказа: $DSH_CHAIN_CLASS_NOTE — пробую следующего" >&2
       i=$((i + 1))
       continue

@@ -790,9 +790,16 @@ jobs:
       # переменная окружения step-уровня доходит до любого файла каталога
       # без per-файловой проводки — то же обоснование, что design.md
       # называл для job-level, просто на меньшем радиусе.
+      #
+      # DSH_PROVIDER_CHAIN — тот же приём, второй потребитель (#1289):
+      # scripts/ci/guards/provider-chain-var-drift-guard.sh сверяет
+      # множество имён vars.DSH_PROVIDER_CHAIN против config/provider-
+      # usage.json, тем же контекстным чтением без токена, что уже
+      # применяет dsh_require_provider_chain (scripts/lib/dsh-ci.sh).
       - name: Каталог гвардий scripts/ci/guards — перебор (#749)
         env:
           GH_TOKEN: ${{ github.token }}
+          DSH_PROVIDER_CHAIN: ${{ vars.DSH_PROVIDER_CHAIN }}
         run: bash scripts/ci/run_guards.sh
 
   # Инвариант 4 (#244) — автофикс НА ВХОДЕ, не гейт постфактум (issue #493).
