@@ -51,6 +51,9 @@ DISPATCH_CONSUMER = "deploy-worker.yml"
 # conflict-mechanical-rebase.yml (#762) — тот же класс: `git push` рёбейзнутой
 # ветки под github.token не зажигает downstream pr-review/ai-review
 # (антирекурсия GitHub), нужен PAT владельца.
+# zombie-run-watch.yml (#1106, находка ревью PR #1212, круг 3) — тот же
+# класс: события от GITHUB_TOKEN не зажигают новые workflow-прогоны, а весь
+# смысл close→reopen — именно зажечь required-чеки заново.
 PIPELINE_CONSUMERS = [
     "conflict-mechanical-rebase.yml",
     "deploy-dsh-edge.yml",
@@ -59,6 +62,7 @@ PIPELINE_CONSUMERS = [
     "plugin-forge.yml",
     "repo-ci.yml",
     "worker.yml",
+    "zombie-run-watch.yml",
 ]
 
 # Фиксированный список workflows: появление/переименование файла — сознательная
@@ -144,6 +148,13 @@ EXPECTED_WORKFLOWS = frozenset({
     # dev, поэтому не входит ни в DISPATCH_CONSUMER, ни в PIPELINE_CONSUMERS.
     "worker-ci.yml",
     "worker.yml",
+    # Issue #1106: сторож зомби-прогонов PR-чеков (`queued`, 0 job'ов) —
+    # переэмиссия событий PR (close→reopen) + секреты TELEGRAM_* для
+    # эскалации рецидива. Читает secrets.GH_PIPELINE_PAT (находка ревью
+    # PR #1212, круг 3, см. PIPELINE_CONSUMERS) — под github.token события
+    # close→reopen не зажгли бы required-чеки заново (docs/research/
+    # 21-github-actions.md), PR оставался бы зомби навсегда молча.
+    "zombie-run-watch.yml",
 })
 
 ALL_WORKFLOWS = sorted(

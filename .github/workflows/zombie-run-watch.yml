@@ -1,0 +1,78 @@
+# Сторож зомби-прогонов PR-чеков (issue #1106, живой случай PR #1088): run
+# застревает `status=queued` с `jobs.total_count: 0` навсегда — `gh run
+# rerun` отказывает («This workflow is already running», нечего
+# перезапускать), сторожа не было. Отдельный файл, не правка orchestra.yml
+# (та территория занята параллельной работой, PR #1136 — тот же приём, что
+# merge-health-watch.yml выбрал для issue #967) и не правка каденса самого
+# пульса.
+#
+# Газ — переэмиссия событий PR (close→reopen, head SHA не меняется) ровно
+# один раз на head_sha; рецидив ПОСЛЕ переэмиссии — эскалация (issue #120 +
+# Telegram), не повторный retry (scripts/orchestra/zombie_run_watch.py,
+# докстринг модуля целиком).
+name: zombie-run-watch
+
+on:
+  schedule:
+    # 15 минут — тот же порядок величины, что ZOMBIE_AGE_MINUTES в
+    # zombie_run_watch.py. ЧЕСТНАЯ оговорка (ревью PR #1212): доставка
+    # schedule в этом репозитории замерена ~7% (docs/research/
+    # 21-github-actions.md, «Замер schedule») — каденс НЕ гарантирован,
+    # застрявший прогон замечается за часы, а не за один-два тика. Это
+    # свойство канала, а не порога: газ от него не зависит.
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  # Actions API чтения (находка доводки PR #1212, круг 5): сторож читает
+  # /actions/runs, /actions/workflows/{id}/runs (занятость concurrency-
+  # группы) и Contents API (версия workflow-файла на head). Без `actions:
+  # read` первый же продовый прогон отвечал бы 403 на /actions/runs —
+  # живой прецедент perms: quota-watch.yml (`actions: read`).
+  actions: read
+
+concurrency:
+  group: zombie-run-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Job-level permissions ПОЛНОСТЬЮ заменяют workflow-level (docs/research/
+    # 21-github-actions.md, #884/#890) — перечислено явно, не понадеялись на
+    # наследование.
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Зомби-прогоны PR-чеков — снять и переэмиттить (issue #1106)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # PAT владельца для close→reopen (находка ревью PR #1212, круг 3):
+          # события от GITHUB_TOKEN не зажигают новые workflow-прогоны
+          # (docs/research/21-github-actions.md, класс #18/#929/#955) — под
+          # github.token close→reopen был бы no-op, PR оставался бы зомби
+          # НАВСЕГДА при сплошь зелёных прогонах сторожа. Тот же приём, что
+          # ORCHESTRA_PAT у orchestra.yml (update_branch) — раздельные
+          # переменные, не общий GH_TOKEN: маркер-комментарий и чтение
+          # маркеров дедупа обязаны остаться под github.token/`github-
+          # actions[bot]`, иначе trusted_login=EVENT_ACTOR_LOGIN перестанет
+          # находить свои же маркеры (они писались бы от лица владельца PAT),
+          # и дедуп «одна попытка на head_sha» сломается тихо и навсегда.
+          GH_PIPELINE_PAT: ${{ secrets.GH_PIPELINE_PAT }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/orchestra/zombie_run_watch.py run
