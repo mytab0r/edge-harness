@@ -207,7 +207,8 @@ jobs:
       head: ${{ steps.answer.outputs.head }}
       dsh_rc: ${{ steps.answer.outputs.dsh_rc }}
       # failure_reason (#419, расширено #727): quota_exhausted |
-      # rate_limit_retry_budget_exceeded | all_providers_exhausted | пусто —
+      # rate_limit_retry_budget_exceeded | all_providers_exhausted |
+      # chain_budget_exhausted (#1160) | пусто —
       # пишет ai_dsh.sh в $AI_WORK/failure_reason.txt, различает в тексте
       # вердикта «лимита нет вовсе» от «лимит есть, но что-то ещё сломано»
       # (правило AGENTS.md, см. ai_review.py::error_reason).
@@ -573,7 +574,8 @@ jobs:
           ANSWER: ${{ needs.review.outputs.answer }}
           DSH_RC: ${{ needs.review.outputs.dsh_rc }}
           # #419/#727: quota_exhausted | rate_limit_retry_budget_exceeded |
-          # all_providers_exhausted | пусто — см. ai_review.py::error_reason.
+          # all_providers_exhausted | chain_budget_exhausted (#1160) |
+          # пусто — см. ai_review.py::error_reason.
           FAILURE_REASON: ${{ needs.review.outputs.failure_reason }}
           # Цепочка провайдеров (#727): имя успешного провайдера — в шапку
           # комментария (человек видит, кто фактически ответил); даты сброса

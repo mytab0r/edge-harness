@@ -126,7 +126,12 @@ def test_parse_registry_entries_pins_the_live_repo_invariants_registry():
     text = live_path.read_text(encoding="utf-8")
     parsed = inv.parse_registry_entries(text)
 
-    assert set(parsed) == {str(n) for n in range(1, 19)} | {"21"}, (
+    # Не range(1, N): 21 занят этим PR (#1247), 22 занят #1253 (слит в main
+    # через #1260), 19/20 — разрыв до слияния открытых PR #1061/#1136
+    # (арбитр `invariant_numbering.py next` держит номера за открытыми ветками).
+    # Реестр main+этой ветки — 1..18 подряд плюс 21 и 22; разрыв 19/20 —
+    # ожидаемое следствие арбитража по открытым PR, не дрейф формата.
+    assert set(parsed) == {str(n) for n in range(1, 19)} | {"21", "22"}, (
         "диапазон номеров реестра изменился (см. docstring "
         "scripts/orchestra/repo_invariants.py) — обнови множество в этом "
         "пине, ИЛИ REGISTRY_ENTRY_RE перестал видеть живую запись"

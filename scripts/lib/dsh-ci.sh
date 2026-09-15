@@ -878,10 +878,23 @@ PATCH
 #   DSH_TIMEOUT_SECS               — таймаут КАЖДОЙ попытки (вызывающий уже задаёт)
 #   DSH_RATE_LIMIT_MAX_WAIT_SECS   — суммарный бюджет ожидания (по умолчанию 1800 — 30 мин)
 #   DSH_RATE_LIMIT_INITIAL_DELAY_SECS / DSH_RATE_LIMIT_MAX_DELAY_SECS — старт/потолок паузы
+#   DSH_CHAIN_DEADLINE_EPOCH       — (необязательно, #1160) epoch-дедлайн ВСЕГО
+#                             прогона цепочки; задаёт его только
+#                             dsh_run_with_provider_chain (см. ниже). С дедлайном
+#                             НОЖ считается на КАЖДОЙ попытке, включая каждый
+#                             ретрай внутри одного провайдера:
+#                             min(DSH_TIMEOUT_SECS, дедлайн − сейчас); остаток
+#                             ≤ 0 — попытка не стартует вовсе, fail loud
+#                             DSH_RUN_FAILURE_REASON=chain_budget_exhausted.
+#                             Без переменной поведение прежнее (остальные
+#                             вызывающие — worker/hands/ai-review — её не задают).
 # Результат (переменные, не stdout — вызывающий печатает свой отчёт):
-#   DSH_RUN_RC              — код возврата ПОСЛЕДНЕЙ попытки dsh
+#   DSH_RUN_RC              — код возврата ПОСЛЕДНЕЙ попытки dsh (1, если ни
+#                             одна попытка не была запущена — исчерпание
+#                             дедлайна цепочки до первой попытки)
 #   DSH_RUN_FAILURE_REASON  — "" (успех/обычный транспортный отказ) |
-#                             quota_exhausted | rate_limit_retry_budget_exceeded
+#                             quota_exhausted | rate_limit_retry_budget_exceeded |
+#                             chain_budget_exhausted (#1160)
 #   DSH_RUN_WAITED_SECS     — суммарно проспано в ретрае RATE_LIMIT за ЭТОТ
 #                             вызов (#877): цепочка провайдеров читает его,
 #                             чтобы уменьшать ОБЩИЙ бюджет ожидания на
@@ -892,15 +905,47 @@ dsh_run_with_retry() { # answer_file err_file prompt_text
   local max_wait="${DSH_RATE_LIMIT_MAX_WAIT_SECS:-1800}"
   local delay="${DSH_RATE_LIMIT_INITIAL_DELAY_SECS:-30}"
   local max_delay="${DSH_RATE_LIMIT_MAX_DELAY_SECS:-300}"
-  local timeout_secs="${DSH_TIMEOUT_SECS:-3600}"
+  local base_timeout="${DSH_TIMEOUT_SECS:-3600}"
+  local chain_deadline="${DSH_CHAIN_DEADLINE_EPOCH:-}"
+  local timeout_secs chain_remaining
   local waited=0 attempt=1 wait_left rc
   local attempt_start attempt_elapsed
+  # rc=1 (не пусто): исчерпание дедлайна цепочки ДО первой попытки обязано
+  # оставить DSH_RUN_RC ненулевым — «ни одной попытки» это отказ, не успех
+  # (правило AGENTS.md «Fail loud, не silent-wrong»).
+  rc=1
   DSH_RUN_FAILURE_REASON=""
   while :; do
+    # #1160 (находка ai-review PR #1247, показана симуляцией живьём): нож
+    # считается ПЕРЕД КАЖДОЙ попыткой, включая каждый ретрай внутри одного
+    # провайдера, а не один раз на границе провайдера. Прежний код выдавал
+    # каждому ретраю полный срез attempt_timeout_secs: провайдер, ответивший
+    # ретраебельным RATE_LIMIT и затем «висящий», сжигал
+    # N ретраев × полный срез (до ~5×7200с + 300с ожиданий ≈ 10 ч на ОДНОГО
+    # провайдера при бюджете цепочки 9000с) — класс #1141 оставался
+    # достижимым ВНУТРИ формально установленного бюджета.
+    timeout_secs="$base_timeout"
+    if [ -n "$chain_deadline" ]; then
+      chain_remaining=$(( chain_deadline - $(date +%s) ))
+      if [ "$chain_remaining" -le 0 ]; then
+        DSH_RUN_FAILURE_REASON="chain_budget_exhausted"
+        echo "::error::dsh: суммарный бюджет цепочки провайдеров (#1160) исчерпан — попытка $attempt НЕ стартует (нож длиной ${timeout_secs}с или меньше означал бы запуск без ножа, то есть молча снятую гарантию бюджета)" >&2
+        break
+      fi
+      if [ "$chain_remaining" -lt "$timeout_secs" ]; then
+        echo "dsh: нож попытки $attempt урезан остатком бюджета цепочки (#1160): ${chain_remaining}с вместо ${timeout_secs}с"
+        timeout_secs="$chain_remaining"
+      fi
+    fi
     echo "dsh: попытка $attempt (суммарно уже ждал ${waited}с из бюджета ${max_wait}с)"
     attempt_start=$(date +%s)
     set +e
-    timeout "$timeout_secs" dsh --profile headless "$prompt_text" \
+    # DSH_ATTEMPT_KNIFE_SECS — нож ИМЕННО этой попытки, видимый ребёнку:
+    # прод-процесс его не читает (режет настоящий `timeout`), смоук-заглушка
+    # dsh читает, чтобы честно эмулировать нож на каждом ретрае (иначе
+    # симуляция давала бы попытке больше времени, чем даёт реальный нож).
+    DSH_ATTEMPT_KNIFE_SECS="$timeout_secs" \
+      timeout "$timeout_secs" dsh --profile headless "$prompt_text" \
       >"$answer_file" 2>"$err_file"
     rc=$?
     set -e
@@ -928,6 +973,21 @@ dsh_run_with_retry() { # answer_file err_file prompt_text
       break
     fi
     [ "$delay" -gt "$wait_left" ] && delay=$wait_left
+    if [ -n "$chain_deadline" ]; then
+      chain_remaining=$(( chain_deadline - $(date +%s) ))
+      if [ "$chain_remaining" -le 0 ]; then
+        # Спать до дедлайна смысла нет: верх цикла не даст следующей попытке
+        # стартовать и назовёт причину точно (chain_budget_exhausted).
+        # Счётчик попыток инкрементируем ВРУЧНУЮ (обычный инкремент живёт
+        # после sleep, который здесь не выполняется) — иначе сообщение
+        # верхнего цикла назвало бы номер УЖЕ выполненной попытки.
+        attempt=$((attempt + 1))
+        continue
+      fi
+      # Пауза тоже не может выйти за дедлайн — иначе суммарная гарантия
+      # бюджета была бы «бюджет + до max_delay сна», а не бюджет.
+      [ "$delay" -gt "$chain_remaining" ] && delay=$chain_remaining
+    fi
     echo "::warning::временный RATE_LIMIT провайдера — жду ${delay}с и повторяю (в сумме ждал ${waited}с)"
     sleep "$delay"
     waited=$((waited + delay))
@@ -1114,7 +1174,8 @@ dsh_require_provider_chain() { # [consumer_id]
 # Именно поэтому дальше по умолчанию НЕ стоп, а «пробуем следующего» —
 # симметрично уже принятому в #737 доводу (ниже) для пустого stderr:
 # цена ошибки «переключились зря» — потратить время следующего провайдера
-# (секунды-минуты, при 6-часовом бюджете job'а и цепочке из 8 записей — это
+# (секунды-минуты, при 340-минутном бюджете job'а worker.yml (timeout-minutes:
+# 340) и цепочке из 8 записей — это
 # ограниченная, не бесконечная трата: количество попыток равно длине
 # DSH_PROVIDER_CHAIN, не циклу); цена ошибки «остановились зря» — потерять
 # ВСЮ оставшуюся цепочку и весь прогон целиком, как и случилось 2026-09-13.
@@ -1190,7 +1251,12 @@ dsh_require_provider_chain() { # [consumer_id]
 dsh_chain_should_advance() { # err_file failure_reason rc
   local err_file=$1 reason=$2 rc=$3
   case "$reason" in
-    quota_exhausted|rate_limit_retry_budget_exceeded)
+    # #1160: chain_budget_exhausted приходит и ИЗНУТРИ ретраев провайдера
+    # (дедлайн цепочки заметил dsh_run_with_retry) — класс тот же
+    # «переключаемся»: верх цикла цепочки на следующей итерации не даст
+    # следующему провайдеру стартовать и назовёт исчерпание бюджета её
+    # каноническим сообщением (одно место правды о причине).
+    quota_exhausted|rate_limit_retry_budget_exceeded|chain_budget_exhausted)
       DSH_CHAIN_CLASS_NOTE="$reason"
       return 0 ;;
   esac
@@ -1443,16 +1509,25 @@ dsh_model_confirmed() { # model_id
 # DSH_CHAIN_TOTAL_BUDGET_SECS (необязательный, по умолчанию 9000с/150 мин) —
 # суммарный wall-clock бюджет НА ВЕСЬ прогон цепочки (все провайдеры вместе,
 # считая пул — initial_rl_used/elapsed не сбрасывается между ними). Не
-# отдельный от DSH_TIMEOUT_SECS механизм, а ВЕРХНИЙ ПОТОЛОК на него: перед
-# КАЖДОЙ попыткой эффективный таймаут этой попытки — min(DSH_TIMEOUT_SECS,
-# остаток общего бюджета), передаётся в dsh_run_with_retry как DSH_TIMEOUT_SECS
-# именно ЭТОЙ попытки. `timeout` физически не даёт ни одной попытке выйти за
-# остаток бюджета — первый (самый надёжный) провайдер по-прежнему получает
-# полные 7200с, если бюджет позволяет (типичный случай — почти всегда
-# позволяет, медиана успешной ЕДИНИЧНОЙ попытки GLM по 10 свежим успешным
-# прогонам worker.yml 2026-09-14 ≈ 54 мин; максимум замерен 6014с/100 мин),
-# а КАЖДЫЙ следующий резервный провайдер автоматически получает то, что
-# осталось от бюджета — не вторые полные 120 минут.
+# отдельный от DSH_TIMEOUT_SECS механизм, а ВЕРХНИЙ ПОТОЛОК на него: НОЖ
+# накладывается на КАЖДУЮ попытку И КАЖДЫЙ ретрай внутри неё (находка
+# ai-review PR #1247: срез только на границе провайдера давал ретраю полного
+# провайдера до ~5×7200с+300с ≈ 10 ч — класс #1141 оставался достижимым
+# внутри формального бюджета). Механика двух уровней: перед каждой попыткой
+# эффективный таймаут — min(DSH_TIMEOUT_SECS, остаток общего бюджета),
+# передаётся в dsh_run_with_retry как DSH_TIMEOUT_SECS этой попытки, а сам
+# дедлайн (chain_start + budget, epoch) едет туда же как
+# DSH_CHAIN_DEADLINE_EPOCH — dsh_run_with_retry пересчитывает нож перед
+# КАЖДОЙ попыткой и КАЖДОЙ паузой ретрая, при остатке ≤ 0 попытка не
+# стартует вовсе (fail loud chain_budget_exhausted). Итог: суммарное
+# wall-clock время цепочки физически не может превысить chain_total_budget
+# (плюс доли секунды между замерами date) — первый (самый надёжный)
+# провайдер по-прежнему получает полные 7200с, если бюджет позволяет
+# (типичный случай — почти всегда позволяет, медиана успешной ЕДИНИЧНОЙ
+# попытки GLM по 10 свежим успешным прогонам worker.yml 2026-09-14 ≈ 54 мин;
+# максимум замерен 6014с/100 мин), а КАЖДЫЙ следующий резервный провайдер
+# автоматически получает то, что осталось от бюджета — не вторые полные 120
+# минут.
 #
 # Порог 9000с (150 мин) обоснован тем же замером (не «на глаз», AGENTS.md
 # «Порог обоснуй замером»): максимум наблюдаемой ЛЕГИТИМНОЙ единичной попытки
@@ -1550,8 +1625,12 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
   # секунды пула здесь не учтены, что при бюджете 9000с и типичном отказе
   # пула за 18-40с не меняет решения ни разу в замере).
   local chain_total_budget="${DSH_CHAIN_TOTAL_BUDGET_SECS:-9000}"
-  local chain_start chain_elapsed chain_budget_remaining attempt_timeout_secs
+  local chain_start chain_deadline_epoch chain_elapsed chain_budget_remaining attempt_timeout_secs
   chain_start=$(date +%s)
+  # #1160: дедлайн в epoch — единственное число, по которому dsh_run_with_retry
+  # режет КАЖДУЮ попытку и каждый ретрай (DSH_CHAIN_DEADLINE_EPOCH ниже), а
+  # срез на границе провайдера — производное от него же, не второй источник.
+  chain_deadline_epoch=$(( chain_start + chain_total_budget ))
   while [ "$i" -lt "$count" ] && [ "$stop" -eq 0 ]; do
     chain_elapsed=$(( $(date +%s) - chain_start ))
     chain_budget_remaining=$((chain_total_budget - chain_elapsed))
@@ -1605,6 +1684,10 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
     # итерации while уже могли потратить время на пропуски/патчи), и он же
     # становится ПОТОЛКОМ для DSH_TIMEOUT_SECS этой попытки — `timeout`
     # физически не даст ни одной попытке выйти за пределы chain_total_budget.
+    # Это срез НАЧАЛА попытки; что ни один РЕТРАЙ внутри неё тоже не выйдет за
+    # дедлайн, гарантирует DSH_CHAIN_DEADLINE_EPOCH (dsh_run_with_retry
+    # пересчитывает нож перед каждой попыткой сам) — граница провайдера не
+    # единственный держатель гарантии, найдка ai-review PR #1247.
     chain_elapsed=$(( $(date +%s) - chain_start ))
     chain_budget_remaining=$((chain_total_budget - chain_elapsed))
     if [ "$chain_budget_remaining" -le 0 ]; then
@@ -1630,7 +1713,8 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
     echo "цепочка провайдеров: пробую $name ($base_url, $model), остаток общего бюджета RATE_LIMIT: ${rl_true_remaining}с из ${chain_rl_budget}с (#877)${cap_note}${budget_note}"
     export DEEPSEEK_BASE_URL="$base_url" DEEPSEEK_MODEL="$model" DEEPSEEK_API_KEY="$key"
     DSH_MAX_TOKENS="$max_tokens" dsh_patch_profile headless
-    DSH_TIMEOUT_SECS="$attempt_timeout_secs" DSH_RATE_LIMIT_MAX_WAIT_SECS="$rl_remaining" dsh_run_with_retry "$answer_file" "$err_file" "$prompt_text"
+    DSH_TIMEOUT_SECS="$attempt_timeout_secs" DSH_RATE_LIMIT_MAX_WAIT_SECS="$rl_remaining" \
+      DSH_CHAIN_DEADLINE_EPOCH="$chain_deadline_epoch" dsh_run_with_retry "$answer_file" "$err_file" "$prompt_text"
     chain_rl_used=$((chain_rl_used + ${DSH_RUN_WAITED_SECS:-0}))
     if [ "$DSH_RUN_RC" -eq 0 ]; then
       DSH_CHAIN_PROVIDER="$name"
