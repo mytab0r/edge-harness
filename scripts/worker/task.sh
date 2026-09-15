@@ -619,6 +619,9 @@ dsh_install_plugins_suite "$WORK/plugins" || die "suite ротации учёт�
 # ANTHROPIC_OAUTH_1/2, не vars.PLUGINS_SUITE_URL. Импорт — до первого dsh.
 dsh_install_anthropic_pool "$WORK/anthropic-pool" || die "быстрый провайдер Claude не установился (см. ::error:: выше, #838)"
 dsh_import_anthropic_accounts || die "импорт аккаунтов Claude не удался (см. ::error:: выше, #838)"
+# Факт «какой аккаунт пригоден и почему не пригодны остальные» — до первого
+# прогона, а не постфактум из агрегата pool_unavailable (#1311).
+dsh_pool_preflight
 # Нейтрализация self-регистрации плагина в settings — гонка с нашей
 # статической регистрацией (#1097/#1130), см. dsh-ci.sh для причины.
 dsh_patch_anthropic_pool_plugin || die "патч плагина anthropic-oauth-pool не применился (см. ::error:: выше, #1130)"
@@ -638,10 +641,14 @@ dsh_patch_anthropic_pool_plugin || die "патч плагина anthropic-oauth-
 _chain_head=$(jq -c '.[0]' <<<"$DSH_PROVIDER_CHAIN")
 _chain_head_secret=$(jq -r '.secret_env' <<<"$_chain_head")
 DEEPSEEK_BASE_URL=$(jq -r '.base_url' <<<"$_chain_head")
-DEEPSEEK_MODEL=$(jq -r '.model' <<<"$_chain_head")
+# #1309: у элемента цепочки может не быть поля `model` вовсе (форма
+# `models` — список кандидатов одного ключа). Затравка читает ПЕРВОГО
+# кандидата через то же одно место правды, что и сам цикл цепочки
+# (dsh_entry_model_candidates), а не третьей копией разбора JSON здесь.
+DEEPSEEK_MODEL=$(dsh_chain_head_model "$DSH_PROVIDER_CHAIN")
 DEEPSEEK_API_KEY="${!_chain_head_secret:-}"
 export DEEPSEEK_BASE_URL DEEPSEEK_MODEL DEEPSEEK_API_KEY
-DSH_MAX_TOKENS=$(jq -r '.max_output_tokens // 131072' <<<"$_chain_head") dsh_patch_profile headless
+DSH_MAX_TOKENS=$(dsh_chain_head_max_tokens "$DSH_PROVIDER_CHAIN") dsh_patch_profile headless
 dsh_mount_plugins_suite headless || die "suite ротации учёток не смонтировался (см. ::error:: выше, #215)"
 dsh_mount_anthropic_pool headless || die "быстрый провайдер Claude не смонтировался (см. ::error:: выше, #838)"
 
@@ -695,6 +702,10 @@ WORKER_TASK_FAILURE_REASON="$DSH_RUN_FAILURE_REASON"
 WORKER_CHAIN_PROVIDER="$DSH_CHAIN_PROVIDER"
 WORKER_CHAIN_TRIED="$DSH_CHAIN_TRIED"
 WORKER_CHAIN_RESET_HINT="$DSH_CHAIN_RESET_HINT"
+# #1307: разбор исхода цепочки по классам и признак «повтор имеет смысл» —
+# см. dsh_run_with_provider_chain/_dsh_chain_report_exhausted.
+WORKER_CHAIN_OUTCOME_SUMMARY="${DSH_CHAIN_OUTCOME_SUMMARY:-}"
+WORKER_CHAIN_RETRY_USEFUL="${DSH_CHAIN_RETRY_USEFUL:-0}"
 echo "dsh завершился с кодом $rc (провайдер: ${WORKER_CHAIN_PROVIDER:-нет успеха}, опробованы: ${WORKER_CHAIN_TRIED:-?})"
 # Отпечаток HEAD ветки ПОСЛЕ прогона — сравнивается с WORKER_BRANCH_START_SHA
 # на шаге 8 (dsh_worker_run_is_success, issue #876).
@@ -891,7 +902,15 @@ if [ "$WORKER_TASK_FAILURE_REASON" = "quota_exhausted" ] || \
       # провайдеру остаток» (которого сообщение здесь не знает).
       reason="временный RATE_LIMIT провайдера не снялся до исчерпания общего бюджета ожидания на весь прогон (${WORKER_RATE_LIMIT_MAX_WAIT_SECS}с суммарно, #877; код возврата $rc)" ;;
     all_providers_exhausted)
-      reason="цепочка провайдеров исчерпана целиком (опробованы: ${WORKER_CHAIN_TRIED:-?})${WORKER_CHAIN_RESET_HINT:+, ближайший названный сброс: $WORKER_CHAIN_RESET_HINT} — повтор внутри этого прогона не поможет (docs/runbooks/switch-llm-provider.md, #727)" ;;
+      # #1307: «исчерпана целиком» говорится ТОЛЬКО когда каждый провайдер
+      # реально без квоты. Иначе текст называет разбор по классам и тот факт,
+      # что повтор имеет смысл — иначе владелец читал «ждать сброса» там, где
+      # шесть провайдеров из восьми не были опробованы по-настоящему.
+      if [ "${WORKER_CHAIN_RETRY_USEFUL:-0}" = "1" ]; then
+        reason="ни один провайдер цепочки не ответил, но цепочка НЕ исчерпана квотой (опробованы: ${WORKER_CHAIN_TRIED:-?}) — ${WORKER_CHAIN_OUTCOME_SUMMARY:-разбор по классам недоступен}${WORKER_CHAIN_RESET_HINT:+; названный сброс: $WORKER_CHAIN_RESET_HINT}. Повтор ИМЕЕТ смысл: часть провайдеров не получила настоящей попытки (#1307, docs/runbooks/switch-llm-provider.md)"
+      else
+        reason="цепочка провайдеров исчерпана целиком (опробованы: ${WORKER_CHAIN_TRIED:-?})${WORKER_CHAIN_RESET_HINT:+, ближайший названный сброс: $WORKER_CHAIN_RESET_HINT} — все реально без квоты, повтор внутри этого прогона не поможет (docs/runbooks/switch-llm-provider.md, #727)"
+      fi ;;
   esac
   release_out="$(lease_cli release-full "$number" 2>&1)" && release_rc=0 || release_rc=$?
   if [ "$release_rc" -eq 0 ]; then

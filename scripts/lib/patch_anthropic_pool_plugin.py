@@ -248,6 +248,70 @@ export function classifyPoolUnavailable(accounts) {
 }"""
 
 
+# Патч 5 (#1311): refreshToken обязателен только В МОМЕНТ рефреша, а не как
+# условие использовать аккаунт вообще.
+#
+# Апстрим проверяет `!oauth?.accessToken || !oauth?.refreshToken` ПЕРВОЙ
+# строкой createRefreshCoordinator — то есть ДО проверки срока. Аккаунт с
+# долгоживущим токеном и без refreshToken отвергается на каждом запросе
+# (`Account <id> has no Claude OAuth credentials`), падает в ветку catch
+# forward() и получает cooldown 15с; наружу это выходит агрегатом
+# `pool_unavailable`, неотличимым от исчерпанной квоты соседа.
+#
+# Что такой аккаунт — штатный случай, а не поломка, репозиторий уже
+# зафиксировал дважды: patch PATCH_POOL_SKIP_CONDITION ниже (#1130,
+# «долгоживущий accessToken владельца, которому вообще не нужен рефреш») и
+# docs/research/32-claude-oauth-provider.md (llm-pi-ai детектит `sk-ant-oat`
+# и работает Bearer'ом без всякого рефреша). Патч 5 доводит это до конца:
+# нет accessToken — отказ (работать нечем); есть accessToken без срока —
+# работаем как есть; срок истёк и рефрешить нечем — отказ с ТОЧНЫМ текстом,
+# а не с общим «нет credentials».
+PATCH_REFRESH_TOKEN_OPTIONAL_OLD = (
+    "      if (!oauth?.accessToken || !oauth?.refreshToken) "
+    "throw new Error(`Account ${id} has no Claude OAuth credentials`)"
+)
+
+PATCH_REFRESH_TOKEN_OPTIONAL_NEW = (
+    "      // #1311: refreshToken нужен только для САМОГО рефреша (см. ниже),\n"
+    "      // не как условие пользоваться аккаунтом. Долгоживущий токен без\n"
+    "      // refreshToken — штатный случай, а не «нет credentials».\n"
+    "      if (!oauth?.accessToken) "
+    "throw new Error(`Account ${id} has no Claude OAuth access token`)"
+)
+
+PATCH_REFRESH_CALL_GUARD_OLD = "      const next = await refreshToken(oauth.refreshToken)"
+
+PATCH_REFRESH_CALL_GUARD_NEW = (
+    "      // #1311: сюда доходим, только если токен САМ объявил истёкший срок\n"
+    "      // (условие выше). Рефрешить нечем — честный текст про срок и\n"
+    "      // отсутствие refreshToken, а не общее «нет credentials».\n"
+    "      if (!oauth.refreshToken) "
+    "throw new Error(`Account ${id} access token expired and carries no refreshToken`)\n"
+    "      const next = await refreshToken(oauth.refreshToken)"
+)
+
+
+# Патч 6 (#1311): импорт аккаунта не требует refreshToken.
+#
+# Тот же класс, что патч 5, но на входе: `importAccount` (lib/accounts.js)
+# отвергает секрет без refreshToken («Source has no usable claudeAiOauth
+# credentials») — то есть долгоживущий токен владельца физически не попадал в
+# пул, а наш bash-импорт (dsh_import_anthropic_accounts) видел лишь ненулевой
+# код возврата и пропускал аккаунт с общим предупреждением. Требуем ровно то,
+# без чего работать нельзя, — accessToken.
+PATCH_IMPORT_REFRESH_OPTIONAL_OLD = (
+    "  if (!oauth?.accessToken || !oauth?.refreshToken) "
+    "throw new Error('Source has no usable claudeAiOauth credentials')"
+)
+
+PATCH_IMPORT_REFRESH_OPTIONAL_NEW = (
+    "  // #1311: refreshToken опционален — долгоживущий токен без него рабочий,\n"
+    "  // см. patch_anthropic_pool_plugin.py, патч 5 (pool.js).\n"
+    "  if (!oauth?.accessToken) "
+    "throw new Error('Source has no claudeAiOauth.accessToken')"
+)
+
+
 class PatchMarkerNotFound(RuntimeError):
     """Отказ конкретного патча — сообщение уже готово к печати человеку."""
 
@@ -271,7 +335,8 @@ def main() -> int:
     package_dir = Path(sys.argv[1])
     index_js = package_dir / "lib" / "index.js"
     pool_js = package_dir / "lib" / "pool.js"
-    for required in (index_js, pool_js):
+    accounts_js = package_dir / "lib" / "accounts.js"
+    for required in (index_js, pool_js, accounts_js):
         if not required.is_file():
             print(f"ОШИБКА: {required} не найден — не тот каталог/форма ассета изменилась", file=sys.stderr)
             return 1
@@ -300,14 +365,26 @@ def main() -> int:
         pool_js_content = _replace_required(
             pool_js_content, PATCH_POOL_CLASSIFY_EXPORT_OLD, PATCH_POOL_CLASSIFY_EXPORT_NEW,
             "pool_classify_export", pool_js)
+        pool_js_content = _replace_required(
+            pool_js_content, PATCH_REFRESH_TOKEN_OPTIONAL_OLD, PATCH_REFRESH_TOKEN_OPTIONAL_NEW,
+            "refresh_token_optional", pool_js)
+        pool_js_content = _replace_required(
+            pool_js_content, PATCH_REFRESH_CALL_GUARD_OLD, PATCH_REFRESH_CALL_GUARD_NEW,
+            "refresh_call_guard", pool_js)
+        accounts_js_content = accounts_js.read_text(encoding="utf-8")
+        accounts_js_content = _replace_required(
+            accounts_js_content, PATCH_IMPORT_REFRESH_OPTIONAL_OLD, PATCH_IMPORT_REFRESH_OPTIONAL_NEW,
+            "import_refresh_optional", accounts_js)
     except PatchMarkerNotFound as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
     index_js.write_text(index_js_content, encoding="utf-8")
     pool_js.write_text(pool_js_content, encoding="utf-8")
+    accounts_js.write_text(accounts_js_content, encoding="utf-8")
     print(f"PATCHED_OK: {index_js}")
     print(f"PATCHED_OK: {pool_js}")
+    print(f"PATCHED_OK: {accounts_js}")
     return 0
 
 

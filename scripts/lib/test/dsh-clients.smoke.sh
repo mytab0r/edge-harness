@@ -889,10 +889,39 @@ TELEGRAM_CHAT_ID="42" \
 GH_ISSUE_JSON='{"number":123,"title":"Smoke живая форма инцидента #876","body":"## Цель\nпрогон\n\n## Критерий готовности\nсессия","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
 SMOKE_DSH_STOP_ERROR="INVALID_API_KEY: unauthorized" \
   run_client_expect_fail "worker-chain-refusal-red" "$REPO/scripts/worker/task.sh"
-assert_log "цепочка провайдеров исчерпана" "worker-chain-refusal-red: отказ dsh обязан закончиться исчерпанием цепочки с честной причиной"
+# #1307: раньше здесь проверялась ЛИТЕРАЛЬНАЯ фраза «цепочка провайдеров
+# исчерпана». Она перестала быть верной для этого сценария: INVALID_API_KEY —
+# транзиентный класс, цепочка НЕ исчерпана квотой, и говорить «исчерпана» тут
+# значило бы ровно то, за что #1307 и заведён. Проверяется теперь ИНВАРИАНТ,
+# ради которого сценарий существует: отказ провайдера отнесён не к агенту, и
+# причина названа разбором по классам, а не общей фразой. Это СТРОЖЕ прежней
+# проверки: прежняя прошла бы и на тексте без единого класса.
+assert_log "Автономный воркер остановлен провайдером, не своей ошибкой" "worker-chain-refusal-red: отказ dsh обязан быть отнесён к провайдеру, а не к агенту"
+assert_log "транзиентных отказов: 1" "worker-chain-refusal-red: причина обязана прийти разбором по классам (#1307), а не общей фразой"
+assert_log "Повтор ИМЕЕТ смысл" "worker-chain-refusal-red: транзиентный класс обязан называть, что повтор осмыслен (#1307)"
 assert_log "GH-API-LOCK-DELETE refs/locks/task-123" "worker-chain-refusal-red: задача не возвращена в пул при отказе dsh — осталась занятой"
 assert_not_log "Автономный воркер справился" "worker-chain-refusal-red: живой класс #876 — существование PR не маскирует отказ dsh"
-echo "SMOKE: worker-chain-refusal-red — ок (#876/#1084)"
+echo "SMOKE: worker-chain-refusal-red — ок (#876/#1084/#1307)"
+
+# ── #1307, парный сценарий: РЕАЛЬНОЕ исчерпание квоты. Прежняя формулировка
+# «исчерпана целиком» обязана остаться именно здесь — иначе «починить»
+# сценарий выше можно было бы, вычеркнув фразу отовсюду. Прод-форма строки —
+# дословная (RATE_LIMIT: Weekly/Monthly Limit Exhausted), та же, что уже
+# кормит dsh_run_with_retry и dsh-provider-chain.smoke.sh.
+scenario_start
+WORKER_LOGIN="mytab0r" \
+WORKER_TASK="123" \
+RUNNER_TEMP="$TMP/rt-w-chain-quota" \
+GH_TOKEN="smoke-pat-token" \
+TELEGRAM_BOT_TOKEN="smoke-tg-token" \
+TELEGRAM_CHAT_ID="42" \
+GH_ISSUE_JSON='{"number":123,"title":"Smoke: цепочка реально без квоты","body":"## Цель\nпрогон\n\n## Критерий готовности\nсессия","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
+SMOKE_DSH_STOP_ERROR="RATE_LIMIT: Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-09-17 08:51:55" \
+  run_client_expect_fail "worker-chain-quota-red" "$REPO/scripts/worker/task.sh"
+assert_log "исчерпана целиком" "worker-chain-quota-red: когда ВСЕ провайдеры реально без квоты, прежняя формулировка обязана остаться (#1307)"
+assert_log "повтор внутри этого прогона не поможет" "worker-chain-quota-red: при реальной квоте действие обязано остаться «ждать», а не «повторить»"
+assert_not_log "Повтор ИМЕЕТ смысл" "worker-chain-quota-red: при реальной квоте повтор смысла не имеет — сообщение не должно звать повторять"
+echo "SMOKE: worker-chain-quota-red — ок (#1307)"
 
 scenario_start
 WORKER_LOGIN="mytab0r" \

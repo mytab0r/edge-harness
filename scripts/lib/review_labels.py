@@ -566,7 +566,14 @@ def should_run_ai_review(current_labels, stored_fingerprint: str | None,
 # останавливается на первой пустой строке, чтобы проза/фенсы ниже не
 # притворялись фактами (см. header_facts). Одно место правды — раньше жило
 # только в ai_review.py, check_pr.py читало бы вторую копию regex.
-FACT_RE = re.compile(r"^(pr|head|reviewer|diff|provider|reset-at|reason|class):\s*(.+)$")
+# #1307: chain-retry-useful — факт «часть провайдеров цепочки НЕ получила
+# настоящей попытки» (наш бюджет ожидания/транзиент, не квота). Читает
+# scheduler.trigger_ai_review: без него `reset-at` одного реально
+# исчерпанного провайдера придерживал авто-повтор для ВСЕЙ цепочки до
+# его даты — живой случай 2026-09-15: GLM с датой 2026-09-17 против пяти
+# провайдеров, которым досталось 0с бюджета (прогон worker.yml 35010410097).
+FACT_RE = re.compile(
+    r"^(pr|head|reviewer|diff|provider|reset-at|reason|class|chain-retry-useful):\s*(.+)$")
 
 
 def transport_failed(dsh_rc: str) -> bool:

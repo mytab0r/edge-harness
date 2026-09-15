@@ -3730,7 +3730,25 @@ def trigger_ai_review(repo: str, now: datetime, pulls: list[dict]) -> tuple[list
                 if quota_note:
                     observations.append(quota_note)
             reset_dates = parse_reset_hint_dates(reset_hint)
-            if reset_dates and now < min(reset_dates):
+            # #1307: `reset-at` принадлежит КОНКРЕТНЫМ провайдерам, назвавшим
+            # дату, а не всей цепочке. Живой случай 2026-09-15 (прогон
+            # worker.yml 35010410097, тот же состав цепочки у ai-review): дату
+            # назвал один GLM (2026-09-17), пятерым досталось 0с бюджета
+            # ожидания, двое несли мёртвый id — придерживать авто-повтор двое
+            # суток было решением по факту ОДНОГО провайдера. Факт
+            # chain-retry-useful ставит ai_review.build_comment ровно тогда,
+            # когда разбор по классам (dsh_run_with_provider_chain) показал
+            # хотя бы одного провайдера без настоящей попытки — тогда квота не
+            # тормоз, и повтор идёт как обычно (гейт #857 сам пропустит
+            # реально исчерпанного провайдера ДО попытки, не тратя вызов).
+            retry_useful = facts.get("chain-retry-useful", "") == "1"
+            if retry_useful and reset_dates:
+                observations.append(
+                    f"↻ PR #{pull['number']}: `reset-at` есть, но цепочка НЕ исчерпана "
+                    "квотой (часть провайдеров не получила настоящей попытки) — "
+                    "авто-повтор не придерживаю (#1307)"
+                )
+            if reset_dates and not retry_useful and now < min(reset_dates):
                 next_viable = min(reset_dates)
                 marker = f"{AI_REVIEW_CHAIN_COOLDOWN_MARKER} #{pull['number']}"
                 already = issue_marker_times(repo, pull["number"], marker)
