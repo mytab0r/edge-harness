@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Патчит распакованный плагин dsh-anthropic-oauth-pool: три точечных правки.
+"""Патчит распакованный плагин dsh-anthropic-oauth-pool: четыре патча (шесть
+точечных правок exact string match — патч 4 складывается из трёх правок
+разом, см. ниже).
 
 Класс #1097 (второй заход, #1130, живой прогон worker.yml 34753001158):
 плагин регистрирует себя в llm-pi-ai через `ctx.get('settings').update(...)`
@@ -47,6 +49,40 @@ oauth.expiresAt - Date.now() > REFRESH_SKEW_MS) return account` ложно и п
 этом патче. Один повтор того же запроса тем же аккаунтом; неудача (сеть,
 битый `refreshToken`, повторный 401/403) — прежнее поведение: cooldown 60с,
 следующий аккаунт.
+
+Четвёртый, независимый дефект (#1192, живой прогон worker.yml 34792555573):
+когда все аккаунты пула исчерпаны в рамках одного HTTP-вызова, `forward()`
+(`lib/index.js`, ветка `else` после цикла перебора аккаунтов) отвечает
+агрегатом `{"type":"pool_unavailable","message":"No Anthropic account is
+available","retryAt":...}` — тем же текстом что при 401/403 (креды
+отвергнуты, нужен перевыпуск секретов ВЛАДЕЛЬЦЕМ), что и при 429 (лимит
+Anthropic, само пройдёт). Причина не прокидывается наружу, хотя КАЖДЫЙ
+реальный HTTP-ответ Anthropic уже пишет `account.lastStatus` (тот же
+`forward()`, чуть выше) — агрегат просто не смотрит на эти уже собранные
+данные.
+
+Патч 4 состоит из трёх точечных правок, применяемых АТОМАРНО вместе с
+первыми тремя (тот же принцип «все патчи проверяются до записи любого
+файла»):
+  - PATCH_POOL_CLASSIFY_EXPORT (lib/pool.js): добавляет ЧИСТУЮ функцию
+    `classifyPoolUnavailable(accounts)` — без сети/файлов, читает только
+    `lastStatus`/`lastError`, уже записанные `forward()`/`discoverModels()`.
+    Классы: `auth_rejected` (401/403 — нужен владелец), `rate_limited` (429 —
+    само пройдёт), `network_error` (исключение при попытке, не HTTP-ответ),
+    `unknown` (в записанном состоянии аккаунта нет ни 401/403, ни 429, ни
+    lastError — аккаунт мог ни разу не пробоваться в этом процессе, либо его
+    последний записанный ответ был вне этих классов, например 200/5xx из
+    прошлых вызовов). Секреты/токены сюда не попадают — только числовой код
+    ответа.
+  - PATCH_IMPORT_CLASSIFY (lib/index.js): добавляет `classifyPoolUnavailable`
+    в существующий import из `./pool.js`.
+  - PATCH_POOL_UNAVAILABLE_REASON (lib/index.js): вызывает классификацию
+    внутри ветки `else` и кладёт `reason`/`accounts` в то же JSON-тело
+    `pool_unavailable`, рядом с уже существующими `message`/`retryAt`.
+
+`scripts/lib/dsh-ci.sh` (`dsh_run_with_pool_then_chain`) читает `reason` из
+stderr и печатает владельцу два РАЗНЫХ факта вместо одной гадательной фразы
+(AGENTS.md, «Алерт не гадает»).
 
 Патчи — точная строковая замена (exact match), не regex/sed по шаблону: если
 апстрим сменил форму любого куска, замена НЕ применится и скрипт откажет
@@ -133,6 +169,33 @@ PATCH_REACTIVE_REFRESH_NEW = """        if ([401, 403].includes(response.status)
           account.cooldownUntil = Date.now() + 60_000; continue
         }"""
 
+PATCH_IMPORT_CLASSIFY_OLD = (
+    "import { createRefreshCoordinator, selectAccount, updateQuotaFromHeaders, available } "
+    "from './pool.js'"
+)
+
+PATCH_IMPORT_CLASSIFY_NEW = (
+    "import { createRefreshCoordinator, selectAccount, updateQuotaFromHeaders, available, "
+    "classifyPoolUnavailable } from './pool.js'"
+)
+
+PATCH_POOL_UNAVAILABLE_REASON_OLD = """    } else {
+      res.statusCode = 503; res.setHeader('content-type', 'application/json')
+      const next = [...runtime.values()].filter((a) => a.cooldownUntil).sort((a, b) => a.cooldownUntil - b.cooldownUntil)[0]
+      res.end(JSON.stringify({ type: 'error', error: { type: 'pool_unavailable', message: lastError?.message || 'No Anthropic account is available', retryAt: next?.cooldownUntil || null } }))
+    }"""
+
+PATCH_POOL_UNAVAILABLE_REASON_NEW = """    } else {
+      res.statusCode = 503; res.setHeader('content-type', 'application/json')
+      const next = [...runtime.values()].filter((a) => a.cooldownUntil).sort((a, b) => a.cooldownUntil - b.cooldownUntil)[0]
+      // #1192: reason/accounts различают auth_rejected (401/403, нужен
+      // владелец) от rate_limited (429, само пройдёт) — без них 'pool_unavailable'
+      // был одинаковым текстом для обоих сценариев. classifyPoolUnavailable
+      // (lib/pool.js) — чистая функция над уже собранным account.lastStatus.
+      const { reason, accounts } = classifyPoolUnavailable([...runtime.values()])
+      res.end(JSON.stringify({ type: 'error', error: { type: 'pool_unavailable', message: lastError?.message || 'No Anthropic account is available', retryAt: next?.cooldownUntil || null, reason, accounts } }))
+    }"""
+
 PATCH_POOL_SKIP_CONDITION_OLD = "      if (oauth.expiresAt && oauth.expiresAt - Date.now() > REFRESH_SKEW_MS) return account"
 
 PATCH_POOL_SKIP_CONDITION_NEW = """      // #1130 (доработка, решение владельца): отсутствующий expiresAt
@@ -146,6 +209,43 @@ PATCH_POOL_SKIP_CONDITION_NEW = """      // #1130 (доработка, реше�
       // Реактивное восстановление на реальный 401/403 — PATCH_REACTIVE_REFRESH
       // (lib/index.js), эта ветка обязана применяться вместе с той.
       if (!oauth.expiresAt || oauth.expiresAt - Date.now() > REFRESH_SKEW_MS) return account"""
+
+# Якорь — последние 4 строки pool.js (конец createRefreshCoordinator и конец
+# файла), не пересекается со строкой, которую трогает PATCH_POOL_SKIP_CONDITION
+# выше — оба патча применяются к одному и тому же содержимому независимо друг
+# от друга, порядок применения не важен.
+PATCH_POOL_CLASSIFY_EXPORT_OLD = """    pending.set(id, work)
+    return work
+  }
+}"""
+
+PATCH_POOL_CLASSIFY_EXPORT_NEW = """    pending.set(id, work)
+    return work
+  }
+}
+
+// #1192: pool_unavailable раньше был агрегатом без причины — 401/403 (креды
+// отвергнуты Anthropic, нужен перевыпуск секретов) и 429 (лимит, само
+// пройдёт) выглядели снаружи одинаково. Чистая функция (без сети/файлов) —
+// читает только lastStatus/lastError, которые forward()/discoverModels()
+// (lib/index.js) уже записывают на каждый реальный HTTP-ответ Anthropic;
+// секреты/токены сюда не попадают, только числовой код ответа.
+export function classifyPoolUnavailable(accounts) {
+  const summary = accounts.map((a) => ({
+    id: a.id,
+    class: a.lastStatus === 401 || a.lastStatus === 403 ? 'auth_rejected'
+      : a.lastStatus === 429 ? 'rate_limited'
+      : a.lastError ? 'network_error'
+      : 'unknown',
+    lastStatus: a.lastStatus || null,
+    cooldownUntil: a.cooldownUntil || null,
+  }))
+  const reason = summary.some((a) => a.class === 'auth_rejected') ? 'auth_rejected'
+    : summary.some((a) => a.class === 'rate_limited') ? 'rate_limited'
+    : summary.some((a) => a.class === 'network_error') ? 'network_error'
+    : 'unknown'
+  return { reason, accounts: summary }
+}"""
 
 
 class PatchMarkerNotFound(RuntimeError):
@@ -176,7 +276,7 @@ def main() -> int:
             print(f"ОШИБКА: {required} не найден — не тот каталог/форма ассета изменилась", file=sys.stderr)
             return 1
 
-    # Все три патча проверяются на исходном содержимом ДО первой записи —
+    # Все четыре патча проверяются на исходном содержимом ДО первой записи —
     # частичное применение (например патч 1 прошёл, патч 2 нет) не оставляет
     # плагин в наполовину пропатченном состоянии.
     try:
@@ -187,10 +287,19 @@ def main() -> int:
         index_js_content = _replace_required(
             index_js_content, PATCH_REACTIVE_REFRESH_OLD, PATCH_REACTIVE_REFRESH_NEW,
             "reactive_refresh", index_js)
+        index_js_content = _replace_required(
+            index_js_content, PATCH_IMPORT_CLASSIFY_OLD, PATCH_IMPORT_CLASSIFY_NEW,
+            "import_classify", index_js)
+        index_js_content = _replace_required(
+            index_js_content, PATCH_POOL_UNAVAILABLE_REASON_OLD, PATCH_POOL_UNAVAILABLE_REASON_NEW,
+            "pool_unavailable_reason", index_js)
         pool_js_content = pool_js.read_text(encoding="utf-8")
         pool_js_content = _replace_required(
             pool_js_content, PATCH_POOL_SKIP_CONDITION_OLD, PATCH_POOL_SKIP_CONDITION_NEW,
             "pool_skip_condition", pool_js)
+        pool_js_content = _replace_required(
+            pool_js_content, PATCH_POOL_CLASSIFY_EXPORT_OLD, PATCH_POOL_CLASSIFY_EXPORT_NEW,
+            "pool_classify_export", pool_js)
     except PatchMarkerNotFound as exc:
         print(str(exc), file=sys.stderr)
         return 1

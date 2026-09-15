@@ -128,5 +128,30 @@ Date.now() > REFRESH_SKEW_MS) return account` (`REFRESH_SKEW_MS = 5 * 60 *
 просроченный и зовёт `ensureFresh()` снова — переиспользует существующую
 логику рефреша, не дублирует её).
 
+## Дополнение 2026-09-14 (#1192): pool_unavailable — 401/403 и 429 агрегировались в одно сообщение
+
+Живой прогон worker.yml **34792555573** (00:23Z, уже после фикса #1130):
+`anthropic-oauth-pool` за 17 секунд честно перебрал все аккаунты и ответил
+`{"type":"error","error":{"type":"pool_unavailable","message":"No Anthropic
+account is available","retryAt":1789345764948}}`. Разбор `lib/index.js::forward`
+(тот же релиз `dsh-plugins-suite-v1`) показал: функция РАЗЛИЧАЕТ 401/403 и 429
+внутри цикла перебора аккаунтов (разные ветки, разный `cooldownUntil`), но
+финальная агрегация в `pool_unavailable` (ветка `else` после цикла) это
+различие теряла — сообщение было одинаковым и при отвергнутых кредах
+(нужен перевыпуск секретов владельцем), и при исчерпанном лимите (само
+пройдёт), хотя `account.lastStatus` уже нёс нужный код ответа.
+
+Фикс #1192 — четвёртый точечный патч плагина (`scripts/lib/
+patch_anthropic_pool_plugin.py`, вместе с тремя из #1097/#1130): чистая
+функция `classifyPoolUnavailable(accounts)` в `lib/pool.js` классифицирует
+каждый аккаунт по `lastStatus`/`lastError` (`auth_rejected`/`rate_limited`/
+`network_error`/`unknown`, без сети/файлов — секреты не участвуют), `lib/
+index.js` кладёт результат (`reason`/`accounts`) в то же JSON-тело
+`pool_unavailable`. `scripts/lib/dsh-ci.sh::dsh_pool_unavailable_owner_note`
+читает `reason` и формулирует владельцу два разных факта («владелец нужен,
+перевыпуск ANTHROPIC_OAUTH_*» против «владелец НЕ нужен, ретрай в
+<время>»); поле отсутствует (патч не применился/форма ответа изменилась) —
+честное «не классифицирована», без подстановки одной из гипотез.
+
 ## Источники
-`npm pack @deepseek-ai/dsh-llm-pi-ai@0.1.1-rc.2` / `@earendil-works/pi-ai@0.82.1`; `scripts/lib/dsh-ci.sh:17,19`; плагин `dsh-anthropic-oauth-pool-0.1.0.tgz`; github 1rgs/claude-code-proxy, musistudio/claude-code-router, BerriAI/litellm (WebFetch 2026-09-10); дополнение 2026-09-13 (#1097) — `npm pack @deepseek-ai/dsh@0.1.1-rc.2 @deepseek-ai/dsh-headless@0.1.1-rc.2 @deepseek-ai/dsh-settings@0.1.1-rc.2 @deepseek-ai/dsh-code-runtime-worker-thread@0.1.1-rc.2 @deepseek-ai/dsh-agent-default-model@0.1.1-rc.2`, релиз `dsh-plugins-suite-v1` (issue #1097); поправка 2026-09-13 (#1130) — живой `npm install -g` того же набора tarball'ов + `dsh --profile headless --dump-config` (подтвердил монтаж `dsh-settings-file`), `@earendil-works/pi-ai@0.82.1` `dist/models.js` (`createProvider`/`Models.getModel`), `@deepseek-ai/dsh-settings@0.1.1-rc.2` `lib/index.js` (`mergeLayers`), живой прогон worker.yml 34753001158; дополнение 2026-09-13 (#1130, превентивный рефреш) — `lib/pool.js`/`lib/index.js` плагина (релиз `dsh-plugins-suite-v1`), живой node-тест `createRefreshCoordinator` с синтетическими `readAccount`/`writeAccount`/`refreshToken` (`scripts/lib/test/dsh-anthropic-pool.guard.sh`, секция 14).
+`npm pack @deepseek-ai/dsh-llm-pi-ai@0.1.1-rc.2` / `@earendil-works/pi-ai@0.82.1`; `scripts/lib/dsh-ci.sh:17,19`; плагин `dsh-anthropic-oauth-pool-0.1.0.tgz`; github 1rgs/claude-code-proxy, musistudio/claude-code-router, BerriAI/litellm (WebFetch 2026-09-10); дополнение 2026-09-13 (#1097) — `npm pack @deepseek-ai/dsh@0.1.1-rc.2 @deepseek-ai/dsh-headless@0.1.1-rc.2 @deepseek-ai/dsh-settings@0.1.1-rc.2 @deepseek-ai/dsh-code-runtime-worker-thread@0.1.1-rc.2 @deepseek-ai/dsh-agent-default-model@0.1.1-rc.2`, релиз `dsh-plugins-suite-v1` (issue #1097); поправка 2026-09-13 (#1130) — живой `npm install -g` того же набора tarball'ов + `dsh --profile headless --dump-config` (подтвердил монтаж `dsh-settings-file`), `@earendil-works/pi-ai@0.82.1` `dist/models.js` (`createProvider`/`Models.getModel`), `@deepseek-ai/dsh-settings@0.1.1-rc.2` `lib/index.js` (`mergeLayers`), живой прогон worker.yml 34753001158; дополнение 2026-09-13 (#1130, превентивный рефреш) — `lib/pool.js`/`lib/index.js` плагина (релиз `dsh-plugins-suite-v1`), живой node-тест `createRefreshCoordinator` с синтетическими `readAccount`/`writeAccount`/`refreshToken` (`scripts/lib/test/dsh-anthropic-pool.guard.sh`, секция 14); дополнение 2026-09-14 (#1192) — тот же релиз `dsh-plugins-suite-v1`, скачан заново и распакован (`lib/index.js::forward`, ветка `else`), живой node-вызов `classifyPoolUnavailable`, импортированной из ПАТЧЕННОГО prod `pool.js` (не пересказ), живой прогон worker.yml 34792555573.
