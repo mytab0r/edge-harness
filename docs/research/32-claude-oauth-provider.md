@@ -158,7 +158,9 @@ index.js` кладёт результат (`reason`/`accounts`) в то же JSO
 Живой инцидент — прогон `worker.yml` 34893177035: пул отказал в 20:30:30
 телом `{"type":"error","error":{"type":"pool_unavailable","message":"No
 Anthropic account is available","retryAt":1789418114634}}`. Разбор
-`lib/index.js::forward` (тот же релиз плагина, секция 11 этого файла) —
+`lib/index.js::forward` (тот же релиз плагина; дословная копия кода —
+фикстура `write_fixture_package`, секция 11 гвардии
+`scripts/lib/test/dsh-anthropic-pool.guard.sh`) —
 ветка `else` (ни один аккаунт не ответил успехом) формирует именно это тело:
 `retryAt: next?.cooldownUntil || null`, где `next` — аккаунт с НАИМЕНЬШИМ
 `cooldownUntil` среди тех, у кого он вообще есть (401/403 ставят cooldown
@@ -173,7 +175,12 @@ Anthropic account is available","retryAt":1789418114634}}`. Разбор
 `scripts/lib/dsh-ci.sh`) разбирает поле и ждёт названное время (потолок
 `DSH_POOL_RETRY_AT_MAX_WAIT_SECS`, по умолчанию 300с — единственный
 известный образец величины, 284с, второго образца в репозитории нет,
-«не подтверждено» для распределения этой величины в общем случае).
+«не подтверждено» для распределения этой величины в общем случае; не более
+`DSH_POOL_RETRY_AT_MAX_RETRIES` повторов, по умолчанию 2 — следствие той же
+фикстуры: cooldown +60с/+15с ставится в момент отказа аккаунта ВНУТРИ
+прохода `forward`, поэтому при проходе длиннее кулдауна `retryAt` оказывается
+в прошлом, ожидание не тратит бюджет, и без счётчика повторов цикл
+бесконечен — блокер ai-review PR #1292).
 
 ## Источники
-`npm pack @deepseek-ai/dsh-llm-pi-ai@0.1.1-rc.2` / `@earendil-works/pi-ai@0.82.1`; `scripts/lib/dsh-ci.sh:17,19`; плагин `dsh-anthropic-oauth-pool-0.1.0.tgz`; github 1rgs/claude-code-proxy, musistudio/claude-code-router, BerriAI/litellm (WebFetch 2026-09-10); дополнение 2026-09-13 (#1097) — `npm pack @deepseek-ai/dsh@0.1.1-rc.2 @deepseek-ai/dsh-headless@0.1.1-rc.2 @deepseek-ai/dsh-settings@0.1.1-rc.2 @deepseek-ai/dsh-code-runtime-worker-thread@0.1.1-rc.2 @deepseek-ai/dsh-agent-default-model@0.1.1-rc.2`, релиз `dsh-plugins-suite-v1` (issue #1097); поправка 2026-09-13 (#1130) — живой `npm install -g` того же набора tarball'ов + `dsh --profile headless --dump-config` (подтвердил монтаж `dsh-settings-file`), `@earendil-works/pi-ai@0.82.1` `dist/models.js` (`createProvider`/`Models.getModel`), `@deepseek-ai/dsh-settings@0.1.1-rc.2` `lib/index.js` (`mergeLayers`), живой прогон worker.yml 34753001158; дополнение 2026-09-13 (#1130, превентивный рефреш) — `lib/pool.js`/`lib/index.js` плагина (релиз `dsh-plugins-suite-v1`), живой node-тест `createRefreshCoordinator` с синтетическими `readAccount`/`writeAccount`/`refreshToken` (`scripts/lib/test/dsh-anthropic-pool.guard.sh`, секция 14); дополнение 2026-09-14 (#1192) — тот же релиз `dsh-plugins-suite-v1`, скачан заново и распакован (`lib/index.js::forward`, ветка `else`), живой node-вызов `classifyPoolUnavailable`, импортированной из ПАТЧЕННОГО prod `pool.js` (не пересказ), живой прогон worker.yml 34792555573.; дополнение 2026-09-14 (#1288) — живой прогон worker.yml 34893177035, разбор `lib/index.js::forward` (тот же релиз, секция 11 фикстуры этого файла).
+`npm pack @deepseek-ai/dsh-llm-pi-ai@0.1.1-rc.2` / `@earendil-works/pi-ai@0.82.1`; `scripts/lib/dsh-ci.sh:17,19`; плагин `dsh-anthropic-oauth-pool-0.1.0.tgz`; github 1rgs/claude-code-proxy, musistudio/claude-code-router, BerriAI/litellm (WebFetch 2026-09-10); дополнение 2026-09-13 (#1097) — `npm pack @deepseek-ai/dsh@0.1.1-rc.2 @deepseek-ai/dsh-headless@0.1.1-rc.2 @deepseek-ai/dsh-settings@0.1.1-rc.2 @deepseek-ai/dsh-code-runtime-worker-thread@0.1.1-rc.2 @deepseek-ai/dsh-agent-default-model@0.1.1-rc.2`, релиз `dsh-plugins-suite-v1` (issue #1097); поправка 2026-09-13 (#1130) — живой `npm install -g` того же набора tarball'ов + `dsh --profile headless --dump-config` (подтвердил монтаж `dsh-settings-file`), `@earendil-works/pi-ai@0.82.1` `dist/models.js` (`createProvider`/`Models.getModel`), `@deepseek-ai/dsh-settings@0.1.1-rc.2` `lib/index.js` (`mergeLayers`), живой прогон worker.yml 34753001158; дополнение 2026-09-13 (#1130, превентивный рефреш) — `lib/pool.js`/`lib/index.js` плагина (релиз `dsh-plugins-suite-v1`), живой node-тест `createRefreshCoordinator` с синтетическими `readAccount`/`writeAccount`/`refreshToken` (`scripts/lib/test/dsh-anthropic-pool.guard.sh`, секция 14); дополнение 2026-09-14 (#1192) — тот же релиз `dsh-plugins-suite-v1`, скачан заново и распакован (`lib/index.js::forward`, ветка `else`), живой node-вызов `classifyPoolUnavailable`, импортированной из ПАТЧЕННОГО prod `pool.js` (не пересказ), живой прогон worker.yml 34792555573.; дополнение 2026-09-14 (#1288) — живой прогон worker.yml 34893177035, разбор `lib/index.js::forward` (тот же релиз, секция 11 гвардии `scripts/lib/test/dsh-anthropic-pool.guard.sh`, фикстура `write_fixture_package`).

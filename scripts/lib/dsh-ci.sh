@@ -1555,15 +1555,20 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
 #
 # `retryAt` разбирается ТОЛЬКО из тела с `"type":"pool_unavailable"` (не из
 # произвольного JSON, где поле `retryAt` могло бы значить что угодно другое)
-# — см. `_dsh_pool_retry_at_wait_secs` ниже. Три исхода вместо одного:
+# — см. `_dsh_pool_retry_at_wait_secs` ниже. Четыре исхода вместо одного:
 #   1. Пул отказал НЕ формой pool_unavailable (сеть, 401/403, битый JSON,
 #      просто текст) — как и раньше: одна попытка, откат на цепочку.
 #   2. pool_unavailable + retryAt, момент близко (≤ DSH_POOL_RETRY_AT_MAX_
 #      WAIT_SECS остатка бюджета ожидания) — ждём РОВНО названное время и
-#      повторяем ТОТ ЖЕ пул (не цепочку) — прод-сценарий #1288 живёт здесь.
+#      повторяем ТОТ ЖЕ пул (не цепочку) — прод-сценарий #1288 живёт здесь;
+#      повторов НЕ БОЛЬШЕ DSH_POOL_RETRY_AT_MAX_RETRIES (см. ниже).
 #   3. pool_unavailable + retryAt, момент дальше бюджета ожидания, ИЛИ поле
 #      отсутствует/не число — откат на цепочку, но сообщение честно называет,
 #      какой из двух случаев это был (не молчит, AGENTS.md «Алерт не гадает»).
+#   4. Повторы из п.2 исчерпаны (пул продолжает отвечать занятостью — в т.ч.
+#      с retryAt в прошлом/нуле, чьё «ожидание» не тратит бюджет вовсе) —
+#      откат на цепочку, сообщение называет потолок повторов (блокер ai-review
+#      PR #1292, вердикт rework: без потолка цикл не кончается никогда).
 #
 # DSH_POOL_RETRY_AT_MAX_WAIT_SECS (необязательный, по умолчанию 300с) —
 # СУММАРНЫЙ бюджет ожидания retryAt за весь вызов этой функции (не за одну
@@ -1587,13 +1592,28 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
 # легитимный прогон ≈272 мин, ~68 мин запаса) этот бюджет не задевает — 300с
 # на два порядка меньше свободного запаса.
 #
+# DSH_POOL_RETRY_AT_MAX_RETRIES (необязательный, по умолчанию 2) — потолок
+# ПОВТОРОВ пула, отдельный от бюджета ожидания: retryAt в прошлом/нуле
+# клампится к нулю, `sleep 0` НЕ расходует суммарный бюджет, и без отдельного
+# счётчика цикл «пул занят → повтор немедленно» не кончается никогда (блокер
+# ai-review PR #1292, вердикт rework; живой замер ревьюера: заглушка, вечно
+# отвечающая телом инцидента с retryAt = now−5с, дала 582 вызова пула за
+# 15с — процесс убит по таймауту, до цепочки дело не дошло). Значение 2 —
+# исходная попытка плюс два повтора: закрывает прод-сценарий #1288 (одно
+# ожидание 284с + повтор) с запасом ещё на одну занятость, худший случай
+# ограничен тремя полными попытками dsh_run_with_retry. Замерной базы для
+# распределения ИМЕННО ЧИСЛА повторов нет, «не подтверждено» — потолок
+# переопределяется переменной без правки кода.
+#
 # Честная граница: `retryAt` — заявление ПУЛА, не факт, который мы можем
 # проверить иначе, кроме как повторным запросом. Пул может ошибиться или
 # сообщить время, которое всё равно окажется занятым, — цикл ниже не ждёт
-# ДОЛЬШЕ суммарного бюджета ни при каких повторных retryAt (тормоз без газа
-# не принимается, AGENTS.md) и, исчерпав бюджет, честно откатывается на
-# цепочку — не то же самое, что «ждать, пока пул не ответит», а именно
-# ограниченная, разово обоснованная попытка не тратить резерв зря.
+# ДОЛЬШЕ суммарного бюджета И не делает БОЛЬШЕ DSH_POOL_RETRY_AT_MAX_RETRIES
+# повторов ни при каких повторных retryAt (два газа на одном тормозе,
+# AGENTS.md «тормоз без газа не принимается») и, исчерпав любой из них,
+# честно откатывается на цепочку — не то же самое, что «ждать/повторять,
+# пока пул не ответит», а именно ограниченная, разово обоснованная попытка
+# не тратить резерв зря.
 _dsh_pool_retry_at_wait_secs() { # err_file -> секунды до retryAt на stdout, rc=0 если разобрано
   local err_file=$1 json_str type_field retry_at_ms now_ms
   json_str=$(tr '\n' ' ' <"$err_file" | grep -oE '\{.*\}' 2>/dev/null || true)
@@ -1721,7 +1741,8 @@ dsh_run_with_pool_then_chain() { # answer_file err_file prompt_text
   local answer_file=$1 err_file=$2 prompt_text=$3
   local pool_rl_used=0 pool_err_note pool_reason_note
   local pool_retry_at_budget="${DSH_POOL_RETRY_AT_MAX_WAIT_SECS:-300}"
-  local pool_retry_at_waited=0 retry_at_wait budget_left
+  local pool_retry_at_max_retries="${DSH_POOL_RETRY_AT_MAX_RETRIES:-2}"
+  local pool_retry_at_waited=0 pool_retry_at_retries=0 retry_at_wait budget_left
   if [ "${DSH_ANTHROPIC_POOL_ACTIVE:-0}" = "1" ]; then
     while :; do
       echo "быстрый провайдер: пробую Anthropic OAuth Pool (failover между аккаунтами — внутри одного вызова, lib/index.js плагина)"
@@ -1759,13 +1780,21 @@ dsh_run_with_pool_then_chain() { # answer_file err_file prompt_text
       if retry_at_wait=$(_dsh_pool_retry_at_wait_secs "$err_file"); then
         budget_left=$((pool_retry_at_budget - pool_retry_at_waited))
         if [ "$budget_left" -gt 0 ] && [ "$retry_at_wait" -le "$budget_left" ]; then
+          # Блокер ai-review PR #1292: retryAt в прошлом/нуле клампится к нулю
+          # ниже, `sleep 0` не тратит бюджет — бюджет здесь НЕ ограничивает
+          # цикл; единственный газ на этом пути — счётчик повторов.
+          if [ "$pool_retry_at_retries" -ge "$pool_retry_at_max_retries" ]; then
+            echo "::warning::быстрый провайдер Claude (anthropic-oauth-pool) занят (rc=$DSH_RUN_RC), причина: $pool_err_note — $pool_reason_note — пул сам назвал момент возврата через ${retry_at_wait}с, исчерпан потолок повторов пула ($pool_retry_at_retries из $pool_retry_at_max_retries, остаток бюджета ожидания ${budget_left}с из ${pool_retry_at_budget}с) — не жду, пробую цепочку vars.DSH_PROVIDER_CHAIN/манифеста использования (#1288)"
+            break
+          fi
           [ "$retry_at_wait" -gt 0 ] || retry_at_wait=0
           echo "::warning::быстрый провайдер Claude (anthropic-oauth-pool) занят (rc=$DSH_RUN_RC), причина: $pool_err_note — $pool_reason_note — пул сам назвал момент возврата через ${retry_at_wait}с (бюджет ожидания ${pool_retry_at_budget}с, уже ждал ${pool_retry_at_waited}с) — жду и повторяю тем же провайдером (#1288)"
           sleep "$retry_at_wait"
           pool_retry_at_waited=$((pool_retry_at_waited + retry_at_wait))
+          pool_retry_at_retries=$((pool_retry_at_retries + 1))
           continue
         fi
-        echo "::warning::быстрый провайдер Claude (anthropic-oauth-pool) занят (rc=$DSH_RUN_RC), причина: $pool_err_note — $pool_reason_note — пул назвал момент возврата через ${retry_at_wait}с, это дольше бюджета ожидания ${pool_retry_at_budget}с (уже ждал ${pool_retry_at_waited}с, остаток ${budget_left}с) — не жду, пробую цепочку vars.DSH_PROVIDER_CHAIN/манифеста использования (#1288)"
+        echo "::warning::быстрый провайдер Claude (anthropic-oauth-pool) занят (rc=$DSH_RUN_RC), причина: $pool_err_note — $pool_reason_note — пул назвал момент возврата через ${retry_at_wait}с, это дольше остатка бюджета ожидания (${budget_left}с из ${pool_retry_at_budget}с, уже ждал ${pool_retry_at_waited}с) — не жду, пробую цепочку vars.DSH_PROVIDER_CHAIN/манифеста использования (#1288)"
         break
       fi
       echo "::warning::быстрый провайдер Claude (anthropic-oauth-pool) отказал (rc=$DSH_RUN_RC), причина: $pool_err_note — $pool_reason_note — пробую цепочку vars.DSH_PROVIDER_CHAIN/манифеста использования (#838)"
