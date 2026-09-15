@@ -2692,3 +2692,187 @@ def test_ai_prompt_checklist_asks_about_mechanisms_own_failure_mode():
         "ai_prompt.md потерял пункт чеклиста про собственный отказ "
         "механизма/пустой вход/крайнее значение объекта"
     )
+
+
+# ── Транзиентный обрыв gh api не стоит вычисленного вердикта (issue #770) ────
+#
+# Тесты этого блока НЕ подменяют ai.gh/ai.run_gh целиком (как остальной
+# файл выше) — они подменяют subprocess.run на уровне ai_review.py, чтобы
+# проверить РЕАЛЬНЫЙ путь через gh_retry.call_gh_with_retry, а не мок,
+# который эту логику обходит.
+
+from types import SimpleNamespace as _SNS
+
+
+def _proc(returncode, stdout="", stderr=""):
+    return _SNS(returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+def test_gh_survives_one_transient_blip_via_real_subprocess(monkeypatch):
+    # Прод-форма дословно: живой инцидент issue #770 (run 34950741729).
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if len(calls) == 1:
+            return _proc(1, stderr="unexpected end of JSON input")
+        return _proc(0, stdout='{"id": 1}')
+
+    sleeps = []
+    monkeypatch.setattr(ai.subprocess, "run", fake_run)
+    monkeypatch.setattr(ai.time, "sleep", sleeps.append)
+
+    result = ai.gh("repos/o/r/pulls/1")
+
+    assert result == {"id": 1}
+    assert len(calls) == 2, "повтора не случилось — транзиентный обрыв не пережит"
+    assert calls[0] == ["gh", "api", "repos/o/r/pulls/1"]
+    assert len(sleeps) == 1, "перед повтором обязана быть выдержка"
+
+
+def test_run_gh_survives_one_transient_blip_via_real_subprocess(monkeypatch):
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if len(calls) == 1:
+            return _proc(1, stderr="unexpected end of JSON input")
+        return _proc(0, stdout="")
+
+    monkeypatch.setattr(ai.subprocess, "run", fake_run)
+    monkeypatch.setattr(ai.time, "sleep", lambda s: None)
+
+    ai.run_gh("api", "-X", "POST", "repos/o/r/issues/612/comments", "-f", "body=hi")
+
+    assert len(calls) == 2
+
+
+def test_gh_fatal_error_fails_immediately_no_retry(monkeypatch):
+    # Живой вызов 2026-09-15: gh api repos/mytab0r/edge-harness/pulls/999999999
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return _proc(1, stderr="gh: Not Found (HTTP 404)")
+
+    monkeypatch.setattr(ai.subprocess, "run", fake_run)
+    monkeypatch.setattr(ai.time, "sleep",
+                         lambda s: pytest.fail("содержательный отказ (404) не должен спать в ожидании повтора"))
+
+    with pytest.raises(RuntimeError) as exc:
+        ai.gh("repos/o/r/pulls/999999999")
+    assert len(calls) == 1
+    assert "gh api repos/o/r/pulls/999999999" in str(exc.value)
+    assert "HTTP 404" in str(exc.value)
+
+
+def test_gh_transient_exhaustion_raises_gh_call_exhausted(monkeypatch):
+    # Все попытки — транзиентный обрыв: бюджет исчерпан, поднимается
+    # GhCallExhausted (не голый RuntimeError) — cmd_verdict различает его
+    # именно по классу исключения, чтобы обогатить сообщение вердиктом.
+    def fake_run(argv, **kwargs):
+        return _proc(1, stderr="unexpected end of JSON input")
+
+    monkeypatch.setattr(ai.subprocess, "run", fake_run)
+    monkeypatch.setattr(ai.time, "sleep", lambda s: None)
+
+    with pytest.raises(ai.gh_retry.GhCallExhausted):
+        ai.gh("repos/o/r/pulls/1")
+
+
+# ── cmd_verdict: исчерпание повтора на публикации не теряет вычисленный
+# вердикт (issue #770, критерий 2/3) ──────────────────────────────────────────
+
+def test_cmd_verdict_exhaustion_on_comment_post_preserves_computed_verdict(monkeypatch, tmp_path):
+    # Голова/файлы читаются нормально (label уже выбран — approve/ai:ok),
+    # но публикация комментария-вердикта обрывается транзиентно и повтор
+    # исчерпан. Сообщение обязано нести уже вычисленный вердикт — читатель
+    # не платит за модель второй раз, чтобы его узнать.
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+    fake_gh, calls = _fake_gh_verdict("deadbeef", "deadbeef", files, [])
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    def flaky_run_gh(*a):
+        if a[:2] == ("api", "-X") and a[3].endswith("/comments"):
+            raise ai.gh_retry.GhCallExhausted(
+                "gh api -X", 4, 12.3, "unexpected end of JSON input")
+        # метка/статус проходят нормально — это НЕ тест про метки.
+
+    monkeypatch.setattr(ai, "run_gh", flaky_run_gh)
+
+    with pytest.raises(RuntimeError) as exc:
+        ai.cmd_verdict(_verdict_args(tmp_path, "Всё чисто.\nВЕРДИКТ: approve"))
+
+    text = str(exc.value)
+    assert "Вердикт УЖЕ ВЫЧИСЛЕН" in text
+    assert "approve" in text
+    assert ai.AI_OK in text  # метка тоже названа, не только сырой verdict
+    assert "unexpected end of JSON input" in text  # исходная ошибка не потеряна
+    assert "повторный запуск" in text.lower()
+
+
+def test_cmd_verdict_exhaustion_before_label_known_says_so_honestly(monkeypatch, tmp_path):
+    # Обрыв на САМОЙ ПЕРВОЙ сети (pull = gh(...)) — label ещё не вычислен
+    # (зависит от huge_diff_size_gate, который читает files). Сообщение не
+    # имеет права ПРИДУМАТЬ метку, которой ещё не было — честно называет
+    # это состояние текстом, не пустотой.
+    def gh_exhausted(*_args, **_kwargs):
+        raise ai.gh_retry.GhCallExhausted("gh api repos/o/r/pulls/294", 4, 9.9,
+                                           "unexpected end of JSON input")
+
+    monkeypatch.setattr(ai, "gh", gh_exhausted)
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    with pytest.raises(RuntimeError) as exc:
+        ai.cmd_verdict(_verdict_args(tmp_path, "Всё чисто.\nВЕРДИКТ: approve"))
+
+    text = str(exc.value)
+    assert "Вердикт УЖЕ ВЫЧИСЛЕН" in text
+    assert "approve" in text
+    assert "метка ещё не выбрана" in text
+
+
+def test_cmd_verdict_fatal_gh_error_is_not_disguised_as_exhaustion(monkeypatch, tmp_path):
+    # Содержательный отказ (404 — PR не найден) НЕ должен притворяться
+    # исчерпанием транзиентных попыток: это другой класс, не обогащается
+    # вердиктом (обогащение — только для GhCallExhausted).
+    def gh_fatal(*_args, **_kwargs):
+        raise RuntimeError("gh api repos/o/r/pulls/294: gh: Not Found (HTTP 404)")
+
+    monkeypatch.setattr(ai, "gh", gh_fatal)
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    with pytest.raises(RuntimeError) as exc:
+        ai.cmd_verdict(_verdict_args(tmp_path, "Всё чисто.\nВЕРДИКТ: approve"))
+
+    assert "Вердикт УЖЕ ВЫЧИСЛЕН" not in str(exc.value)
+    assert "HTTP 404" in str(exc.value)
+
+
+# ── issue #770, критерий 4: PR не остаётся вообще без ai:*-метки, если обрыв
+# случился между POST новой и DELETE старой ──────────────────────────────────
+
+def test_cmd_verdict_posts_new_label_before_deleting_stale_ones(monkeypatch, tmp_path):
+    # ai:failed уже стоит (прошлый автоповтор), новый вердикт — approve
+    # (ai:ok): новая метка обязана уйти ПЕРВОЙ, старая снимается ПОСЛЕ —
+    # если процесс оборвётся между вызовами, PR несёт ОБЕ метки, не НОЛЬ.
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+    fake_gh, calls = _fake_gh_verdict("deadbeef", "deadbeef", files, [ai.AI_FAILED])
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, "Всё чисто.\nВЕРДИКТ: approve"))
+
+    assert rc == 0
+    label_calls = [a for a in run_gh_calls if a[:2] == ("api", "-X") and a[3].endswith("/labels")
+                    or (a[:2] == ("api", "-X") and "/labels/" in a[3])]
+    methods_in_order = [a[2] for a in label_calls]
+    assert methods_in_order[0] == "POST", "новая метка обязана уйти ПЕРВОЙ"
+    assert "DELETE" in methods_in_order[1:], "старая метка снимается ПОСЛЕ новой"

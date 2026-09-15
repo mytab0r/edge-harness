@@ -78,6 +78,7 @@ import re
 import string
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -91,6 +92,14 @@ _LIB = SCRIPT_DIR.parent / "lib" / "review_labels.py"
 _spec = importlib.util.spec_from_file_location("review_labels", _LIB)
 review_labels = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(review_labels)
+
+# Классификация транзиентного/содержательного отказа gh api + повтор с
+# выдержкой — одно место правды на весь репозиторий (issue #770): второй
+# копии повтора здесь не заводим.
+_ghr_spec = importlib.util.spec_from_file_location(
+    "gh_retry", SCRIPT_DIR.parent / "lib" / "gh_retry.py")
+gh_retry = importlib.util.module_from_spec(_ghr_spec)
+_ghr_spec.loader.exec_module(gh_retry)
 
 # Третья категория находок — чеклист некритичных замечаний в теле PR (#462):
 # парсинг блока ЗАМЕЧАНИЕ и слияние с телом PR — общее место правды с
@@ -206,25 +215,27 @@ transport_failed = review_labels.transport_failed
 reason_tag = review_labels.reason_tag
 
 
-def gh(*args: str) -> dict | list:
-    result = subprocess.run(
-        ["gh", "api", *args],
-        capture_output=True, text=True, encoding="utf-8",
+def _gh_subprocess_run(argv: list[str]) -> subprocess.CompletedProcess:
+    """Единственное место, где строится env/encoding для вызова `gh` —
+    gh()/run_gh() передают сюда уже готовый argv, gh_retry.call_gh_with_retry
+    вызывает это как `run(argv)` столько раз, сколько нужно повтору."""
+    return subprocess.run(
+        argv, capture_output=True, text=True, encoding="utf-8",
         env={**os.environ, "NO_COLOR": "1"},
     )
-    if result.returncode != 0:
-        raise RuntimeError(f"gh api {' '.join(args[:2])}: {result.stderr.strip()}")
+
+
+def gh(*args: str) -> dict | list:
+    # Транзиентный обрыв (обрыв транспорта, 5xx/429/408) повторяется с
+    # выдержкой ВНУТРИ этого вызова — issue #770: одиночный сетевой блип не
+    # обязан ронять уже вычисленный вердикт наружу. Содержательный отказ
+    # (401/403/404/422, rc=4) — падает с первой попытки, как и раньше.
+    result = gh_retry.call_gh_with_retry(["gh", "api", *args], run=_gh_subprocess_run, sleep=time.sleep)
     return json.loads(result.stdout)
 
 
 def run_gh(*args: str) -> None:
-    result = subprocess.run(
-        ["gh", *args],
-        capture_output=True, text=True, encoding="utf-8",
-        env={**os.environ, "NO_COLOR": "1"},
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"gh {' '.join(args[:2])}: {result.stderr.strip()}")
+    gh_retry.call_gh_with_retry(["gh", *args], run=_gh_subprocess_run, sleep=time.sleep)
 
 
 def pr_diff(pr: int) -> subprocess.CompletedProcess:
@@ -1298,132 +1309,168 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     # пересказу.
     reason_tag_value = review_labels.reason_tag(args.dsh_rc, args.failure_reason) if verdict == "error" else None
 
-    pull = gh(f"repos/{repo}/pulls/{args.pr}")
-    if pull["head"]["sha"] != args.head:
-        print(f"::warning::head PR #{args.pr} сменился ({args.head[:12]} → "
-              f"{pull['head']['sha'][:12]}) — вердикт {verdict} не применяю: "
-              f"новый пуш заведёт свежее ревью")
-        notify_head_moved(repo, args.pr, verdict, args.head, pull["head"]["sha"])
-        return 0
+    # label зависит от verdict ПОСЛЕ размерного гейта (huge_diff_size_gate
+    # ниже, внутри try) — он сам читает files из сети, поэтому не может быть
+    # вычислен раньше первого сетевого вызова. None здесь — честный признак
+    # «обрыв случился ДО того, как label стал известен» для except ниже, не
+    # значение по умолчанию, которое можно принять за настоящую метку.
+    label = None
 
-    # Файлы читаются ДО применения вердикта (находка 1 вердикта ai-review
-    # PR #294, гонка): list_pr_files — отдельный сетевой вызов (возможно,
-    # несколько страниц), и между проверкой головы выше и этим моментом
-    # проходит время, в которое автор успевает запушить новый коммит. Раньше
-    # это не было опасно — протухший ai:ok безусловно умирал на следующем
-    # check_pr.py; но #252 научил его переживать неизменный дифф, и та же
-    # гонка делает его вечным: комментарий уйдёт с `diff:` от НЕревьюенных
-    # файлов, ai_verdict_keep будет подтверждать его при каждом пуше. Поэтому
-    # СРАЗУ после чтения файлов голова сверяется ЕЩЁ РАЗ, и до единой строчки
-    # правки (метка/большой-ok/комментарий) — если она уехала от args.head,
-    # выходим без применения вердикта вовсе.
-    files = review_labels.list_pr_files(repo, args.pr, gh)
-    pull_after_files = gh(f"repos/{repo}/pulls/{args.pr}")
-    if pull_after_files["head"]["sha"] != args.head:
-        print(f"::warning::head PR #{args.pr} сменился во время чтения файлов "
-              f"({args.head[:12]} → {pull_after_files['head']['sha'][:12]}) — "
-              f"вердикт {verdict} не применяю: новый пуш заведёт свежее ревью")
-        notify_head_moved(repo, args.pr, verdict, args.head, pull_after_files["head"]["sha"])
-        return 0
+    # Вердикт уже ПОЛНОСТЬЮ вычислен на этой строке (verdict/findings/tasks/
+    # remarks/reason — чистые функции над answer, сети не было ни разу выше).
+    # Всё, что дальше, — публикация вычисленного результата: транзиентный
+    # обрыв здесь (issue #770) не должен стоить этого вычисления. gh()/
+    # run_gh() уже повторяют одиночный TRANSIENT-блип внутри себя
+    # (gh_retry.call_gh_with_retry); если бюджет повторов исчерпан на КАКОМ-ТО
+    # вызове публикации, except ниже добавляет к сообщению уже вычисленный
+    # вердикт — следующий читатель не обязан звать модель заново, чтобы его
+    # узнать (issue #770, критерий 3).
+    try:
+        pull = gh(f"repos/{repo}/pulls/{args.pr}")
+        if pull["head"]["sha"] != args.head:
+            print(f"::warning::head PR #{args.pr} сменился ({args.head[:12]} → "
+                  f"{pull['head']['sha'][:12]}) — вердикт {verdict} не применяю: "
+                  f"новый пуш заведёт свежее ревью")
+            notify_head_moved(repo, args.pr, verdict, args.head, pull["head"]["sha"])
+            return 0
 
-    # Газ к тормозу review:large (#204): подтверждение размера опирается на
-    # состоявшийся вердикт AI, а не на факт запуска — added считается по
-    # files, уже сверенным с головой ВЫШЕ, поэтому не может прийти из уехавшей
-    # головы (тот же баг, что и протухший diff_fp, закрыт одной сверкой).
-    added = sum(f["additions"] for f in files)
+        # Файлы читаются ДО применения вердикта (находка 1 вердикта ai-review
+        # PR #294, гонка): list_pr_files — отдельный сетевой вызов (возможно,
+        # несколько страниц), и между проверкой головы выше и этим моментом
+        # проходит время, в которое автор успевает запушить новый коммит. Раньше
+        # это не было опасно — протухший ai:ok безусловно умирал на следующем
+        # check_pr.py; но #252 научил его переживать неизменный дифф, и та же
+        # гонка делает его вечным: комментарий уйдёт с `diff:` от НЕревьюенных
+        # файлов, ai_verdict_keep будет подтверждать его при каждом пуше. Поэтому
+        # СРАЗУ после чтения файлов голова сверяется ЕЩЁ РАЗ, и до единой строчки
+        # правки (метка/большой-ok/комментарий) — если она уехала от args.head,
+        # выходим без применения вердикта вовсе.
+        files = review_labels.list_pr_files(repo, args.pr, gh)
+        pull_after_files = gh(f"repos/{repo}/pulls/{args.pr}")
+        if pull_after_files["head"]["sha"] != args.head:
+            print(f"::warning::head PR #{args.pr} сменился во время чтения файлов "
+                  f"({args.head[:12]} → {pull_after_files['head']['sha'][:12]}) — "
+                  f"вердикт {verdict} не применяю: новый пуш заведёт свежее ревью")
+            notify_head_moved(repo, args.pr, verdict, args.head, pull_after_files["head"]["sha"])
+            return 0
 
-    # Диффы сверх check_pr.LARGE_DIFF_HUGE_LINES: суждение модели о размере
-    # ЗАМЕНЯЕТ эскалацию владельцу (мандат 2026-09-11, #939, отменяет #204
-    # п.«escalate»/#901) — читается ДО выбора вердикт-метки, потому что
-    # 'bloated'/'missing' переопределяют сам verdict, а не только газ
-    # large_ok_decision. 'na' (дифф не гигантский) и 'justified' verdict не
-    # трогают. Уже наступивший verdict == "error" (контракт ВЕРДИКТ нарушен,
-    # или #210 empty_rework) не переклассифицируется второй раз — та причина
-    # точнее и вычислена раньше.
-    size_status, size_detail = huge_diff_size_gate(added, answer)
-    if size_status == "bloated" and verdict != "error":
-        verdict = "rework"
-        bloat_note = (f"Объём диффа (+{added} строк, порог "
-                      f"{check_pr.LARGE_DIFF_HUGE_LINES}) признан раздутым AI-ревьюером: "
-                      f"{size_detail}")
-        findings = f"{bloat_note}\n\n{findings}" if findings.strip() else bloat_note
-    elif size_status == "missing" and verdict != "error":
-        verdict = "error"
-        reason = (f"дифф +{added} строк (порог {check_pr.LARGE_DIFF_HUGE_LINES}) требует "
-                  "явного суждения о размере (строка «РАЗМЕР: оправдан» либо «РАЗМЕР: "
-                  "раздут: …», см. ai_prompt.md), но модель её не дала — строки нет, их "
-                  "несколько, или формулировка не по контракту (тот же класс, что пустой "
-                  "rework без находок, #210)")
-        findings = f"{reason}\n\n{findings}" if findings.strip() else reason
-        reason_tag_value = review_labels.reason_tag(args.dsh_rc, args.failure_reason)
+        # Газ к тормозу review:large (#204): подтверждение размера опирается на
+        # состоявшийся вердикт AI, а не на факт запуска — added считается по
+        # files, уже сверенным с головой ВЫШЕ, поэтому не может прийти из уехавшей
+        # головы (тот же баг, что и протухший diff_fp, закрыт одной сверкой).
+        added = sum(f["additions"] for f in files)
 
-    current = {label["name"] for label in pull["labels"]}
-    label = AI_OK if verdict == "approve" else (AI_CHANGES if verdict == "rework" else AI_FAILED)
-    # Тот же класс идемпотентности, что вердикт-метка review:* в check_pr.py
-    # (#203): повторный вердикт ТОГО ЖЕ значения (автоповтор ai:failed по
-    # таймеру #196, повторный approve после подтягивания main) не выполняет
-    # ни одного изменяющего вызова — ни лишних unlabeled/labeled в таймлайне;
-    # смена вердикта переставляет метку как раньше (решение —
-    # verdict_label_changes, одно место правды с check_pr.py).
-    stale_verdicts, need_verdict_post = review_labels.verdict_label_changes(
-        current, label, AI_VERDICTS)
-    for old in stale_verdicts:
-        run_gh("api", "-X", "DELETE", f"repos/{repo}/issues/{args.pr}/labels/{old}")
-    if need_verdict_post:
-        run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/labels",
-               "-f", f"labels[]={label}")
-    # Множество меток ПОСЛЕ свопа — то, что реально осталось на сервере
-    # (раньше сюда уходило current | {label} без снятых старых ai:*).
-    labels_after = (current - set(stale_verdicts)) | ({label} if need_verdict_post else set())
+        # Диффы сверх check_pr.LARGE_DIFF_HUGE_LINES: суждение модели о размере
+        # ЗАМЕНЯЕТ эскалацию владельцу (мандат 2026-09-11, #939, отменяет #204
+        # п.«escalate»/#901) — читается ДО выбора вердикт-метки, потому что
+        # 'bloated'/'missing' переопределяют сам verdict, а не только газ
+        # large_ok_decision. 'na' (дифф не гигантский) и 'justified' verdict не
+        # трогают. Уже наступивший verdict == "error" (контракт ВЕРДИКТ нарушен,
+        # или #210 empty_rework) не переклассифицируется второй раз — та причина
+        # точнее и вычислена раньше.
+        size_status, size_detail = huge_diff_size_gate(added, answer)
+        if size_status == "bloated" and verdict != "error":
+            verdict = "rework"
+            bloat_note = (f"Объём диффа (+{added} строк, порог "
+                          f"{check_pr.LARGE_DIFF_HUGE_LINES}) признан раздутым AI-ревьюером: "
+                          f"{size_detail}")
+            findings = f"{bloat_note}\n\n{findings}" if findings.strip() else bloat_note
+        elif size_status == "missing" and verdict != "error":
+            verdict = "error"
+            reason = (f"дифф +{added} строк (порог {check_pr.LARGE_DIFF_HUGE_LINES}) требует "
+                      "явного суждения о размере (строка «РАЗМЕР: оправдан» либо «РАЗМЕР: "
+                      "раздут: …», см. ai_prompt.md), но модель её не дала — строки нет, их "
+                      "несколько, или формулировка не по контракту (тот же класс, что пустой "
+                      "rework без находок, #210)")
+            findings = f"{reason}\n\n{findings}" if findings.strip() else reason
+            reason_tag_value = review_labels.reason_tag(args.dsh_rc, args.failure_reason)
 
-    # Commit Status API — тот же вердикт вторым каналом, параллельно метке
-    # (#345): allow_auto_merge читает required status checks, не метки.
-    # error → pending, не failure (review_labels.ai_status_state): сбой
-    # провайдера/транспорта — не решение о коде, у него свой газ — автоповтор
-    # по таймеру (#196), failure держал бы проверку красной до нового пуша.
-    status_description = f"ai-review: error — {reason}" if verdict == "error" else f"ai-review: {verdict}"
-    review_labels.post_commit_status(
-        repo, args.head, review_labels.STATUS_AI_REVIEW,
-        review_labels.ai_status_state(verdict), status_description,
-        run_gh, review_labels.run_target_url(repo))
+        current = {label["name"] for label in pull["labels"]}
+        label = AI_OK if verdict == "approve" else (AI_CHANGES if verdict == "rework" else AI_FAILED)
+        # Тот же класс идемпотентности, что вердикт-метка review:* в check_pr.py
+        # (#203): повторный вердикт ТОГО ЖЕ значения (автоповтор ai:failed по
+        # таймеру #196, повторный approve после подтягивания main) не выполняет
+        # ни одного изменяющего вызова — ни лишних unlabeled/labeled в таймлайне;
+        # смена вердикта переставляет метку как раньше (решение —
+        # verdict_label_changes, одно место правды с check_pr.py).
+        stale_verdicts, need_verdict_post = review_labels.verdict_label_changes(
+            current, label, AI_VERDICTS)
+        # Новая метка СНАЧАЛА, старые снимаются ПОСЛЕ (issue #770, критерий 4:
+        # «не имеет права оставить PR вообще без ai:*, если обрыв случился
+        # между вызовами») — если процесс обрывается между этими двумя
+        # вызовами (после исчерпания повторов), PR несёт на короткое время
+        # ДВЕ ai:*-метки, а не НОЛЬ; следующий прогон verdict сам приведёт
+        # множество к одному значению через тот же verdict_label_changes.
+        if need_verdict_post:
+            run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/labels",
+                   "-f", f"labels[]={label}")
+        for old in stale_verdicts:
+            run_gh("api", "-X", "DELETE", f"repos/{repo}/issues/{args.pr}/labels/{old}")
+        # Множество меток ПОСЛЕ свопа — то, что реально осталось на сервере
+        # (раньше сюда уходило current | {label} без снятых старых ai:*).
+        labels_after = (current - set(stale_verdicts)) | ({label} if need_verdict_post else set())
 
-    # apply_large_ok сама молчит на "skip" (дифф не review:large, AI не
-    # одобрил содержимое, либо verdict уже переопределён размером выше) —
-    # эскалации владельцу здесь больше нет (#939), решение по размеру уже
-    # принято суждением модели до этой строки.
-    apply_large_ok(repo, args.pr, added, labels_after, verdict)
+        # Commit Status API — тот же вердикт вторым каналом, параллельно метке
+        # (#345): allow_auto_merge читает required status checks, не метки.
+        # error → pending, не failure (review_labels.ai_status_state): сбой
+        # провайдера/транспорта — не решение о коде, у него свой газ — автоповтор
+        # по таймеру (#196), failure держал бы проверку красной до нового пуша.
+        status_description = f"ai-review: error — {reason}" if verdict == "error" else f"ai-review: {verdict}"
+        review_labels.post_commit_status(
+            repo, args.head, review_labels.STATUS_AI_REVIEW,
+            review_labels.ai_status_state(verdict), status_description,
+            run_gh, review_labels.run_target_url(repo))
 
-    # Третья категория находок (#462): блоки ЗАМЕЧАНИЕ сливаются в чеклист
-    # ТЕЛА PR, не в комментарий — тело переживает прокрутку и не пропадает
-    # среди прочих комментариев. merge_checklist сама решает, нужен ли PATCH
-    # вовсе (None — новых пунктов нет, отмеченные автором чекбоксы не трогаем).
-    if remarks:
-        new_pr_body = review_checklist.merge_checklist(pull_after_files.get("body") or "", remarks)
-        if new_pr_body is not None:
-            run_gh("api", "-X", "PATCH", f"repos/{repo}/pulls/{args.pr}",
-                   "-f", "body=" + new_pr_body)
-            print(f"checklist: {len(remarks)} замечаний слито в тело PR")
+        # apply_large_ok сама молчит на "skip" (дифф не review:large, AI не
+        # одобрил содержимое, либо verdict уже переопределён размером выше) —
+        # эскалации владельцу здесь больше нет (#939), решение по размеру уже
+        # принято суждением модели до этой строки.
+        apply_large_ok(repo, args.pr, added, labels_after, verdict)
 
-    # Отпечаток диффа (#252) — в шапку комментария, чтобы check_pr.py на
-    # следующем пуше мог сравнить и сохранить метку, если PR не изменился
-    # (см. review_labels.diff_fingerprint/diff_unchanged). files — те же,
-    # что уже сверены с головой выше.
-    diff_fp = review_labels.diff_fingerprint(files)
-    body = build_comment(args.pr, args.head, verdict, findings, tasks, diff_fp=diff_fp,
-                          remarks=remarks, chain_provider=args.chain_provider,
-                          reset_hint=args.reset_hint, reason_tag_value=reason_tag_value,
-                          class_signal=class_signal)
-    run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/comments",
-           "-f", "body=" + body)
+        # Третья категория находок (#462): блоки ЗАМЕЧАНИЕ сливаются в чеклист
+        # ТЕЛА PR, не в комментарий — тело переживает прокрутку и не пропадает
+        # среди прочих комментариев. merge_checklist сама решает, нужен ли PATCH
+        # вовсе (None — новых пунктов нет, отмеченные автором чекбоксы не трогаем).
+        if remarks:
+            new_pr_body = review_checklist.merge_checklist(pull_after_files.get("body") or "", remarks)
+            if new_pr_body is not None:
+                run_gh("api", "-X", "PATCH", f"repos/{repo}/pulls/{args.pr}",
+                       "-f", "body=" + new_pr_body)
+                print(f"checklist: {len(remarks)} замечаний слито в тело PR")
 
-    # Кандидат класса дефекта (#1237) уже лежит в шапке комментария выше
-    # (`class:`, build_comment) — отдельной записи в реестр здесь больше НЕТ
-    # (issue #1255: job `verdict` не имеет `issues: write`, #939, а отдельный
-    # POST на issue #1238 падал 403 при исправно опубликованном главном
-    # комментарии — silent-wrong divergence между эмиссией и записью).
-    # gather (job `review`) агрегирует кандидатов из уже опубликованных
-    # комментариев-вердиктов напрямую (defect_classes.recent_candidate_stats) —
-    # см. докстринг defect_classes.py «Носитель».
+        # Отпечаток диффа (#252) — в шапку комментария, чтобы check_pr.py на
+        # следующем пуше мог сравнить и сохранить метку, если PR не изменился
+        # (см. review_labels.diff_fingerprint/diff_unchanged). files — те же,
+        # что уже сверены с головой выше.
+        diff_fp = review_labels.diff_fingerprint(files)
+        body = build_comment(args.pr, args.head, verdict, findings, tasks, diff_fp=diff_fp,
+                              remarks=remarks, chain_provider=args.chain_provider,
+                              reset_hint=args.reset_hint, reason_tag_value=reason_tag_value,
+                              class_signal=class_signal)
+        run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/comments",
+               "-f", "body=" + body)
+
+        # Кандидат класса дефекта (#1237) уже лежит в шапке комментария выше
+        # (`class:`, build_comment) — отдельной записи в реестр здесь больше НЕТ
+        # (issue #1255: job `verdict` не имеет `issues: write`, #939, а отдельный
+        # POST на issue #1238 падал 403 при исправно опубликованном главном
+        # комментарии — silent-wrong divergence между эмиссией и записью).
+        # gather (job `review`) агрегирует кандидатов из уже опубликованных
+        # комментариев-вердиктов напрямую (defect_classes.recent_candidate_stats) —
+        # см. докстринг defect_classes.py «Носитель».
+    except gh_retry.GhCallExhausted as error:
+        # issue #770, критерий 3: сообщение обязано нести вычисленный вердикт,
+        # не только факт «публикация не удалась» — GhCallExhausted сам несёт
+        # вызов/класс/попытки+время/что делать (__str__), здесь добавляется
+        # ПЯТАЯ часть, специфичная для cmd_verdict: сам вердикт, который
+        # публикация не донесла, — следующий читатель не платит за модель
+        # второй раз, чтобы его узнать.
+        label_note = f" ({label})" if label is not None else " (метка ещё не выбрана — обрыв до размерного гейта)"
+        raise RuntimeError(
+            f"{error} Вердикт УЖЕ ВЫЧИСЛЕН и не потерян: {verdict}{label_note} — "
+            f"повторный запуск `verdict` на этом же --answer опубликует его "
+            f"без обращения к модели заново."
+        ) from error
 
     if verdict == "error":
         tail = redact("\n".join((answer or "").splitlines()[-12:]))
