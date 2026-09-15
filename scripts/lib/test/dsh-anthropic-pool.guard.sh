@@ -1125,8 +1125,15 @@ echo "GUARD(anthropic-pool): 23) pool_unavailable без retryAt -> ответ �
 #      подряд: потолок DSH_POOL_RETRY_AT_MAX_RETRIES=2 обязан остановить
 #      цикл на РОВНО трёх вызовах пула (исходная + два повтора) и честно
 #      уйти на цепочку — не на шестом вызове (когда кончились бы тела).
-#      Мутация (снять счётчик повторов) красит СЕКЦИЮ 19 числом вызовов
-#      (6 вместо 3), дословные выводы обоих прогонов — в PR #1292. ────────
+#      Мутация (снять счётчик повторов: `pool_retry_at_retries + 1` → `+ 0`),
+#      исполненная на ребейзнутом хеде, даёт ДВА наблюдаемых исхода (находка
+#      ai-review PR #1292, второй раунд; оба прогонены, не по памяти):
+#      полный прогон гвардии ВИСНЕТ на секции 19 #1192 — её стаб вечно
+#      отвечает телом с УЖЕ ПРОШЕДШИМ retryAt, цикл без счётчика не кончается,
+#      процесс убит по таймауту (rc=124, вывод обрывается после секции 18);
+#      в изоляции от того ствига (прогон без секции 19) секция 24 краснеет
+#      числом вызовов — 6 вместо 3. Дословные выводы обоих прогонов — в
+#      PR #1292. ────────
 (
   dsh() { dsh_pool_retry_stub "$@"; }
   export -f dsh
@@ -1152,5 +1159,38 @@ echo "GUARD(anthropic-pool): 23) pool_unavailable без retryAt -> ответ �
   [[ "$OUT" == *"пробую цепочку"* ]] || { echo "::error::24) сообщение обязано назвать намерение уйти на цепочку: $OUT" >&2; exit 1; }
 ) || fail "24) пул, упорно отвечающий retryAt в прошлом, обязан упереться в потолок повторов и уйти на цепочку"
 echo "GUARD(anthropic-pool): 24) прошлое retryAt пять подряд -> потолок повторов (3 вызова), честный откат на цепочку — ок (блокер ai-review PR #1292)"
+
+# ── 25) Блокер ai-review PR #1292 (второй раунд): многострочный stderr —
+#      ЧУЖИЕ JSON-строки ДО и ПОСЛЕ тела pool_unavailable (реальная форма:
+#      клиент пишет лог-строки вокруг ответа, #1193 раунд 4). Жадная вырезка
+#      «tr '\n' ' ' | grep -oE '\{.*\}'» брала от первой { до последней } и
+#      ломалась на таком шуме (rc=1, «не разобран») — фикс #1288 молча
+#      выключался ровно на многострочном stderr, прогон неотличим от
+#      дофиксного. Вырезка теперь ПОСТРОЧНАЯ с якорем, одно место правды с
+#      dsh_pool_unavailable_owner_note (_dsh_pool_unavailable_body): шум до
+#      и после не мешает, retryAt разбирается, пул повторён. Мутация (вернуть
+#      tr-жадную вырезку в _dsh_pool_retry_at_wait_secs) красит эту секцию —
+#      «цепочка не должна была вызываться». ─────────────────────────────────
+(
+  dsh() { dsh_pool_retry_stub "$@"; }
+  export -f dsh
+  export DSH_ANTHROPIC_POOL_ACTIVE=1
+  now_ms=$(( $(date +%s) * 1000 ))
+  export SMOKE_POOL_BODY_1="$(printf '%s\n%s\n%s' \
+    "{\"level\":\"info\",\"msg\":\"request started\",\"retryAt\":$((now_ms + 14400000)),\"extra\":{\"a\":1}}" \
+    "dsh: SERVER: 503 {\"type\":\"error\",\"error\":{\"type\":\"pool_unavailable\",\"message\":\"No Anthropic account is available\",\"retryAt\":$((now_ms + 10000))}}" \
+    '{"level":"error","msg":"upstream unavailable","retryAt":"NOT_A_NUMBER"}')"
+  unset SMOKE_POOL_BODY_2 2>/dev/null || true
+  export SMOKE_MODE_primary_model=ok
+  rm -f "$CHAIN_CALLED_MARK" "$POOL_RETRY_CALL_LOG"; : >"$ANSWER"; : >"$ERR"
+  LOG="$WORK/log25.txt"
+  dsh_run_with_pool_then_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+  OUT="$(cat "$LOG")"
+  [ "$DSH_RUN_RC" = "0" ] || { echo "::error::25) ожидался успех пула на повторе, получено rc=$DSH_RUN_RC: $OUT" >&2; exit 1; }
+  [ "$DSH_CHAIN_PROVIDER" = "anthropic-oauth-pool" ] || { echo "::error::25) DSH_CHAIN_PROVIDER='$DSH_CHAIN_PROVIDER', ожидался anthropic-oauth-pool — шум до/после тела не должен ломать разбор" >&2; exit 1; }
+  [ ! -f "$CHAIN_CALLED_MARK" ] || { echo "::error::25) цепочка не должна была вызываться — тело с retryAt среди шума обязано разобраться: $OUT" >&2; exit 1; }
+  [ "$(wc -l <"$POOL_RETRY_CALL_LOG")" = "2" ] || { echo "::error::25) пул обязан быть вызван РОВНО дважды (разбор + повтор): $(cat "$POOL_RETRY_CALL_LOG")" >&2; exit 1; }
+) || fail "25) тело pool_unavailable среди чужих JSON-строк до/после не разбирается"
+echo "GUARD(anthropic-pool): 25) многострочный stderr (шум до/после тела) -> retryAt разобран, пул повторён — ок (блокер ai-review PR #1292, раунд 2)"
 
 echo "GUARD(anthropic-pool): быстрый провайдер Claude (#838), инвариант #860 «пул только в worker/hands» — гвардия зелёная"

@@ -1586,8 +1586,13 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
 # несимметрична на два порядка: до 300с ожидания против 11417с (3ч10мин),
 # которые тот же прогон #1288 потратил на резервную цепочку без этого фикса
 # — даже если бы бюджет ожидания был выжжен впустую (пул НЕ ответил и на
-# повторе), проигрыш ограничен порогом (300с + время одной попытки пула,
-# по логам #1288/#1067 обычно секунды-десятки секунд), не часами. Общий
+# повторе), проигрыш ограничен бюджетом (≤300с ожидания) ПЛЮС попытками
+# пула — названы ОБЕ границы: норма по #1288/#1067 — секунды-десятки секунд
+# на попытку; худший случай — DSH_POOL_RETRY_AT_MAX_RETRIES+1 полных попыток
+# dsh_run_with_retry, каждая до DSH_TIMEOUT_SECS (7200с в worker.yml), т.е.
+# ЧАСЫ (см. следующий абзац про «три полные попытки»), и сверку с
+# 68-минутным запасом worker.yml надо считать по этой, большей, цифре.
+# Общий
 # 340-минутный потолок job'а (worker.yml, обоснование #1160/PR #1247: худший
 # легитимный прогон ≈272 мин, ~68 мин запаса) этот бюджет не задевает — 300с
 # на два порядка меньше свободного запаса.
@@ -1614,18 +1619,24 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
 # честно откатывается на цепочку — не то же самое, что «ждать/повторять,
 # пока пул не ответит», а именно ограниченная, разово обоснованная попытка
 # не тратить резерв зря.
+# Единая вырезка тела pool_unavailable из stderr (класс «жадная вырезка»,
+# раунд 4 PR #1193): ПОСТРОЧНО, якорем `"type":"pool_unavailable"`, последнее
+# вхождение — grep физически не выходит за пределы строки тела, чужой JSON
+# до/после тела не прилипает. Одно место правды на
+# dsh_pool_unavailable_owner_note и _dsh_pool_retry_at_wait_secs. redact()
+# первым звеном маскирует производные секрета (#743), структуру тела не ломает.
+_dsh_pool_unavailable_body() { # err_file -> подстрока от якоря до конца строки тела
+  redact <"$1" 2>/dev/null | grep -oE '"type":"pool_unavailable".*' 2>/dev/null | tail -1
+}
+
 _dsh_pool_retry_at_wait_secs() { # err_file -> секунды до retryAt на stdout, rc=0 если разобрано
-  local err_file=$1 json_str type_field retry_at_ms now_ms
-  # redact() ПЕРВЫМ звеном конвейера — класс #743 (гвардия
-  # dsh-stderr-redact-guard): тело ответа пула — сырой stderr клиента
-  # модели, может нести производное секрета (например 401-тело с токеном в
-  # message) — маскируем до любого другого звена; маскирование значений
-  # JSON-структуру (type/retryAt) не ломает.
-  json_str=$(redact <"$err_file" | tr '\n' ' ' | grep -oE '\{.*\}' 2>/dev/null || true)
-  [ -n "$json_str" ] || return 1
-  type_field=$(jq -r '(.error.type // .type // empty)' <<<"$json_str" 2>/dev/null) || return 1
-  [ "$type_field" = "pool_unavailable" ] || return 1
-  retry_at_ms=$(jq -r '(.error.retryAt // .retryAt // empty)' <<<"$json_str" 2>/dev/null)
+  local err_file=$1 pool_body retry_at_ms now_ms
+  pool_body=$(_dsh_pool_unavailable_body "$err_file")
+  [ -n "$pool_body" ] || return 1
+  # Поля читаются тем же приёмом, что reason в dsh_pool_unavailable_owner_note:
+  # вырезанная строка НЕ валидный JSON (обрезана якорем с обеих сторон), jq
+  # сюда не годится — только ограниченные грепы по конкретным полям.
+  retry_at_ms=$(printf '%s' "$pool_body" | grep -oE '"retryAt":[0-9]+' | head -1 | grep -oE '[0-9]+') || retry_at_ms=""
   [[ "$retry_at_ms" =~ ^[0-9]+$ ]] || return 1
   now_ms=$(( $(date +%s) * 1000 ))
   echo $(( (retry_at_ms - now_ms) / 1000 ))
@@ -1698,7 +1709,9 @@ _dsh_pool_retry_at_wait_secs() { # err_file -> секунды до retryAt на 
 # пула. `reason`/`retryAt` читаются только из вырезанной строки тела.
 dsh_pool_unavailable_owner_note() { # err_file
   local err_file=$1 pool_reason pool_retry_at retry_note note has_body=0 pool_body
-  pool_body=$(grep -oE '"type":"pool_unavailable".*' "$err_file" 2>/dev/null | tail -1) || pool_body=""
+  # Вырезка тела — общая с _dsh_pool_retry_at_wait_secs (#1288): одно место
+  # правды, построчный якорь вместо жадной вырезки (раунд 4 PR #1193).
+  pool_body=$(_dsh_pool_unavailable_body "$err_file") || pool_body=""
   if [ -n "$pool_body" ]; then
     has_body=1
     pool_reason=$(printf '%s' "$pool_body" | grep -oE '"reason":"[a-z_]+"' | head -1 | sed -E 's/.*"reason":"([a-z_]+)".*/\1/') || pool_reason=""
@@ -1778,9 +1791,13 @@ dsh_run_with_pool_then_chain() { # answer_file err_file prompt_text
       [ -n "$pool_err_note" ] || pool_err_note="stderr пуст — диагностику дать не может"
       # #1192: reason читаем ДО той же перезаписи err_file, которой посвящён
       # комментарий #1067 выше — тем же приёмом («здесь, до перезаписи»).
-      # Ребейз на c1df957 (#1192/#1193): note владельца сопровождает КАЖДЫЙ
-      # исход пула, не только финальный откат — «владелец нужен» при
-      # auth_rejected отменяет смысл ожидания retryAt (retryAt может врать).
+      # Ребейз на c1df957 (#1192/#1193): note владельца печатается на КАЖДОМ
+      # исходе пула, а не только на финальном откате — владелец видит
+      # auth_rejected («владелец нужен») уже в первом предупреждении. ЭТО
+      # НЕ ГЕЙТ: код ниже reason не читает и ожидание по нему не отменяет —
+      # при auth_rejected ожидание/повторы могут оказаться заведомо
+      # безнадёжными, вред ограничен потолками (бюджет 300с, ≤2 повтора);
+      # гейт по reason — отдельное решение, не сделано в этом PR.
       pool_reason_note=$(dsh_pool_unavailable_owner_note "$err_file")
       if retry_at_wait=$(_dsh_pool_retry_at_wait_secs "$err_file"); then
         budget_left=$((pool_retry_at_budget - pool_retry_at_waited))
