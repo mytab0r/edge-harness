@@ -55,6 +55,11 @@ export PRIORITY_TOP_FIXTURE="$WORK/priority-fixture.json"
 echo '[]' >"$PRIORITY_TOP_FIXTURE"
 NOT_PROCESS_ACK=(--not-process-ack "не про приоритет, тест дедупа #566")
 
+# Валидное тело с объявлением связи (#720) — используется во всех случаях ниже
+VALID_BODY="### Чем блокируется
+ничем
+"
+
 cat >"$WORK/bin/gh" <<GHEOF
 #!/usr/bin/env bash
 if [ "\$1" = "repo" ] && [ "\$2" = "view" ]; then
@@ -95,7 +100,7 @@ note() { echo "$@"; }
 
 # ── случай 1: похожий заголовок, БЕЗ --confirm-not-duplicate — отказ ─────────
 rm -f "$MARKER" "$CREATED_BODY"
-if bash "$SCRIPT_SRC" --title "$TITLE_564" --body b --label task "${NOT_PROCESS_ACK[@]}" >"$WORK/out1" 2>"$WORK/err1"; then
+if bash "$SCRIPT_SRC" --title "$TITLE_564" --body "$VALID_BODY" --label task "${NOT_PROCESS_ACK[@]}" >"$WORK/out1" 2>"$WORK/err1"; then
   note "FAIL случай 1: похожий заголовок принят без --confirm-not-duplicate"; fail=1
 elif [ -f "$MARKER" ]; then
   note "FAIL случай 1: gh issue create был вызван, хотя похожая задача есть"; fail=1
@@ -107,7 +112,9 @@ fi
 
 # ── случай 2: похожий заголовок + --confirm-not-duplicate — принято, причина в теле ──
 rm -f "$MARKER" "$CREATED_BODY"
-if ! bash "$SCRIPT_SRC" --title "$TITLE_564" --body "исходное тело" --label task \
+# Тело с объявлением связи + исходное содержимое
+BODY_WITH_DEP="${VALID_BODY}исходное тело"
+if ! bash "$SCRIPT_SRC" --title "$TITLE_564" --body "$BODY_WITH_DEP" --label task \
     --confirm-not-duplicate "разные причины отказа, не дубль" "${NOT_PROCESS_ACK[@]}" >"$WORK/out2" 2>"$WORK/err2"; then
   note "FAIL случай 2: --confirm-not-duplicate отклонён"; cat "$WORK/err2"; fail=1
 elif [ ! -f "$MARKER" ]; then
@@ -124,7 +131,7 @@ fi
 
 # ── случай 3: непохожий заголовок — принято без всякого флага ───────────────
 rm -f "$MARKER" "$CREATED_BODY"
-if ! bash "$SCRIPT_SRC" --title "Совсем другая задача про докер-канарейку" --body b --label task \
+if ! bash "$SCRIPT_SRC" --title "Совсем другая задача про докер-канарейку" --body "$VALID_BODY" --label task \
     "${NOT_PROCESS_ACK[@]}" >"$WORK/out3" 2>"$WORK/err3"; then
   note "FAIL случай 3: непохожий заголовок отклонён"; cat "$WORK/err3"; fail=1
 elif [ ! -f "$MARKER" ]; then
