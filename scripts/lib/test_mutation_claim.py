@@ -256,6 +256,8 @@ def test_run_mutation_proof_setup_error_baseline_red(tmp_path: Path):
     outcome = mutation_claim.run_mutation_proof(tmp_path, claim)
     assert outcome.verdict == "setup_error"
     assert "красный ДО мутации" in outcome.message
+    # Ошибка ДО применения патча: дерево не трогалось вовсе.
+    assert outcome.tree_restored is None
 
 
 def test_run_mutation_proof_setup_error_patch_does_not_apply(tmp_path: Path):
@@ -273,6 +275,7 @@ def test_run_mutation_proof_setup_error_patch_does_not_apply(tmp_path: Path):
     assert outcome.verdict == "setup_error"
     assert "не накладывается" in outcome.message
     # Дерево не тронуто.
+    assert outcome.tree_restored is None
     assert _git(tmp_path, "status", "--porcelain").stdout.strip() == ""
 
 
@@ -288,7 +291,64 @@ def test_run_mutation_proof_proved_on_real_behavioral_coupling(tmp_path: Path):
     )
     outcome = mutation_claim.run_mutation_proof(tmp_path, claim)
     assert outcome.verdict == "proved"
+    assert outcome.tree_restored is True
     assert _git(tmp_path, "status", "--porcelain").stdout.strip() == ""
+
+
+_TEST_TOGGLE_VANDAL = """\
+import target
+
+
+def test_toggle():
+    if target.VALUE != "fixed":
+        # Вандализм ТОЛЬКО под мутацией: перезапись файла ломает контекст
+        # патча, `git apply -R` обязан упасть — проверяем аварийное
+        # восстановление дерева (находка ai-review PR #1028).
+        with open("target.py", "w", encoding="utf-8") as fh:
+            fh.write('VALUE = "vandalised"\\n')
+    assert target.VALUE == "fixed"
+"""
+
+
+def test_run_mutation_proof_revert_failure_restores_tree(tmp_path: Path):
+    """Неудавшийся `git apply -R` не оставляет дерево мутированным молча:
+    тест-вандал перезаписывает target.py ПОД мутацией (контекст патча
+    исчезает, reverse-apply падает), аварийное восстановление
+    (`git checkout --` по путям патча) возвращает файл. Исход — setup_error,
+    но `tree_restored is True` и дерево чистое (находка ai-review PR #1028)."""
+    (tmp_path / "target.py").write_text(_TARGET_FIXED, encoding="utf-8")
+    (tmp_path / "test_toggle.py").write_text(_TEST_TOGGLE_VANDAL, encoding="utf-8")
+    _init_repo(tmp_path)
+    patch = _diff_for_toggle(tmp_path)
+    claim = mutation_claim.MutationClaim(
+        test_cmd="python -m pytest test_toggle.py -q",
+        test_target="test_toggle.py",
+        patch_text=patch,
+    )
+    outcome = mutation_claim.run_mutation_proof(tmp_path, claim)
+    assert outcome.verdict == "setup_error"
+    assert outcome.tree_restored is True
+    assert "аварийно" in outcome.message
+    assert _git(tmp_path, "status", "--porcelain").stdout.strip() == ""
+
+
+def test_patch_file_paths_parses_diff_headers():
+    patch = (
+        "diff --git a/scripts/lib/x.py b/scripts/lib/x.py\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/scripts/lib/x.py\n"
+        "+++ b/scripts/lib/x.py\n"
+        "@@ -1,1 +1,1 @@\n"
+        "-old\n"
+        "+new\n"
+        "diff --git a/scripts/lib/y.py b/scripts/lib/y.py\n"
+        "new file mode 100644\n"
+    )
+    assert mutation_claim.patch_file_paths(patch) == [
+        "scripts/lib/x.py",
+        "scripts/lib/y.py",
+    ]
+    assert mutation_claim.patch_file_paths("") == []
 
 
 # ── run_mutation_proof: живая история PR #893 ────────────────────────────────
@@ -359,8 +419,55 @@ def test_run_mutation_proof_false_claim_on_pr893_fixture(tmp_path: Path):
     )
     outcome = mutation_claim.run_mutation_proof(repo, claim)
     assert outcome.verdict == "false_claim", outcome.report()
+    assert outcome.tree_restored is True
     # Рабочее дерево обязано вернуться в исходное состояние независимо от вердикта.
     assert _git(repo, "status", "--porcelain").stdout.strip() == ""
+
+
+# ── _sections: fenced-блоки не терминируют секцию ────────────────────────────
+
+def test_sections_hash_context_line_inside_diff_fence_not_truncated():
+    """Строка « ## Раздел» ВНУТРИ дифф-фенса (заголовок markdown в диффе,
+    после strip начинающаяся с «## ») не терминирует секцию заявления —
+    раньше секция обрезалась на середине патча, и автор видел отказ
+    «не найден блок ```diff» на визуально корректном блоке (находка
+    ai-review PR #1028)."""
+    body = (
+        "## Доказательство мутацией\n"
+        "Тест: `python -m pytest scripts/lib/test_x.py::test_y -q`\n"
+        "```diff\n"
+        "--- a/docs/readme.md\n"
+        "+++ b/docs/readme.md\n"
+        "@@ -1,2 +1,2 @@\n"
+        " ## Раздел\n"
+        "-старое\n"
+        "+новое\n"
+        "```\n"
+        "\n"
+        "## Чеклист ревью\n"
+        "- [ ] пункт\n"
+    )
+    sections = mutation_claim._sections(body, mutation_claim.MUTATION_HEADING)
+    assert len(sections) == 1
+    assert " ## Раздел" in sections[0]
+    assert "+новое" in sections[0]
+    # И полный parse на таком теле проходит, а не падает «не найден блок».
+    claims = mutation_claim.parse_mutation_claims(body)
+    assert len(claims) == 1
+    assert "+новое" in claims[0].patch_text
+
+
+def test_sections_heading_inside_fence_does_not_start_section():
+    """Заголовок внутри фенса (цитата формата блока в примере) не открывает
+    секцию — фенс-состояние учитывается и ДО секции."""
+    body = (
+        "Пролог.\n"
+        "```\n"
+        "## Доказательство мутацией\n"
+        "```\n"
+        "Эпилог без блоков.\n"
+    )
+    assert mutation_claim._sections(body, mutation_claim.MUTATION_HEADING) == []
 
 
 if __name__ == "__main__":

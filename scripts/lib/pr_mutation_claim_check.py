@@ -19,21 +19,36 @@
      паттерн). Блокирует: заявленное число совпадений — то же самое, что
      утверждение «мутация доказана» для мутации, разница только в форме
      проверки.
-  3. **«Мутация доказана»** — ТОЛЬКО для PR, меняющих `scripts/ci/guards/
-     *.sh` (см. `mutation_claim.guard_catalog_paths_changed`). Дорогая
-     (применяет патч, дважды гоняет pytest, откатывает) — ограничена этим
-     подмножеством: за 15 дней истории репозитория (2026-08-28…2026-09-11,
-     328 коммитов) ровно 12 коммитов трогали `scripts/ci/guards/*.sh`
-     (~3,7%, около одного PR в один-два дня) — не каждый PR платит цену
-     мутационного прогона. Блокирует: обязательна для таких PR (её
-     отсутствие — контрактное нарушение, не «не заявлено»), и обязана
-     закончиться вердиктом `proved`.
+  3. **«Мутация доказана»** — проверяется ВСЕГДА, когда блок присутствует
+     в теле PR: автор написал блок — он заявил, проверка за этим следует
+     (находка ai-review PR #1028: ограничение «только PR с гвардиями»
+     пропускало мотивирующий случай — ложное «доказательство мутацией»
+     коммита 508e6899 из #893 лежало в PR, трогавшем только
+     `scripts/git/worktree-cleanup.py` и
+     `scripts/lib/test_worktree_cleanup_guard.py`, и мимо собственно
+     механизма #968 прошло бы молча). ОБЯЗАТЕЛЬНЫМ блок держится только
+     для PR, меняющих `scripts/ci/guards/*.sh` (см.
+     `mutation_claim.guard_catalog_paths_changed`): дорогая проверка
+     (применяет патч, дважды гоняет pytest, откатывает) ложится на автора
+     только тогда, когда он сам заявил мутацию или добавляет/меняет гвардию
+     каталога. Блокирует: у заявленной мутации обязан быть вердикт `proved`;
+     у обязательной — само её наличие. Удаление гвардии каталога не
+     блокирует (патчу нечего снимать), но печатает отдельную строку —
+     решение за ревью.
 
 Вход: событие `pull_request` (тело PR, номер — из $GITHUB_EVENT_PATH, без
 `gh api`); список изменённых файлов — `gh api .../pulls/{n}/files`
 (GH_TOKEN уже в env на уровне шага-перебора каталога гвардий, #749, см.
 repo-ci.yml). На событиях, отличных от pull_request (push, workflow_dispatch)
 — проверка пропускается целиком с явной причиной (тела PR нет), это не сбой.
+
+Замер цены обязательного блока — командой, не по памяти (числа зависят от
+окна и базы: находка ai-review PR #1028 показала, что прежние «12 из 328 за
+окно» по памяти не воспроизводятся). На базе этой ветки dddd94c вся история —
+343 коммита, из них 19 трогают `scripts/ci/guards/*.sh` (~5,5%):
+
+    git log dddd94c --format='%H' -- 'scripts/ci/guards/*.sh' | wc -l   # 19
+    git rev-list --count dddd94c                                        # 343
 
 Запуск: python scripts/lib/pr_mutation_claim_check.py
 """
@@ -60,6 +75,20 @@ _MC_SPEC.loader.exec_module(mutation_claim)  # type: ignore[union-attr]
 
 REPO_ROOT = mutation_claim.REPO_ROOT
 
+# Честный газ тормоза (находка ai-review PR #1028): repo-ci.yml триггерится
+# на голый `pull_request:` без `edited`, поэтому САМА правка тела PR
+# обязательную проверку не перезапускает. Каждое сообщение, починка которого
+# требует правки тела, обязано называть рабочий путь: новый коммит (любой) —
+# или переоткрытие PR. Прецедент триггера с `edited` — orchestra.yml (#599);
+# подключать `edited` к repo-ci здесь сознательно не делаем: каждая правка
+# тела перезапускала бы весь job `test` и цепочку ai-review — отдельное
+# решение о цене, не побочный эффект этого механизма.
+GAS_NOTE = (
+    "Газ: добавь/исправь блок в теле PR и запуши любой коммит (одна правка "
+    "тела прогон repo-ci не перезапускает — триггер без `edited`), либо "
+    "переоткрой PR"
+)
+
 
 class GhError(RuntimeError):
     pass
@@ -81,20 +110,26 @@ def _gh_api(*args: str) -> dict | list | None:
     return json.loads(result.stdout) if result.stdout.strip() else None
 
 
-def list_pr_changed_files(repo: str, number: int) -> list[str]:
-    """Пути файлов PR, статус которых не `removed` (постранично, класс #308 —
-    не читать только первую страницу)."""
-    paths: list[str] = []
+def list_pr_changed_and_removed_files(repo: str, number: int) -> tuple[list[str], list[str]]:
+    """(изменённые, удалённые) пути файлов PR, постранично (класс #308 —
+    не читать только первую страницу). Удалённые (`status == "removed"`)
+    НЕ выбрасываются молча: PR, целиком убивающий гвардию каталога, —
+    крайнее значение объекта, и раньше оно было невидимо в логе вовсе
+    (находка ai-review PR #1028)."""
+    changed: list[str] = []
+    removed: list[str] = []
     page = 1
     while True:
         chunk = _gh_api(f"repos/{repo}/pulls/{number}/files?per_page=100&page={page}") or []
         for entry in chunk:
-            if entry.get("status") != "removed":
-                paths.append(entry["filename"])
+            if entry.get("status") == "removed":
+                removed.append(entry["filename"])
+            else:
+                changed.append(entry["filename"])
         if len(chunk) < 100:
             break
         page += 1
-    return paths
+    return changed, removed
 
 
 def _report_unverified(body: str) -> bool:
@@ -115,7 +150,7 @@ def _report_unverified(body: str) -> bool:
         f"машина проверить не может ({check.mentions}), но не помечает их "
         f"под «{mutation_claim.UNVERIFIED_HEADING}» — читатель может принять "
         f"прозу за доказательство. Добавь секцию с этим заголовком, "
-        f"перечислив, что именно непроверено."
+        f"перечислив, что именно непроверено. {GAS_NOTE}"
     )
     return True
 
@@ -125,7 +160,7 @@ def _run_class_closed(body: str, repo_root: Path) -> bool:
     try:
         claims = mutation_claim.parse_class_closed_claims(body)
     except mutation_claim.MutationClaimFormatError as error:
-        print(f"::error::{error}")
+        print(f"::error::{error} {GAS_NOTE}")
         return True
     failed = False
     for claim in claims:
@@ -145,32 +180,55 @@ def _run_class_closed(body: str, repo_root: Path) -> bool:
     return failed
 
 
-def _run_mutation_proof(body: str, changed_files: list[str], repo_root: Path) -> bool:
-    """True — есть провал (гвардия обязательна и не доказана / отсутствует /
-    неверной формы). Печатает, требуется ли проверка вовсе — молчаливого
-    пропуска (когда PR реально меняет гвардию) быть не должно."""
-    guard_paths = mutation_claim.guard_catalog_paths_changed(changed_files)
-    if not guard_paths:
-        print(
-            "mutation-claim: PR не меняет scripts/ci/guards/*.sh — "
-            "мутационная проверка не требуется (ограничение цены, #968)"
-        )
-        return False
+def _run_mutation_proof(
+    body: str, changed_files: list[str], removed_files: list[str], repo_root: Path
+) -> bool:
+    """True — есть провал (заявленная мутация не доказана / обязательный блок
+    отсутствует / блок неверной формы). Печатает, что проверяется, а что нет —
+    молчаливого пропуска быть не должно.
 
-    print(f"mutation-claim: PR меняет гвардию(и) каталога: {guard_paths} — требуется «{mutation_claim.MUTATION_HEADING}»")
+    Заявление проверяется ВСЕГДА, когда блок присутствует в теле: автор
+    написал блок — он заявил, и мотивирующий случай (#893: ложное
+    «доказательство мутацией» в PR, НЕ трогающем каталог гвардий) проходит
+    мимо механизма только при ограничении «сначала посмотри файлы PR»
+    (находка ai-review PR #1028). Обязательным блок остаётся только для PR,
+    меняющих `scripts/ci/guards/*.sh` — цена на тех, кто не заявлял, не
+    ложится."""
+    guard_paths = mutation_claim.guard_catalog_paths_changed(changed_files)
+    removed_guards = mutation_claim.guard_catalog_paths_changed(removed_files)
+    if removed_guards:
+        # Не блокирует (патчу нечего снимать), но и не молчит: удаление
+        # гвардии — крайнее значение объекта, решение за ревью (находка
+        # ai-review PR #1028).
+        print(
+            f"::warning::mutation-claim: PR УДАЛЯЕТ гвардию(и) каталога: "
+            f"{removed_guards} — мутационная проверка на удаление не "
+            f"запускается (снимать нечего), решение за ревью"
+        )
+    if guard_paths:
+        print(f"mutation-claim: PR меняет гвардию(и) каталога: {guard_paths} — требуется «{mutation_claim.MUTATION_HEADING}»")
+
     try:
         claims = mutation_claim.parse_mutation_claims(body)
     except mutation_claim.MutationClaimFormatError as error:
-        print(f"::error::{error}")
+        print(f"::error::{error} {GAS_NOTE}")
         return True
+
     if not claims:
+        if guard_paths:
+            print(
+                f"::error::mutation-claim: PR меняет {guard_paths}, но тело PR не "
+                f"несёт блока «{mutation_claim.MUTATION_HEADING}» — заявление о "
+                f"мутации обязательно для PR, добавляющего/меняющего гвардию каталога "
+                f"scripts/ci/guards/*.sh (issue #968). {GAS_NOTE}"
+            )
+            return True
         print(
-            f"::error::mutation-claim: PR меняет {guard_paths}, но тело PR не "
-            f"несёт блока «{mutation_claim.MUTATION_HEADING}» — заявление о "
-            f"мутации обязательно для PR, добавляющего/меняющего гвардию каталога "
-            f"scripts/ci/guards/*.sh (issue #968)"
+            "mutation-claim: PR не меняет scripts/ci/guards/*.sh, блок "
+            "«Доказательство мутацией» в теле отсутствует — мутационная "
+            "проверка не требуется (ограничение цены, #968)"
         )
-        return True
+        return False
 
     failed = False
     for claim in claims:
@@ -178,6 +236,18 @@ def _run_mutation_proof(body: str, changed_files: list[str], repo_root: Path) ->
         print(outcome.report())
         if outcome.verdict != "proved":
             failed = True
+            print(f"mutation-claim: {GAS_NOTE}")
+        if outcome.tree_restored is False:
+            # Не продолжаем по мутированному дереву: следующий прогон дал бы
+            # вердикт по чужой причине (данные различают, не догадка —
+            # mutation_claim.MutationProofOutcome.tree_restored).
+            print(
+                "::error::mutation-claim: дерево могло остаться мутированным "
+                "после этого заявления — остальные заявления этого прогона "
+                "не проверяются (продолжение дало бы вердикты по чужой "
+                "причине); исправь патч и запуши заново"
+            )
+            break
     return failed
 
 
@@ -206,12 +276,12 @@ def main() -> int:
     failed = _run_class_closed(body, REPO_ROOT)
 
     try:
-        changed_files = list_pr_changed_files(repo, number)
+        changed_files, removed_files = list_pr_changed_and_removed_files(repo, number)
     except GhError as error:
         print(f"::error::mutation-claim: список файлов PR #{number} не прочитан ({error})")
         return 1
 
-    failed = _run_mutation_proof(body, changed_files, REPO_ROOT) or failed
+    failed = _run_mutation_proof(body, changed_files, removed_files, REPO_ROOT) or failed
 
     return 1 if failed else 0
 
