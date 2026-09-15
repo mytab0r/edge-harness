@@ -956,5 +956,151 @@ echo "GUARD(anthropic-pool): 18) dsh_pool_unavailable_owner_note — восем�
   grep -q "перевыпуск секретов ANTHROPIC_OAUTH_1 ANTHROPIC_OAUTH_2" "$POOL_LOG19" || { echo "::error::19) предупреждение не назвало конкретные секреты на перевыпуск: $(cat "$POOL_LOG19")" >&2; exit 1; }
 ) || fail "19) сквозной путь: reason виден в предупреждении, откат на цепочку не сломан"
 echo "GUARD(anthropic-pool): 19) dsh_run_with_pool_then_chain — reason виден владельцу, откат на цепочку честный (класс #1067/#838 не сломан) — ок (#1192)"
+# ── 20) #1288 (живой инцидент, прогон worker.yml 34893177035): пул отдаёт
+#      прод-форму отказа ДОСЛОВНО из этого инцидента — `retryAt` уже в
+#      прошлом к моменту прогона гвардии (фиксированная дата инцидента,
+#      2026-09-14T20:35:14Z) — эффективный остаток отрицателен, что попадает
+#      в ветку «близко» (клампится к 0, ретраим немедленно, не «далеко»).
+#      Второй вызов пула отвечает успехом -> цепочка НЕ вызывается вовсе,
+#      несмотря на то что первая попытка пула провалилась.
+#
+# MUTATION-PROOF
+# ref: 8cd752e6
+# paths: scripts/lib/dsh-ci.sh
+# run: bash scripts/lib/test/dsh-anthropic-pool.guard.sh
+# expect: 20) прод-форма ответа пула из инцидента #1288 (34893177035) не приводит к повтору того же провайдера
+#
+# (ref — коммит main ДО этого фикса: dsh_run_with_pool_then_chain там не
+# читает retryAt вовсе и откатывается на цепочку одной попыткой — секция 15
+# красная с DSH_CHAIN_PROVIDER='PRIMARY' вместо 'anthropic-oauth-pool'.) ────
+POOL_RETRY_CALL_LOG="$WORK/pool-retry-calls.log"
+# Дословное тело ответа пула из инцидента #1288 (прогон 34893177035,
+# 20:30:30): retryAt=1789418114634мс = 2026-09-14T20:35:14Z.
+POOL_BODY_INCIDENT_1288='dsh: SERVER: 503 {"type":"error","error":{"type":"pool_unavailable","message":"No Anthropic account is available","retryAt":1789418114634}}'
+dsh_pool_retry_stub() {
+  case "${1:-}" in
+    --profile)
+      if grep -q 'provider: anthropic-pool' "$HOME/.dsh/profiles/headless/cordis.patch.yml" 2>/dev/null; then
+        echo call >>"$POOL_RETRY_CALL_LOG"
+        local n; n=$(wc -l <"$POOL_RETRY_CALL_LOG")
+        local body_var="SMOKE_POOL_BODY_$n"
+        local body="${!body_var:-}"
+        if [ -z "$body" ]; then
+          echo "smoke: ответ от anthropic-oauth-pool (попытка $n)"
+          return 0
+        fi
+        echo "$body" >&2
+        return 1
+      else
+        touch "$CHAIN_CALLED_MARK"
+        echo "smoke: ответ от $DEEPSEEK_MODEL"
+        return 0
+      fi ;;
+    *) echo "::error::SMOKE(retryAt): dsh-заглушка не знает вызов: $*" >&2; return 99 ;;
+  esac
+}
+(
+  dsh() { dsh_pool_retry_stub "$@"; }
+  export -f dsh
+  export DSH_ANTHROPIC_POOL_ACTIVE=1
+  export SMOKE_POOL_BODY_1="$POOL_BODY_INCIDENT_1288"
+  unset SMOKE_POOL_BODY_2 2>/dev/null || true
+  export SMOKE_MODE_primary_model=ok
+  rm -f "$CHAIN_CALLED_MARK" "$POOL_RETRY_CALL_LOG"; : >"$ANSWER"; : >"$ERR"
+  LOG="$WORK/log20.txt"
+  dsh_run_with_pool_then_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+  OUT="$(cat "$LOG")"
+  [ "$DSH_RUN_RC" = "0" ] || { echo "::error::20) ожидался успех пула на повторе, получено rc=$DSH_RUN_RC: $OUT" >&2; exit 1; }
+  [ "$DSH_CHAIN_PROVIDER" = "anthropic-oauth-pool" ] || { echo "::error::20) DSH_CHAIN_PROVIDER='$DSH_CHAIN_PROVIDER', ожидался anthropic-oauth-pool" >&2; exit 1; }
+  [ ! -f "$CHAIN_CALLED_MARK" ] || { echo "::error::20) цепочка не должна была вызываться — retryAt близко, пул обязан был ответить на повторе" >&2; exit 1; }
+  [ "$(wc -l <"$POOL_RETRY_CALL_LOG")" = "2" ] || { echo "::error::20) пул обязан быть вызван РОВНО дважды (первая попытка + повтор после retryAt): $(cat "$POOL_RETRY_CALL_LOG")" >&2; exit 1; }
+  [[ "$OUT" == *"пул сам назвал момент возврата через"* ]] || { echo "::error::20) сообщение обязано честно назвать факт retryAt: $OUT" >&2; exit 1; }
+  [[ "$OUT" == *"жду и повторяю тем же провайдером (#1288)"* ]] || { echo "::error::20) сообщение обязано назвать намерение повторить тот же провайдер: $OUT" >&2; exit 1; }
+) || fail "20) прод-форма ответа пула из инцидента #1288 (34893177035) не приводит к повтору того же провайдера"
+echo "GUARD(anthropic-pool): 20) retryAt прод-формы инцидента #1288 близко -> пул повторён, цепочка не тронута — ок"
+
+# ── 21) Бюджет ожидания retryAt — СУММАРНЫЙ, не per-попытка: два подряд
+#      close-retryAt (6с каждый) при бюджете 10с — первый укладывается
+#      (10>6), второй уже НЕ укладывается в остаток (10-6=4 < 6) -> третьей
+#      попытки пула нет, честный откат на цепочку с остатком бюджета в
+#      сообщении. ─────────────────────────────────────────────────────────
+(
+  dsh() { dsh_pool_retry_stub "$@"; }
+  export -f dsh
+  export DSH_ANTHROPIC_POOL_ACTIVE=1
+  export DSH_POOL_RETRY_AT_MAX_WAIT_SECS=30
+  now_ms=$(( $(date +%s) * 1000 ))
+  # Первый retryAt (20с) укладывается в полный бюджет (30с); второй (50с) —
+  # НЕ укладывается в остаток (30-~20=~10 < 50), даже с учётом того, что
+  # `sleep` в этой гвардии — заглушка-no-op (реальное время между попытками
+  # не проходит, оба retryAt считаются от одной и той же точки «сейчас») и
+  # с учётом накладных расходов на процессы между вызовом `date` здесь и
+  # внутри `_dsh_pool_retry_at_wait_secs` (секунды на Windows Git Bash из-за
+  # спавна процессов patch_profile/jq/grep) — разрыв 20с/50с выбран заведомо
+  # больше любого реалистичного дребезга.
+  export SMOKE_POOL_BODY_1="dsh: SERVER: 503 {\"type\":\"error\",\"error\":{\"type\":\"pool_unavailable\",\"message\":\"No Anthropic account is available\",\"retryAt\":$((now_ms + 20000))}}"
+  export SMOKE_POOL_BODY_2="dsh: SERVER: 503 {\"type\":\"error\",\"error\":{\"type\":\"pool_unavailable\",\"message\":\"No Anthropic account is available\",\"retryAt\":$((now_ms + 50000))}}"
+  export SMOKE_MODE_primary_model=ok
+  rm -f "$CHAIN_CALLED_MARK" "$POOL_RETRY_CALL_LOG"; : >"$ANSWER"; : >"$ERR"
+  LOG="$WORK/log21.txt"
+  dsh_run_with_pool_then_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+  OUT="$(cat "$LOG")"
+  [ "$DSH_RUN_RC" = "0" ] || { echo "::error::21) ожидался успех после отката на цепочку, получено rc=$DSH_RUN_RC: $OUT" >&2; exit 1; }
+  [ "$DSH_CHAIN_PROVIDER" = "PRIMARY" ] || { echo "::error::21) DSH_CHAIN_PROVIDER='$DSH_CHAIN_PROVIDER', ожидался PRIMARY (откат на цепочку после исчерпания бюджета)" >&2; exit 1; }
+  [ -f "$CHAIN_CALLED_MARK" ] || { echo "::error::21) цепочка обязана была запуститься — суммарный бюджет исчерпан" >&2; exit 1; }
+  [ "$(wc -l <"$POOL_RETRY_CALL_LOG")" = "2" ] || { echo "::error::21) пул обязан быть вызван РОВНО дважды (первый retryAt уложился, второй — уже нет): $(cat "$POOL_RETRY_CALL_LOG")" >&2; exit 1; }
+  [[ "$OUT" == *"жду и повторяю тем же провайдером (#1288)"* ]] || { echo "::error::21) первый retryAt (3с) обязан был уложиться в бюджет и вызвать повтор: $OUT" >&2; exit 1; }
+  [[ "$OUT" == *"это дольше бюджета ожидания 30с (уже ждал "*"с, остаток "*"с)"* ]] || { echo "::error::21) второй retryAt (50с) обязан честно назвать превышение ОСТАТКА суммарного бюджета (не полного бюджета заново): $OUT" >&2; exit 1; }
+) || fail "21) суммарный бюджет ожидания retryAt не учитывает уже потраченное на предыдущих повторах"
+echo "GUARD(anthropic-pool): 21) бюджет ожидания retryAt суммируется по повторам, не выдаётся заново — ок (#1288)"
+
+# ── 22) retryAt ДАЛЕКО за пределами бюджета уже на ПЕРВОЙ попытке -> пул
+#      вызывается ровно один раз (без ожидания), честный откат на цепочку
+#      называет и факт retryAt, и то, что порог превышен. ─────────────────
+(
+  dsh() { dsh_pool_retry_stub "$@"; }
+  export -f dsh
+  export DSH_ANTHROPIC_POOL_ACTIVE=1
+  export DSH_POOL_RETRY_AT_MAX_WAIT_SECS=300
+  now_ms=$(( $(date +%s) * 1000 ))
+  # #1288: далёкое будущее (часы вперёд) — потолок ожидания обязателен, его
+  # превышение (в т.ч. когда retryAt может оказаться враньём/далёким
+  # будущим) — законный повод идти дальше, а не ждать это время целиком.
+  export SMOKE_POOL_BODY_1="dsh: SERVER: 503 {\"type\":\"error\",\"error\":{\"type\":\"pool_unavailable\",\"message\":\"No Anthropic account is available\",\"retryAt\":$((now_ms + 14400000))}}"
+  export SMOKE_MODE_primary_model=ok
+  rm -f "$CHAIN_CALLED_MARK" "$POOL_RETRY_CALL_LOG"; : >"$ANSWER"; : >"$ERR"
+  LOG="$WORK/log22.txt"
+  dsh_run_with_pool_then_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+  OUT="$(cat "$LOG")"
+  [ "$DSH_RUN_RC" = "0" ] || { echo "::error::22) ожидался успех после отката на цепочку, получено rc=$DSH_RUN_RC: $OUT" >&2; exit 1; }
+  [ "$DSH_CHAIN_PROVIDER" = "PRIMARY" ] || { echo "::error::22) DSH_CHAIN_PROVIDER='$DSH_CHAIN_PROVIDER', ожидался PRIMARY" >&2; exit 1; }
+  [ -f "$CHAIN_CALLED_MARK" ] || { echo "::error::22) цепочка обязана была запуститься" >&2; exit 1; }
+  [ "$(wc -l <"$POOL_RETRY_CALL_LOG")" = "1" ] || { echo "::error::22) пул НЕ обязан быть вызван повторно — retryAt (4 часа) дальше бюджета (300с) уже на первой попытке: $(cat "$POOL_RETRY_CALL_LOG")" >&2; exit 1; }
+  [[ "$OUT" == *"пул назвал момент возврата через"* ]] || { echo "::error::22) сообщение обязано назвать факт retryAt: $OUT" >&2; exit 1; }
+  [[ "$OUT" == *"это дольше бюджета ожидания 300с"* ]] || { echo "::error::22) сообщение обязано честно назвать превышение бюджета (не молчать, не гадать): $OUT" >&2; exit 1; }
+) || fail "22) далёкий retryAt не откатывается на цепочку честно"
+echo "GUARD(anthropic-pool): 22) retryAt дальше бюджета ожидания -> без ожидания, честный откат на цепочку — ок (#1288)"
+
+# ── 23) pool_unavailable БЕЗ поля retryAt (null — прод-форма плагина, когда
+#      ни у одного аккаунта нет известного cooldownUntil, lib/index.js:
+#      `next?.cooldownUntil || null`) -> ответ не разобран, откат на
+#      цепочку СТАРЫМ путём (не пытаемся угадывать время ожидания). ───────
+(
+  dsh() { dsh_pool_retry_stub "$@"; }
+  export -f dsh
+  export DSH_ANTHROPIC_POOL_ACTIVE=1
+  export SMOKE_POOL_BODY_1='dsh: SERVER: 503 {"type":"error","error":{"type":"pool_unavailable","message":"No Anthropic account is available","retryAt":null}}'
+  export SMOKE_MODE_primary_model=ok
+  rm -f "$CHAIN_CALLED_MARK" "$POOL_RETRY_CALL_LOG"; : >"$ANSWER"; : >"$ERR"
+  LOG="$WORK/log23.txt"
+  dsh_run_with_pool_then_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+  OUT="$(cat "$LOG")"
+  [ "$DSH_RUN_RC" = "0" ] || { echo "::error::23) ожидался успех после отката на цепочку, получено rc=$DSH_RUN_RC: $OUT" >&2; exit 1; }
+  [ "$DSH_CHAIN_PROVIDER" = "PRIMARY" ] || { echo "::error::23) DSH_CHAIN_PROVIDER='$DSH_CHAIN_PROVIDER', ожидался PRIMARY" >&2; exit 1; }
+  [ "$(wc -l <"$POOL_RETRY_CALL_LOG")" = "1" ] || { echo "::error::23) пул НЕ обязан быть вызван повторно — retryAt отсутствует (null), ждать нечего: $(cat "$POOL_RETRY_CALL_LOG")" >&2; exit 1; }
+  [[ "$OUT" == *"отказал (rc=1), причина:"*"пробую цепочку"* ]] || { echo "::error::23) без разобранного retryAt сообщение обязано остаться старым (регрессия #838): $OUT" >&2; exit 1; }
+  [[ "$OUT" != *"пул сам назвал момент возврата"* ]] || { echo "::error::23) retryAt=null не должен трактоваться как разобранный: $OUT" >&2; exit 1; }
+) || fail "23) pool_unavailable без retryAt должен откатываться старым путём, не гадая время ожидания"
+echo "GUARD(anthropic-pool): 23) pool_unavailable без retryAt -> ответ не разобран, откат старым путём — ок (#1288)"
 
 echo "GUARD(anthropic-pool): быстрый провайдер Claude (#838), инвариант #860 «пул только в worker/hands» — гвардия зелёная"
