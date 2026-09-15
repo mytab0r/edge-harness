@@ -117,6 +117,7 @@ UNVERIFIABLE_PHRASES = [
 
 _HEADING_LINE_RE = re.compile(r"^##\s+\S")
 _FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
+_DIFF_GIT_HEADER_RE = re.compile(r"^diff --git a/(.+) b/(.+)$", re.MULTILINE)
 
 
 class MutationClaimFormatError(ValueError):
@@ -127,26 +128,46 @@ class MutationClaimFormatError(ValueError):
 
 def _sections(body: str, heading: str) -> list[str]:
     """Тела ВСЕХ секций `body`, чей заголовок построчно равен `heading`
-    (после strip). Секция кончается на следующей `## `-строке или на конце
-    текста — тот же формат, что уже описан в docs/agents/PROTOCOL.md для
-    «## Варианты владельца» (узкий нарочно: произвольная проза с тем же
-    заголовком-подстрокой где-то в другом контексте не матчится, потому что
-    заголовок должен занимать строку целиком)."""
+    (после strip). Секция кончается на следующей `## `-строке ВНЕ
+    fenced-блока или на конце текста — тот же формат, что уже описан в
+    docs/agents/PROTOCOL.md для «## Варианты владельца» (узкий нарочно:
+    произвольная проза с тем же заголовком-подстрокой где-то в другом
+    контексте не матчится, потому что заголовок должен занимать строку
+    целиком).
+
+    Fenced-блоки (` ``` `-строки, босые после strip) учитываются при
+    сканировании: дифф патча внутри блока заявления регулярно несёт
+    контекстные строки вида ` ## Раздел` (заголовки markdown-документов в
+    диффе), которые после strip начинаются с «## » — без учёта фенсов секция
+    обрезалась бы на середине патча, а автор видел бы отказ «не найден блок
+    ```diff» на визуально корректном блоке (находка ai-review PR #1028).
+    Маркер фенса — ЦЕЛАЯ строка, начинающаяся с ```; инлайн-``` и вложенные
+    фенсы не поддерживаются (тот же узкий формат, что у самих заголовков)."""
     lines = (body or "").splitlines()
     out: list[str] = []
-    i = 0
-    n = len(lines)
-    while i < n:
-        if lines[i].strip() == heading:
-            j = i + 1
-            block: list[str] = []
-            while j < n and not _HEADING_LINE_RE.match(lines[j].strip()):
-                block.append(lines[j])
-                j += 1
+    block: list[str] | None = None
+    in_fence = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            if block is not None:
+                block.append(line)
+            continue
+        if not in_fence and block is not None and _HEADING_LINE_RE.match(stripped):
             out.append("\n".join(block).strip("\n"))
-            i = j
-        else:
-            i += 1
+            # Заголовок-терминатор может сам быть заголовком той же секции
+            # (два одинаковых блока подряд) — как и в прежнем построчном
+            # скане, он открывает следующую секцию, а не теряется.
+            block = [] if stripped == heading else None
+            continue
+        if not in_fence and block is None and stripped == heading:
+            block = []
+            continue
+        if block is not None:
+            block.append(line)
+    if block is not None:
+        out.append("\n".join(block).strip("\n"))
     return out
 
 
@@ -311,6 +332,13 @@ class MutationProofOutcome:
     verdict: str  # "proved" | "false_claim" | "setup_error"
     message: str
     phases: list[PhaseResult] = field(default_factory=list)
+    # Судьба рабочего дерева — данным, не догадкой вызывающего кода («алерт
+    # не гадает»): None — дерево не трогалось вовсе (ошибка ДО применения
+    # патча); True — мутация снята (штатным `git apply -R` или аварийным
+    # `git checkout --`); False — могло ОСТАТЬСЯ мутированным. False обязывает
+    # вызывающий код не продолжать проверки на этом дереве: следующий прогон
+    # дал бы вердикт по чужой причине.
+    tree_restored: bool | None = None
 
     def report(self) -> str:
         lines = [f"mutation-claim[{self.verdict}]: {self.message}"]
@@ -321,6 +349,63 @@ class MutationProofOutcome:
             if tail:
                 lines.append("    " + tail.replace("\n", "\n    "))
         return "\n".join(lines)
+
+
+def patch_file_paths(patch_text: str) -> list[str]:
+    """Пути файлов, которых касается патч, по заголовкам `diff --git a/… b/…`.
+    Порядок первого появления, без дублей. Нужен аварийному восстановлению
+    дерева (`git checkout --` по этим путям, см. `run_mutation_proof`) —
+    после НЕУДАВШЕГОСЯ `git apply -R` других машинных улик о затронутых
+    файлах нет, кроме самого патча."""
+    out: list[str] = []
+    for match in _DIFF_GIT_HEADER_RE.finditer(patch_text or ""):
+        for path in match.groups():
+            if path not in out:
+                out.append(path)
+    return out
+
+
+def _restore_patch_files(repo_root: Path, patch_text: str) -> PhaseResult:
+    """Аварийное восстановление дерева после НЕУДАВШЕГОСЯ `git apply -R`:
+    `git checkout --` по путям из заголовков патча. Восстанавливает версию
+    индекса — совпадает с состоянием на входе только при чистом на входе
+    дереве (как в CI-чекауте); это честная граница механизма, а не полная
+    гарантия (см. докстринг run_mutation_proof). Одиночный несуществующий
+    pathspec (файл, СОЗДАННЫЙ патчем: в индексе его нет) валит bulk-вызов
+    целиком — тогда пути восстанавливаются по одному, чтобы одна ошибка не
+    топила остальные."""
+    name = "git checkout -- (аварийное восстановление после неудавшегося отката)"
+    paths = patch_file_paths(patch_text)
+    if not paths:
+        return PhaseResult(
+            name, 1, "",
+            "в патче нет заголовков diff --git — пути восстановления неизвестны",
+        )
+    bulk = subprocess.run(
+        ["git", "checkout", "--", *paths],
+        cwd=repo_root, capture_output=True, text=True, encoding="utf-8",
+    )
+    if bulk.returncode == 0:
+        return PhaseResult(name, 0, f"восстановлены: {paths}", "")
+    restored: list[str] = []
+    broken: list[str] = []
+    stderr = ""
+    for path in paths:
+        per = subprocess.run(
+            ["git", "checkout", "--", path],
+            cwd=repo_root, capture_output=True, text=True, encoding="utf-8",
+        )
+        if per.returncode == 0:
+            restored.append(path)
+        else:
+            broken.append(path)
+            stderr = per.stderr.strip()
+    if broken:
+        return PhaseResult(
+            name, 1, f"восстановлены: {restored}",
+            f"НЕ восстановлены: {broken}: {stderr}",
+        )
+    return PhaseResult(name, 0, f"восстановлены: {restored} (bulk-вызов падал на несуществующем pathspec)", "")
 
 
 def _git_apply(repo_root: Path, patch_text: str, *extra_args: str) -> PhaseResult:
@@ -383,9 +468,18 @@ def run_mutation_proof(repo_root: Path, claim: MutationClaim) -> MutationProofOu
          вернуться к зелёному (иначе патч отменяется нечисто, и рабочее
          дерево остаётся мутированным — тоже setup_error, не молчаливый успех).
 
-    Working tree после вызова ВСЕГДА восстанавливается до состояния на входе
-    (даже при setup_error) — `git checkout --` по файлам патча в блоке finally
-    вызывающего кода не нужен: функция сама гарантирует чистый откат ниже."""
+    Working tree после вызова: штатно мутация снимается `git apply -R` в
+    finally-блоке мутационной фазы; если откат не прошёл — аварийно,
+    `git checkout --` по путям из заголовков патча
+    (`_restore_patch_files`). Восстановление через checkout возвращает
+    версию индекса, то есть состояние на входе ТОЛЬКО при чистом на входе
+    дереве (как в CI-чекауте) — это честная граница механизма, а не полная
+    гарантия. Если не сработал и checkout, исход сообщает это словами и
+    путями (`tree_restored == False`), а вызывающий код обязан не
+    продолжать проверки на таком дереве: следующий прогон дал бы вердикт
+    по чужой причине (находка ai-review PR #1028: прежняя версия обещала
+    «всегда восстанавливается», а при неудавшемся откате молча оставляла
+    мутацию — и glue-цикл продолжал по следующим заявлениям)."""
     phases: list[PhaseResult] = []
 
     baseline = _run_test(repo_root, claim.test_target)
@@ -426,11 +520,23 @@ def run_mutation_proof(repo_root: Path, claim: MutationClaim) -> MutationProofOu
         phases.append(revert)
 
     if revert.returncode != 0:
+        restore = _restore_patch_files(repo_root, claim.patch_text)
+        phases.append(restore)
+        if restore.passed:
+            return MutationProofOutcome(
+                "setup_error",
+                "откат патча (git apply -R) не прошёл — доказательство не "
+                "завершено; дерево восстановлено аварийно (git checkout --)",
+                phases,
+                tree_restored=True,
+            )
         return MutationProofOutcome(
             "setup_error",
-            "откат патча (git apply -R) не прошёл — рабочее дерево могло "
+            "откат патча (git apply -R) не прошёл, аварийное восстановление "
+            "(git checkout --) тоже НЕ полностью — рабочее дерево могло "
             "остаться мутированным, требуется ручная проверка",
             phases,
+            tree_restored=False,
         )
 
     if mutated.passed:
@@ -440,6 +546,7 @@ def run_mutation_proof(repo_root: Path, claim: MutationClaim) -> MutationProofOu
             "после применения патча, снимающего фикс — заявленная мутация "
             "не проверяет поведение (класс #893: имя есть, тела нет)",
             phases,
+            tree_restored=True,
         )
 
     restored = _run_test(repo_root, claim.test_target)
@@ -450,6 +557,7 @@ def run_mutation_proof(repo_root: Path, claim: MutationClaim) -> MutationProofOu
             f"после возврата патча тест «{claim.test_target}» остался "
             "красным — откат не восстановил исходное поведение",
             phases,
+            tree_restored=False,
         )
 
     return MutationProofOutcome(
@@ -457,4 +565,5 @@ def run_mutation_proof(repo_root: Path, claim: MutationClaim) -> MutationProofOu
         f"доказано: тест «{claim.test_target}» красный под мутацией, "
         "зелёный до и после возврата",
         phases,
+        tree_restored=True,
     )
