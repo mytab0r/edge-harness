@@ -308,6 +308,8 @@ dsh_install_anthropic_pool "$WORK/anthropic-pool" \
   || { echo "::error::быстрый провайдер Claude не установился (см. ::error:: выше, #838)" >&2; exit 1; }
 dsh_import_anthropic_accounts \
   || { echo "::error::импорт аккаунтов Claude не удался (см. ::error:: выше, #838)" >&2; exit 1; }
+# #1311 — см. тот же вызов и обоснование в scripts/worker/task.sh.
+dsh_pool_preflight
 # Нейтрализация self-регистрации плагина в settings — гонка с нашей
 # статической регистрацией (#1097/#1130), см. dsh-ci.sh для причины.
 dsh_patch_anthropic_pool_plugin \

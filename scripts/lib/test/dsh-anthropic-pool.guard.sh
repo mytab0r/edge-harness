@@ -1241,4 +1241,133 @@ printf '%s\n' 'dsh: TRANSPORT: connection refused' >"$NO_ACC_ERR"
   || fail "27) отказ вообще без тела pool_unavailable обязан давать ПУСТО"
 echo "GUARD(anthropic-pool): 27) нет accounts в теле -> честный пробел, не выдуманный факт (#1310) — ок"
 
+# ── 28) #1311: предполётная проверка называет КАЖДЫЙ аккаунт по имени и по
+#      факту, а не одним агрегатом. Поведенческая, с настоящим HTTP-сервером
+#      на loopback: фикстура-«плагин» несёт те же КОНСТАНТЫ в той же форме,
+#      что настоящий lib/index.js (константы проверка читает оттуда, а не
+#      дублирует у себя), поэтому её эндпоинты указывают на этот сервер.
+#      Сценарий воспроизводит ровно живую ситуацию 2026-09-15: один аккаунт
+#      под квотой (429), второй выбывает на рефреше (Anthropic ротирует
+#      refreshToken, снимок в секрете отстал), третий живой.
+PREFLIGHT_WORK="$(mktemp -d)"
+PKG="$PREFLIGHT_WORK/package"
+mkdir -p "$PKG/lib"
+cat >"$PREFLIGHT_WORK/server.mjs" <<'SERVER'
+import http from 'node:http'
+import fs from 'node:fs'
+const server = http.createServer(async (req, res) => {
+  if (req.method === 'POST' && req.url.startsWith('/oauth/token')) {
+    const chunks = []; for await (const c of req) chunks.push(c)
+    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+    if (body.refresh_token === 'refresh-live') {
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify({ access_token: 'access-fresh', refresh_token: 'refresh-live-2', expires_in: 3600 }))
+      return
+    }
+    // Прод-форма отказа ротированного/отозванного refresh-токена.
+    res.statusCode = 400; res.setHeader('content-type', 'application/json')
+    res.end(JSON.stringify({ error: 'invalid_grant' })); return
+  }
+  if (req.url.startsWith('/v1/models')) {
+    const auth = req.headers.authorization || ''
+    if (auth === 'Bearer access-quota') {
+      res.statusCode = 429
+      res.setHeader('anthropic-ratelimit-unified-5h-reset', String(Math.floor(Date.now() / 1000) + 285))
+      res.end('{}'); return
+    }
+    if (auth === 'Bearer access-fresh') { res.setHeader('content-type', 'application/json'); res.end('{"data":[]}'); return }
+    res.statusCode = 401; res.end('{}'); return
+  }
+  res.statusCode = 404; res.end('{}')
+})
+server.listen(0, '127.0.0.1', () => fs.writeFileSync(process.argv[2], String(server.address().port)))
+SERVER
+PORT_FILE="$PREFLIGHT_WORK/port.txt"
+node "$PREFLIGHT_WORK/server.mjs" "$PORT_FILE" &
+PREFLIGHT_SERVER_PID=$!
+trap 'kill "$PREFLIGHT_SERVER_PID" 2>/dev/null || true' EXIT
+# `command sleep` — в обход заглушки sleep(){ :; } в шапке этого файла:
+# здесь нужно НАСТОЯЩЕЕ ожидание старта процесса, а не мгновенный no-op.
+for _ in $(seq 1 50); do [ -s "$PORT_FILE" ] && break; command sleep 0.2; done
+[ -s "$PORT_FILE" ] || fail "28) фикстурный HTTP-сервер не поднялся"
+PREFLIGHT_PORT="$(cat "$PORT_FILE")"
+# Форма констант — ДОСЛОВНО как в lib/index.js плагина (см. constFromPlugin в
+# scripts/lib/anthropic_pool_preflight.mjs): это и есть предмет связи.
+{
+  printf "const API_BASE = 'http://127.0.0.1:%s'\n" "$PREFLIGHT_PORT"
+  printf "const TOKEN_URL = 'http://127.0.0.1:%s/oauth/token'\n" "$PREFLIGHT_PORT"
+  printf "const CLIENT_ID = 'test-client-id'\n"
+  printf "const OAUTH_BETAS = ['oauth-2025-04-20', 'claude-code-20250219']\n"
+} >"$PKG/lib/index.js"
+# Мини-реализация контракта accounts.js (readConfig/readAccount/writeAccount/
+# writeConfig над DSH_ANTHROPIC_POOL_DIR) — тот же формат файлов, что у
+# настоящего модуля, включая обёртку claudeAiOauth.
+cat >"$PKG/lib/accounts.js" <<'ACC'
+import fs from 'node:fs'
+import path from 'node:path'
+const dir = () => process.env.DSH_ANTHROPIC_POOL_DIR
+const cfg = () => path.join(dir(), 'pool.json')
+export function readConfig() {
+  try { return JSON.parse(fs.readFileSync(cfg(), 'utf8')) } catch { return { strategy: 'least-used', accounts: [] } }
+}
+export function writeConfig(config) { fs.writeFileSync(cfg(), JSON.stringify(config, null, 2) + '\n') }
+export function readAccount(id) {
+  const value = JSON.parse(fs.readFileSync(path.join(dir(), id + '.json'), 'utf8'))
+  const oauth = value.claudeAiOauth || value.oauth
+  if (!oauth) throw new Error(`No claudeAiOauth in account ${id}`)
+  return { id, oauth }
+}
+export function writeAccount(id, value) {
+  fs.writeFileSync(path.join(dir(), id + '.json'), JSON.stringify({ claudeAiOauth: value.oauth }, null, 2) + '\n')
+}
+ACC
+POOL_DIR="$PREFLIGHT_WORK/accounts"
+mkdir -p "$POOL_DIR"
+# anthropic-1: живой accessToken под квотой Anthropic (429) — expiresAt в
+# будущем, рефреш не нужен, до сети доходит сам токен.
+printf '%s\n' '{"claudeAiOauth":{"accessToken":"access-quota","refreshToken":"refresh-live","expiresAt":99999999999999}}' >"$POOL_DIR/anthropic-1.json"
+# anthropic-2: снимок отстал — refreshToken уже ротирован живой сессией.
+printf '%s\n' '{"claudeAiOauth":{"accessToken":"access-stale","refreshToken":"refresh-rotated-away","expiresAt":1}}' >"$POOL_DIR/anthropic-2.json"
+# anthropic-3: рефреш проходит, доступ живой.
+printf '%s\n' '{"claudeAiOauth":{"accessToken":"access-stale","refreshToken":"refresh-live","expiresAt":1}}' >"$POOL_DIR/anthropic-3.json"
+printf '%s\n' '{"strategy":"least-used","accounts":[{"id":"anthropic-1","enabled":true},{"id":"anthropic-2","enabled":true},{"id":"anthropic-3","enabled":true}]}' >"$POOL_DIR/pool.json"
+PRE_LOG="$PREFLIGHT_WORK/preflight.txt"
+DSH_ANTHROPIC_POOL_DIR="$POOL_DIR" node "$REPO/scripts/lib/anthropic_pool_preflight.mjs" "$PKG" >"$PRE_LOG" 2>&1 \
+  || fail "28) предполётная проверка обязана завершаться кодом 0 при любом исходе: $(cat "$PRE_LOG")"
+PRE_OUT="$(cat "$PRE_LOG")"
+grep -q "аккаунт anthropic-1: RATE_LIMITED" "$PRE_LOG" \
+  || fail "28) аккаунт под квотой обязан быть назван RATE_LIMITED поимённо: $PRE_OUT"
+grep -q "аккаунт anthropic-2: REFRESH_FAILED" "$PRE_LOG" \
+  || fail "28) выбывший на рефреше аккаунт обязан быть назван REFRESH_FAILED, а не утонуть в агрегате соседа (#1311): $PRE_OUT"
+grep -q "аккаунт anthropic-3: OK" "$PRE_LOG" \
+  || fail "28) живой аккаунт обязан быть назван пригодным: $PRE_OUT"
+grep -q "пригодных аккаунтов 1 из 3" "$PRE_LOG" || fail "28) сводка обязана называть числа: $PRE_OUT"
+grep -q "refresh-anthropic-pool.md" "$PRE_LOG" || fail "28) сообщение обязано назвать рунбук лечения (газ): $PRE_OUT"
+grep -q "ротирует refreshToken" "$PRE_LOG" || fail "28) сообщение обязано назвать частую ПРИЧИНУ, а не только факт: $PRE_OUT"
+for secret in access-quota access-stale refresh-live refresh-rotated-away access-fresh refresh-live-2; do
+  grep -q "$secret" "$PRE_LOG" && fail "28) значение токена ($secret) утекло в лог предполётной проверки: $PRE_OUT"
+done
+# Непригодные ПРЯМО СЕЙЧАС выключены на этот прогон; под квотой — НЕ выключен
+# (его cooldown пул посчитает сам, квота может отпустить в середине прогона).
+python3 - "$POOL_DIR/pool.json" <<'PYCHK' || fail "28) состояние pool.json после предполётной проверки неверно"
+import json, sys
+rows = {a["id"]: a.get("enabled", True) for a in json.load(open(sys.argv[1]))["accounts"]}
+assert rows["anthropic-2"] is False, rows
+assert rows["anthropic-1"] is True, rows
+assert rows["anthropic-3"] is True, rows
+PYCHK
+echo "GUARD(anthropic-pool): 28) предполётная проверка называет каждый аккаунт по имени и факту (квота / мёртвый refreshToken / живой), токены в лог не текут, непригодный выключен на прогон (#1311) — ок"
+
+# ── 29) #1311: форма констант плагина изменилась — проверка падает ГРОМКО, а
+#      не подставляет своё значение эндпоинта (тот же принцип, что у
+#      scripts/lib/patch_anthropic_pool_plugin.py).
+printf "%s\n" "const SOMETHING_ELSE = 'x'" >"$PKG/lib/index.js"
+if DSH_ANTHROPIC_POOL_DIR="$POOL_DIR" node "$REPO/scripts/lib/anthropic_pool_preflight.mjs" "$PKG" >"$PREFLIGHT_WORK/shape.txt" 2>&1; then
+  fail "29) изменившаяся форма констант плагина обязана валить проверку, а не молча подставлять свой эндпоинт: $(cat "$PREFLIGHT_WORK/shape.txt")"
+fi
+grep -q "PLUGIN_SHAPE_CHANGED" "$PREFLIGHT_WORK/shape.txt" \
+  || fail "29) отказ обязан называть класс PLUGIN_SHAPE_CHANGED: $(cat "$PREFLIGHT_WORK/shape.txt")"
+echo "GUARD(anthropic-pool): 29) форма констант плагина изменилась -> громкий отказ, не молчаливая подстановка (#1311) — ок"
+kill "$PREFLIGHT_SERVER_PID" 2>/dev/null || true
+
 echo "GUARD(anthropic-pool): быстрый провайдер Claude (#838), инвариант #860 «пул только в worker/hands» — гвардия зелёная"

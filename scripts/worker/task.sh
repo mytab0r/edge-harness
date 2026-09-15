@@ -619,6 +619,9 @@ dsh_install_plugins_suite "$WORK/plugins" || die "suite ротации учёт�
 # ANTHROPIC_OAUTH_1/2, не vars.PLUGINS_SUITE_URL. Импорт — до первого dsh.
 dsh_install_anthropic_pool "$WORK/anthropic-pool" || die "быстрый провайдер Claude не установился (см. ::error:: выше, #838)"
 dsh_import_anthropic_accounts || die "импорт аккаунтов Claude не удался (см. ::error:: выше, #838)"
+# Факт «какой аккаунт пригоден и почему не пригодны остальные» — до первого
+# прогона, а не постфактум из агрегата pool_unavailable (#1311).
+dsh_pool_preflight
 # Нейтрализация self-регистрации плагина в settings — гонка с нашей
 # статической регистрацией (#1097/#1130), см. dsh-ci.sh для причины.
 dsh_patch_anthropic_pool_plugin || die "патч плагина anthropic-oauth-pool не применился (см. ::error:: выше, #1130)"
