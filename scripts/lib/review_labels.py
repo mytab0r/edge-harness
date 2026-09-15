@@ -170,6 +170,21 @@ def gate1_decided(labels) -> bool:
     return bool(names & set(GATE1_LABELS))
 
 
+def gate1_open(labels) -> bool:
+    """True — гейт 1 (детерминированное ревью) ОТКРЫЛ слияние: `review:ok`
+    ЛИБО связка `review:large` + `review:large-ok` (находка #702, живой
+    случай PR #333). Не путать с `gate1_decided` выше — та отвечает
+    «гейт 1 УЖЕ ЗАКОНЧИЛ работу» (true и для голого `review:large` без
+    `-ok`), эта — «гейт 1 РАЗРЕШИЛ слияние». Вынесена отдельной функцией
+    (#1287, orchestrator-core-v2), чтобы `merge_label_gate` ниже и снимок
+    наблюдаемого состояния PR (`scheduler.build_observed_pr`, design.md
+    §2.2 — граница `awaiting_gate1`/`awaiting_gate2`) читали ОДНУ и ту же
+    формулу вместо двух похожих копий — ровно тот класс расхождения
+    (#303/#432), ради закрытия которого существует снимок."""
+    names = _names(labels)
+    return REVIEW_OK in names or (REVIEW_LARGE in names and LARGE_OK in names)
+
+
 def merge_label_gate(labels) -> str | None:
     """Причина, по которой метки запрещают слияние; None — метки слияние открыли.
 
@@ -194,8 +209,7 @@ def merge_label_gate(labels) -> str | None:
     открытия («слияние ждёт review:large-ok» — ждёт, не игнорирует
     навсегда)."""
     names = _names(labels)
-    gate1_ok = REVIEW_OK in names or (REVIEW_LARGE in names and LARGE_OK in names)
-    if not gate1_ok:
+    if not gate1_open(names):
         return (
             f"нет вердикта {REVIEW_OK} (ждёт детерминированное ревью, "
             f"{LARGE_OK} для крупного диффа, или доработку)"
