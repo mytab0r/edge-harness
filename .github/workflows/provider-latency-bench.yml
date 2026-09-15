@@ -104,6 +104,7 @@ jobs:
           OLLAMA_CLOUD_3_API_KEY: ${{ secrets.OLLAMA_CLOUD_3_API_KEY }}
           OPENROUTER_1_API_KEY: ${{ secrets.OPENROUTER_1_API_KEY }}
           OPENROUTER_2_API_KEY: ${{ secrets.OPENROUTER_2_API_KEY }}
+          ZAI_1_API_KEY: ${{ secrets.ZAI_1_API_KEY }}
         run: |
           python -m pytest scripts/measure/test_probe_max_output_tokens.py -q
           echo "$PROBE_ENTRIES_JSON" | python -c '
