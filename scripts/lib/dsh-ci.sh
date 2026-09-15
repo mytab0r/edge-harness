@@ -1616,7 +1616,12 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
 # не тратить резерв зря.
 _dsh_pool_retry_at_wait_secs() { # err_file -> секунды до retryAt на stdout, rc=0 если разобрано
   local err_file=$1 json_str type_field retry_at_ms now_ms
-  json_str=$(tr '\n' ' ' <"$err_file" | grep -oE '\{.*\}' 2>/dev/null || true)
+  # redact() ПЕРВЫМ звеном конвейера — класс #743 (гвардия
+  # dsh-stderr-redact-guard): тело ответа пула — сырой stderr клиента
+  # модели, может нести производное секрета (например 401-тело с токеном в
+  # message) — маскируем до любого другого звена; маскирование значений
+  # JSON-структуру (type/retryAt) не ломает.
+  json_str=$(redact <"$err_file" | tr '\n' ' ' | grep -oE '\{.*\}' 2>/dev/null || true)
   [ -n "$json_str" ] || return 1
   type_field=$(jq -r '(.error.type // .type // empty)' <<<"$json_str" 2>/dev/null) || return 1
   [ "$type_field" = "pool_unavailable" ] || return 1
