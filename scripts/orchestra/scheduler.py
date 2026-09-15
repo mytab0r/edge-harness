@@ -887,16 +887,28 @@ def dispatch_conflict_rework(
     Признака «механический дрейф или содержательный конфликт» ДО попытки не
     существует: GitHub REST отдаёт только mergeable_state, не конфликтующие
     ханки. Поэтому решение простое (владелец, issue #474): РОВНО одна
-    авто-попытка ребейза на PR (CONFLICT_REWORK_MAX_ATTEMPTS=1, лифтайм-
-    счётчик — conflict_rework_attempts выше, граница conflict_first_labeled_at,
-    — НЕ сбрасывается по эпизодам конфликта, тот же компромисс, что уже
-    принят для AI_REVIEW_MAX_ATTEMPTS; CONFLICT_REWORK_MARKER в комментарии
-    PR ниже — только заметка для человека на момент диспатча, счётчик её не
-    перечитывает). Сошлось —
-    mark_conflicts снимет метку сама следующим проходом (это и есть признак
-    «был дрейф», ПОСТфактум); не сошлось — эскалация владельцу (escalate,
-    тот же канал, что предохранитель конвейера #120) с файлами-кандидатами
-    (conflict_overlap_hint — эвристика, честно помечена как таковая).
+    ЗАСЧИТАННАЯ авто-попытка ребейза на PR (CONFLICT_REWORK_MAX_ATTEMPTS=1,
+    лифтайм-счётчик — conflict_rework_attempts выше, граница
+    conflict_first_labeled_at, — НЕ сбрасывается по эпизодам конфликта, тот
+    же компромисс, что уже принят для AI_REVIEW_MAX_ATTEMPTS;
+    CONFLICT_REWORK_MARKER в комментарии PR ниже — только заметка для
+    человека на момент диспатча, счётчик её не перечитывает). Дальше — ТРИ
+    исхода вместо одного (класс #1027/#1029, тот же приём, что #1030 дал
+    dispatch_ai_review_rework; живой случай #1029: эскалация 19:56, PR слит
+    через 37 минут — ложная тревога по определению):
+      - прогон попытки сам завершился conclusion из FAILURE_CONCLUSIONS —
+        инфраструктурный отказ ЭТОГО прогона, не «не сошлось»: автоматический
+        повтор без эскалации и без нового бюджета (газ устойчивого инфра-
+        отказа — общий предохранитель conveyor_gate #120);
+      - PR уже закрыт/слит между снимком pulls и перепроверкой — предмет
+        эскалации исчез сам, эскалации нет;
+      - только иначе (засчитанная попытка с прогоном не из
+        FAILURE_CONCLUSIONS, PR всё ещё dirty) — эскалация владельцу
+        (escalate, тот же канал, что предохранитель конвейера #120): текст
+        называет ФАКТ (conclusion прогона и адрес его лога, run_log_url),
+        не утверждает причину, а файлы-кандидаты помечены как ОЦЕНКА сверху
+        (conflict_overlap_hint — пересечение изменений через compare API, не
+        точные конфликтующие строки).
 
     Идемпотентность — worker_runs_active (тот же гейт, что dispatch_worker):
     воркер один на репозиторий, пока прошлый прогон жив (in_progress/
@@ -1025,7 +1037,8 @@ def dispatch_conflict_rework(
             # различить: квота провайдера, таймаут 340 минут (#1067) или
             # неудавшийся push ПОСЛЕ того, как агент начал работу, дают тот
             # же итог, что настоящий содержательный конфликт.
-            run_conclusion = last_worker_run_conclusion(repo, task_number)
+            run = last_worker_run(repo, task_number)
+            run_conclusion = (run or {}).get("conclusion")
             if run_conclusion in FAILURE_CONCLUSIONS:
                 # Исход 1: инфраструктурный отказ ЭТОГО прогона — попытка не
                 # была честной пробой ребейза (или отработала git-шаг, но
@@ -1078,21 +1091,23 @@ def dispatch_conflict_rework(
                         "вперёд уже после него"
                     )
                 elif run_conclusion is None:
+                    # Адрес «лога» здесь даёт суффикс ниже (run_log_url(None)
+                    # — список прогонов worker.yml): атрибуции нет, адресовать
+                    # нечего, кроме всего workflow.
                     reason = (
-                        "прогон worker.yml по этой задаче не атрибутирован (аренда сгорела "
-                        "до следа?) — см. лог worker.yml вручную"
+                        "прогон worker.yml по этой задаче не атрибутирован (аренда сгорела до следа?)"
                     )
                 else:
                     reason = (
                         f"последний прогон worker.yml по этой задаче завершился с "
                         f"conclusion={run_conclusion!r} — не success и не известный "
-                        "инфра-отказ, см. лог worker.yml вручную"
+                        "инфра-отказ"
                     )
                 text = (
                     f"🚨 edge-harness: {marker}\n"
                     f"PR #{number} (задача #{task_number}) остаётся dirty после {attempts} "
                     f"авто-попытки ребейза worker.yml — {reason}. Нужно решение владельца: "
-                    "посмотреть лог последнего прогона и разобраться. Файлы-кандидаты "
+                    f"разобраться (лог прогона: {run_log_url(repo, run)}). Файлы-кандидаты "
                     "(оценка сверху по пересечению изменений PR и main через compare API, "
                     f"не точные конфликтующие строки): {overlap_text}."
                 )
@@ -1443,9 +1458,12 @@ def dispatch_ai_review_rework(
                         "(keep-path) — стоят находки прежнего ревью того же диффа"
                     )
                 elif run_conclusion is None:
+                    # Адрес «лога» здесь даёт суффикс ниже (run_log_url(None)
+                    # — список прогонов worker.yml), тот же класс, что чинит
+                    # dispatch_conflict_rework: «см. лог вручную» без адреса —
+                    # путь без пункта назначения.
                     reason = (
-                        "прогон worker.yml по этой задаче не атрибутирован (аренда сгорела "
-                        "до следа?) — см. лог worker.yml вручную"
+                        "прогон worker.yml по этой задаче не атрибутирован (аренда сгорела до следа?)"
                     )
                 else:
                     # Атрибутированный прогон с conclusion ВНЕ FAILURE_CONCLUSIONS
@@ -1459,13 +1477,14 @@ def dispatch_ai_review_rework(
                     reason = (
                         f"последний прогон worker.yml по этой задаче завершился с "
                         f"conclusion={run_conclusion!r} — не success и не известный "
-                        "инфра-отказ, см. лог worker.yml вручную"
+                        "инфра-отказ"
                     )
                 text = (
                     f"🚨 edge-harness: {marker}\n"
                     f"PR #{number} (задача #{task_number}) остаётся с ai:changes-requested "
                     f"на том же отпечатке диффа после {attempts} авто-попытки доводки "
-                    f"worker.yml — {reason}. Нужно решение владельца: посмотреть находки "
+                    f"worker.yml — {reason}. Лог прогона: {run_log_url(repo, run)}. "
+                    "Нужно решение владельца: посмотреть находки "
                     "ai-review (gh pr view --comments) и разобраться руками."
                 )
                 escalation = escalate(repo, WATCHDOG_ISSUE, text)
@@ -1778,9 +1797,12 @@ def pr_bad_checks(repo: str, pull: dict) -> list[str]:
 
 def merge_queue(
     repo: str, pulls: list[dict],
-) -> tuple[list[str], list[str], bool, int | None, bool]:
-    """Возвращает (наблюдения, действия, был_ли_жёсткий_сбой_after_merge,
-    номер слитого PR или None, была_ли_обновлена_ветка) — см. after_merge.
+) -> tuple[list[str], list[str], bool, bool, int | None, bool]:
+    """Возвращает (наблюдения, действия, был_ли_жёсткий_сбой_АРХИВА,
+    был_ли_жёсткий_сбой_ЗАМЕТКИ, номер слитого PR или None,
+    была_ли_обновлена_ветка) — оба флага насквозь из after_merge, склейкой
+    назад к одному булеву не сводятся: финальный алерт различает, ЧТО
+    сломалось (см. докстринг after_merge и merge_session_hard_failure_alert_text).
 
     Наблюдения vs действия разведены по #456: причины ПРОПУСКА кандидата
     (черновик, не тот mergeable_state, проверки не готовы/красные, гейт меток
@@ -1895,27 +1917,30 @@ def merge_queue(
         observations = [f"⏸️ {item}" for item in skipped]
         other_pulls = [p for p in pulls if p["number"] != pull["number"]]
         merge_sha = (merge_result or {}).get("sha")
-        after_observations, after_actions, hard_failure = after_merge(
+        after_observations, after_actions, archive_hard_failure, note_hard_failure = after_merge(
             repo, pull, other_pulls, merge_sha=merge_sha)
         observations += after_observations
         actions += after_actions
-        return observations, actions, hard_failure, pull["number"], True  # один за проход: см. merge_loop
+        return (observations, actions, archive_hard_failure, note_hard_failure,
+                pull["number"], True)  # один за проход: см. merge_loop
     observations = [f"⏸️ {item}" for item in skipped]
-    return observations, actions, False, None, updated
+    return observations, actions, False, False, None, updated
 
 
-def merge_loop(repo: str, pulls: list[dict]) -> tuple[list[str], list[str], bool, list[dict]]:
+def merge_loop(repo: str, pulls: list[dict]) -> tuple[list[str], list[str], bool, bool, list[dict]]:
     """Цикл слияний одного прогона (#297) — main() зовёт эту функцию вместо
     одиночного merge_queue. Возвращает (наблюдения, действия,
-    был_ли_жёсткий_сбой, финальный список открытых PR) — четвёртое поле
-    добавлено дедупликацией запросов GitHub API (#443): раньше main() ПОСЛЕ
-    этой функции трижды сам перечитывал open_pulls(repo) для
-    trigger_ai_review/stale_ready_pulls/accept_merged_tasks, хотя нужный
-    снимок уже лежит здесь — цикл сам ведёт актуальный `pulls`, обновляя его
-    КАЖДЫЙ раз, когда что-то реально изменилось (слияние или подтянутая
-    ветка), и не трогая его, когда проход не сделал ничего. Возвращаемое
-    значение — тот же снимок, что дал бы свежий open_pulls(repo) в момент
-    возврата, без отдельного HTTP-вызова.
+    был_ли_жёсткий_сбой_АРХИВА, был_ли_жёсткий_сбой_ЗАМЕТКИ, финальный список
+    открытых PR) — оба флага насквозь из merge_queue/after_merge раздельно
+    (см. их докстринги: у сбоя архива и сбоя заметки разный газ в финальном
+    алерте). Пятое поле добавлено дедупликацией запросов GitHub API (#443):
+    раньше main() ПОСЛЕ этой функции трижды сам перечитывал open_pulls(repo)
+    для trigger_ai_review/stale_ready_pulls/
+    accept_merged_tasks, хотя нужный снимок уже лежит здесь — цикл сам ведёт
+    актуальный `pulls`, обновляя его КАЖДЫЙ раз, когда что-то реально
+    изменилось (слияние или подтянутая ветка), и не трогая его, когда проход
+    не сделал ничего. Возвращаемое значение — тот же снимок, что дал бы
+    свежий open_pulls(repo) в момент возврата, без отдельного HTTP-вызова.
 
     Каждая итерация — один проход merge_queue (сериализация «одно слияние за
     проход» не меняется, #252/#288; «одно обновление ветки за проход» —
@@ -1937,17 +1962,19 @@ def merge_loop(repo: str, pulls: list[dict]) -> tuple[list[str], list[str], bool
     доступный mergeable_state."""
     observations: list[str] = []
     actions: list[str] = []
-    hard_failure = False
+    archive_hard_failure = False
+    note_hard_failure = False
     merged_count = 0
     deadline = time.monotonic() + MERGE_LOOP_TIMEOUT_SECONDS
     while merged_count < MERGE_LOOP_MAX_MERGES and time.monotonic() < deadline:
         # Бюджет на ЭТОТ проход (см. merge_queue) — сбрасывается заново каждую
         # итерацию, не один раз на весь прогон (было так до #297).
         reset_update_branch_budget()
-        iter_observations, iter_actions, iter_hard_failure, merged_number, updated = merge_queue(repo, pulls)
+        iter_observations, iter_actions, iter_archive_failure, iter_note_failure, merged_number, updated = merge_queue(repo, pulls)
         observations += iter_observations
         actions += iter_actions
-        hard_failure = hard_failure or iter_hard_failure
+        archive_hard_failure = archive_hard_failure or iter_archive_failure
+        note_hard_failure = note_hard_failure or iter_note_failure
         if merged_number is not None:
             merged_count += 1
             pulls = open_pulls(repo)  # слияние закрыло PR — состояние изменилось
@@ -1964,7 +1991,7 @@ def merge_loop(repo: str, pulls: list[dict]) -> tuple[list[str], list[str], bool
             f"🔁 цикл слияний: {merged_count} PR слито за прогон "
             f"(потолок {MERGE_LOOP_MAX_MERGES}, #297)"
         )
-    return observations, actions, hard_failure, pulls
+    return observations, actions, archive_hard_failure, note_hard_failure, pulls
 
 
 # ── Сессии раннеров в морде dsh-edge (#119) ───────────────────────────────────────
@@ -2114,21 +2141,43 @@ def _morde_ingest(opener: urllib.request.OpenerDirector, session_id: str, events
 # префиксу 🚨 — этот же маркер используют обе функции ниже для жёсткого
 # сбоя, ни одна не метит им норму), не пересобираем текст заново — одно
 # место правды на факт.
-_MERGE_SESSION_HARD_FAILURE_FACTS: list[str] = []
+#
+# ДВА бакета вместо одного (находка ai-ревью #1053, второй круг): алерт
+# обязан различать, ЧТО именно сломалось — архив сессии (сирота возможна,
+# газ — sweep #940) или дозапись заметки-итога (мержа могло не быть вовсе,
+# сироты нет, sweep «по статусу задачи» её не тронет — один текст «про
+# архив и сироту» для обоих случаев врал второму). Классификация — В МОМЕНТ
+# записи, по месту вызова: вызывающий и так знает, чей результат
+# записывает, парсить собственные строки ради этого не нужно.
+_MERGE_SESSION_ARCHIVE_FAILURE_FACTS: list[str] = []
+_MERGE_SESSION_NOTE_FAILURE_FACTS: list[str] = []
 
 
-def _record_merge_session_hard_failure_facts(lines: list[str]) -> None:
-    """Копит факт-строки жёсткого сбоя (префикс 🚨) за текущий прогон —
-    reset_merge_session_hard_failure_facts() сбрасывает границу (тот же
-    приём, что reset_update_branch_budget для бюджета прохода)."""
-    _MERGE_SESSION_HARD_FAILURE_FACTS.extend(line for line in lines if line.startswith("🚨"))
+def _record_merge_session_hard_failure_facts(lines: list[str], kind: str) -> None:
+    """Копит факт-строки жёсткого сбоя (префикс 🚨) за текущий прогон.
+    kind — КТО произвёл строки: "archive" (archive_runner_sessions) или
+    "notes" (append_session_notes); неизвестный kind — громкий ValueError,
+    не тихая запись в чужой бакет (fail loud). Граница между прогонами/тестами
+    — reset_merge_session_hard_failure_facts() (тот же приём, что
+    reset_update_branch_budget для бюджета прохода)."""
+    buckets = {
+        "archive": _MERGE_SESSION_ARCHIVE_FAILURE_FACTS,
+        "notes": _MERGE_SESSION_NOTE_FAILURE_FACTS,
+    }
+    if kind not in buckets:
+        raise ValueError(f"_record_merge_session_hard_failure_facts: неизвестный kind={kind!r}")
+    buckets[kind].extend(line for line in lines if line.startswith("🚨"))
 
 
 def reset_merge_session_hard_failure_facts() -> None:
     """Граница между прогонами/тестами — вызывается main() перед ПЕРВЫМ
     накопителем фактов этого прогона (unhealthy_pulls, затем after_merge
-    внутри merge_loop)."""
-    _MERGE_SESSION_HARD_FAILURE_FACTS.clear()
+    внутри merge_loop и accept_merged_tasks) — сбрасывает ОБА бакета: флаги
+    не должны переживать прогон, и текст алерта не должен подмешивать факты
+    чужого прогона (важно для тестов, вызывающих main() несколько раз в одном
+    процессе)."""
+    _MERGE_SESSION_ARCHIVE_FAILURE_FACTS.clear()
+    _MERGE_SESSION_NOTE_FAILURE_FACTS.clear()
 
 
 # Адрес sweep-скрипта в дереве ЭТОГО прогона — модульная константа ради
@@ -2166,32 +2215,60 @@ def _orphan_sweep_gas_text() -> str:
 
 
 def merge_session_hard_failure_alert_text(
-    archive_hard_failure: bool, stall_hard_failure: bool, stall_lines: list[str],
+    archive_hard_failure: bool, note_hard_failure: bool, stall_hard_failure: bool,
+    stall_lines: list[str],
 ) -> str:
-    """Текст финального Telegram-алерта main() на жёсткий сбой архива сессии
-    раннера/детектора простоя (#119/#201) — вынесен из main() отдельной
-    функцией ради юнит-теста без прогона всего main() (тот же приём, что уже
-    дают render_action_report/merge_loop — маленькая чистая функция вместо
-    прозы внутри самого main()).
+    """Текст финального Telegram-алерта main() на жёсткий сбой архива сессии,
+    дозаписи заметки-итога и детектора простоя (#119/#480/#201) — вынесен из
+    main() отдельной функцией ради юнит-теста без прогона всего main() (тот же
+    приём, что уже дают render_action_report/merge_loop — маленькая чистая
+    функция вместо прозы внутри самого main()).
 
     Прежний текст архива отсылал читателя «см. отчёт этого прогона orchestra
     выше» — у читателя Telegram-алерта этого отчёта нет под рукой («Алерт не
-    гадает», AGENTS.md). Здесь — дословный факт из
-    _MERGE_SESSION_HARD_FAILURE_FACTS (см. докстринг сбора выше) и НАЗВАННЫЙ
-    газ: периодический sweep осиротевших сессий (issue #940,
-    scripts/orchestra/session_orphan_sweep.py, PR #944) читает статус ЗАДАЧИ
-    и не зависит от причины конкретно ЭТОГО сбоя архива — статус sweep
-    («слит или нет») код определяет сам (_orphan_sweep_gas_text), а не
-    предлагает получателю сверить что-то вручную."""
+    гадает», AGENTS.md). Здесь — дословный факт из одноимённых бакетов
+    (_record_merge_session_hard_failure_facts, см. её докстринг) и НАЗВАННЫЙ
+    газ, РАЗНЫЙ для разных видов сбоя (находка ai-ревью #1053, второй круг:
+    один текст «После мержа PR архивация… + sweep уберёт сироту» врал случаю
+    «сломалась только заметка» — мержа могло не быть вовсе, сироты нет,
+    sweep «по статусу задачи» живую сессию открытой задачи не тронет):
+
+    - архив (сирота возможна: сессия слитой задачи остаётся активной) — газ
+      sweep (#940/#944), статус «слит или нет» код определяет сам
+      (_orphan_sweep_gas_text);
+    - заметка (мержа могло не быть: дозапись идёт и при возврате в пул, и при
+      закрытии приёмкой) — газ честный: автоматической повторной дозаписи
+      НЕТ, заметка пишется один раз в момент события; адрес ручной дописки —
+      тот же ingest-запрос, что пишет её в норме (POST /api/sessions/<id>/
+      ingest, docs/research/12-dsh-edge-session-api.md, патч
+      0004-harness-ingest), сессия и текст — в факте выше;
+    - детектор простоя — газ: следующий пульс повторяет его сам (#201)."""
     broken = []
     if archive_hard_failure:
-        facts = "\n".join(_MERGE_SESSION_HARD_FAILURE_FACTS) or (
+        facts = "\n".join(_MERGE_SESSION_ARCHIVE_FAILURE_FACTS) or (
             "причина не сохранена этим прогоном (см. лог шага orchestra вручную)"
         )
         broken.append(
-            "После мержа PR архивация сессии раннера (или дозапись заметки-итога) в "
-            f"морде dsh-edge не удалась. Мерж не откатывается. Факт:\n{facts}\n"
+            "После мержа PR архивация сессии раннера в морде dsh-edge не удалась "
+            "(сессия слитой задачи остаётся в списке активных — сирота). Мерж не "
+            f"откатывается. Факт:\n{facts}\n"
             + _orphan_sweep_gas_text()
+        )
+    if note_hard_failure:
+        facts = "\n".join(_MERGE_SESSION_NOTE_FAILURE_FACTS) or (
+            "причина не сохранена этим прогоном (см. лог шага orchestra вручную)"
+        )
+        broken.append(
+            "Дозапись заметки-итога в сессию раннера в морде dsh-edge не удалась "
+            "(событие — мерж PR, закрытие задачи приёмкой или возврат в пул; какая "
+            f"именно сессия — в факте ниже). Заметка-итог потеряна безвозвратно: "
+            "автоматической повторной дозаписи НЕТ — заметка пишется один раз в момент "
+            f"события, повторного прогона у неё не предусмотрено. Факт:\n{facts}\n"
+            + "Газ: ручная дописка тем же запросом, каким пишет оркестратор, — POST "
+            "/api/sessions/<session_id>/ingest (контракт: docs/research/"
+            "12-dsh-edge-session-api.md, патч 0004-harness-ingest; session_id и текст "
+            "заметки — в факте выше). Автоматического газа у этого сбоя нет и быть "
+            "не может — событие однократное, это названо прямо, а не спрятано."
         )
     if stall_hard_failure:
         stall_facts = "\n".join(stall_lines) or "причина не сохранена этим прогоном"
@@ -2202,11 +2279,14 @@ def merge_session_hard_failure_alert_text(
             "следующий пульс orchestra (каждые 15 минут) повторяет детектор заново без "
             "ручного вмешательства."
         )
-    return "🚨 edge-harness: [статус: " + (
-        "архив сессии раннера сломан" if archive_hard_failure and not stall_hard_failure else
-        "детектор простоя сломан" if stall_hard_failure and not archive_hard_failure else
-        "архив сессии раннера и детектор простоя сломаны"
-    ) + "]\n" + "\n".join(broken)
+    parts = []
+    if archive_hard_failure:
+        parts.append("архив сессии раннера сломан")
+    if note_hard_failure:
+        parts.append("дозапись заметки-итога сломана")
+    if stall_hard_failure:
+        parts.append("детектор простоя сломан")
+    return "🚨 edge-harness: [статус: " + "; ".join(parts) + "]\n" + "\n".join(broken)
 
 
 def archive_runner_sessions(task_numbers: list[int]) -> tuple[list[str], bool]:
@@ -2377,19 +2457,13 @@ def last_worker_run(repo: str, task_number: int) -> dict | None:
     return None
 
 
-def last_worker_run_conclusion(repo: str, task_number: int) -> str | None:
-    """Conclusion последнего прогона worker.yml, атрибутированного задаче —
-    None, если атрибуции не нашлось вовсе ИЛИ прогон ещё не завершился
-    (GitHub не заполняет `conclusion` для in_progress/queued — оба случая
-    неразличимы этой функцией по конструкции; `last_worker_run` — для
-    вызывающих, которым важно различить их). Используется
-    dispatch_conflict_rework::escalate ниже (находка ревью PR #478 —
-    "алерт не гадает"): текст эскалации обязан называть ФАКТ (conclusion
-    прогона), а не утверждать причину («содержательный конфликт»), которую
-    отсюда не различить (инфраструктурный сбой/квота/таймаут дают тот же
-    итог «PR всё ещё dirty», что и настоящий конфликт)."""
-    run = last_worker_run(repo, task_number)
-    return run.get("conclusion") if run else None
+def run_log_url(repo: str, run: dict | None) -> str:
+    """Адрес лога прогона для текста эскалации: html_url из API, без него —
+    канонический вид по id (оба адреса ведут на один прогон); прогона нет —
+    адрес списка прогонов workflow'а (реальная страница, не «ищи вручную»)."""
+    if run is None:
+        return f"https://github.com/{repo}/actions/workflows/{WORKER_WORKFLOW}"
+    return run.get("html_url") or f"https://github.com/{repo}/actions/runs/{run.get('id')}"
 
 
 def resume_series_by_merge(repo: str, pull: dict, task_number: int) -> str | None:
@@ -2453,16 +2527,21 @@ def after_merge(
     диспатч по коммиту и откажет громко (RuntimeError), а не тихо продиспатчит
     вслепую.
 
-    Возвращает (наблюдения, действия, был_ли_жёсткий_сбой_архивации) — #456:
-    все строки этой функции сама по себе — действия (мерж уже случился,
-    release/dispatch/напоминание/Telegram/архив — реальные вызовы), кроме
-    того, что кладёт update_remaining_pulls (там есть настоящие наблюдения —
-    см. её докстринг). Мерж уже состоялся — жёсткий сбой не откатывает и не
-    блокирует эту функцию, только поднимается наверх для эскалации (main()
-    красит прогон ПОСЛЕ мержа)."""
+    Возвращает (наблюдения, действия, был_ли_жёсткий_сбой_АРХИВА,
+    был_ли_жёсткий_сбой_ЗАМЕТКИ) — #456: все строки этой функции сама по
+    себе — действия (мерж уже случился, release/dispatch/напоминание/Telegram/
+    архив — реальные вызовы), кроме того, что кладёт update_remaining_pulls
+    (там есть настоящие наблюдения — см. её докстринг). Мерж уже состоялся —
+    жёсткий сбой не откатывает и не блокирует эту функцию, только поднимается
+    наверх для эскалации (main() красит прогон ПОСЛЕ мержа). Флаги архива и
+    заметки НЕ склеены в один (находка ai-ревью #1053, второй круг): у них
+    разная механика и разный газ в финальном алерте (сирота+sweep против
+    «заметка потеряна безвозвратно»), склейка заставила бы алерт врать в
+    случае «сломалась только заметка»."""
     observations: list[str] = []
     actions = []
-    hard_failure = False
+    archive_hard_failure = False
+    note_hard_failure = False
     number = pull["number"]
     # Пагинация (#294, третье место того же класса: check_pr.py и ai_review.py
     # уже читали через review_labels.list_pr_files, здесь оставалась сырая
@@ -2609,11 +2688,10 @@ def after_merge(
         note_lines, note_hard_failure = append_session_notes(
             [(n, f"🔀 PR #{number} слит в main.") for n in task_numbers])
         actions += note_lines
-        _record_merge_session_hard_failure_facts(note_lines)
-        archive_lines, hard_failure = archive_runner_sessions(task_numbers)
+        _record_merge_session_hard_failure_facts(note_lines, "notes")
+        archive_lines, archive_hard_failure = archive_runner_sessions(task_numbers)
         actions += archive_lines
-        _record_merge_session_hard_failure_facts(archive_lines)
-        hard_failure = hard_failure or note_hard_failure
+        _record_merge_session_hard_failure_facts(archive_lines, "archive")
     # Чеклист некритичных замечаний ревью (#462, третья категория находок):
     # незакрытые пункты НЕ блокировали слияние (иначе некритичное стало бы
     # критичным и вернуло бы конвейер к вечным кругам, тот же класс решения,
@@ -2656,7 +2734,7 @@ def after_merge(
     remaining_observations, remaining_actions = update_remaining_pulls(repo, pull["number"], other_pulls or [])
     observations += remaining_observations
     actions += remaining_actions
-    return observations, actions, hard_failure
+    return observations, actions, archive_hard_failure, note_hard_failure
 
 
 def update_remaining_pulls(repo: str, merged_number: int, other_pulls: list[dict]) -> tuple[list[str], list[str]]:
@@ -4192,10 +4270,10 @@ def unhealthy_pulls(repo: str, now: datetime, pulls: list[dict], *, pool: list[d
     заметок на этом пути раньше ВЫБРАСЫВАЛСЯ: 🚨-строка жила только в отчёте
     прогона (зелёного), Telegram молчал — «сигнал есть, но его никто не
     увидит» (находка ai-ревью #1053, тот же класс, что этот PR закрывает для
-    after_merge/accept_merged_tasks). Теперь факт копится в
-    _MERGE_SESSION_HARD_FAILURE_FACTS (тот же список, не второй), а флаг
-    main() OR-ит в archive_hard_failure — общий финальный алерт и красный код,
-    второй механизм не заводится."""
+    after_merge/accept_merged_tasks). Теперь факт копится в общий бакет
+    заметок (_MERGE_SESSION_NOTE_FAILURE_FACTS, не второй), а флаг main()
+    OR-ит в note_hard_failure — общий финальный алерт (со своим, заметочным
+    текстом и газом) и красный код, второй механизм не заводится."""
     lines = []
     # Заметки-итоги в сессии раннера (#480) — один логин на весь обход, см.
     # append_session_notes.
@@ -4244,9 +4322,9 @@ def unhealthy_pulls(repo: str, now: datetime, pulls: list[dict], *, pool: list[d
                 (number, f"♻️ Задача #{number} возвращена в пул: PR #{pull['number']} нездоров ({reason})."))
             break  # одной причины на задачу достаточно — не дублируем комментарии
     note_lines, note_hard_failure = append_session_notes(session_notes)
-    # Факт — в общий список финального алерта (см. докстринг выше); строки —
-    # в отчёт прогона, как и раньше.
-    _record_merge_session_hard_failure_facts(note_lines)
+    # Факт — в общий бакет заметок финального алерта (см. докстринг выше);
+    # строки — в отчёт прогона, как и раньше.
+    _record_merge_session_hard_failure_facts(note_lines, "notes")
     lines += note_lines
     return lines, note_hard_failure
 
@@ -5168,10 +5246,20 @@ def accept_merged_tasks(
     означает «других открытых PR не было», но это решение вызывающего, а не
     дефолт по умолчанию.
 
-    Возвращает (наблюдения, действия, был_ли_жёсткий_сбой) — #456: «улика ещё
-    не готова» и «приёмка отложена другим открытым PR» ничего не меняют
-    (ничего не запощено, ничего не закрыто) — раньше эти строки попадали в
-    тот же список, что реальные закрытия/провалы/эскалации.
+    Возвращает (наблюдения, действия, был_ли_жёсткий_сбой_УЛИК,
+    был_ли_жёсткий_сбой_ЗАМЕТКИ) — #456: «улика ещё не готова» и «приёмка
+    отложена другим открытым PR» ничего не меняют (ничего не запощено, ничего
+    не закрыто) — раньше эти строки попадали в тот же список, что реальные
+    закрытия/провалы/эскалации. Флаг улик (сбой проверки улики/pending, оба
+    уже эскалированы per-task ВНУТРИ этой функции) и флаг заметок (сбой
+    дозаписи итога в сессию, per-task эскалации НЕ имеет) НЕ склеены в один
+    (находка ai-ревью #1053, второй круг): склейка переименовывала бы сбой
+    проверки улик в «архивация/заметка не удалась» в финальном алерте — у
+    них разные текст и газ (merge_session_hard_failure_alert_text). Факт
+    заметок копится здесь же в общий бакет заметок (#1051: раньше 🚨-строка
+    жила только в отчёте прогона, Telegram молчал — «сигнал есть, но его
+    никто не увидит»; класс закрыт в ТРЕТЬЕМ месте вызова
+    append_session_notes, после after_merge и unhealthy_pulls).
 
     Живой случай (проверки на входе вместо гвардий постфактум, задача о
     приёмке при открытом втором PR): приёмка закрыла #320, пока по нему был
@@ -5451,8 +5539,8 @@ def accept_merged_tasks(
         session_notes.append((number, f"♻️ Задача #{number} не закрыта приёмкой ({category}) — {detail}."))
     note_lines, note_hard_failure = append_session_notes(session_notes)
     actions += note_lines
-    hard_failure = hard_failure or note_hard_failure
-    return observations, actions, hard_failure
+    _record_merge_session_hard_failure_facts(note_lines, "notes")
+    return observations, actions, hard_failure, note_hard_failure
 
 
 def render_action_report(observations: list[str], actions: list[str]) -> list[str]:
@@ -5572,25 +5660,25 @@ def main() -> int:
     # PR не могло измениться со времени снимка выше.
     conflict_lines = mark_conflicts(repo, pulls)
     # Граница фактов жёсткого сбоя архива/заметки сессии раннера этого
-    # прогона (см. докстринг _MERGE_SESSION_HARD_FAILURE_FACTS выше) —
-    # сбрасывается ПЕРЕД накопителями этого прогона (unhealthy_pulls ниже и
-    # after_merge внутри merge_loop), не между ними: между вызовами main()
-    # список не должен копить факты чужого прогона (важно для тестов,
-    # вызывающих main() несколько раз в одном процессе). Раньше сброс стоял
-    # после unhealthy_pulls — с появлением у неё собственных фактов (находка
+    # прогона (см. докстринг бакетов выше) — сбрасывается ПЕРЕД накопителями
+    # этого прогона (unhealthy_pulls ниже, after_merge внутри merge_loop и
+    # accept_merged_tasks), не между ними: между вызовами main() список не
+    # должен копить факты чужого прогона (важно для тестов, вызывающих main()
+    # несколько раз в одном процессе). Раньше сброс стоял после
+    # unhealthy_pulls — с появлением у неё собственных фактов (находка
     # ai-ревью #1053) он обязан идти раньше ПЕРВОГО из них.
     reset_merge_session_hard_failure_facts()
     # #196, поведение 2: нездоровый PR возвращает задачу в пул ДО очереди
     # слияния — освобождённая задача должна попасть в тот же отчёт, а
     # merge_queue ниже не зависит от пула задач.
     unhealthy_lines, unhealthy_note_hard_failure = unhealthy_pulls(repo, now, pulls, pool=pool)
-    merge_observations, merge_actions, archive_hard_failure, pulls = merge_loop(repo, pulls)
-    # Жёсткий сбой заметок из unhealthy_pulls — тот же класс («дозапись
-    # заметки-итога сломана»), тот же канал: OR-ится в archive_hard_failure
-    # ровно как after_merge OR-ит свой note_hard_failure, — общий финальный
-    # Telegram-алерт и красный код, второй механизм не заводится (находка
-    # ai-ревью #1053).
-    archive_hard_failure = archive_hard_failure or unhealthy_note_hard_failure
+    merge_observations, merge_actions, archive_hard_failure, merge_note_hard_failure, pulls = merge_loop(repo, pulls)
+    # Флаги архива и заметок идут РАЗДЕЛЬНО до самого финального алерта
+    # (находка ai-ревью #1053, второй круг): у них разные факт-бакеты, текст
+    # и газ — merge_session_hard_failure_alert_text ниже собирает текст по
+    # флагам, склейка здесь заставила бы его врать о том, ЧТО сломалось.
+    # note_hard_failure вычисляется после accept_merged_tasks — там тоже свой
+    # note-флаг.
     # #196, поведение 1: PR с review:ok без вердикта AI (или ai:failed)
     # дольше порога — оркестратор сам запускает ai-review.yml. merge_loop уже
     # вернул актуальный список открытых PR (#443): если он что-то слил или
@@ -5621,8 +5709,17 @@ def main() -> int:
     # инцидент #320/#325): свежий снимок открытых PR НАМЕРЕННО не переиспользует
     # pulls выше — PR, который стал причиной этой приёмки, мог открыться прямо
     # перед этой строкой, и только явный поздний запрос страхует от гонки.
-    accept_observations, accept_actions, accept_hard_failure = accept_merged_tasks(
+    accept_observations, accept_actions, accept_hard_failure, accept_note_hard_failure = accept_merged_tasks(
         repo, pool, merged, now, open_pulls_list=open_pulls(repo))
+    # Три источника жёсткого сбоя ЗАМЕТКИ — один флаг (тот же класс «дозапись
+    # заметки-итога сломана», тот же канал): после мержа (after_merge),
+    # при возврате задачи в пул (unhealthy_pulls) и при закрытии приёмкой
+    # (accept_merged_tasks). УЛИКИ приёмки (accept_hard_failure) в него не
+    # входят — у них своя per-task эскалация внутри accept_merged_tasks и
+    # своя проводка ниже, склейка переименовала бы сбой в алерте.
+    note_hard_failure = (
+        merge_note_hard_failure or unhealthy_note_hard_failure or accept_note_hard_failure
+    )
     if accept_actions:
         pool = open_task_issues(repo)  # пересчёт: приёмка могла закрыть задачи
     free = sum(1 for issue in pool if not issue["assignees"])
@@ -5698,9 +5795,14 @@ def main() -> int:
     )
     lines += render_action_report(observations, actions)
 
-    # Приёмка (#227): жёсткий сбой уже эскалирован по каждой затронутой задаче
-    # внутри accept_merged_tasks — здесь только красим прогон, второй сигнал
-    # не заводим (тот же принцип, что у archive_hard_failure ниже).
+    # Приёмка (#227): жёсткий сбой УЛИКИ (проверка улики/pending) уже
+    # эскалирован по каждой затронутой задаче внутри accept_merged_tasks —
+    # здесь только красим прогон, второй сигнал не заводим. Жёсткий сбой
+    # ЗАМЕТКИ там per-task эскалации НЕ имеет — он вынесен отдельным флагом
+    # (accept_note_hard_failure) и доезжает до общего финального алерта ниже
+    # через note_hard_failure (находка ai-ревью #1053: прежний комментарий
+    # «жёсткий сбой уже эскалирован по каждой затронутой задаче» был верен
+    # только для улик, заметки молчали и в Telegram, и в тексте).
     if accept_hard_failure:
         lines.append("🚨 приёмка: минимум одна улика не проверена из-за поломки — прогон окрашен красным")
 
@@ -5740,10 +5842,13 @@ def main() -> int:
     # очередь эта поломка не блокирует. Но fail loud: прогон обязан покраситься
     # ПОСЛЕ того, как отчёт уже сохранён, и эскалация уходит тем же каналом,
     # что предохранитель конвейера (#120), — не заводим третий канал сигнала.
-    if archive_hard_failure or stall_hard_failure:
+    # Текст различает, ЧТО сломалось (архив/заметка/детектор — находка
+    # ai-ревью #1053, второй круг), и для каждого вида называет свой газ.
+    if archive_hard_failure or note_hard_failure or stall_hard_failure:
         escalation = escalate(
             repo, WATCHDOG_ISSUE,
-            merge_session_hard_failure_alert_text(archive_hard_failure, stall_hard_failure, stall_lines),
+            merge_session_hard_failure_alert_text(
+                archive_hard_failure, note_hard_failure, stall_hard_failure, stall_lines),
         )
         lines.append(f"🚨 прогон окрашен красным ({escalation})")
         summary(lines)
