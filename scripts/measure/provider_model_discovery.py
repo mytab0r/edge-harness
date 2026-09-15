@@ -125,13 +125,21 @@ VERIFY_PROMPT = "Ответь одним словом: OK."
 
 # Семейства, для которых discovery вообще имеет смысл (#848: NVIDIA-NIM,
 # Ollama Cloud, OpenRouter — ровно три провайдера из живого замера #836 с
-# ошибочным id). GLM/Z.AI и базовый env-provider сюда не входят — их id уже
-# подтверждён отдельным путём (confirmed-provider-models.json, #737) либо не
-# входит в эту постановку.
+# ошибочным id). GLM и базовый env-provider сюда не входят — их id уже
+# подтверждён отдельным путём (confirmed-provider-models.json, #737).
+#
+# Z.AI добавлен #1289 (доводка задачи про манифест vs vars.DSH_PROVIDER_CHAIN):
+# запись ZAI/glm-5 была снята из config/provider-usage.json #1067 именно
+# потому, что id НИКОГДА не проходил живую сверку /v1/models (не было
+# доступа к ZAI_1_API_KEY в той сессии) — честная причина «не проверено», не
+# «проверено и дало отказ». Прежний комментарий здесь ошибочно утверждал
+# «id уже подтверждён» для Z.AI — не подтверждён (см. confirmed-provider-
+# models.json на момент #1067: хэша 'glm-5' там не было).
 FAMILY_LIST_STRATEGIES = {
     "nvidia-nim": ["openai_models"],
     "ollama-cloud": ["openai_models", "ollama_tags"],
     "openrouter": ["openrouter_free"],
+    "zai": ["openai_models"],
 }
 
 _FAMILY_RE = re.compile(r'^(.*)-\d+$')

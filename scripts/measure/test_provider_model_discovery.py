@@ -281,11 +281,14 @@ def test_discover_route_full_success_with_key(monkeypatch):
 
 
 def test_load_routes_by_family_covers_expected_families():
+    # #1289: "zai" добавлена в FAMILY_LIST_STRATEGIES (доводка манифест-vs-vars)
+    # — PLUGINS_SUITE_CANDIDATE_ROUTES несёт ровно один аккаунт "zai-1".
     grouped = pmd.load_routes_by_family()
-    assert set(grouped) == {"nvidia-nim", "ollama-cloud", "openrouter"}
+    assert set(grouped) == {"nvidia-nim", "ollama-cloud", "openrouter", "zai"}
     assert len(grouped["nvidia-nim"]) == 2
     assert len(grouped["ollama-cloud"]) == 3
     assert len(grouped["openrouter"]) == 2
+    assert len(grouped["zai"]) == 1
     for routes in grouped.values():
         for route in routes:
             assert {"alias", "base_url", "secret_env", "family", "display_name"} <= route.keys()

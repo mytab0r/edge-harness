@@ -76,7 +76,7 @@ jobs:
       - name: Гвардия дефолта провайдера/модели (класс #153) на новых файлах
         run: bash scripts/lib/test/provider-default.guard.sh
 
-      - name: Discovery живых model id (NVIDIA NIM / Ollama Cloud / OpenRouter)
+      - name: Discovery живых model id (NVIDIA NIM / Ollama Cloud / OpenRouter / Z.AI)
         env:
           NVIDIA_NIM_1_API_KEY: ${{ secrets.NVIDIA_NIM_1_API_KEY }}
           NVIDIA_NIM_2_API_KEY: ${{ secrets.NVIDIA_NIM_2_API_KEY }}
@@ -85,6 +85,7 @@ jobs:
           OLLAMA_CLOUD_3_API_KEY: ${{ secrets.OLLAMA_CLOUD_3_API_KEY }}
           OPENROUTER_1_API_KEY: ${{ secrets.OPENROUTER_1_API_KEY }}
           OPENROUTER_2_API_KEY: ${{ secrets.OPENROUTER_2_API_KEY }}
+          ZAI_1_API_KEY: ${{ secrets.ZAI_1_API_KEY }}
         run: python scripts/measure/provider_model_discovery.py
 
       # #1289: разовый живой замер потолка output-токенов — под явным входом
