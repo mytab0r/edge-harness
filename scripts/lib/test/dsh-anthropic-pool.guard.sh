@@ -965,14 +965,19 @@ echo "GUARD(anthropic-pool): 19) dsh_run_with_pool_then_chain — reason вид�
 #      несмотря на то что первая попытка пула провалилась.
 #
 # MUTATION-PROOF
-# ref: 8cd752e6
+# ref: c1df957
 # paths: scripts/lib/dsh-ci.sh
 # run: bash scripts/lib/test/dsh-anthropic-pool.guard.sh
 # expect: 20) прод-форма ответа пула из инцидента #1288 (34893177035) не приводит к повтору того же провайдера
 #
-# (ref — коммит main ДО этого фикса: dsh_run_with_pool_then_chain там не
-# читает retryAt вовсе и откатывается на цепочку одной попыткой — секция 15
-# красная с DSH_CHAIN_PROVIDER='PRIMARY' вместо 'anthropic-oauth-pool'.) ────
+# (ref — голова main ДО этого фикса, c1df957 (#1192/#1193): там
+# dsh_run_with_pool_then_chain не читает retryAt вовсе и откатывается на
+# цепочку одной попыткой — секция 20 красная с DSH_CHAIN_PROVIDER='PRIMARY'
+# вместо 'anthropic-oauth-pool'. Прежний ref 8cd752e6 после ребейза не
+# годится: он старше #1192, откат к нему вырезал бы и
+# dsh_pool_unavailable_owner_note, гвардия умирала бы на секциях 15-19
+# main, не доходя до секции 20 — живая находка обязательной проверки test
+# на ребейзнутом хеде.) ────
 POOL_RETRY_CALL_LOG="$WORK/pool-retry-calls.log"
 # Дословное тело ответа пула из инцидента #1288 (прогон 34893177035,
 # 20:30:30): retryAt=1789418114634мс = 2026-09-14T20:35:14Z.
