@@ -163,7 +163,19 @@ for (const row of rows) {
       headers: headersFor(token), signal: AbortSignal.timeout(20_000),
     })
     if (probe.status === 200) {
-      verdicts.push({ id: row.id, verdict: 'OK', detail: needsRefresh ? 'токен обновлён' : 'токен из секрета ещё жив', usable: true })
+      // ЧЕСТНАЯ ГРАНИЦА: /v1/models — не инференс, и 200 здесь доказывает
+      // ЖИВЫЕ КРЕДЫ, а не наличие квоты на запросы к модели. Аккаунт,
+      // исчерпавший лимит /v1/messages, здесь вполне может ответить 200.
+      // Не называть это «аккаунт работает» — ровно та подмена измеренного
+      // предполагаемым, из-за которой агрегат reason и читался как «квота у
+      // обоих» (#1311).
+      verdicts.push({
+        id: row.id,
+        verdict: 'OK',
+        detail: (needsRefresh ? 'токен обновлён' : 'токен из секрета ещё жив')
+          + ', креды приняты Anthropic (квота на инференс этим запросом НЕ проверяется: /v1/models не инференс)',
+        usable: true,
+      })
       usable += 1
     } else if (probe.status === 429) {
       verdicts.push({ id: row.id, verdict: 'RATE_LIMITED', detail: `квота Anthropic исчерпана (HTTP 429${resetNote(probe)})`, usable: false })
