@@ -112,15 +112,16 @@ def probe_max_output_tokens(base_url: str, model: str, key: str,
 
 def main() -> int:
     if len(sys.argv) < 4:
-        print("использование: probe_max_output_tokens.py <base_url> <model> <secret_env> [probe_max_tokens]", file=sys.stderr)
+        print("использование: probe_max_output_tokens.py <base_url> <model> <secret_env> [probe_max_tokens] [timeout_secs]", file=sys.stderr)
         return 2
     base_url, model, secret_env = sys.argv[1], sys.argv[2], sys.argv[3]
     probe_max_tokens = int(sys.argv[4]) if len(sys.argv) > 4 else DEFAULT_PROBE_MAX_TOKENS
+    timeout_secs = float(sys.argv[5]) if len(sys.argv) > 5 else DEFAULT_TIMEOUT_SECS
     key = os.environ.get(secret_env, "")
     if not key:
         print(f"::error::секрет {secret_env} не задан в окружении", file=sys.stderr)
         return 1
-    result = probe_max_output_tokens(base_url, model, key, probe_max_tokens=probe_max_tokens)
+    result = probe_max_output_tokens(base_url, model, key, probe_max_tokens=probe_max_tokens, timeout_secs=timeout_secs)
     print(f"probe_max_output_tokens: base_url={base_url} model={model!r} "
           f"probe_max_tokens={probe_max_tokens} -> outcome={result['outcome']} "
           f"http={result['http']} confirmed_limit={result['confirmed_limit']} note={result['note']!r}")

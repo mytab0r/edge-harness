@@ -113,6 +113,10 @@ jobs:
                        e["base_url"], e["model"], e["secret_env"]]
               if "probe_max_tokens" in e:
                   args.append(str(e["probe_max_tokens"]))
+              elif "timeout_secs" in e:
+                  args.append("5000000")
+              if "timeout_secs" in e:
+                  args.append(str(e["timeout_secs"]))
               subprocess.run(args, check=False)
           '
 
