@@ -20,25 +20,67 @@ Retention story (находка ревью PR #893, второй раунд: д�
 Безопасность:
   - Никогда не удаляет дерево с файлом-маркером `.worktree-keep`
   - Никогда не удаляет дерево с незакоммиченными изменениями
-  - Никогда не удаляет дерево с локальными коммитами
+  - Никогда не удаляет дерево, для которого не ДОКАЗАНО, что коммиты
+    существуют где-то ещё — origin-ветка синхронна, ИЛИ содержимое HEAD
+    равно живому апстриму/origin/main напрямую, ИЛИ (последний рубеж) PR
+    ветки доказанно merged (см. условие 2 — три яруса, честная граница
+    названа там же)
   - Никогда не удаляет дерево открытого PR
-  - Fail loud вместо молчаливого удаления
+  - Fail loud вместо молчаливого удаления — три исхода, не два (носитель
+    `scripts/lib/check_result.py`, issue #1096): «доказано сохранено»,
+    «доказано НЕ сохранено», «доказать не удалось». Третий исход НИКОГДА
+    не читается как разрешение снять дерево.
 
 Условия удаления (ВСЕ должны быть выполнены):
   0. Нет файла-маркера `.worktree-keep` в корне дерева — объявленный ручной
      способ защитить конкретное дерево (не хардкод имени/номера, см.
      `WorktreeAnalyzer.KEEP_MARKER_NAME`); --force НЕ отменяет
-  1. Нет незакоммиченных изменений (git status --porcelain пусто)
-  2. Нет локальных коммитов, которых нет больше нигде (git rev-list --count
-     @{u}.., с запасным путём через origin/main, если апстрим-ветка уже
-     упразднена на origin и вычищена локальным fetch --prune)
+  1. Нет незакоммиченных изменений (git status --porcelain пусто); --force
+     НЕ отменяет. Газ (issue #1250): закоммить и запушить (тогда решает
+     условие 2), либо осознанно отбросить правки (`git checkout -- . &&
+     git clean -fd`), либо поставить `.worktree-keep`, если дерево нужно
+     оставить как есть надолго — сообщение отказа называет это явно.
+  2. Работа доказанно существует где-то ещё, не только в этом дереве
+     (`check_unpushed_commits`, --force НЕ отменяет никогда, ни один из
+     трёх ярусов). Три яруса по убыванию силы сигнала, дословный докстринг
+     метода — источник правды (три РЕАЛЬНЫХ раунда живого замера, не
+     гипотеза):
+       (а) классика: апстрим-ветка резолвится и локальный HEAD не впереди
+           неё (`git rev-list --count @{u}..` == 0) — коммиты уже на origin;
+       (б) squash-safe против ЖИВОГО апстрима: апстрим существует, но
+           переписан (ребейз/force-push) — содержимое дерева файлов
+           идентично `@{u}` напрямую (не sha-историю) — коммиты физически
+           лежат на origin под другим sha;
+       (в) squash-safe против main: апстрим полностью удалён — содержимое
+           идентично `origin/main` напрямую;
+       (г) ПОСЛЕДНИЙ рубеж, единственный, реально снимающий деревья на
+           живых данных этого репозитория (issue #1250, раунды 1-2 дали
+           `Removed: 0` на 73-76 живых деревьях БЕЗ этого яруса, включая
+           заведомо merged #1109/#1027 — main и апстрим постоянно копят
+           довески от других каналов перед слиянием, полное сравнение
+           дерева файлов не масштабируется): (а)/(б)/(в) не доказали —
+           доверяем статусу PR (`gh pr list`, уже кэширован условием 3):
+           `merged` ⇒ ok(), иначе ⇒ violation. ЧЕСТНО НАЗВАННЫЙ ОСТАТОЧНЫЙ
+           РИСК: коммит, сделанный ПОСЛЕ слияния PR и никогда никуда не
+           запушенный, будет ошибочно принят за сохранённый — узкий,
+           признанный, задокументированный компромисс (полный разбор —
+           докстринг `check_unpushed_commits`), не молчаливый регресс.
+       `unknown` — только когда сама команда сравнения физически не
+       выполнилась технически (например `origin/main` не резолвится) ИЛИ
+       статус PR не удалось получить на последнем рубеже — не когда
+       сравнение прошло и показало расхождение (это `violation`).
   3. Associated PR не в статусе open (см. ниже про сигнал "жива ли ветка")
   4. Дерево старше retention_hours (по умолчанию 1 час, мерится по mtime
      КОРНЕВОГО каталога дерева — прокси, не точное время слияния PR, см.
      Retention story ниже; инъекция параметром — не жёсткая константа,
      чтобы тесты не зависели от системных часов)
-  5. По опции --force пропускается ТОЛЬКО проверка 3 (статус PR, debug-путь);
-     пункты 0, 1, 2, 4 обязательны всегда, --force их не отменяет
+  5. По опции --force пропускается ТОЛЬКО проверка 3 (статус PR как
+     ОТДЕЛЬНЫЙ гейт "PR ещё open", debug-путь). Пункты 0, 1, 2, 4 обязательны
+     ВСЕГДА и не читают `self.force` нигде в своём коде — --force никогда
+     не может привести к потере незакоммиченной работы. Оговорка: условие 2
+     САМО вызывает `get_pr_status` на своём последнем рубеже (г) — это
+     НЕ то же самое, что проверка 3 (открыт ли PR прямо сейчас), и от
+     `self.force` тоже не зависит; см. честную границу в условии 2 выше.
 
 Почему сигнал не "ветка удалена на origin" (замер #891, живой прогон на
 edge-harness): в этом репозитории оркестратор сливает PR, но НЕ удаляет
@@ -47,6 +89,19 @@ origin", включая ветки PR, смердженных месяцами �
 присутствия ветки на origin делала бы уборку бессмысленной для этого
 репозитория (0 кандидатов навсегда) — авторитетный сигнал "работа ещё не
 закончена" здесь только статус PR (gh pr list), не факт существования ветки.
+
+Каталоги без `.git` под `.claude/worktrees/` (issue #1250, пункт 5): этот
+скрипт видит только то, что знает `git worktree list --porcelain` — обычный
+каталог без `.git` там НЕ зарегистрирован как worktree и структурно не
+может быть ни удалён, ни защищён этим кодом. Найденные при замере
+(`432-gate1-decided`, `_scratch_pool`, `pr-workflow-sessions-8f1ab5`, все три
+2026-09-14) не признаны ни мусором, ни чужой инфраструктурой — решение
+`git worktree remove`/`rm -rf` этого скрипта не касается: происхождение
+неизвестно (не текущий git worktree, не гарантированно неиспользуемый
+scratch), удалять вслепую — риск потери чужой работы того же класса,
+которого эта задача и избегает. `scan_orphan_directories()` только
+ОТЧИТЫВАЕТСЯ о них построчно в сводке (не молчаливое игнорирование) —
+решение, что с ними делать, за оператором.
 """
 
 import subprocess
@@ -64,6 +119,13 @@ _console_utf8_spec = importlib.util.spec_from_file_location(
     "console_utf8", Path(__file__).resolve().parent.parent / "lib" / "console_utf8.py")
 _console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))
 # --- конец console_utf8 bootstrap ---
+
+# --- check_result bootstrap (носитель третьего состояния, issue #1096/#1250) ---
+_check_result_spec = importlib.util.spec_from_file_location(
+    "check_result", Path(__file__).resolve().parent.parent / "lib" / "check_result.py")
+check_result = importlib.util.module_from_spec(_check_result_spec)
+_check_result_spec.loader.exec_module(check_result)
+# --- конец check_result bootstrap ---
 
 
 def run_cmd(cmd: str, cwd: Optional[str] = None, check: bool = False) -> Tuple[str, int]:
@@ -113,6 +175,8 @@ class WorktreeAnalyzer:
         # обязательным гейтом почти для всех кандидатов — это десятки/сотни
         # последовательных сетевых вызовов на один прогон, минуты и квота
         # API. Один пакетный запрос ~5с против сотен по ~1с, замер #891).
+        # Он же переиспользуется условием 2 (squash-safe признак, #1250) —
+        # второй пакетный запрос НЕ заводится, кэш общий.
         self._pr_status_cache: Optional[dict] = None
         self._pr_status_cache_ok: bool = False
 
@@ -159,8 +223,76 @@ class WorktreeAnalyzer:
             return True  # Если не смогли проверить — считаем грязным
         return bool(output.strip())
 
-    def check_unpushed_commits(self, worktree_path: str) -> bool:
-        """Проверить наличие локальных коммитов, которых нет больше нигде.
+    def check_unpushed_commits(self, worktree_path: str, branch: str) -> "check_result.CheckResult":
+        """Доказана ли сохранность коммитов где-то ещё, кроме этого дерева.
+
+        Три исхода (`check_result.CheckResult`, issue #1096/#1250), не bool:
+          - ok(): доказано сохранено — апстрим синхронен (классика), ИЛИ
+            содержимое HEAD равно текущему апстриму/main, ИЛИ PR ветки
+            доказанно merged (см. три яруса ниже).
+          - violation([...]): ни один ярус не доказал сохранность, а PR
+            доказанно НЕ merged (open/closed) — содержимое НЕ доказано
+            сохранённым нигде.
+          - unknown(reason): ни один ярус физически не выполнился и статус
+            PR тоже не удалось получить — вызывающий код обязан трактовать
+            это как отказ (fail loud), не как "можно".
+
+        ЖИВОЙ ЗАМЕР (issue #1250, три прогона на реальных 73-76 деревьях)
+        заставил пересмотреть эту функцию дважды — оба раза честно, не
+        задним числом:
+
+        Раунд 1 (чистое сравнение дерева файлов с origin/main, без статуса
+        PR вовсе): технически корректно отличает "мой вклад совпадает с
+        main" от "не совпадает", но НЕПРИМЕНИМО на практике — main
+        непрерывно копит чужие изменения от всех остальных слитых PR,
+        поэтому полное сравнение дерева почти ВСЕГДА показывает расхождение
+        для ветки старше пары часов, даже если её СОБСТВЕННЫЙ вклад давно
+        слит. Живой замер: `Removed: 0` из 75 деревьев — фикс не снимал
+        НИ ОДНОГО дерева, включая заведомо смёрженные (#1109 PR #1140
+        MERGED, #1027 PR #1030 MERGED) — оба диффят и от main, И от
+        собственного живого апстрима (см. ниже), потому что апстрим этих
+        веток сам получил дополнительные ревью-фиксапы от другого канала
+        ДО финального слияния — содержимое локальной копии всегда меньше
+        итогового, а доказать "моё — подмножество итогового" дёшево
+        технически невозможно (сравнение деревьев различает "равно"/
+        "не равно", не "подмножество").
+
+        Раунд 2 (двухъярусное сравнение содержимого — с живым апстримом,
+        затем с main, без статуса PR): решает узкий частный случай "просто
+        переписанный апстрим той же самой правкой" (`mechanical_rebase.py
+        --force-with-lease`), но НЕ решает основной живой случай выше
+        (апстрим/main получили ДОПОЛНИТЕЛЬНЫЕ изменения, не только
+        переписывание) — на тех же 75 деревьях всё ещё `Removed: 0`.
+
+        Раунд 3 (этот код): сравнение содержимого остаётся ПЕРВЫМ и
+        предпочтительным сигналом (два яруса ниже, сильные и узкие — не
+        нуждаются в сети), но когда оба яруса показали расхождение,
+        последним рубежом становится статус PR (`gh pr list`, уже кэширован
+        для условия 3) — GitHub authoritative: если PR ветки доказанно
+        `merged`, ВСЁ его финальное содержимое (каким бы оно ни стало к
+        моменту слияния — с любыми довесками от любого канала) уже в main,
+        и локальная копия, отличающаяся от main, просто СТАРЕЕ финальной
+        версии, а не содержит НЕЧТО, чего нет нигде. `violation` наступает,
+        только когда содержимое отличается И PR доказанно НЕ merged
+        (open/closed) — это по-прежнему блокирует реальный "рабочий" случай
+        (см. `can_remove_worktree`, условие 3, где `open` уже гейтит отдельно
+        задолго до этого).
+
+        ЧЕСТНО НАЗВАННЫЙ ОСТАТОЧНЫЙ РИСК (issue #1250, «не потеряй работу» —
+        главное ограничение задачи, обсуждалось явно, не по умолчанию):
+        коммит, сделанный ПОСЛЕ того, как PR этой же ветки уже смёржен, и НИ
+        РАЗУ не запушенный никуда, окажется классифицирован как `ok()` —
+        `pr_status == 'merged'` побеждает расхождение содержимого без
+        дальнейшей проверки. Условие 1 (`check_dirty`) по-прежнему абсолютно
+        и ловит НЕЗАКОММИЧЕННЫЕ хвосты такой работы; не ловит ЗАКОММИЧЕННЫЙ
+        локальный хвост поверх уже смёрженного PR. В операционной модели
+        этого репозитория (`AGENTS.md`: «Закрытая задача не переоткрывается
+        никогда», ветки переиспользуются после CLOSED, не после MERGED) это
+        осознанный редкий анти-паттерн, не типичный путь — но он РЕАЛЕН и
+        назван здесь явно, а не спрятан. Альтернатива (не доверять
+        merged-статусу вовсе) была опробована (раунды 1–2 выше) и не даёт ни
+        одного снятого дерева на живых данных — тормоз без названного газа
+        хуже, чем узкий названный риск.
 
         Без "2>/dev/null" — run_cmd уже вызывается с capture_output=True
         (stderr идёт в result.stderr, не на консоль), а сама редирекция вида
@@ -169,25 +301,62 @@ class WorktreeAnalyzer:
         дерево навсегда считается "опасным" (баг найден поведенческим
         тестом на реальном git-репозитории, не текстовой гвардией, #891).
         """
+        content_diverged = False
+
         output, rc = run_cmd('git rev-list --count @{u}..', cwd=worktree_path)
         if rc == 0:
             try:
-                return int(output.strip() or 0) > 0
+                ahead = int(output.strip() or 0)
             except ValueError:
-                return True
-        # @{u} не резолвится — типичный случай: апстрим-ветка уже удалена на
-        # origin и локальная remote-tracking ссылка вычищена `git fetch
-        # --prune` (ровно так и происходит после слияния PR). Без этого
-        # запасного пути check_unpushed_commits возвращал(а) True для КАЖДОГО
-        # дерева слитой ветки навсегда — скрипт никогда ничего не удалял
-        # (баг найден поведенческим тестом на реальном репозитории, #891, а
-        # не текстовой гвардией). Апстрима больше нет — сверяем HEAD дерева
-        # напрямую с origin/main: если он уже есть в истории main, коммиты
-        # никуда не потеряются при удалении дерева.
-        _, rc_main = run_cmd('git merge-base --is-ancestor HEAD origin/main', cwd=worktree_path)
-        if rc_main == 0:
-            return False
-        return True  # Не смогли доказать безопасность — считаем опасным
+                ahead = None
+            if ahead == 0:
+                return check_result.ok()
+            # ahead>0 (или не распарсилось) — апстрим есть, но локально
+            # впереди него. Ярус 1: сверяем содержимое с ЖИВЫМ апстримом —
+            # сильный, узкий сигнал (переписанная той же правкой ветка).
+            _, diff_rc = run_cmd('git diff --quiet HEAD @{u}', cwd=worktree_path)
+            if diff_rc == 0:
+                return check_result.ok()
+            if diff_rc == 1:
+                content_diverged = True
+            else:
+                return check_result.unknown(
+                    f"git diff HEAD @{{u}} завершился кодом {diff_rc} в "
+                    f"{worktree_path} — не удалось сравнить дерево с апстримом"
+                )
+        else:
+            # Апстрим не резолвится вовсе (ветка удалена на origin) — ярус 2:
+            # сравнение с origin/main напрямую (слабее яруса 1, но лучше,
+            # чем ничего, когда апстрима больше нет вовсе).
+            _, diff_rc = run_cmd('git diff --quiet HEAD origin/main', cwd=worktree_path)
+            if diff_rc == 0:
+                return check_result.ok()
+            if diff_rc == 1:
+                content_diverged = True
+            else:
+                return check_result.unknown(
+                    f"git diff HEAD origin/main завершился кодом {diff_rc} в "
+                    f"{worktree_path} — не удалось сравнить дерево с main"
+                )
+
+        # Оба доступных яруса содержимого показали расхождение — ярус 3
+        # (последний рубеж, issue #1250 раунд 3, см. докстринг выше):
+        # доверяем статусу PR как единственному сигналу, переживающему живой
+        # паттерн "апстрим получил довески от другого канала перед слиянием".
+        assert content_diverged
+        pr_status = self.get_pr_status(branch)
+        if pr_status is None:
+            return check_result.unknown(
+                f"содержимое ветки {branch} отличается и от апстрима/main, а "
+                f"статус PR определить не удалось ({self._pr_lookup_diagnosis(branch)})"
+            )
+        if pr_status == 'merged':
+            return check_result.ok()
+        return check_result.violation([
+            f"содержимое ветки {branch} отличается от апстрима/main, а PR "
+            f"не merged (status={pr_status}) — коммиты не доказаны "
+            "сохранёнными нигде"
+        ])
 
     def get_worktree_age_hours(self, worktree_path: str) -> float:
         """Получить возраст worktree'а в часах (по времени последнего доступа)"""
@@ -249,6 +418,7 @@ class WorktreeAnalyzer:
         None — либо PR по этой ветке не найден, либо весь пакетный запрос
         не удался (сеть/gh недоступен) — вызывающий код (can_remove_worktree)
         обязан трактовать None как отказ, не как "можно удалять" (fail loud).
+        Различие между "не найден" и "сеть недоступна" — `_pr_lookup_diagnosis`.
         """
         if not branch.startswith('agent/'):
             return None
@@ -257,6 +427,29 @@ class WorktreeAnalyzer:
         if not self._pr_status_cache_ok:
             return None
         return self._pr_status_cache.get(branch)
+
+    def _pr_lookup_diagnosis(self, branch: str) -> str:
+        """Человекочитаемая причина, ПОЧЕМУ `get_pr_status` вернул None —
+        три разных факта, а не один общий "не определилось" (issue #1250,
+        пункт 2: третье состояние обязано называть, что с ним делать):
+          - ветка не `agent/*` — поиск PR структурно неприменим (например
+            DETACHED HEAD) — это состояние НАВСЕГДА и это ожидаемо;
+          - `gh pr list` в этом прогоне не удался — временное состояние,
+            следующий прогон может его снять сам;
+          - `gh pr list` отработал, но PR с такой веткой не найден вообще —
+            ветка либо никогда не публиковалась, либо PR был удалён без
+            merge/close, а не просто "статус неизвестен" — требует решения
+            оператора, само не рассосётся.
+        """
+        if not branch.startswith('agent/'):
+            return "ветка не agent/* — поиск PR по номеру задачи не применим"
+        if self._pr_status_cache is None:
+            self._load_pr_status_cache()
+        if not self._pr_status_cache_ok:
+            return "gh pr list --state all не удался в этом прогоне (сеть/токен недоступны) — повтори позже"
+        if branch not in self._pr_status_cache:
+            return "gh pr list не нашёл ни одного PR с этой веткой — PR либо не создавался, либо удалён без merge/close"
+        return "статус определён"  # не должно вызываться в этом случае
 
     # Файл-маркер ручной защиты (известный хвост #891, живой случай: при
     # прогоне-замере на 133 деревьях пришлось РУКАМИ исключить
@@ -279,10 +472,15 @@ class WorktreeAnalyzer:
     def has_keep_marker(self, worktree_path: str) -> bool:
         return (Path(worktree_path) / self.KEEP_MARKER_NAME).exists()
 
-    def can_remove_worktree(self, worktree_info: dict) -> Tuple[bool, str]:
+    def can_remove_worktree(self, worktree_info: dict) -> Tuple[bool, str, str]:
         """
         Проверить, безопасно ли удалять worktree.
-        Возвращает (can_remove, reason).
+        Возвращает (can_remove, reason_code, reason_message). reason_code —
+        машиночитаемый ключ статистики (семантика, не парсинг подстроки
+        сообщения — AGENTS.md «Семантика важнее подстроки»); reason_message
+        — человекочитаемое сообщение, обязано называть газ (что сделать,
+        чтобы дерево стало снимаемым), кроме кодов, где газ не нужен (PR
+        сам смёржится/закроется, retention сам истечёт).
         """
         path = worktree_info['path']
         branch = self.branch_name(worktree_info.get('branch', 'unknown'))
@@ -291,16 +489,36 @@ class WorktreeAnalyzer:
         # ровно как и остальные проверки безопасности ниже (--force снимает
         # ТОЛЬКО проверку статуса PR, см. проверку 3).
         if self.has_keep_marker(path):
-            return False, f"Protected by {self.KEEP_MARKER_NAME} marker"
+            return False, "protected", (
+                f"Protected by {self.KEEP_MARKER_NAME} marker — газ: удалить файл "
+                f"{self.KEEP_MARKER_NAME} из корня дерева, когда защита больше не нужна."
+            )
 
         # Проверка 1: наличие незакоммиченных изменений — --force НЕ отменяет
         if self.check_dirty(path):
-            return False, "Has uncommitted changes"
+            return False, "dirty", (
+                "Has uncommitted changes — газ: закоммить и запушить (дальше решает "
+                "проверка сохранности коммитов), либо осознанно отбросить правки "
+                "(git checkout -- . && git clean -fd) и прогнать уборщик снова, либо "
+                f"поставить {self.KEEP_MARKER_NAME}, если дерево нужно оставить как есть."
+            )
 
-        # Проверка 2: наличие локальных коммитов, которых нет больше нигде —
-        # --force НЕ отменяет
-        if self.check_unpushed_commits(path):
-            return False, "Has unpushed commits"
+        # Проверка 2: работа доказанно существует где-то ещё — --force НЕ
+        # отменяет (squash-safe признак, issue #1250, см. докстринг файла).
+        work = self.check_unpushed_commits(path, branch)
+        if work.status == check_result.STATUS_VIOLATION:
+            return False, "unpushed", (
+                "Has unpushed commits (" + "; ".join(work.violations) + ") — газ: "
+                "запушить ветку на origin, или открыть/дождаться merge PR, чтобы "
+                "работа существовала хотя бы в одном месте, кроме этого дерева."
+            )
+        if work.status == check_result.STATUS_UNKNOWN:
+            return False, "unknown_work", (
+                f"Could not determine if work is preserved ({work.reason}) — газ: "
+                "свериться руками (git -C <дерево> diff HEAD origin/main, gh pr list "
+                "--head <ветка>) и снять дерево вручную (git worktree remove --force "
+                "<путь>), если сохранность подтвердится."
+            )
 
         # Проверка 3: статус PR — единственная проверка, пропускаемая
         # --force (debug-путь). Не "ветка есть на origin": оркестратор этого
@@ -310,16 +528,47 @@ class WorktreeAnalyzer:
         if not self.force:
             pr_status = self.get_pr_status(branch)
             if pr_status is None:
-                return False, "Could not determine PR status (no PR found or gh unavailable) — keeping to be safe"
+                diag = self._pr_lookup_diagnosis(branch)
+                return False, "unknown_pr", (
+                    f"Could not determine PR status ({diag}) — keeping to be safe."
+                )
             if pr_status == 'open':
-                return False, "Associated PR is still open"
+                return False, "open_pr", "Associated PR is still open"
 
         # Проверка 4: retention (дерево достаточно старое) — не зависит от --force
         age_hours = self.get_worktree_age_hours(path)
         if age_hours < self.retention_hours:
-            return False, f"Too young (age: {age_hours:.1f}h < {self.retention_hours}h retention)"
+            return False, "young", f"Too young (age: {age_hours:.1f}h < {self.retention_hours}h retention)"
 
-        return True, "Safe to remove"
+        return True, "ok", "Safe to remove"
+
+    def scan_orphan_directories(self) -> List[str]:
+        """Каталоги под `.claude/worktrees/`, о которых `git worktree list`
+        НЕ знает (обычно — нет `.git`, не настоящий worktree). Этот скрипт
+        их не удаляет и не защищает — структурно ограничен тем, что видит
+        git (issue #1250, пункт 5, см. докстринг файла целиком). Единственная
+        обязанность — не молчать про них."""
+        base = Path(self.repo_root) / ".claude" / "worktrees"
+        if not base.is_dir():
+            return []
+        known_paths = set()
+        for wt in self.get_worktrees():
+            try:
+                known_paths.add(str(Path(wt['path']).resolve()))
+            except OSError:
+                known_paths.add(wt['path'])
+        orphans = []
+        for entry in sorted(base.iterdir()):
+            if not entry.is_dir():
+                continue
+            try:
+                resolved = str(entry.resolve())
+            except OSError:
+                resolved = str(entry)
+            if resolved in known_paths:
+                continue
+            orphans.append(entry.name)
+        return orphans
 
     def remove_worktree(self, worktree_path: str) -> bool:
         """Удалить worktree, вернуть True если успешно"""
@@ -343,18 +592,20 @@ class WorktreeAnalyzer:
             'kept': 0,
             'protected': [],
             'dirty': [],
-            'young': [],
-            'unknown_pr_status': [],
             'unpushed': [],
+            'unknown_work': [],
             'open_pr': [],
-            'errors': []
+            'unknown_pr': [],
+            'young': [],
+            'errors': [],
+            'orphan_dirs': self.scan_orphan_directories(),
         }
 
         for wt in worktrees:
             path = wt['path']
             branch = self.branch_name(wt.get('branch', 'unknown'))
 
-            can_remove, reason = self.can_remove_worktree(wt)
+            can_remove, code, message = self.can_remove_worktree(wt)
 
             if can_remove:
                 if self.verbose:
@@ -366,23 +617,36 @@ class WorktreeAnalyzer:
             else:
                 stats['kept'] += 1
                 if self.verbose:
-                    print(f"Keeping: {branch} ({reason})")
-
-                # Categorize the reason
-                if "Protected by" in reason:
-                    stats['protected'].append(branch)
-                elif "uncommitted" in reason:
-                    stats['dirty'].append(branch)
-                elif "unpushed" in reason:
-                    stats['unpushed'].append(branch)
-                elif "Could not determine" in reason:
-                    stats['unknown_pr_status'].append(branch)
-                elif "young" in reason:
-                    stats['young'].append(branch)
-                elif "still open" in reason:
-                    stats['open_pr'].append(branch)
+                    print(f"Keeping: {branch} ({message})")
+                stats.setdefault(code, []).append((branch, message))
 
         return stats
+
+    # Реестр разделов сводки — код категории (из can_remove_worktree),
+    # заголовок и общий газ (что делать), если он один на всю категорию.
+    # Семантика по коду, не парсинг подстроки текста сообщения (AGENTS.md
+    # «Семантика важнее подстроки») — тот же принцип, что и в
+    # can_remove_worktree/analyze_and_cleanup.
+    _SECTIONS = [
+        ("protected", "Protected (.worktree-keep)",
+         f"Газ: удалить файл {KEEP_MARKER_NAME} из корня дерева, когда защита больше не нужна."),
+        ("dirty", "Dirty (uncommitted changes)",
+         "Газ: закоммить и запушить, либо осознанно отбросить правки "
+         "(git checkout -- . && git clean -fd), либо поставить .worktree-keep."),
+        ("unpushed", "Unpushed / unproven work",
+         "Газ: запушить ветку на origin, или открыть/дождаться merge PR."),
+        ("unknown_work", "Could not prove work is preserved",
+         "Газ: свериться руками (git diff HEAD origin/main, gh pr list --head <ветка>) "
+         "и снять вручную (git worktree remove --force), если сохранность подтвердится."),
+        ("open_pr", "Open PR (not merged)",
+         "Газ не нужен — дерево станет кандидатом само после слияния или закрытия PR."),
+        ("unknown_pr", "Unknown PR status (kept to be safe)",
+         "Газ: см. причину у каждой ветки — либо повтори прогон позже (gh был "
+         "недоступен), либо реши руками (открыть PR или git worktree remove --force), "
+         "если PR для этой ветки никогда не создавался."),
+        ("young", "Too young (retention)",
+         "Газ не нужен — дерево станет кандидатом само после окончания retention-окна."),
+    ]
 
     def print_summary(self, stats: dict):
         """Вывести сводку"""
@@ -391,52 +655,30 @@ class WorktreeAnalyzer:
         print(f"Removed: {stats['removed']}")
         print(f"Kept: {stats['kept']}")
 
-        if stats['protected']:
-            print(f"\nProtected ({WorktreeAnalyzer.KEEP_MARKER_NAME}): {len(stats['protected'])}")
-            for b in stats['protected'][:5]:
-                print(f"  - {b}")
-            if len(stats['protected']) > 5:
-                print(f"  ... and {len(stats['protected']) - 5} more")
+        for code, title, guidance in self._SECTIONS:
+            entries = stats.get(code) or []
+            if not entries:
+                continue
+            print(f"\n{title}: {len(entries)}")
+            print(f"  {guidance}")
+            for branch, _message in entries[:5]:
+                print(f"  - {branch}")
+            if len(entries) > 5:
+                print(f"  ... and {len(entries) - 5} more")
 
-        if stats['dirty']:
-            print(f"\nDirty (uncommitted): {len(stats['dirty'])}")
-            for b in stats['dirty'][:5]:
-                print(f"  - {b}")
-            if len(stats['dirty']) > 5:
-                print(f"  ... and {len(stats['dirty']) - 5} more")
-
-        if stats['unpushed']:
-            print(f"\nUnpushed commits: {len(stats['unpushed'])}")
-            for b in stats['unpushed'][:5]:
-                print(f"  - {b}")
-            if len(stats['unpushed']) > 5:
-                print(f"  ... and {len(stats['unpushed']) - 5} more")
-
-        if stats['young']:
-            print(f"\nToo young (retention): {len(stats['young'])}")
-            for b in stats['young'][:3]:
-                print(f"  - {b}")
-            if len(stats['young']) > 3:
-                print(f"  ... and {len(stats['young']) - 3} more")
-
-        if stats['open_pr']:
-            print(f"\nOpen PR (not merged): {len(stats['open_pr'])}")
-            for b in stats['open_pr'][:3]:
-                print(f"  - {b}")
-            if len(stats['open_pr']) > 3:
-                print(f"  ... and {len(stats['open_pr']) - 3} more")
-
-        if stats['unknown_pr_status']:
-            print(f"\nUnknown PR status (kept to be safe): {len(stats['unknown_pr_status'])}")
-            for b in stats['unknown_pr_status'][:3]:
-                print(f"  - {b}")
-            if len(stats['unknown_pr_status']) > 3:
-                print(f"  ... and {len(stats['unknown_pr_status']) - 3} more")
-
-        if stats['errors']:
+        if stats.get('errors'):
             print(f"\nErrors: {len(stats['errors'])}")
             for branch, error in stats['errors']:
                 print(f"  - {branch}: {error}")
+
+        orphans = stats.get('orphan_dirs') or []
+        if orphans:
+            print(f"\nNon-worktree directories under .claude/worktrees (no .git, not managed by this script): {len(orphans)}")
+            print("  Не удаляются и не защищаются этим скриптом — происхождение не проверено, реши руками (issue #1250, п.5).")
+            for name in orphans[:5]:
+                print(f"  - {name}")
+            if len(orphans) > 5:
+                print(f"  ... and {len(orphans) - 5} more")
 
 
 def main():
@@ -449,7 +691,8 @@ def main():
     parser.add_argument(
         '--force',
         action='store_true',
-        help='Skip PR status check (debug only)'
+        help='Skip PR status check only (debug/offline path) — never skips '
+             'the dirty/unproven-work/keep-marker safety checks (issue #1250)'
     )
     parser.add_argument(
         '--verbose',
