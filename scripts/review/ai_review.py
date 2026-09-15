@@ -325,7 +325,8 @@ def size_question_section(added: int) -> str:
 
 
 def error_reason(answer: str, dsh_rc: str, failure_reason: str = "",
-                  reset_hint: str = "", empty_rework: bool = False) -> str:
+                  reset_hint: str = "", empty_rework: bool = False,
+                  outcome_summary: str = "", retry_useful: bool = False) -> str:
     """Причина verdict=error — теперь ПЯТЬ состояний, не смешиваемые в одно
     (класс silent-wrong прогона 33572445063: ошибка провайдера читалась как
     «модель нарушила контракт»; #419 добавил различение внутри самого
@@ -432,6 +433,23 @@ def error_reason(answer: str, dsh_rc: str, failure_reason: str = "",
                 "результат")
     if failure_reason == "all_providers_exhausted":
         when = reset_hint.strip() if reset_hint else "дата неизвестна — ни один провайдер её не назвал"
+        # #1307: «все исчерпаны» — верно ТОЛЬКО когда каждый провайдер реально
+        # без квоты. Живой разбор (прогон ai-review 34965204800, worker.yml
+        # 35010410097): из восьми реально без квоты был один, пять отвалились
+        # по НАШЕМУ исчерпанному бюджету ожидания, два несли мёртвый id —
+        # а текст звал «ждать сброса», и оркестратор придерживал автоповтор
+        # (#196) до даты того единственного. Разбор по классам приходит
+        # готовым из dsh_run_with_provider_chain (DSH_CHAIN_OUTCOME_SUMMARY),
+        # здесь он НЕ пересчитывается вторым разбором тех же строк.
+        if retry_useful:
+            detail = outcome_summary.strip() or (
+                "разбор по классам недоступен — сводка не доехала из ai_dsh.sh")
+            return (f"ревью не состоялось — ни один провайдер цепочки не ответил "
+                    f"(код возврата {dsh_rc}), но цепочка НЕ исчерпана квотой: "
+                    f"{detail}. Названный сброс: {when}. Действие: повтор ИМЕЕТ "
+                    "смысл — часть провайдеров не получила настоящей попытки "
+                    "(наш бюджет ожидания/транзиент), см. разбор выше и "
+                    "docs/runbooks/switch-llm-provider.md (#1307)")
         return (f"ревью не состоялось — все провайдеры цепочки исчерпаны/недоступны "
                 f"(код возврата {dsh_rc}), ближайший сброс: {when} — действие: "
                 "ждать сброса вне CI, либо добавить нового провайдера в "
@@ -650,7 +668,8 @@ def build_comment(number: int, sha: str, verdict: str, findings: str,
                   chain_provider: str | None = None,
                   reset_hint: str | None = None,
                   reason_tag_value: str | None = None,
-                  class_signal: "defect_classes.ClassSignal | None" = None) -> str:
+                  class_signal: "defect_classes.ClassSignal | None" = None,
+                  chain_retry_useful: bool = False) -> str:
     """Канонический комментарий-вердикт. Шапка-факты — САМЫЕ ПЕРВЫЕ строки,
     до первого пустой строки (инвариант: file_tasks.py парсит ТОЛЬКО эту
     зону и фенсы задач, проза и заборы не могут притвориться фактами).
@@ -697,6 +716,11 @@ def build_comment(number: int, sha: str, verdict: str, findings: str,
     diff_line = f"diff: {diff_fp}\n" if diff_fp else ""
     provider_line = f"provider: {chain_provider}\n" if chain_provider else ""
     reset_line = f"reset-at: {reset_hint}\n" if reset_hint else ""
+    # #1307: `reset-at` сам по себе НЕ значит «до этой даты ничего не
+    # получится» — он может принадлежать одному провайдеру из восьми. Факт
+    # ниже говорит оркестратору (scheduler.trigger_ai_review), что остальные
+    # не были опробованы по-настоящему и авто-повтор придерживать нечем.
+    retry_useful_line = "chain-retry-useful: 1\n" if chain_retry_useful else ""
     reason_line = f"reason: {reason_tag_value}\n" if reason_tag_value else ""
     class_line = ""
     if class_signal is not None and class_signal.state != defect_classes.STATE_NOT_NAMED:
@@ -704,7 +728,7 @@ def build_comment(number: int, sha: str, verdict: str, findings: str,
         class_line = f"class: {class_signal.state}={slugs}\n"
     head = (
         f"pr: {number}\nhead: {sha}\nreviewer: {verdict}\n"
-        f"{diff_line}{provider_line}{reset_line}{reason_line}{class_line}\n"
+        f"{diff_line}{provider_line}{reset_line}{retry_useful_line}{reason_line}{class_line}\n"
         f"🤖 AI-ревью — второй гейт конвейера (#18). Вердикт: {verdict}."
     )
     backlog, tail, unscoped = partition_tasks(tasks)
@@ -1286,8 +1310,13 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     # не смешиваются ни в логе, ни в тексте для человека (silent-wrong класс:
     # ошибка провайдера не должна выглядеть как «модель ответила криво», а
     # временный RATE_LIMIT — как настоящая поломка, #419).
+    # #1307: признак «повтор имеет смысл» приходит строкой ("1"/"0"/пусто) —
+    # сравнение со строкой, а не bool(str): непустая "0" истинна как объект.
+    chain_retry_useful = str(getattr(args, "chain_retry_useful", "")).strip() == "1"
     reason = (error_reason(answer, args.dsh_rc, args.failure_reason, args.reset_hint,
-                            empty_rework=empty_rework)
+                            empty_rework=empty_rework,
+                            outcome_summary=getattr(args, "chain_outcome_summary", ""),
+                            retry_useful=chain_retry_useful)
               if verdict == "error" else None)
     if reason and not findings.strip():
         findings = reason
@@ -1412,7 +1441,8 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     body = build_comment(args.pr, args.head, verdict, findings, tasks, diff_fp=diff_fp,
                           remarks=remarks, chain_provider=args.chain_provider,
                           reset_hint=args.reset_hint, reason_tag_value=reason_tag_value,
-                          class_signal=class_signal)
+                          class_signal=class_signal,
+                          chain_retry_useful=chain_retry_useful and verdict == "error")
     run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/comments",
            "-f", "body=" + body)
 
@@ -1473,6 +1503,13 @@ def main() -> int:
     # / chain_reset_hint.txt, ai_dsh.sh) — оба необязательны, тот же принцип.
     verdict.add_argument("--chain-provider", default="")
     verdict.add_argument("--reset-hint", default="")
+    # #1307: разбор исхода цепочки ПО КЛАССАМ (DSH_CHAIN_OUTCOME_SUMMARY) и
+    # признак «повтор имеет смысл» (DSH_CHAIN_RETRY_USEFUL) — оба приходят из
+    # ai_dsh.sh файлами chain_outcome_summary.txt/chain_retry_useful.txt.
+    # Необязательны по тому же принципу, что --dsh-rc/--reset-hint: ручной
+    # запуск без них теряет уточнение, но не падает.
+    verdict.add_argument("--chain-outcome-summary", default="")
+    verdict.add_argument("--chain-retry-useful", default="")
     verdict.set_defaults(func=cmd_verdict)
 
     args = parser.parse_args()

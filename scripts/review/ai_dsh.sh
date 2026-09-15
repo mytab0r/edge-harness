@@ -123,6 +123,12 @@ if [ -n "$DSH_RUN_FAILURE_REASON" ]; then
 fi
 printf '%s' "$DSH_CHAIN_PROVIDER" >"$AI_WORK/chain_provider.txt"
 printf '%s' "$DSH_CHAIN_RESET_HINT" >"$AI_WORK/chain_reset_hint.txt"
+# #1307: разбор исхода цепочки ПО КЛАССАМ и признак «повтор имеет смысл».
+# Без них шапка вердикта несла только `reset-at`, и оркестратор придерживал
+# авто-повтор (#196) до даты сброса ОДНОГО реально исчерпанного провайдера,
+# хотя остальные не получили ни секунды бюджета ожидания.
+printf '%s' "${DSH_CHAIN_OUTCOME_SUMMARY:-}" >"$AI_WORK/chain_outcome_summary.txt"
+printf '%s' "${DSH_CHAIN_RETRY_USEFUL:-0}" >"$AI_WORK/chain_retry_useful.txt"
 
 printf '%s' "$rc" >"$AI_WORK/dsh_rc.txt"
 

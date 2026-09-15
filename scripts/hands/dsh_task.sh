@@ -336,10 +336,14 @@ dsh_patch_anthropic_pool_plugin \
 _chain_head=$(jq -c '.[0]' <<<"$DSH_PROVIDER_CHAIN")
 _chain_head_secret=$(jq -r '.secret_env' <<<"$_chain_head")
 DEEPSEEK_BASE_URL=$(jq -r '.base_url' <<<"$_chain_head")
-DEEPSEEK_MODEL=$(jq -r '.model' <<<"$_chain_head")
+# #1309: у элемента цепочки может не быть поля `model` вовсе (форма
+# `models` — список кандидатов одного ключа). Затравка читает ПЕРВОГО
+# кандидата через то же одно место правды, что и сам цикл цепочки
+# (dsh_entry_model_candidates), а не третьей копией разбора JSON здесь.
+DEEPSEEK_MODEL=$(dsh_chain_head_model "$DSH_PROVIDER_CHAIN")
 DEEPSEEK_API_KEY="${!_chain_head_secret:-}"
 export DEEPSEEK_BASE_URL DEEPSEEK_MODEL DEEPSEEK_API_KEY
-DSH_MAX_TOKENS=$(jq -r '.max_output_tokens // 131072' <<<"$_chain_head") dsh_patch_profile headless
+DSH_MAX_TOKENS=$(dsh_chain_head_max_tokens "$DSH_PROVIDER_CHAIN") dsh_patch_profile headless
 
 # ── 3c. Монтаж suite (после патча — тот же порядок, что доказан для
 # hands-streamer в 3d ниже) ────────────────────────────────────────────────────
@@ -425,6 +429,9 @@ HANDS_TASK_FAILURE_REASON="$DSH_RUN_FAILURE_REASON"
 HANDS_CHAIN_PROVIDER="$DSH_CHAIN_PROVIDER"
 HANDS_CHAIN_TRIED="$DSH_CHAIN_TRIED"
 HANDS_CHAIN_RESET_HINT="$DSH_CHAIN_RESET_HINT"
+# #1307 — см. тот же приём в scripts/worker/task.sh.
+HANDS_CHAIN_OUTCOME_SUMMARY="${DSH_CHAIN_OUTCOME_SUMMARY:-}"
+HANDS_CHAIN_RETRY_USEFUL="${DSH_CHAIN_RETRY_USEFUL:-0}"
 DSH_SECS=$(( $(date -u +%s) - DSH_START_TS ))
 echo "dsh завершился с кодом $rc (провайдер: ${HANDS_CHAIN_PROVIDER:-нет успеха}, опробованы: ${HANDS_CHAIN_TRIED:-?})"
 
@@ -541,7 +548,12 @@ else
       echo "::error::провайдер: временный RATE_LIMIT не снялся за бюджет ожидания ${HANDS_RATE_LIMIT_MAX_WAIT_SECS}с (код возврата $rc) — не сбой агента" >&2
       ;;
     all_providers_exhausted)
-      echo "::error::цепочка провайдеров исчерпана целиком (опробованы: ${HANDS_CHAIN_TRIED:-?})${HANDS_CHAIN_RESET_HINT:+, ближайший названный сброс: $HANDS_CHAIN_RESET_HINT} — повтор внутри этого прогона не поможет (docs/runbooks/switch-llm-provider.md, #727)" >&2
+      # #1307: см. тот же разбор в scripts/worker/task.sh.
+      if [ "${HANDS_CHAIN_RETRY_USEFUL:-0}" = "1" ]; then
+        echo "::error::ни один провайдер цепочки не ответил, но цепочка НЕ исчерпана квотой (опробованы: ${HANDS_CHAIN_TRIED:-?}) — ${HANDS_CHAIN_OUTCOME_SUMMARY:-разбор по классам недоступен}${HANDS_CHAIN_RESET_HINT:+; названный сброс: $HANDS_CHAIN_RESET_HINT}. Повтор ИМЕЕТ смысл: часть провайдеров не получила настоящей попытки (#1307, docs/runbooks/switch-llm-provider.md)" >&2
+      else
+        echo "::error::цепочка провайдеров исчерпана целиком (опробованы: ${HANDS_CHAIN_TRIED:-?})${HANDS_CHAIN_RESET_HINT:+, ближайший названный сброс: $HANDS_CHAIN_RESET_HINT} — все реально без квоты, повтор внутри этого прогона не поможет (docs/runbooks/switch-llm-provider.md, #727)" >&2
+      fi
       ;;
     *)
       echo "::error::dsh завершился с кодом $rc" >&2

@@ -1193,4 +1193,52 @@ echo "GUARD(anthropic-pool): 24) прошлое retryAt пять подряд ->
 ) || fail "25) тело pool_unavailable среди чужих JSON-строк до/после не разбирается"
 echo "GUARD(anthropic-pool): 25) многострочный stderr (шум до/после тела) -> retryAt разобран, пул повторён — ок (блокер ai-review PR #1292, раунд 2)"
 
+# ── 26) #1310: поаккаунтная разбивка (`accounts`, добавлена #1192 ради
+#      различения «какой ключ живой») ДОХОДИТ ДО ЛОГА. Живой дефект: текстовый
+#      хвост режется до 200 символов (#1067) и обрывается ровно на
+#      `"accounts":[{"id":"anthropic-1","c` — прогоны worker.yml 34942030597
+#      (2026-09-15T08:04:16Z) и 35010410097 (19:28:38Z). Тело здесь —
+#      ДОСЛОВНАЯ прод-форма второго из них, дополненная полем accounts в том
+#      виде, в каком его пишет патченный плагин (сценарий 17 выше доказывает
+#      этот вид отдельно). Мутация: убери pool_accounts_note из сообщения —
+#      предупреждение снова расскажет «rate_limited», не сказав, что именно
+#      anthropic-2 в этом процессе не пробовался ни разу.
+(
+  export DSH_ANTHROPIC_POOL_ACTIVE=1
+  export SMOKE_MODE_primary_model=ok
+  rm -f "$CHAIN_CALLED_MARK"; : >"$ANSWER"; : >"$ERR"
+  dsh() {
+    case "${1:-}" in
+      --profile)
+        if grep -q 'provider: anthropic-pool' "$HOME/.dsh/profiles/headless/cordis.patch.yml" 2>/dev/null; then
+          echo 'dsh: RATE_LIMIT: 503 {"type":"error","error":{"type":"pool_unavailable","message":"No Anthropic account is available","retryAt":0,"reason":"rate_limited","accounts":[{"id":"anthropic-1","class":"rate_limited","lastStatus":429,"cooldownUntil":1789500803738},{"id":"anthropic-2","class":"unknown","lastStatus":null,"cooldownUntil":null}]}}' >&2
+          return 1
+        else
+          touch "$CHAIN_CALLED_MARK"; echo "smoke: ответ от $DEEPSEEK_MODEL"; return 0
+        fi ;;
+      *) echo "::error::SMOKE(26): dsh-заглушка не знает вызов: $*" >&2; return 99 ;;
+    esac
+  }
+  export -f dsh
+  POOL_LOG26="$WORK/pool-warning-26.txt"
+  DSH_RATE_LIMIT_MAX_WAIT_SECS=0 dsh_run_with_pool_then_chain "$ANSWER" "$ERR" "промпт smoke" >"$POOL_LOG26" 2>&1
+  [ "$DSH_RUN_RC" = "0" ] || { echo "::error::26) ожидался успех после отката на цепочку, получено rc=$DSH_RUN_RC: $(cat "$POOL_LOG26")" >&2; exit 1; }
+  grep -q "аккаунты: anthropic-1: rate_limited (HTTP 429)" "$POOL_LOG26" \
+    || { echo "::error::26) разбивка по аккаунтам не доехала до лога — ровно тот дефект, ради которого #1192 клал accounts в тело: $(cat "$POOL_LOG26")" >&2; exit 1; }
+  grep -q "anthropic-2: unknown" "$POOL_LOG26" \
+    || { echo "::error::26) ВТОРОЙ аккаунт обязан быть назван: агрегат reason=rate_limited верен и когда второй ключ не пробовался вовсе: $(cat "$POOL_LOG26")" >&2; exit 1; }
+) || fail "26) поаккаунтная разбивка пула не доехала до лога"
+echo "GUARD(anthropic-pool): 26) accounts[] из тела pool_unavailable доходит до лога целиком — видно, какой из двух ключей живой (#1310) — ок"
+
+# ── 27) #1310: разбивки нет в теле (плагин без патча #1192 / старая форма) —
+#      честный пробел, не выдуманный факт и не падение.
+NO_ACC_ERR="$WORK/err-27.txt"
+printf '%s\n' 'dsh: SERVER: 503 {"type":"error","error":{"type":"pool_unavailable","message":"No Anthropic account is available","retryAt":null}}' >"$NO_ACC_ERR"
+[ -z "$(dsh_pool_accounts_note "$NO_ACC_ERR")" ] \
+  || fail "27) тела без accounts обязано давать ПУСТО, а не выдуманную разбивку: $(dsh_pool_accounts_note "$NO_ACC_ERR")"
+printf '%s\n' 'dsh: TRANSPORT: connection refused' >"$NO_ACC_ERR"
+[ -z "$(dsh_pool_accounts_note "$NO_ACC_ERR")" ] \
+  || fail "27) отказ вообще без тела pool_unavailable обязан давать ПУСТО"
+echo "GUARD(anthropic-pool): 27) нет accounts в теле -> честный пробел, не выдуманный факт (#1310) — ок"
+
 echo "GUARD(anthropic-pool): быстрый провайдер Claude (#838), инвариант #860 «пул только в worker/hands» — гвардия зелёная"
