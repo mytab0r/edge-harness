@@ -3190,6 +3190,10 @@ def test_dispatch_conflict_rework_silent_while_worker_active(monkeypatch):
         "issues/560/timeline?per_page=100": [],
         "workflows/worker.yml/runs?status=in_progress": {
             "workflow_runs": [workflow_run(33814313381, "in_progress")]},
+        # active_worker_runs (#1032, одно место правды фетча) читает ОБА статуса
+        # всегда: у сведённого к списку предиката больше нет раннего return на
+        # in_progress, поэтому queued-фетч доходит и при занятом воркере.
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
     })
     patch_gh(monkeypatch, fake)
     assume_worker_not_stalled(monkeypatch)
@@ -3482,6 +3486,7 @@ def test_dispatch_conflict_rework_defers_escalation_while_attempt_still_running(
         ],
         "workflows/worker.yml/runs?status=in_progress": {
             "workflow_runs": [workflow_run(34027474271, "in_progress")]},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
         # Отметка git-шага ставится РАНО в прогоне (перед dsh_run_with_retry,
         # scripts/worker/task.sh) — задолго до конца 340-минутного job'а (#1067),
         # поэтому attempts может стать 1 ещё ПОКА прогон "in_progress" (тот
@@ -5482,6 +5487,7 @@ def test_dispatch_worker_silent_while_worker_run_in_progress(monkeypatch):
     fake = FakeGh({
         "workflows/worker.yml/runs?status=in_progress": {
             "workflow_runs": [workflow_run(33814313381, "in_progress")]},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
     })
     patch_gh(monkeypatch, fake)
     assume_worker_not_stalled(monkeypatch)
@@ -5552,7 +5558,10 @@ def test_worker_runs_active_still_blocks_recent_in_progress_run(monkeypatch):
     now = datetime.now(timezone.utc)
     run = workflow_run(1, "in_progress")
     run["run_started_at"] = (now - timedelta(minutes=5)).isoformat(timespec="seconds").replace("+00:00", "Z")
-    fake = FakeGh({"workflows/worker.yml/runs?status=in_progress": {"workflow_runs": [run]}})
+    fake = FakeGh({
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": [run]},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+    })
     patch_gh(monkeypatch, fake)
     assert sch.worker_runs_active(REPO) is True
 
@@ -6141,6 +6150,7 @@ def test_dispatch_worker_stays_silent_while_worker_active_even_when_rework_avail
     fake = FakeGh({
         "workflows/worker.yml/runs?status=in_progress": {
             "workflow_runs": [workflow_run(33814313381, "in_progress")]},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
     })
     patch_gh(monkeypatch, fake)
     assume_worker_not_stalled(monkeypatch)

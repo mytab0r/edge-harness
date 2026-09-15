@@ -18,6 +18,7 @@ git-конфликта строкой было бы тем самым запре
 
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -37,6 +38,7 @@ if str(_DIR) not in sys.path:
 # sys.modules["scheduler"] — единственный способ, которым тест и модуль под
 # тестом разделяют ОДИН и тот же патченный объект gh.
 import scheduler as sch  # noqa: E402
+import pulse_guard as pg  # noqa: E402
 import mechanical_rebase as mr  # noqa: E402
 
 
@@ -71,11 +73,12 @@ class FakeGh:
 
     _DEFAULT_ROUTES = {
         "actions/workflows/ai-review.yml/runs": {"workflow_runs": []},
-        # По умолчанию воркер простаивает (issue #764, находка ревью гейта,
-        # требование 2: process_pull теперь спрашивает sch.worker_runs_active
+        # По умолчанию воркер простаивает (issue #764, требование 2, сужено
+        # issue #1032: process_pull теперь спрашивает sch.active_worker_runs
         # ПЕРЕД каждой попыткой) — тесты, для которых занятость воркера не
-        # предмет проверки, явно переопределяют этот маршрут или монки-патчат
-        # sch.worker_runs_active напрямую (см. тесты гейта ниже).
+        # предмет проверки, явно переопределяют этот маршрут (см. тесты
+        # гейта ниже: маршрутизация по ?status=... специфичнее дефолта,
+        # выигрывает по длине совпадения).
         "actions/workflows/worker.yml/runs": {"workflow_runs": []},
     }
 
@@ -101,7 +104,14 @@ class FakeGh:
 
 
 def patch_gh(monkeypatch, fake):
+    # sch.gh — прямые вызовы scheduler.py; pg.gh — реэкспортированные из
+    # pulse_guard функции (all_issue_comments, через который sch.run_claimed_task
+    # читает CLAIM_VIA-след): такая функция разрешает `gh` в ГЛОБАЛЬНЫХ ИМЕНАХ
+    # pulse_guard, и патч одного sch.gh пустил бы тест к ЖИВОЙ сети (находка
+    # этого PR: тест гейта молча спрашивал настоящий `gh api` про задачу #601).
+    # Тот же приём, что patch_gh в test_scheduler.py.
     monkeypatch.setattr(sch, "gh", fake)
+    monkeypatch.setattr(pg, "gh", fake)
 
 
 # ── Real git: bare "origin" + рабочее дерево, как actions/checkout@v7 ───────
@@ -301,8 +311,10 @@ def test_attempt_rebase_raises_git_error_for_missing_branch(tmp_path):
 
 # ── Перенос рукописных шагов гвардии в каталог (issue #897) ─────────────────
 # migrate_guard_steps_if_needed вызывается process_pull МЕЖДУ attempt_rebase
-# ("resolved") и push_rebased — тесты ниже гоняют её изолированно, на РЕАЛЬНОМ
-# git-дереве (не моке), тот же приём, что остальной файл.
+# ("resolved"/"resolved-additive") и push_rebased — тесты ниже гоняют её
+# изолированно, на РЕАЛЬНОМ git-дереве (не моке), тот же приём, что остальной
+# файл. Восстановлены после случайной потери в первой итерации #1032 (находка
+# ai-review PR #1033, требование 1) — дословно, из состава PR #902.
 
 
 def _init_bare_git_repo(tmp_path: Path, name: str) -> Path:
@@ -452,6 +464,37 @@ def test_migrate_guard_steps_if_needed_is_noop_when_repo_ci_is_absent(tmp_path):
     assert mr.migrate_guard_steps_if_needed(work) is None
 
 
+def test_process_pull_runs_guard_step_migration_between_rebase_and_push(tmp_path, monkeypatch):
+    """Проводка migrate_guard_steps_if_needed в process_pull (находка ai-review
+    PR #1033, требование 1 — первая итерация #1032 стёрла и функцию, и её
+    вызов): порядок ровно «ребейз → перенос → пуш», исход по-прежнему
+    "resolved". Мутация: удали вызов migrate_guard_steps_if_needed из
+    process_pull — тест краснеет (order == ["push"] без "migrate")."""
+    origin = build_origin(tmp_path)
+    work = clone_workdir(origin, tmp_path)
+    p = pull(601, ref="agent/601-drifted-a")
+    fake = FakeGh({"issues/601/timeline?per_page=100": []})
+    patch_gh(monkeypatch, fake)
+    order: list[str] = []
+    monkeypatch.setattr(
+        mr, "migrate_guard_steps_if_needed",
+        lambda repo_dir: order.append("migrate") and None,
+    )
+    real_push = mr.push_rebased
+
+    def recording_push(repo_dir, head_ref):
+        order.append("push")
+        real_push(repo_dir, head_ref)
+
+    monkeypatch.setattr(mr, "push_rebased", recording_push)
+
+    outcome = mr.process_pull(REPO, p, work)
+
+    assert outcome == "resolved"
+    assert order == ["migrate", "push"]
+    assert branch_tip(origin, "agent/601-drifted-a") != branch_tip(origin, "main")
+
+
 # ── Идентичность git на раннере (issue #764, находка ревью гейта, требование 1) ──
 
 
@@ -524,7 +567,6 @@ def test_process_pull_reports_missing_identity_as_infra_error(tmp_path, monkeypa
     p = pull(601, ref="agent/601-drifted-a")
     fake = FakeGh({"issues/601/timeline?per_page=100": []})
     patch_gh(monkeypatch, fake)
-    monkeypatch.setattr(sch, "worker_runs_active", lambda repo: False)
 
     outcome = mr.process_pull(REPO, p, work)
 
@@ -533,16 +575,49 @@ def test_process_pull_reports_missing_identity_as_infra_error(tmp_path, monkeypa
 
 
 # ── Взаимное исключение с агентским путём (issue #764, находка ревью гейта, требование 2) ──
+# Гейт гоняется через НАСТОЯЩИЙ фетч sch.active_worker_runs (маршруты FakeGh
+# по ?status=... — прод-форма ответа Actions API), не через мок предиката:
+# сужение гейта живёт ровно в связке «фетч → возраст → CLAIM_VIA-след».
 
 
-def test_process_pull_defers_when_worker_is_active(tmp_path, monkeypatch):
+def worker_run_payload(run_id: int, status: str, *, started_minutes_ago: float) -> dict:
+    """Прод-форма элемента workflow_runs (поля, которые читают
+    sch.active_worker_runs/_run_is_stalled/run_age_minutes): id, status,
+    run_started_at/created_at. Возраст — относительно реального now, потому
+    что process_pull берёт datetime.now(timezone.utc) сам; оба порога
+    (WORKER_STALL_MINUTES=255, WORKER_CLAIM_TRACE_GRACE_MINUTES=10) на
+    порядки больше длительности теста, зафиксированная дата фикстуры здесь
+    не «стареет» (тот же приём, что докстринг sch._run_is_stalled запрещает
+    для ДЛИТЕЛЬНЫХ горизонтов)."""
+    started = (
+        datetime.now(timezone.utc) - timedelta(minutes=started_minutes_ago)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return {"id": run_id, "status": status, "run_started_at": started, "created_at": started}
+
+
+CLAIM_COMMENT_BODY = (
+    "🔒 Аренда задачи: `mytab0r` держит замок `refs/locks/task-601` "
+    "Канал: worker run 777, task=conflict-rework."
+)
+"""Прод-форма следа аренды (claim_task.claim + CLAIM_VIA из task.sh):
+именно по подстроке `worker run 777` sch.run_claimed_task сопоставляет
+прогон ↔ задача."""
+
+
+def test_process_pull_defers_when_a_worker_run_is_still_queued(tmp_path, monkeypatch):
+    """`queued` — атрибуция невозможна (claim ещё не мог случиться, см.
+    блок-комментарий у worker_blocks_pr) — блокирует БЕЗУСЛОВНО, тот же
+    консервативный отказ, что был у старого repo-wide гейта."""
     origin = build_origin(tmp_path)
     work = clone_workdir(origin, tmp_path)
     p = pull(601, ref="agent/601-drifted-a")
     original_tip = branch_tip(origin, "agent/601-drifted-a")
-    fake = FakeGh({"issues/601/timeline?per_page=100": []})
+    fake = FakeGh({
+        "issues/601/timeline?per_page=100": [],
+        "actions/workflows/worker.yml/runs?status=queued": {
+            "workflow_runs": [worker_run_payload(778, "queued", started_minutes_ago=0.5)]},
+    })
     patch_gh(monkeypatch, fake)
-    monkeypatch.setattr(sch, "worker_runs_active", lambda repo: True)
 
     outcome = mr.process_pull(REPO, p, work)
 
@@ -550,24 +625,135 @@ def test_process_pull_defers_when_worker_is_active(tmp_path, monkeypatch):
     assert branch_tip(origin, "agent/601-drifted-a") == original_tip  # head не тронут
 
 
-def test_run_reports_worker_running_and_skips_push(tmp_path, monkeypatch):
-    """Мутационное доказательство (issue #764, находка ревью гейта, требование 2):
-    без этого гейта (monkeypatch.setattr(sch, "worker_runs_active", lambda repo: False))
-    PR #601 получил бы "resolved" и запушенную ветку — тест ниже покраснел бы на
-    строке assert outcomes[601] == "resolved", доказывая, что гейт — не no-op."""
+def test_process_pull_defers_when_active_worker_claims_the_same_task(tmp_path, monkeypatch):
+    """Issue #1032 — ядро сужения гейта: активный `in_progress`-прогон СТАРШЕ
+    грейс-порога (след уже обязан был появиться) несёт CLAIM_VIA-след ИМЕННО
+    задачи #601 (та же задача, что резолвится из имени ветки
+    agent/601-drifted-a) — это ровно опасность issue #764 (агент может сейчас
+    пушить в эту же ветку), блок остаётся."""
     origin = build_origin(tmp_path)
     work = clone_workdir(origin, tmp_path)
     p = pull(601, ref="agent/601-drifted-a")
     original_tip = branch_tip(origin, "agent/601-drifted-a")
-    fake = FakeGh({"pulls?state=open": [p], "issues/601/timeline?per_page=100": []})
+    fake = FakeGh({
+        "issues/601/timeline?per_page=100": [],
+        "issues/601/comments?per_page=100": [{"body": CLAIM_COMMENT_BODY}],
+        "actions/workflows/worker.yml/runs?status=in_progress": {
+            "workflow_runs": [worker_run_payload(777, "in_progress", started_minutes_ago=30)]},
+    })
     patch_gh(monkeypatch, fake)
-    monkeypatch.setattr(sch, "worker_runs_active", lambda repo: True)
+
+    outcome = mr.process_pull(REPO, p, work)
+
+    assert outcome == "worker-running"
+    assert branch_tip(origin, "agent/601-drifted-a") == original_tip
+
+
+def test_process_pull_proceeds_when_active_worker_claims_a_different_task(tmp_path, monkeypatch):
+    """Мутационное доказательство обратного (issue #1032, живой замер: воркер
+    занят ~89% времени, старый repo-wide гейт откладывал ВСЮ очередь на
+    каждом таком прогоне): активный воркер старше грейс-порога и его след
+    аренды указывает на ДРУГОЙ прогон (не run 777 этого job'а — воркер
+    работает над ЧУЖОЙ задачей) — сужение гейта обязано ПРОПУСТИТЬ этот PR
+    (старый бинарный гейт здесь красил бы "worker-running" безусловно, теряя
+    отток по всей остальной очереди)."""
+    origin = build_origin(tmp_path)
+    work = clone_workdir(origin, tmp_path)
+    p = pull(601, ref="agent/601-drifted-a")
+    fake = FakeGh({
+        "issues/601/timeline?per_page=100": [],
+        "issues/601/comments?per_page=100": [{"body": CLAIM_COMMENT_BODY}],
+        "actions/workflows/worker.yml/runs?status=in_progress": {
+            "workflow_runs": [worker_run_payload(999, "in_progress", started_minutes_ago=30)]},
+    })
+    patch_gh(monkeypatch, fake)
+
+    outcome = mr.process_pull(REPO, p, work)
+
+    assert outcome == "resolved"
+    assert branch_tip(origin, "agent/601-drifted-a") != branch_tip(origin, "main")
+
+
+def test_process_pull_defers_when_in_progress_run_is_young_without_claim_trace(tmp_path, monkeypatch):
+    """Окно молодого прогона (issue #1032, находка ai-review PR #1033,
+    требование 2): CLAIM_VIA-след появляется НЕ в первые секунды статуса
+    in_progress — до claim_task.claim воркер проходит выборку пула,
+    dup-гардию, квоту и PAT-авторизацию (минуты). Молодой in_progress-прогон
+    БЕЗ следа НЕ доказывает «воркер занят другим PR» — гейт блокирует
+    консервативно (первая итерация гейта здесь молча разрешала, заново
+    открывая окно #764 ровно на конфликтных PR — том классе, который
+    dispatch_conflict_rework и диспатчит).
+
+    Мутационное доказательство: сними проверку возраста в worker_blocks_pr
+    (удали условие `age < WORKER_CLAIM_TRACE_GRACE_MINUTES` из решения о
+    блокировке) — тест краснеет (outcome "resolved" вместо "worker-running");
+    test_process_pull_defers_when_a_worker_run_is_still_queued при той же
+    мутации остаётся зелёным (queued блокируется отдельной веткой) — ровно
+    та дыра, которую закрывает грейс-порог."""
+    origin = build_origin(tmp_path)
+    work = clone_workdir(origin, tmp_path)
+    p = pull(601, ref="agent/601-drifted-a")
+    original_tip = branch_tip(origin, "agent/601-drifted-a")
+    fake = FakeGh({
+        "issues/601/timeline?per_page=100": [],
+        "issues/601/comments?per_page=100": [],  # следа аренды ещё нет
+        "actions/workflows/worker.yml/runs?status=in_progress": {
+            "workflow_runs": [worker_run_payload(777, "in_progress", started_minutes_ago=1)]},
+    })
+    patch_gh(monkeypatch, fake)
+
+    outcome = mr.process_pull(REPO, p, work)
+
+    assert outcome == "worker-running"
+    assert branch_tip(origin, "agent/601-drifted-a") == original_tip
+
+
+def test_process_pull_proceeds_when_in_progress_run_outlived_grace_without_trace(tmp_path, monkeypatch):
+    """Газ грейс-порога (правило «тормоз без газа не принимается»): прогон
+    пережил WORKER_CLAIM_TRACE_GRACE_MINUTES и так и не оставил следа —
+    атрибуция «воркер занят другим PR» теперь обоснована, гейт ПРОПУСКАЕТ
+    PR. Без этой ветки порог был бы односторонним тормозом (тот же класс
+    #196/#205): очередь стояла бы, пока не завершится ЧУЖОЙ прогон."""
+    origin = build_origin(tmp_path)
+    work = clone_workdir(origin, tmp_path)
+    p = pull(601, ref="agent/601-drifted-a")
+    fake = FakeGh({
+        "issues/601/timeline?per_page=100": [],
+        "issues/601/comments?per_page=100": [],
+        "actions/workflows/worker.yml/runs?status=in_progress": {
+            "workflow_runs": [worker_run_payload(777, "in_progress", started_minutes_ago=45)]},
+    })
+    patch_gh(monkeypatch, fake)
+
+    outcome = mr.process_pull(REPO, p, work)
+
+    assert outcome == "resolved"
+    assert branch_tip(origin, "agent/601-drifted-a") != branch_tip(origin, "main")
+
+
+def test_run_reports_worker_running_and_skips_push(tmp_path, monkeypatch):
+    """Мутационное доказательство (issue #764, находка ревью гейта, требование 2):
+    без этого гейта (замени маршрут worker.yml/runs на пустой
+    {"workflow_runs": []} в обоих статусах) PR #601 получил бы "resolved" и
+    запушенную ветку — тест ниже покраснел бы на строке assert
+    outcomes[601] == "worker-running", доказывая, что гейт — не no-op."""
+    origin = build_origin(tmp_path)
+    work = clone_workdir(origin, tmp_path)
+    p = pull(601, ref="agent/601-drifted-a")
+    original_tip = branch_tip(origin, "agent/601-drifted-a")
+    fake = FakeGh({
+        "pulls?state=open": [p],
+        "issues/601/timeline?per_page=100": [],
+        "actions/workflows/worker.yml/runs?status=queued": {
+            "workflow_runs": [worker_run_payload(778, "queued", started_minutes_ago=0.5)]},
+    })
+    patch_gh(monkeypatch, fake)
 
     lines, outcomes = mr.run(REPO, work)
 
     assert outcomes[601] == "worker-running"
     assert branch_tip(origin, "agent/601-drifted-a") == original_tip
-    assert any("worker.yml" in line for line in lines)
+    assert any("воркер" in line for line in lines)
 
 
 # ── Каскад после неудачного abort (issue #764, находка ревью гейта, требование 5) ──

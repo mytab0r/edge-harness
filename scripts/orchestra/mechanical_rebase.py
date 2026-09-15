@@ -36,12 +36,27 @@ checkout@v7`, `fetch-depth: 0`), которого у scheduler.py принцип
     mark_conflicts, следующим тактом), уже не попадает в выборку по метке
     `conflict` — агент на него не тратится.
 
-Четыре исхода на PR (process_pull), различены по смыслу, а не по тексту
+Шесть исходов на PR (process_pull), различены по смыслу, а не по тексту
 ошибки git (тот протухнет при смене формулировки — тот же принцип, что
 WORKER_GIT_STEP_MARKER в scheduler.py):
-  - "resolved"          — рёбейз сошёлся, ветка запушена `--force-with-lease`;
-  - "conflict"           — рёбейз СТРУКТУРНО уткнулся в конфликт: после
-                            неудачного `git rebase` существует каталог
+  - "resolved"          — рёбейз сошёлся БЕЗ единого конфликта, ветка
+                            запушена `--force-with-lease`;
+  - "resolved-additive"  — issue #1032: по пути был хотя бы один структурный
+                            конфликт, но КАЖДЫЙ сведён механически
+                            (additive_conflict_merge.try_resolve — класс «обе
+                            стороны независимо дописали новый элемент в одну
+                            точку общего реестра», см. докстринг этого
+                            модуля) и перепроверен (ast.parse полного файла +
+                            pytest затронутых test_*.py) ДО `git rebase
+                            --continue`; ветка запушена так же, как
+                            "resolved" — вызывающая сторона (process_pull) не
+                            различает эти два исхода при решении пушить;
+  - "conflict"           — рёбейз СТРУКТУРНО уткнулся в конфликт, который
+                            additive_conflict_merge либо не признал своим
+                            классом (обычная правка одного и того же кода —
+                            основной случай), либо признал, но верификация
+                            (синтаксис/тесты) отказала: после неудачного
+                            `git rebase` существует каталог
                             `.git/rebase-merge` или `.git/rebase-apply` И в
                             индексе есть НЕЗАВЕДЁННЫЕ пути (`git diff
                             --diff-filter=U`) — оба признака самого git, не
@@ -60,16 +75,25 @@ WORKER_GIT_STEP_MARKER в scheduler.py):
                             не двигаем head, пока по PR летит ai-review.yml
                             (review_labels.other_active_ai_review_runs —
                             переиспользован, вторая копия не заводится);
-  - "worker-running"     — issue #764, находка ревью, требование 2: не
-                            двигаем head, пока по репозиторию активен
-                            worker.yml (sch.worker_runs_active) — единственный
-                            воркер может в этот момент пушить в ЛЮБУЮ
-                            конфликтную ветку (dispatch_conflict_rework), а
-                            метка `conflict` держится до следующего такта
-                            mark_conflicts; без этого гейта механический
-                            force-with-lease мог бы уехать НАД коммитами
-                            агента и сжечь его единственную засчитанную
-                            попытку (CONFLICT_REWORK_MAX_ATTEMPTS=1) вхолостую;
+  - "worker-running"     — issue #764, требование 2, СУЖЕНО issue #1032: не
+                            двигаем head, если активный `in_progress`-прогон
+                            worker.yml несёт CLAIM_VIA-след ИМЕННО задачи
+                            этого PR (worker_blocks_pr — единственный воркер
+                            физически может пушить только в СВОЮ ветку в
+                            данный момент, не в любую конфликтную), ЛИБО
+                            активный прогон ещё `queued` (атрибуция
+                            невозможна — claim ещё не мог случиться), ЛИБО
+                            он `in_progress` без следа, но МОЛОЖЕ порога
+                            sch.WORKER_CLAIM_TRACE_GRACE_MINUTES (след
+                            появляется в первые минуты job'а, не в первую
+                            секунду статуса; находка ai-review PR #1033,
+                            требование 2 — без этого окна гейт молча
+                            разрешал самый опасный случай), — см.
+                            блок-комментарий у worker_blocks_pr;
+                            без этого гейта механический force-with-lease мог
+                            бы уехать НАД коммитами агента и сжечь его
+                            единственную засчитанную попытку
+                            (CONFLICT_REWORK_MAX_ATTEMPTS=1) вхолостую;
   - "infra-error: <текст>" — сбой НЕ через конфликт (сеть, права, ветка
                             удалена, force-with-lease отклонён гонкой,
                             отсутствующая git identity) — AGENTS.md, «fail
@@ -132,6 +156,7 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 _DIR = Path(__file__).resolve().parent
@@ -139,6 +164,7 @@ if str(_DIR) not in sys.path:
     sys.path.insert(0, str(_DIR))  # scheduler.py делает `from pulse_guard import …`
 
 import scheduler as sch  # noqa: E402 — после sys.path выше, тот же приём, что тесты scheduler.py
+import additive_conflict_merge  # noqa: E402 — тот же приём, свой модуль этого же каталога
 
 review_labels = sch.review_labels  # уже загруженный scheduler'ом модуль — не грузим второй раз
 
@@ -165,7 +191,14 @@ class GitError(RuntimeError):
 def run_git(args: list[str], cwd: Path, *, check: bool = True) -> subprocess.CompletedProcess:
     result = subprocess.run(
         ["git", *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8",
-        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        # GIT_EDITOR=true (issue #1032): `git rebase --continue` после
+        # аддитивного сведения (additive_conflict_merge) хочет открыть редактор
+        # для commit message — раннер CI его не имеет, а сообщение и так не
+        # меняется (git rebase сохраняет исходное). "true" — no-op-редактор,
+        # принимает предзаполненное сообщение как есть; безвредно для ВСЕХ
+        # остальных git-команд этого модуля (fetch/checkout/rebase/push/add
+        # редактор не открывают вовсе).
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_EDITOR": "true"},
     )
     if check and result.returncode != 0:
         raise GitError(f"git {' '.join(args)}: {(result.stderr or result.stdout).strip()}")
@@ -196,11 +229,29 @@ def ensure_clean_repo(repo_dir: Path) -> None:
     run_git(["clean", "-fd"], repo_dir, check=False)
 
 
+# Потолок итераций цикла ниже (issue #1032) — чисто защитный: каждая
+# итерация «конфликт → аддитивно сведён → --continue» расходует РОВНО один
+# коммит ветки PR (git rebase не может застрять на одном и том же коммите
+# дважды — --continue либо продвигается, либо сам возвращает ошибку/новую
+# паузу на следующем коммите), поэтому реальный предел — число коммитов PR,
+# всегда конечное. Число ниже — заведомо выше любого практического PR этого
+# репозитория (contract_check.py уже ограничивает диффы разумным размером),
+# это strictly paranoia-гвардия от гипотетического бага цикла, не рабочий
+# лимит.
+_MAX_ADDITIVE_CONTINUE_ATTEMPTS = 50
+
+
 def attempt_rebase(repo_dir: Path, head_ref: str) -> str:
-    """Возвращает "resolved" (рёбейз сошёлся, working tree на перебазированной
-    ветке — пуш ещё не сделан, это отдельный шаг push_rebased) или "conflict"
-    (структурно уткнулись — рёбейз уже отменён `git rebase --abort`, working
-    tree чист). Любой другой сбой — GitError.
+    """Возвращает "resolved" (рёбейз сошёлся ЧИСТО, без единого конфликта),
+    "resolved-additive" (один или несколько конфликтов по пути сведены
+    механически — additive_conflict_merge, issue #1032: ОБЕ стороны
+    независимо дописали новый элемент в одну точку общего реестра, см.
+    докстринг additive_conflict_merge.py) или "conflict" (структурно уткнулись
+    и НЕ сведены — рёбейз уже отменён `git rebase --abort`, working tree
+    чист). И "resolved", и "resolved-additive" — working tree на
+    перебазированной ветке, пуш ещё не сделан (push_rebased — отдельный шаг,
+    вызывающая сторона не различает эти два исхода при принятии решения
+    пушить/не пушить). Любой другой сбой — GitError.
 
     Перед КАЖДОЙ попыткой — ensure_clean_repo (issue #764, требование 5):
     рабочее дерево гарантированно не несёт паузу рёбейза от предыдущего PR
@@ -209,38 +260,61 @@ def attempt_rebase(repo_dir: Path, head_ref: str) -> str:
     run_git(["fetch", "origin", "main", head_ref], repo_dir)
     run_git(["checkout", "-B", head_ref, f"origin/{head_ref}"], repo_dir)
     result = run_git(["rebase", "origin/main"], repo_dir, check=False)
-    if result.returncode == 0:
-        return "resolved"
-    # Каталог паузы рёбейза — структурный признак самого git, не текстовый
-    # матч stderr (тот протухнет при смене формулировки, тот же принцип,
-    # что WORKER_GIT_STEP_MARKER). НО каталог заводится в ДВУХ разных
-    # случаях: (1) честный текстовый конфликт при cherry-pick патча, (2)
-    # патч применился БЕЗ конфликта, но `git commit` внутри рёбейза упал по
-    # другой причине — живой пример (issue #764, находка ревью, требование
-    # 1): раннер без git identity, `git rebase` падает rc=128 «unable to
-    # auto-detect email address», каталог паузы тот же самый. Различаем по
-    # факту НЕЗАВЕДЁННЫХ путей в индексе (`git diff --diff-filter=U`) — это
-    # тоже git-native структурный сигнал (unmerged paths), не подстрочный
-    # матч stderr: настоящий конфликт всегда оставляет unmerged-запись,
-    # сбой на этапе commit — никогда (мутационно проверено #764: rc=128 без
-    # identity даёт `git diff --diff-filter=U` пустым).
-    if _rebase_paused(repo_dir):
-        unmerged = run_git(
+    used_additive_merge = False
+    attempts = 0
+    while result.returncode != 0:
+        attempts += 1
+        if attempts > _MAX_ADDITIVE_CONTINUE_ATTEMPTS:
+            run_git(["rebase", "--abort"], repo_dir, check=False)
+            raise GitError(
+                f"git rebase не сошёлся за {_MAX_ADDITIVE_CONTINUE_ATTEMPTS} "
+                "итераций аддитивного сведения — защитный потолок, не рабочий "
+                "лимит (см. докстринг attempt_rebase)"
+            )
+        # Каталог паузы рёбейза — структурный признак самого git, не текстовый
+        # матч stderr (тот протухнет при смене формулировки, тот же принцип,
+        # что WORKER_GIT_STEP_MARKER). НО каталог заводится в ДВУХ разных
+        # случаях: (1) честный текстовый конфликт при cherry-pick патча, (2)
+        # патч применился БЕЗ конфликта, но `git commit` внутри рёбейза упал по
+        # другой причине — живой пример (issue #764, находка ревью, требование
+        # 1): раннер без git identity, `git rebase` падает rc=128 «unable to
+        # auto-detect email address», каталог паузы тот же самый. Различаем по
+        # факту НЕЗАВЕДЁННЫХ путей в индексе (`git diff --diff-filter=U`) — это
+        # тоже git-native структурный сигнал (unmerged paths), не подстрочный
+        # матч stderr: настоящий конфликт всегда оставляет unmerged-запись,
+        # сбой на этапе commit — никогда (мутационно проверено #764: rc=128 без
+        # identity даёт `git diff --diff-filter=U` пустым).
+        if not _rebase_paused(repo_dir):
+            raise GitError(
+                f"git rebase origin/main упал не через конфликт (rc={result.returncode}): "
+                f"{(result.stderr or result.stdout).strip()}"
+            )
+        unmerged_output = run_git(
             ["diff", "--name-only", "--diff-filter=U"], repo_dir, check=False
         ).stdout.strip()
-        run_git(["rebase", "--abort"], repo_dir, check=False)
-        if unmerged:
+        if not unmerged_output:
+            run_git(["rebase", "--abort"], repo_dir, check=False)
+            raise GitError(
+                "git rebase остановился (создан каталог паузы), но конфликтующих "
+                f"путей в индексе нет (rc={result.returncode}) — это НЕ содержательный "
+                "конфликт, а сбой на этапе commit (частая причина — не настроена git "
+                f"identity в этом окружении): {(result.stderr or result.stdout).strip()}"
+            )
+        unmerged = unmerged_output.splitlines()
+        # Лишь ПОСЛЕ того, как признали конфликт содержательным (unmerged
+        # непуст) — пробуем механическое сведение аддитивных вставок (issue
+        # #1032). Отказ additive_conflict_merge.try_resolve (None) —
+        # честный «не наш класс», штатный путь ниже (abort → "conflict",
+        # PR остаётся кандидатом агентского пути) НЕ меняется.
+        resolved_paths = additive_conflict_merge.try_resolve(repo_dir, unmerged)
+        if resolved_paths is None:
+            run_git(["rebase", "--abort"], repo_dir, check=False)
             return "conflict"
-        raise GitError(
-            "git rebase остановился (создан каталог паузы), но конфликтующих "
-            f"путей в индексе нет (rc={result.returncode}) — это НЕ содержательный "
-            "конфликт, а сбой на этапе commit (частая причина — не настроена git "
-            f"identity в этом окружении): {(result.stderr or result.stdout).strip()}"
-        )
-    raise GitError(
-        f"git rebase origin/main упал не через конфликт (rc={result.returncode}): "
-        f"{(result.stderr or result.stdout).strip()}"
-    )
+        for rel in resolved_paths:
+            run_git(["add", rel], repo_dir)
+        used_additive_merge = True
+        result = run_git(["rebase", "--continue"], repo_dir, check=False)
+    return "resolved-additive" if used_additive_merge else "resolved"
 
 
 def push_rebased(repo_dir: Path, head_ref: str) -> None:
@@ -290,7 +364,15 @@ def migrate_guard_steps_if_needed(repo_dir: Path) -> str | None:
     синтетические git-фикстуры тестов этого модуля, которым файл гвардий не
     предмет проверки) — None БЕЗ вызова translate_repo_ci: физически нечего
     переносить, это не находка транслятора (guard_step_names читает файл
-    безусловно и бросил бы FileNotFoundError, если бы не эта проверка)."""
+    безусловно и бросил бы FileNotFoundError, если бы не эта проверка).
+
+    История этой функции в #1032: первая итерация PR случайно стёрла её
+    вместе со всем переносом #897 при переписывании модуля (находка
+    ai-review PR #1033, требование 1 — скрытая регрессия чужого фикса,
+    молча оставлявшая `translate_repo_ci` без единого продового вызывающего);
+    восстановлена дословно — с новым циклом аддитивного сведения совместима:
+    вызывается после attempt_rebase (в т.ч. "resolved-additive" — конфликтные
+    файлы уже сведены, repo-ci.yml среди них мог быть), до push_rebased."""
     if not (repo_dir / ".github" / "workflows" / "repo-ci.yml").exists():
         return None
     try:
@@ -353,6 +435,80 @@ def conflict_queue(repo: str, pulls: list[dict]) -> list[dict]:
     return conflict_pulls
 
 
+# ── Гейт «воркер активен» — сужен до конкретной ЗАДАЧИ (issue #1032) ────
+#
+# Было: sch.worker_runs_active(repo) — repo-wide булево «жив ли где-то
+# воркер», без разбора, НАД ЧЬЕЙ веткой. Замер 2026-09-12 (issue #1032):
+# воркер занят ~89% времени, и при этом бинарном гейте КАЖДЫЙ прогон, начатый
+# в занятое окно, откладывал ВСЮ очередь целиком — 15 из 28 прогонов
+# `conflict-mechanical-rebase.yml` с 2026-09-08 не тронули НИ ОДНОГО PR по
+# этой причине, хотя единственный активный воркер физически может работать
+# только НАД ОДНОЙ веткой одновременно (worker.yml: concurrency.group=worker,
+# один прогон на репозиторий) — опасность (issue #764, требование 2: force-
+# with-lease поверх коммитов, которые в этот момент пушит агент) реальна
+# ТОЛЬКО для ТОЙ ОДНОЙ ветки, не для остальных 18.
+#
+# Причина исходного репо-wide решения была честной (см. design.md активного
+# чейнджа mechanical-conflict-rebase, «Гонка с агентским путём», где развилка
+# теперь пересмотрена с этим замером): точная привязка «прогон именно по
+# задаче ЭТОГО PR» стоит лишний сетевой вызов на PR очереди. Эта правка
+# платит эту цену ТОЛЬКО когда воркер вообще активен (иначе — 0 дополнительных
+# вызовов, тот же быстрый путь, что раньше): task_ref.resolve_pr_task(pull) —
+# вычисление ЛОКАЛЬНОЕ (regex по имени ветки, без сети), а
+# sch.run_claimed_task(repo, task_number, run_id) — тот же готовый снаряд,
+# которым scheduler.py уже сопоставляет прогон ↔ задача (CLAIM_VIA-след в
+# комментариях issue, claim_task.claim пишет его в первые секунды job'а,
+# задолго до реальной git-работы — см. reap_stalled_worker_run.__doc__).
+#
+# ОКНО МОЛОДОГО ПРОГОНА (находка ai-review PR #1033, требование 2): CLAIM_VIA-
+# след появляется в задаче НЕ в первые секунды статуса in_progress — до
+# claim_task.claim прогон проходит выборку пула, dup-гардию, квоту и
+# PAT-авторизацию (десятки секунд-минуты, см. докстринг
+# sch.WORKER_CLAIM_TRACE_GRACE_MINUTES). in_progress-прогон БЕЗ следа МЛАДШЕ
+# порога блокирует КОНСЕРВАТИВНО (эпистемически тот же случай, что `queued`:
+# атрибуции ещё нет — а он у первой итерации этого гейта молча разрешался,
+# заново открывая окно #764 ровно на том классе PR — конфликтных, — которые
+# dispatch_conflict_rework и диспатчит). Тормоз с газом: отказ самоосвобождается,
+# когда прогон завершился ИЛИ перешагнул порог (дальше решает след); оба пути
+# короче следующего 15-минутного такта.
+#
+# `queued` НЕ сужается вовсе: прогон, ещё стоящий в очереди концюренси-группы,
+# не успел выполнить claim_task.claim — CLAIM_VIA-следа для него физически нет,
+# атрибуция невозможна ни при каком запросе. Пока прогон queued, он ничего не
+# пушил и не мог — блокировка ВСЕЙ очереди в этом (редком) случае — тот же
+# консервативный, безопасный отказ, не регрессия.
+def worker_blocks_pr(repo: str, pull: dict, active_runs: list[dict], now: "datetime") -> bool:
+    """True — этому PR НЕЛЬЗЯ двигать head в этом проходе (см. блок-комментарий
+    выше). Порядок проверки от дешёвого к дорогому: queued (локально) →
+    возраст прогона (локально, sch.run_age_minutes) → CLAIM_VIA-след (сетевой
+    вызов на каждую задачу, только для прогонов старше порога). `active_runs` —
+    прод-форма из sch.active_worker_runs (единственное место правды фетча,
+    находка ai-review PR #1033: дублированный фетч-цикл здесь расходился бы
+    с scheduler тихо). Ветка PR без резолвящейся задачи (task_ref.resolve_pr_task
+    вернул None — не должно случаться: conflict_queue уже фильтрует agent/-ветки
+    через _same_repo_agent_branch, но не гадаем при расхождении) и прогон с
+    нечитаемым id/возрастом (не прод-форма ответа GitHub) — консервативный
+    блок, не тихое разрешение."""
+    if not active_runs:
+        return False
+    if any((run.get("status") or "") == "queued" for run in active_runs):
+        return True  # атрибуция невозможна — claim ещё не мог случиться
+    in_progress = [run for run in active_runs if (run.get("status") or "") == "in_progress"]
+    if not in_progress:
+        return False
+    task_number = sch.task_ref.resolve_pr_task(pull)
+    if task_number is None:
+        return True
+    for run in in_progress:
+        run_id = run.get("id")
+        age = sch.run_age_minutes(run, now)
+        if run_id is None or age is None or age < sch.WORKER_CLAIM_TRACE_GRACE_MINUTES:
+            return True  # молод (или нечитаемая прод-форма): след мог ещё не появиться
+        if sch.run_claimed_task(repo, task_number, run_id):
+            return True
+    return False
+
+
 def process_pull(repo: str, pull: dict, repo_dir: Path) -> str:
     """Один PR — см. докстринг модуля для полного разбора исходов."""
     number = pull["number"]
@@ -360,29 +516,9 @@ def process_pull(repo: str, pull: dict, repo_dir: Path) -> str:
     if not head_ref:
         return "infra-error: PR без head.ref"
     try:
-        # issue #764, находка ревью, требование 2: взаимное исключение с
-        # агентским путём. `dispatch_conflict_rework` (scheduler.py) снимает
-        # assignee/замок и диспатчит worker.yml адресно на ОДИН PR, но метка
-        # `conflict` держится до следующего такта mark_conflicts, и оба
-        # такта (orchestra.yml, conflict-mechanical-rebase.yml) — на одном
-        # 15-минутном кроне без взаимной `needs:` (design.md, «Развилка 2»).
-        # Без гейта механический force-with-lease мог бы уехать НАД
-        # коммитами уже работающего агента: тот получил бы отклонённый push
-        # после честной работы, а conflict_rework_attempts уже засчитал бы
-        # попытку по WORKER_GIT_STEP_MARKER — эскалация владельцу соврала бы
-        # «конфликт не сошёлся» про попытку, которую механический путь сам и
-        # уничтожил (тот же класс, что уже закрывали #588/#597 дорогой
-        # ценой). Гейт repo-wide (sch.worker_runs_active(repo)), не per-PR:
-        # воркер и так единственный активный на весь репозиторий («ровно
-        # один workflow_dispatch за пульс», dispatch_worker/
-        # dispatch_conflict_rework), точная привязка «прогон именно по
-        # задаче ЭТОГО PR» потребовала бы для каждого PR очереди ещё один
-        # запрос к API (task_ref.resolve_pr_task + атрибуция прогона) — цена
-        # без выигрыша, раз пересечение и так исключено на уровне «воркер
-        # один», тот же уровень точности, что уже применяет
-        # dispatch_conflict_rework (worker_runs_active(repo), не per-task,
-        # scheduler.py:778,855).
-        if sch.worker_runs_active(repo):
+        now = datetime.now(timezone.utc)
+        active_runs = sch.active_worker_runs(repo, now)
+        if worker_blocks_pr(repo, pull, active_runs, now):
             return "worker-running"
         running = review_labels.other_active_ai_review_runs(
             repo, number, exclude_run_id=None, gh_func=sch.gh)
@@ -391,11 +527,17 @@ def process_pull(repo: str, pull: dict, repo_dir: Path) -> str:
         outcome = attempt_rebase(repo_dir, head_ref)
         if outcome == "conflict":
             return "conflict"
+        # issue #897, восстановлено после случайной потери в первой итерации
+        # #1032 (находка ai-review PR #1033, требование 1): перенос рукописных
+        # шагов гвардии в каталог — ПОСЛЕ attempt_rebase (оба исхода
+        # "resolved"/"resolved-additive" — working tree на перебазированной
+        # ветке), ДО push_rebased; сбой переноса исход не ухудшает (см.
+        # докстринг migrate_guard_steps_if_needed).
         warning = migrate_guard_steps_if_needed(repo_dir)
         if warning:
             print(f"::warning::PR #{number}: {warning}")
         push_rebased(repo_dir, head_ref)
-        return "resolved"
+        return outcome  # "resolved" или "resolved-additive"
     except RuntimeError as error:
         # GitError (git-слой) и обычный RuntimeError (sch.gh — сетевой/API
         # сбой) — один и тот же бюджет «не по конфликту» (AGENTS.md, «fail
@@ -408,7 +550,7 @@ def run(repo: str, repo_dir: Path) -> tuple[list[str], dict[int, str]]:
     pulls = sch.open_pulls(repo)
     queue = conflict_queue(repo, pulls)
     outcomes: dict[int, str] = {}
-    resolved = conflicted = ai_deferred = worker_busy = failed = 0
+    resolved = additive_resolved = conflicted = ai_deferred = worker_busy = failed = 0
     lines: list[str] = []
     for pull in queue:
         number = pull["number"]
@@ -420,6 +562,15 @@ def run(repo: str, repo_dir: Path) -> tuple[list[str], dict[int, str]]:
                 f"✅ PR #{number}: git rebase origin/main сошёлся механически, "
                 "ветка обновлена и запушена (--force-with-lease); снятие метки "
                 "`conflict` — за mark_conflicts следующим тактом"
+            )
+        elif outcome == "resolved-additive":
+            additive_resolved += 1
+            lines.append(
+                f"🧩 PR #{number}: конфликт сведён автоматически (обе стороны "
+                "независимо дописали новый элемент в один список/реестр, "
+                "additive_conflict_merge, issue #1032) — ветка обновлена и "
+                "запушена (--force-with-lease); синтаксис и затронутые тесты "
+                "перепроверены ДО пуша"
             )
         elif outcome == "conflict":
             conflicted += 1
@@ -433,8 +584,9 @@ def run(repo: str, repo_dir: Path) -> tuple[list[str], dict[int, str]]:
         elif outcome == "worker-running":
             worker_busy += 1
             lines.append(
-                f"⏸️ PR #{number}: воркер (worker.yml) активен по репозиторию — "
-                "head не двигаю в этом проходе, чтобы не сжечь агентскую попытку (#764)"
+                f"⏸️ PR #{number}: воркер (worker.yml) активен над ЭТОЙ ЖЕ задачей "
+                "(либо прогон ещё queued/молод — атрибуции ещё нет) — head не "
+                "двигаю в этом проходе, чтобы не сжечь агентскую попытку (#764)"
             )
         else:
             failed += 1
@@ -442,7 +594,8 @@ def run(repo: str, repo_dir: Path) -> tuple[list[str], dict[int, str]]:
     lines.insert(
         0,
         f"Механический ребейз конфликтов: {len(queue)} PR в очереди, "
-        f"{resolved} сошлись механически, {conflicted} остаются конфликтом "
+        f"{resolved} сошлись механически, {additive_resolved} сведены "
+        f"аддитивным слиянием, {conflicted} остаются конфликтом "
         f"(агентский путь), {ai_deferred} отложены (ai-review), {worker_busy} "
         f"отложены (воркер занят), {failed} инфраструктурных сбоев",
     )

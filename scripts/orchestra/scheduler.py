@@ -2887,11 +2887,33 @@ def _stalled_run_task_number(
             return number
     return None
 
+# Окно молодого in_progress-прогона без CLAIM_VIA-следа (issue #1032, находка
+# ai-review PR #1033, требование 2): след аренды появляется в задаче не в
+# первые секунды статуса in_progress — до `claim_task.py claim` (первые секунды
+# САМОГО job'а, scripts/worker/task.sh) прогон проходит выборку пула (GraphQL),
+# dup-гардию (два `gh api`), чтение замков, квоту и PAT-авторизацию workflow'а —
+# реально это десятки секунд-минуты. in_progress-прогон БЕЗ следа МЛАДШЕ этого
+# порога НЕ доказывает «воркер занят другим PR», поэтому per-task гейт
+# mechanical_rebase (worker_blocks_pr) блокирует его консервативно. Порог —
+# тормоз с газом: самоосвобождается, когда прогон (а) завершился (исчез из
+# списка активных) или (б) перешагнул порог — дальше решает CLAIM_VIA-след;
+# оба пути короче следующего такта `conflict-mechanical-rebase.yml` (15-минутный
+# крон), так что максимальная цена отказа — один такт, как у `queued`.
+# Значение: с запасом сверху против наблюдаемого времени до claim (минуты),
+# но заведомо меньше 15-минутного такта — иначе газ не наступал бы к следующему
+# такту никогда.
+WORKER_CLAIM_TRACE_GRACE_MINUTES = 10
 
-def _run_age_minutes(run: dict, now: datetime) -> float | None:
+
+def run_age_minutes(run: dict, now: datetime) -> float | None:
     """Возраст прогона в минутах от `run_started_at` (когда GitHub его знает)
     или `created_at` (queued/раннее, пока job ещё не подхватил раннер) —
-    `None`, если ни одного поля нет вовсе (не прод-форма ответа)."""
+    `None`, если ни одного поля нет вовсе (не прод-форма ответа).
+
+    Публичное имя (без подчёркивания) — не стилистика: per-task гейт
+    mechanical_rebase.py (issue #1032) читает им возраст ЧУЖОГО прогона против
+    порога WORKER_CLAIM_TRACE_GRACE_MINUTES — частной копии этой арифметики
+    там не заводим."""
     started = run.get("run_started_at") or run.get("created_at")
     return minutes_between(parse_time(started), now) if started else None
 
@@ -2906,7 +2928,7 @@ def _run_is_stalled(run: dict, now: datetime,
     хрупкости, которого правило репозитория «тест кормится прод-формой»
     требует избегать: фиксированная дата фикстуры неизбежно «стареет» по
     календарю сама по себе)."""
-    age = _run_age_minutes(run, now)
+    age = run_age_minutes(run, now)
     return age is not None and age >= threshold_minutes
 
 
@@ -2946,6 +2968,32 @@ def stalled_worker_run(repo: str, now: datetime) -> dict | None:
     return run if run is not None and _run_is_stalled(run, now) else None
 
 
+def active_worker_runs(repo: str, now: datetime | None = None) -> list[dict]:
+    """Активные прогоны worker.yml ОДНИМ списком прод-формы API: незавидшие
+    `in_progress` (целиком, с `run_started_at`/`id` — их читает per-task гейт
+    mechanical_rebase.py, issue #1032) + все `queued`. ЕДИНСТВЕННОЕ место
+    правды фетча «жив ли воркер» (находка ai-review PR #1033: этот фетч-цикл
+    жил в двух копиях — здесь и в mechanical_rebase — и разошёлся бы тихо при
+    первой же правке статусов/порога): булев предикат `worker_runs_active`
+    (три диспетчера) и гейт `worker_blocks_pr` сводятся к этому списку.
+
+    Зависший in_progress (#815, `_run_is_stalled`) исключён так же, как в
+    worker_runs_active. `queued` возвращается БЕЗ порога зависания: стоящий в
+    очереди концюренси-группы ещё не стартовал, WORKER_STALL_MINUTES к нему
+    неприменим физически (нет ни job'а, ни run_started_at)."""
+    now = now or datetime.now(timezone.utc)
+    active: list[dict] = []
+    for status in ("in_progress", "queued"):
+        payload = gh(
+            f"repos/{repo}/actions/workflows/{WORKER_WORKFLOW}/runs?status={status}&per_page=1"
+        ) or {}
+        for run in payload.get("workflow_runs") or []:
+            if status == "in_progress" and _run_is_stalled(run, now):
+                continue  # завис — не блокирует, см. worker_runs_active
+            active.append(run)
+    return active
+
+
 def worker_runs_active(repo: str, now: datetime | None = None) -> bool:
     """Активный воркер = есть worker-ран в статусе in_progress или queued.
     Завершённые (в т.ч. упавшие) не считаются: упавший воркер при свободных
@@ -2959,19 +3007,13 @@ def worker_runs_active(repo: str, now: datetime | None = None) -> bool:
     гейта у неё нет). Сама отмена зависшего прогона и освобождение его задачи —
     отдельный шаг main() (reap_stalled_worker_run), не побочный эффект этой
     read-only проверки: функцию читают несколько мест за один пульс, мутировать
-    GitHub при каждом чтении было бы сюрпризом и лишними вызовами."""
-    now = now or datetime.now(timezone.utc)
-    for status in ("in_progress", "queued"):
-        payload = gh(
-            f"repos/{repo}/actions/workflows/{WORKER_WORKFLOW}/runs?status={status}&per_page=1"
-        ) or {}
-        runs = payload.get("workflow_runs") or []
-        if not runs:
-            continue
-        if status == "in_progress" and _run_is_stalled(runs[0], now):
-            continue  # завис — не блокирует, см. докстринг
-        return True
-    return False
+    GitHub при каждом чтении было бы сюрпризом и лишними вызовами.
+
+    Реализация сведена к `active_worker_runs` (тот же фетч, что у per-task
+    гейта mechanical_rebase, — одно место правды, находка ai-review PR #1033),
+    но сам вопрос «кто именно активен» эта функция не раскрывает — потребителю
+    нужен только булев факт."""
+    return bool(active_worker_runs(repo, now))
 
 
 def reap_stalled_worker_run(
