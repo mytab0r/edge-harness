@@ -26,11 +26,17 @@ def test_decision_comment_first_line_matches_format_470_471():
     assert first_line == "РЕШЕНИЕ: 2"
 
 
+def _valid_signature(secret: str, issue: int, option: int) -> str:
+    return aod.compute_signature(secret, issue, option)
+
+
 def test_main_posts_comment_via_post_issue_comment_not_a_second_path(monkeypatch):
     calls = []
+    monkeypatch.setenv(aod.SIGNATURE_SECRET_ENV_VAR, "sekret")
     monkeypatch.setattr(aod, "issue_still_waiting", lambda repo, issue: True)
     monkeypatch.setattr(aod, "post_issue_comment", lambda repo, issue, text: calls.append((repo, issue, text)))
-    rc = aod.main(["--repo", "o/r", "--issue", "471", "--option", "2"])
+    sig = _valid_signature("sekret", 471, 2)
+    rc = aod.main(["--repo", "o/r", "--issue", "471", "--option", "2", "--signature", sig])
     assert rc == 0
     assert calls == [("o/r", 471, aod.decision_comment(2))]
 
@@ -41,10 +47,107 @@ def test_main_propagates_post_issue_comment_failure_loudly(monkeypatch):
     def boom(repo, issue, text):
         raise RuntimeError("gh api упал")
 
+    monkeypatch.setenv(aod.SIGNATURE_SECRET_ENV_VAR, "sekret")
     monkeypatch.setattr(aod, "issue_still_waiting", lambda repo, issue: True)
     monkeypatch.setattr(aod, "post_issue_comment", boom)
+    sig = _valid_signature("sekret", 471, 1)
     with pytest.raises(RuntimeError):
-        aod.main(["--repo", "o/r", "--issue", "471", "--option", "1"])
+        aod.main(["--repo", "o/r", "--issue", "471", "--option", "1", "--signature", sig])
+
+
+# ── Подпись client_payload (#1251) — три РАЗНЫХ отказа, каждый обрывает main
+# ДО post_issue_comment (прод-форма payload: то, что реально шлёт worker,
+# см. cf-worker/src/harness.ts #dispatchOwnerDecision/#hmac). ──────────────
+
+
+def test_compute_signature_matches_worker_hmac_format():
+    # Прод-форма: HMAC-SHA256(secret, "issue:option") hex — тот же формат,
+    # что #hmac(`${issueNumber}:${option}`, secret) в harness.ts. Проверяем
+    # ЗНАЧЕНИЕ известного тестового вектора, не структуру вызова — если
+    # формат payload'а разойдётся, подпись живого воркера перестанет
+    # совпадать молча, этот тест обязан поймать это первым.
+    import hashlib
+    import hmac as hmac_module
+
+    expected = hmac_module.new(b"test-webhook-secret", b"471:2", hashlib.sha256).hexdigest()
+    assert aod.compute_signature("test-webhook-secret", 471, 2) == expected
+
+
+def test_verify_signature_ok_does_not_raise():
+    sig = _valid_signature("sekret", 471, 2)
+    aod.verify_signature("sekret", 471, 2, sig)  # не должно кинуть
+
+
+def test_verify_signature_secret_not_configured_distinct_message():
+    with pytest.raises(RuntimeError, match="не настроен"):
+        aod.verify_signature(None, 471, 2, "irrelevant")
+
+
+def test_verify_signature_secret_empty_string_treated_as_not_configured():
+    with pytest.raises(RuntimeError, match="не настроен"):
+        aod.verify_signature("", 471, 2, "irrelevant")
+
+
+def test_verify_signature_missing_distinct_message():
+    with pytest.raises(RuntimeError, match="не несёт подписи"):
+        aod.verify_signature("sekret", 471, 2, None)
+
+
+def test_verify_signature_empty_string_treated_as_missing():
+    with pytest.raises(RuntimeError, match="не несёт подписи"):
+        aod.verify_signature("sekret", 471, 2, "")
+
+
+def test_verify_signature_mismatch_distinct_message():
+    wrong = _valid_signature("sekret", 471, 1)  # подпись для ДРУГОГО варианта
+    with pytest.raises(RuntimeError, match="не совпадает"):
+        aod.verify_signature("sekret", 471, 2, wrong)
+
+
+def test_verify_signature_three_failure_messages_are_distinct():
+    # Класс #1096: три исхода не должны схлопнуться в одну строку — иначе
+    # читатель лога не отличит "секрета нет" от "подпись подделана".
+    msgs = set()
+    for call in (
+        lambda: aod.verify_signature(None, 1, 1, "x"),
+        lambda: aod.verify_signature("s", 1, 1, None),
+        lambda: aod.verify_signature("s", 1, 1, _valid_signature("s", 1, 2)),
+    ):
+        try:
+            call()
+        except RuntimeError as error:
+            msgs.add(str(error))
+    assert len(msgs) == 3
+
+
+def test_verify_signature_replayed_for_different_issue_rejected():
+    # Подпись привязана к ПАРЕ issue+option — подпись, выданная для #471,
+    # не годится для #999 с тем же option (перенос подписи на другую задачу).
+    sig = _valid_signature("sekret", 471, 2)
+    with pytest.raises(RuntimeError, match="не совпадает"):
+        aod.verify_signature("sekret", 999, 2, sig)
+
+
+def test_main_stops_before_issue_still_waiting_check_on_bad_signature(monkeypatch):
+    # Подпись проверяется РАНЬШЕ обращения к GitHub API за состоянием
+    # issue — неаутентифицированный вызов не должен даже дойти до сети.
+    called = []
+    monkeypatch.setenv(aod.SIGNATURE_SECRET_ENV_VAR, "sekret")
+    monkeypatch.setattr(aod, "issue_still_waiting", lambda repo, issue: called.append(1) or True)
+    monkeypatch.setattr(aod, "post_issue_comment", lambda *a: called.append("posted"))
+    with pytest.raises(RuntimeError, match="не совпадает"):
+        aod.main(["--repo", "o/r", "--issue", "471", "--option", "2", "--signature", "forged"])
+    assert called == []
+
+
+def test_main_without_secret_env_refuses_even_with_a_valid_looking_signature(monkeypatch):
+    # Секрет job'а отсутствует — job НЕ пытается сверять (нечем), и уж тем
+    # более не принимает произвольную строку как «валидную».
+    monkeypatch.delenv(aod.SIGNATURE_SECRET_ENV_VAR, raising=False)
+    monkeypatch.setattr(aod, "issue_still_waiting", lambda repo, issue: True)
+    monkeypatch.setattr(aod, "post_issue_comment", lambda *a: pytest.fail("не должен писать комментарий"))
+    with pytest.raises(RuntimeError, match="не настроен"):
+        aod.main(["--repo", "o/r", "--issue", "471", "--option", "1", "--signature", "anything"])
 
 
 # ── issue_still_waiting / отказ на протухшей кнопке (находка ревью PR #486,
@@ -77,10 +180,14 @@ def test_issue_still_waiting_false_when_label_removed(monkeypatch):
 def test_main_refuses_stale_button_loudly_without_posting_comment(monkeypatch):
     """Мутация «применить решение без проверки» красит этот тест: нажатие
     кнопки протухшей эскалации не должно писать «РЕШЕНИЕ: N» в задачу,
-    которая больше не ждёт — RuntimeError, не тихий success."""
+    которая больше не ждёт — RuntimeError, не тихий success. Подпись здесь
+    валидная (#1251) — тест проверяет ИМЕННО стадию issue_still_waiting,
+    которая идёт ПОСЛЕ verify_signature, не смешивает два разных отказа."""
     posted = []
+    monkeypatch.setenv(aod.SIGNATURE_SECRET_ENV_VAR, "sekret")
     monkeypatch.setattr(aod, "issue_still_waiting", lambda repo, issue: False)
     monkeypatch.setattr(aod, "post_issue_comment", lambda repo, issue, text: posted.append(text))
+    sig = _valid_signature("sekret", 471, 1)
     with pytest.raises(RuntimeError, match="waiting:owner"):
-        aod.main(["--repo", "o/r", "--issue", "471", "--option", "1"])
+        aod.main(["--repo", "o/r", "--issue", "471", "--option", "1", "--signature", sig])
     assert posted == []
