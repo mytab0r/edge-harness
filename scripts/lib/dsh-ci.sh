@@ -442,7 +442,7 @@ dsh_install_anthropic_pool() { # $1 — рабочий каталог
 # dsh_mount_anthropic_pool монтирует именно его.
 dsh_patch_anthropic_pool_plugin() {
   [ "${DSH_ANTHROPIC_POOL_ACTIVE:-0}" = "1" ] || return 0
-  echo "::group::Патч плагина anthropic-oauth-pool: нейтрализация self-регистрации + фикс рефреша долгоживущих токенов (#1097/#1130)"
+  echo "::group::Патч плагина anthropic-oauth-pool: нейтрализация self-регистрации + фикс рефреша долгоживущих токенов + причина pool_unavailable (#1097/#1130/#1192)"
   local script_dir patched_tgz
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   if [ ! -d "$DSH_ANTHROPIC_POOL_EXTRACTED" ]; then
@@ -450,7 +450,7 @@ dsh_patch_anthropic_pool_plugin() {
     echo "::endgroup::"; return 1
   fi
   if ! python3 "$script_dir/patch_anthropic_pool_plugin.py" "$DSH_ANTHROPIC_POOL_EXTRACTED"; then
-    echo "::error::патч плагина не применился (см. вывод выше) — self-регистрация и/или превентивный рефреш долгоживущих токенов НЕ пофиксены (#1097/#1130)"
+    echo "::error::патч плагина не применился (см. вывод выше) — НЕ пофиксены: self-регистрация и/или превентивный рефреш долгоживущих токенов (#1097/#1130) и/или причина pool_unavailable не прокидывается (#1192)"
     echo "::endgroup::"; return 1
   fi
   patched_tgz="$(dirname "$DSH_ANTHROPIC_POOL_EXTRACTED")/dsh-anthropic-oauth-pool-patched.tgz"
@@ -1579,9 +1579,12 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
 #   auth_rejected  — аккаунт(ы) отвергнуты Anthropic (401/403), владелец нужен;
 #   rate_limited   — аккаунт(ы) исчерпали лимит (429), само пройдёт;
 #   network_error  — исключение при попытке (не HTTP-ответ), не подтверждено;
-#   reason=unknown/поле отсутствует — плагин сам не смог классифицировать,
+#   unknown — в записанном состоянии аккаунтов нет ни 401/403, ни 429, ни
+#     ошибки (аккаунт мог ни разу не пробоваться, либо последний ответ был
+#     вне этих классов), не подтверждено;
+#   поле reason отсутствует в теле — плагин сам не смог классифицировать,
 #     либо патч не применился/апстрим сменил форму — так и сказано, без
-#     подстановки одной из трёх гипотез выше вместо честного пробела.
+#     подстановки одной из гипотез выше вместо честного пробела.
 #
 # Отказ пула МОЖЕТ вообще не быть отказом `pool_unavailable` (таймаут,
 # ошибка соединения с локальным прокси, что угодно другое) — сообщение
@@ -1593,14 +1596,17 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
 # `reason` вырезается ИЗ ТЕЛА pool_unavailable, не из всего err_file целиком
 # (находка ai-review PR #1193, третий раунд): stderr может нести и чужой,
 # не относящийся к пулу JSON/текст со СВОИМ полем `reason` — поиск по всему
-# файлу подобрал бы его, приписав пулу чужой факт. `pool_body` — подстрока
-# ОТ `"type":"pool_unavailable"` до конца этой же строки (прод-форма — один
-# `dsh: SERVER: 503 {...}` на строку, `tr` схлопывает многострочный err_file
-# в одну строку ДО вырезки, тем же приёмом, что уже применяет `pool_err_note`
-# в вызывающей функции), `reason`/`retryAt` читаются только из неё.
+# файлу подобрал бы его, приписав пулу чужой факт. `pool_body` — строка,
+# содержащая `"type":"pool_unavailable"` (прод-форма — один
+# `dsh: SERVER: 503 {...}` на строку); grep ПОСТРОЧЕН, поэтому `.*` в
+# регэкспе физически не может выйти за пределы строки тела — находка
+# ai-review PR #1193, четвёртый раунд: прежний `tr '\n' ' '` схлопывал весь
+# err_file в ОДНУ строку ДО вырезки, и жадный `.*` забирал хвост файла,
+# принимая чужой `reason` из любой последующей строки stderr за причину
+# пула. `reason`/`retryAt` читаются только из вырезанной строки тела.
 dsh_pool_unavailable_owner_note() { # err_file
   local err_file=$1 pool_reason pool_retry_at retry_note note has_body=0 pool_body
-  pool_body=$(tr '\n' ' ' <"$err_file" 2>/dev/null | grep -oE '"type":"pool_unavailable".*' | tail -1) || pool_body=""
+  pool_body=$(grep -oE '"type":"pool_unavailable".*' "$err_file" 2>/dev/null | tail -1) || pool_body=""
   if [ -n "$pool_body" ]; then
     has_body=1
     pool_reason=$(printf '%s' "$pool_body" | grep -oE '"reason":"[a-z_]+"' | head -1 | sed -E 's/.*"reason":"([a-z_]+)".*/\1/') || pool_reason=""
@@ -1623,7 +1629,12 @@ dsh_pool_unavailable_owner_note() { # err_file
       note="ПРИЧИНА: сетевая ошибка при обращении к Anthropic (не 401/403/429) — владелец, вероятно, не нужен, но не подтверждено (проверь сеть/таймауты)"
       ;;
     unknown)
-      note="причина не установлена: ни один аккаунт пула не получил ответ от Anthropic в этом процессе (не подтверждено, нужен ли владелец)"
+      # Нейтральная формулировка (находка ai-review PR #1193, раунд 4): класс
+      # unknown в classifyPoolUnavailable шире, чем «ни разу не пробовался», —
+      # он покрывает и записанный lastStatus вне {401,403,429} (200/5xx из
+      # прошлых вызовов живут в runtime-состоянии так же, как 401). Формулировка
+      # называет ТО, что реально проверено по записанному состоянию.
+      note="причина не установлена: в записанном состоянии аккаунтов пула нет ни 401/403, ни 429, ни ошибки (не подтверждено, нужен ли владелец)"
       ;;
     "")
       if [ "$has_body" = 1 ]; then

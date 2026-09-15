@@ -758,9 +758,10 @@ echo "GUARD(anthropic-pool): 16) мутация формы pool_unavailable -> �
 #       в node с синтетическими аккаунтами. Доказывает: 401/403 ->
 #       auth_rejected; 429 (без auth_rejected рядом) -> rate_limited;
 #       исключение без HTTP-ответа -> network_error; ничего не пробовалось
-#       -> unknown; auth_rejected ИМЕЕТ ПРИОРИТЕТ над rate_limited, когда оба
+#       ЛИБО последний записанный ответ вне {401,403,429} (например 200) ->
+#       unknown; auth_rejected ИМЕЕТ ПРИОРИТЕТ над rate_limited, когда оба
 #       класса присутствуют одновременно (владелец не должен быть пропущен
-#       только потому, что ДРУГОЙ аккаунт всего лишь упёрся в лимit). ───────
+#       только потому, что ДРУГОЙ аккаунт всего лишь упёрся в лимит). ───────
 (
   FIXTURE_ROOT="$(mktemp -d)"
   EXTRACT_DIR="$FIXTURE_ROOT/anthropic-oauth-pool-extracted/package"
@@ -779,6 +780,11 @@ const rateOnly = classifyPoolUnavailable([{ id: 'a1', lastStatus: 429 }])
 const networkOnly = classifyPoolUnavailable([{ id: 'a1', lastError: 'fetch failed: ECONNRESET' }])
 const nothing = classifyPoolUnavailable([{ id: 'a1' }])
 const mixedAuthWins = classifyPoolUnavailable([{ id: 'a1', lastStatus: 429 }, { id: 'a2', lastStatus: 401 }])
+// Находка ai-review PR #1193, раунд 4: класс unknown ШИРЕ, чем «ни разу не
+// пробовался» — записанный lastStatus вне {401,403,429} (например 200 из
+// прошлого вызова, живущий в runtime-состоянии так же, как 401) тоже даёт
+// unknown. Поведение фиксируется кейсом, чтобы докстринг и код не разошлись.
+const stale200 = classifyPoolUnavailable([{ id: 'a1', lastStatus: 200 }])
 
 const checks = [
   ['authOnly.reason', authOnly.reason, 'auth_rejected'],
@@ -788,6 +794,7 @@ const checks = [
   ['networkOnly.reason', networkOnly.reason, 'network_error'],
   ['nothing.reason', nothing.reason, 'unknown'],
   ['mixedAuthWins.reason', mixedAuthWins.reason, 'auth_rejected'],
+  ['stale200.reason', stale200.reason, 'unknown'],
 ]
 let failed = false
 for (const [label, got, want] of checks) {
@@ -809,12 +816,15 @@ echo "GUARD(anthropic-pool): 17) classifyPoolUnavailable — auth_rejected/rate_
 
 # ── 18) #1192: dsh_pool_unavailable_owner_note — прод-форма stderr (реальный
 #       вид «dsh: SERVER: 503 {...}» из живого прогона worker.yml 34792555573,
-#       дополненный полем reason нашим же патчем). Пять исходов, каждый —
+#       дополненный полем reason нашим же патчем). ВОСЕМЬ stderr-форм, каждая —
 #       РАЗНЫЙ факт, не гадание: auth_rejected называет "владелец нужен",
 #       rate_limited — "владелец НЕ нужен" (два сообщения обязаны различаться
-#       буквально, не одним и тем же текстом с другой меткой). Мутация:
-#       поле reason отсутствует (форма до патча/апстрим сменился) -> честный
-#       пробел «не классифицирована», а не подстановка одной из гипотез. ────
+#       буквально, не одним и тем же текстом с другой меткой); поле reason
+#       отсутствует (форма до патча/апстрим сменился) -> честный пробел
+#       «не классифицирована», а не подстановка одной из гипотез; чужой
+#       reason ДО и ПОСЛЕ тела (находка ai-review PR #1193, раунд 4: вырезка
+#       тела обязана держаться в пределах строки тела — причина пула не может
+#       прийти из чужой строки stderr). ─────────────────────────────────────
 (
   WORK18="$(mktemp -d)"
   cat >"$WORK18/err_auth.txt" <<'EOF'
@@ -841,6 +851,22 @@ EOF
   cat >"$WORK18/err_unrelated.txt" <<'EOF'
 dsh: connect ECONNREFUSED 127.0.0.1:47291
 EOF
+  # Чужой reason ПОСЛЕ тела (находка ai-review PR #1193, раунд 4): тело
+  # pool_unavailable БЕЗ reason, НИЖЕ — несвязанная строка чужого компонента
+  # со СВОИМ "reason":"auth_rejected". Причина обязана остаться честным
+  # пробелом «тело есть, без поля reason», а не стать «владелец нужен» —
+  # иначе скоуп вырезки шире строки тела и чужой факт приписан пулу.
+  cat >"$WORK18/err_foreign_after.txt" <<'EOF'
+dsh: SERVER: 503 {"type":"error","error":{"type":"pool_unavailable","message":"No Anthropic account is available","retryAt":1789345764948}}
+2026-09-14T00:24:00Z cache-backend {"level":"error","reason":"auth_rejected","msg":"backend rejected credentials"}
+EOF
+  # Чужой reason ДО тела — тот же класс с другой стороны (чеклист ai-review
+  # PR #1193, раунд 3): тело само несёт auth_rejected, чужая строка ВЫШЕ со
+  # своим rate_limited не должна перебить факт тела.
+  cat >"$WORK18/err_foreign_before.txt" <<'EOF'
+2026-09-14T00:23:00Z cache-backend {"level":"warn","reason":"rate_limited","msg":"retry budget drained"}
+dsh: SERVER: 503 {"type":"error","error":{"type":"pool_unavailable","message":"No Anthropic account is available","retryAt":1789345764948,"reason":"auth_rejected","accounts":[{"id":"anthropic-1","class":"auth_rejected","lastStatus":401,"cooldownUntil":1789345764948}]}}
+EOF
 
   note_auth=$(dsh_pool_unavailable_owner_note "$WORK18/err_auth.txt")
   note_rate=$(dsh_pool_unavailable_owner_note "$WORK18/err_rate.txt")
@@ -848,13 +874,17 @@ EOF
   note_unknown=$(dsh_pool_unavailable_owner_note "$WORK18/err_unknown.txt")
   note_no_reason=$(dsh_pool_unavailable_owner_note "$WORK18/err_no_reason.txt")
   note_unrelated=$(dsh_pool_unavailable_owner_note "$WORK18/err_unrelated.txt")
+  note_foreign_after=$(dsh_pool_unavailable_owner_note "$WORK18/err_foreign_after.txt")
+  note_foreign_before=$(dsh_pool_unavailable_owner_note "$WORK18/err_foreign_before.txt")
 
-  echo "18) auth_rejected: $note_auth"
-  echo "18) rate_limited:  $note_rate"
-  echo "18) network_error: $note_network"
-  echo "18) unknown:       $note_unknown"
-  echo "18) без reason:    $note_no_reason"
-  echo "18) не пул вовсе:  $note_unrelated"
+  echo "18) auth_rejected:   $note_auth"
+  echo "18) rate_limited:    $note_rate"
+  echo "18) network_error:   $note_network"
+  echo "18) unknown:         $note_unknown"
+  echo "18) без reason:      $note_no_reason"
+  echo "18) не пул вовсе:    $note_unrelated"
+  echo "18) чужой reason после тела: $note_foreign_after"
+  echo "18) чужой reason до тела:    $note_foreign_before"
 
   [[ "$note_auth" == *"владелец нужен"* ]] || { echo "::error::18) auth_rejected обязан назвать «владелец нужен»: $note_auth" >&2; exit 1; }
   [[ "$note_auth" == *"ANTHROPIC_OAUTH_1"* && "$note_auth" == *"ANTHROPIC_OAUTH_2"* ]] || { echo "::error::18) auth_rejected обязан назвать имена секретов на перевыпуск: $note_auth" >&2; exit 1; }
@@ -863,6 +893,10 @@ EOF
   [ "$note_auth" != "$note_rate" ] || { echo "::error::18) auth_rejected и rate_limited дали ОДИНАКОВЫЙ текст — ровно та проблема, ради которой заведена задача #1192" >&2; exit 1; }
   [[ "$note_network" == *"не подтверждено"* ]] || { echo "::error::18) network_error обязан честно назвать «не подтверждено»: $note_network" >&2; exit 1; }
   [[ "$note_unknown" == *"не подтверждено"* ]] || { echo "::error::18) unknown (плагин сам не смог классифицировать) обязан назвать «не подтверждено»: $note_unknown" >&2; exit 1; }
+  # Находка ai-review PR #1193, раунд 4: класс unknown шире, чем «ни разу не
+  # пробовался», — формулировка не имеет права утверждать факт «ответа не
+  # было», который по записанному состоянию не проверялся.
+  [[ "$note_unknown" != *"не получил ответ"* ]] || { echo "::error::18) unknown НЕ должен утверждать «ответа не было» — в recorded-состоянии мог быть ответ вне 401/403/429: $note_unknown" >&2; exit 1; }
   # Мутация класса «алерт не гадает»: без поля reason сообщение обязано
   # признать пробел, а НЕ выбрать одну из гипотез (auth_rejected/rate_limited)
   # наугад.
@@ -876,8 +910,19 @@ EOF
   [[ "$note_unrelated" != *"владелец нужен"* && "$note_unrelated" != *"владелец НЕ нужен"* ]] || { echo "::error::18) без тела pool_unavailable сообщение НЕ должно утверждать о владельце ни в одну сторону — $note_unrelated" >&2; exit 1; }
   [[ "$note_unrelated" == *"pool_unavailable в stderr не найдено"* ]] || { echo "::error::18) без тела pool_unavailable сообщение обязано назвать именно ЭТОТ факт (не «поле reason отсутствует В ответе», которого не было): $note_unrelated" >&2; exit 1; }
   [ "$note_unrelated" != "$note_no_reason" ] || { echo "::error::18) «тела нет вовсе» и «тело есть, поля reason нет» дали ОДИНАКОВЫЙ текст — разные факты, разные сообщения" >&2; exit 1; }
-) || fail "18) dsh_pool_unavailable_owner_note не различает исходы либо гадает при отсутствии reason"
-echo "GUARD(anthropic-pool): 18) dsh_pool_unavailable_owner_note — пять исходов различены буквально, без reason — честный пробел, не гадание — ок (#1192)"
+  # Чужой reason ПОСЛЕ тела (находка ai-review PR #1193, раунд 4): причина
+  # читается ТОЛЬКО из строки тела — чужая строка ниже не приписывает пулу
+  # «владелец нужен», класс остаётся честным пробелом.
+  [[ "$note_foreign_after" == *"не классифицирована"* ]] || { echo "::error::18) чужой reason ПОСЛЕ тела: сообщение обязано держать честный пробел, не принимать чужой reason: $note_foreign_after" >&2; exit 1; }
+  [[ "$note_foreign_after" == *"тело pool_unavailable есть"* ]] || { echo "::error::18) чужой reason ПОСЛЕ тела: тело-то БЫЛО, факт «тело есть» обязан сохраниться: $note_foreign_after" >&2; exit 1; }
+  [[ "$note_foreign_after" != *"владелец нужен"* && "$note_foreign_after" != *"владелец НЕ нужен"* ]] || { echo "::error::18) чужой reason ПОСЛЕ тела принят за причину пула — скоуп вырезки шире строки тела (находка ai-review PR #1193, раунд 4): $note_foreign_after" >&2; exit 1; }
+  [ "$note_foreign_after" != "$note_auth" ] || { echo "::error::18) «чужой reason после тела» дал тот же текст, что реальный auth_rejected — чужой факт неотличим от факта тела" >&2; exit 1; }
+  # Чужой reason ДО тела: факт тела (auth_rejected) обязан победить, чужой
+  # rate_limited строкой выше не перебивает его.
+  [[ "$note_foreign_before" == *"владелец нужен"* ]] || { echo "::error::18) чужой reason ДО тела: факт ТЕЛА (auth_rejected) обязан остаться причиной: $note_foreign_before" >&2; exit 1; }
+  [[ "$note_foreign_before" != *"rate_limited"* ]] || { echo "::error::18) чужой reason ДО тела (rate_limited) перебил факт тела (auth_rejected) — причина читается не из тела: $note_foreign_before" >&2; exit 1; }
+) || fail "18) dsh_pool_unavailable_owner_note не различает исходы, гадает при отсутствии reason либо берёт причину не из строки тела"
+echo "GUARD(anthropic-pool): 18) dsh_pool_unavailable_owner_note — восемь stderr-форм, каждый факт свой; чужой reason до/после тела не приписывается пулу, без reason — честный пробел — ок (#1192, раунды 3-4)"
 
 # ── 19) #1192 (сквозной): dsh_run_with_pool_then_chain печатает ОБА факта
 #       (текст отказа + причину «владелец нужен/не нужен») И честно
