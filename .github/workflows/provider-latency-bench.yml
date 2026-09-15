@@ -31,6 +31,14 @@ on:
         description: "Таймаут на КАЖДЫЙ вызов провайдера, секунд (по умолчанию 180)"
         required: false
         type: string
+      probe_max_tokens_entries:
+        description: >-
+          #1289: разовый живой замер потолка output-токенов — JSON-массив
+          [{"base_url","model","secret_env"}], пусто = шаг пропущен. Не
+          хардкодится в файле (класс #153, provider-default.guard.sh) —
+          передаётся параметром на конкретный запуск.
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -78,6 +86,32 @@ jobs:
           OPENROUTER_1_API_KEY: ${{ secrets.OPENROUTER_1_API_KEY }}
           OPENROUTER_2_API_KEY: ${{ secrets.OPENROUTER_2_API_KEY }}
         run: python scripts/measure/provider_model_discovery.py
+
+      # #1289: разовый живой замер потолка output-токенов — под явным входом
+      # workflow_dispatch (probe_max_tokens_entries), не хардкодом файла
+      # (класс #153): probe_max_output_tokens.py принимает base_url/model/
+      # secret_env аргументами, ни один провайдерный литерал сюда не зашит.
+      # Пусто на входе — шаг НИЧЕГО не делает (echo, без сетевых вызовов).
+      - name: 'Замер потолка output-токенов (#1289, опционально по входу)'
+        if: ${{ github.event.inputs.probe_max_tokens_entries != '' }}
+        env:
+          PROBE_ENTRIES_JSON: ${{ github.event.inputs.probe_max_tokens_entries }}
+          NVIDIA_NIM_1_API_KEY: ${{ secrets.NVIDIA_NIM_1_API_KEY }}
+          NVIDIA_NIM_2_API_KEY: ${{ secrets.NVIDIA_NIM_2_API_KEY }}
+          OLLAMA_CLOUD_1_API_KEY: ${{ secrets.OLLAMA_CLOUD_1_API_KEY }}
+          OLLAMA_CLOUD_2_API_KEY: ${{ secrets.OLLAMA_CLOUD_2_API_KEY }}
+          OLLAMA_CLOUD_3_API_KEY: ${{ secrets.OLLAMA_CLOUD_3_API_KEY }}
+          OPENROUTER_1_API_KEY: ${{ secrets.OPENROUTER_1_API_KEY }}
+          OPENROUTER_2_API_KEY: ${{ secrets.OPENROUTER_2_API_KEY }}
+        run: |
+          python -m pytest scripts/measure/test_probe_max_output_tokens.py -q
+          echo "$PROBE_ENTRIES_JSON" | python -c '
+          import json, sys, subprocess
+          entries = json.load(sys.stdin)
+          for e in entries:
+              subprocess.run(["python", "scripts/measure/probe_max_output_tokens.py",
+                               e["base_url"], e["model"], e["secret_env"]], check=False)
+          '
 
   bench:
     runs-on: ubuntu-latest
