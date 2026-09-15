@@ -109,8 +109,11 @@ jobs:
           import json, sys, subprocess
           entries = json.load(sys.stdin)
           for e in entries:
-              subprocess.run(["python", "scripts/measure/probe_max_output_tokens.py",
-                               e["base_url"], e["model"], e["secret_env"]], check=False)
+              args = ["python", "scripts/measure/probe_max_output_tokens.py",
+                       e["base_url"], e["model"], e["secret_env"]]
+              if "probe_max_tokens" in e:
+                  args.append(str(e["probe_max_tokens"]))
+              subprocess.run(args, check=False)
           '
 
   bench:
