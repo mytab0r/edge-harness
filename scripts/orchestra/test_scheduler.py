@@ -4877,7 +4877,10 @@ RAW_WRITE_CENSUS = (
     # его в scripts/lib/merge_reactions.py (единый реестр реакций на мерж) —
     # вне территории этой доводки (не трогаем scripts/lib/merge_reactions*).
     ("scheduler.py", '["gh", "api", "-X", "PUT"', 1, "_guard_raw_subprocess_write"),
-    ("scheduler.py", "data=body, method=\"POST\",", 2, "_guard_raw_subprocess_write"),
+    # 3-е вхождение — post_entity_snapshot (#1287, orchestrator-core-v2,
+    # ходячий скелет снимка состояния задача/PR): POST в Harness DO
+    # (HANDS_TOKEN/HARNESS_URL), гейтится ТЕМ ЖЕ _guard_raw_subprocess_write.
+    ("scheduler.py", "data=body, method=\"POST\",", 3, "_guard_raw_subprocess_write"),
     ("upstream_drift.py", '"push", "origin"', 1, "prod_writes_allowed"),
     ("upstream_drift.py", "str(pr_create)", 1, "prod_writes_allowed"),
 )
