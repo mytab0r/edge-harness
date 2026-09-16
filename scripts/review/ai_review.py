@@ -94,12 +94,26 @@ _spec.loader.exec_module(review_labels)
 
 # Третья категория находок — чеклист некритичных замечаний в теле PR (#462):
 # парсинг блока ЗАМЕЧАНИЕ и слияние с телом PR — общее место правды с
-# after_merge в scheduler.py (тот же файл читает unresolved_items при
+# after_merge в scheduler.py (тот же файл читает unresolved_findings при
 # слиянии), поэтому живёт в lib, не дублируется здесь второй копией регэкспа.
 _rc_spec = importlib.util.spec_from_file_location(
     "review_checklist", SCRIPT_DIR.parent / "lib" / "review_checklist.py")
 review_checklist = importlib.util.module_from_spec(_rc_spec)
 _rc_spec.loader.exec_module(review_checklist)
+
+# Реестр незакрытых находок ревью, ключ файл (#1262, объединяет #1217):
+# gather собирает выписку по файлам этого PR ($findings_section, contents:
+# read достаточно для чтения ветки данных data/review-findings); verdict
+# разбирает НАХОДКА-ЗАКРЫТА из ответа модели в МАРКЕР ТЕЛА PR
+# (review_findings.merge_resolved_marker, отдельный PATCH pull["body"]) —
+# сам реестр не пишет (нет contents: write у job'а verdict, #939), читает
+# after_merge маркер из тела же при слиянии (parse_resolved_marker, без
+# сети), мутация реестра — только там. Носитель «шапка комментария» отвергнут
+# design.md (развилка 3): лишний GET истории комментариев на каждое слияние.
+_rf_spec = importlib.util.spec_from_file_location(
+    "review_findings", SCRIPT_DIR.parent / "lib" / "review_findings.py")
+review_findings = importlib.util.module_from_spec(_rf_spec)
+_rf_spec.loader.exec_module(review_findings)
 
 AI_OK = review_labels.AI_OK
 AI_CHANGES = review_labels.AI_CHANGES
@@ -642,6 +656,12 @@ def findings_of(answer: str, tasks: list[dict] | None = None,
         # defect_classes.CLASS_LINE_RE, третье место правды не заводим).
         if defect_classes.CLASS_LINE_RE.match(stripped):
             continue
+        # Строка НАХОДКА-ЗАКРЫТА (#1262) — тот же машинный трейлер, что
+        # КЛАСС: выше: уходит в маркер ТЕЛА PR (merge_resolved_marker
+        # в cmd_verdict, читает after_merge из pull["body"] при слиянии),
+        # не в прозу, которую видит человек.
+        if review_findings.RESOLVED_LINE_RE.match(stripped):
+            continue
         if in_task:
             if stripped == TASK_CLOSE:
                 in_task = False
@@ -669,7 +689,8 @@ def build_comment(number: int, sha: str, verdict: str, findings: str,
                   reset_hint: str | None = None,
                   reason_tag_value: str | None = None,
                   class_signal: "defect_classes.ClassSignal | None" = None,
-                  chain_retry_useful: bool = False) -> str:
+                  chain_retry_useful: bool = False,
+                  resolved_findings: list[int] | None = None) -> str:
     """Канонический комментарий-вердикт. Шапка-факты — САМЫЕ ПЕРВЫЕ строки,
     до первого пустой строки (инвариант: file_tasks.py парсит ТОЛЬКО эту
     зону и фенсы задач, проза и заборы не могут притвориться фактами).
@@ -712,7 +733,17 @@ def build_comment(number: int, sha: str, verdict: str, findings: str,
     `class:` добавляется, только если состояние не "not_named" — молчание на
     approve-вердиктах без блокирующих находок (у них полю КЛАСС неоткуда
     взяться, п.1 контракта их не касается) не раздувает шапку сотнями пустых
-    строк."""
+    строк.
+
+    resolved_findings (#1262, реестр находок ревью) — id находок реестра
+    (review_findings.py), которые модель отметила НАХОДКА-ЗАКРЫТА в этом
+    раунде: сам факт живёт в ТЕЛЕ PR (review_findings.merge_resolved_marker,
+    отдельный PATCH — тот же выбор носителя, что чеклист ЗАМЕЧАНИЕ выше:
+    after_merge уже читает pull["body"] без отдельного сетевого запроса,
+    сканировать историю комментариев ради этого поля было бы лишним GET на
+    каждое слияние), здесь — только упоминание для человека в прозе
+    комментария, не машинный факт шапки. Пусто/None — строка не
+    добавляется."""
     diff_line = f"diff: {diff_fp}\n" if diff_fp else ""
     provider_line = f"provider: {chain_provider}\n" if chain_provider else ""
     reset_line = f"reset-at: {reset_hint}\n" if reset_hint else ""
@@ -753,6 +784,12 @@ def build_comment(number: int, sha: str, verdict: str, findings: str,
         body += (
             "\n\nНекритичные замечания (не блокируют мерж) — в чеклисте тела PR:\n"
             f"{titles}"
+        )
+    if resolved_findings:
+        ids = ", ".join(f"#{i}" for i in resolved_findings)
+        body += (
+            "\n\nНаходки реестра, отмеченные исправленными в этом раунде "
+            f"(закроются в реестре при слиянии): {ids}"
         )
     if backlog:
         close = "`" * len(TASK_FENCE[: TASK_FENCE.index("з")])  # ровно столько же бэктиков, сколько в открывающем
@@ -898,6 +935,48 @@ def defect_classes_section(repo: str) -> str:
     return defect_classes.render_prompt_section(scan.candidates)
 
 
+def findings_section(repo: str, files: list[dict]) -> str:
+    """$findings_section (#1262, объединяет #1217): выписка открытых находок
+    реестра (review_findings.py, ветка данных data/review-findings) по
+    файлам, которые трогает этот PR. Сбой чтения — не должен ронять gather
+    целиком (тот же приём, что defect_classes_section выше): деградирует на
+    review_findings.render_unavailable, которая называет причину явно
+    (AGENTS.md, «алерт не гадает»), не молчит «находок нет» вместо
+    настоящего «не прочитано»."""
+    try:
+        registry, _sha = review_findings.fetch_registry(gh, repo)
+    except RuntimeError as error:
+        print(f"::warning::gather: реестр находок ревью не прочитан ({error}) — "
+              "промпт получит явное «недоступно», не пустой список")
+        return review_findings.render_unavailable(str(error))
+    filenames = [f["filename"] for f in files]
+    found = review_findings.open_findings_for_files(registry, filenames)
+    return review_findings.render_findings_section(found)
+
+
+def remark_files_outside_diff(remarks: list[dict], files: list[dict]) -> list[tuple[str, str]]:
+    """Пути из полей ФАЙЛ блоков ЗАМЕЧАНИЕ, которых НЕТ среди файлов этого PR
+    (#1262, чеклист ревью PR #1268): путь, выданный моделью мимо диффа,
+    при слиянии тихо ключует находку в реестре навсегда недостижимой — файл,
+    который никто никогда не тронет, не покажет находку ни на одном ревью.
+
+    Различить «легальная находка про файл вне диффа» (вызывающий в другом
+    модуле) и «галлюцинация пути» по списку файлов PR нельзя — поэтому это
+    ::warning:: с фактом и последствием, НЕ молчаливый перевод в skipped
+    (потеря половины находки, которую автор ещё вправе поправить в теле PR
+    до слияния) и НЕ угадывание вердикта. Возвращает список пар
+    (file, title) вне диффа; печать ::warning:: — в cmd_verdict, чтобы
+    держать побочный вывод у одного вызывающего (тот же приём, что
+    _verdict_label_and_age — чистая функция + печать снаружи)."""
+    pr_files = {f["filename"] for f in files}
+    warned = []
+    for remark in remarks:
+        file = (remark.get("file") or "").strip()
+        if file and file not in pr_files:
+            warned.append((file, remark.get("title") or ""))
+    return warned
+
+
 def cmd_gather(args: argparse.Namespace) -> int:
     repo = os.environ["GITHUB_REPOSITORY"]
     pull = gh(f"repos/{repo}/pulls/{args.pr}")
@@ -997,6 +1076,7 @@ def cmd_gather(args: argparse.Namespace) -> int:
         "size_section": size_question_section(added),
         "rules_section": rules_section(),
         "defect_classes_section": defect_classes_section(repo),
+        "findings_section": findings_section(repo, files),
     }
     # Гвардия silent-wrong: если какой-то плейсхолдер шаблона не попал в мэппинг
     # (опечатка, переименование, удаление ключа) — safe_substitute молча оставит
@@ -1278,7 +1358,8 @@ def cmd_verdict(args: argparse.Namespace) -> int:
               "scope": t.get("scope")}
              for t in tasks]
     tasks = [t for t in tasks if t["title"]]
-    remarks = [{"title": redact(r["title"]).strip(), "body": redact(r["body"]).strip()}
+    remarks = [{"title": redact(r["title"]).strip(), "file": r.get("file"),
+                "body": redact(r["body"]).strip()}
                for r in remarks]
     remarks = [r for r in remarks if r["title"]]
 
@@ -1361,6 +1442,19 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     # головы (тот же баг, что и протухший diff_fp, закрыт одной сверкой).
     added = sum(f["additions"] for f in files)
 
+    # ФАЙЛ мимо диффа (#1262, чеклист ревью PR #1268): путь вне списка файлов
+    # PR не молчит — при слиянии он стал бы ключом находки в реестре, которую
+    # никто никогда не увидит (файл, который не трогают, не попадает в
+    # выписку findings_section). Не skipped: легальную находку про файл вне
+    # диффа от галлюцинации пути здесь не отличить, а автор ещё вправе
+    # поправить пункт в теле PR до слияния — ему предупреждение и адресовано.
+    for file, title in remark_files_outside_diff(remarks, files):
+        print(f"::warning::verdict: ФАЙЛ «{file}» из блока ЗАМЕЧАНИЕ "
+              f"«{title[:80]}» не входит в список файлов этого PR — если путь "
+              "не существует в репозитории, перенесённая при слиянии находка "
+              "так и останется невидимой для будущих ревью; проверь/поправь "
+              "путь в пункте чеклиста тела PR")
+
     # Диффы сверх check_pr.LARGE_DIFF_HUGE_LINES: суждение модели о размере
     # ЗАМЕНЯЕТ эскалацию владельцу (мандат 2026-09-11, #939, отменяет #204
     # п.«escalate»/#901) — читается ДО выбора вердикт-метки, потому что
@@ -1422,16 +1516,33 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     # принято суждением модели до этой строки.
     apply_large_ok(repo, args.pr, added, labels_after, verdict)
 
-    # Третья категория находок (#462): блоки ЗАМЕЧАНИЕ сливаются в чеклист
-    # ТЕЛА PR, не в комментарий — тело переживает прокрутку и не пропадает
-    # среди прочих комментариев. merge_checklist сама решает, нужен ли PATCH
-    # вовсе (None — новых пунктов нет, отмеченные автором чекбоксы не трогаем).
-    if remarks:
-        new_pr_body = review_checklist.merge_checklist(pull_after_files.get("body") or "", remarks)
-        if new_pr_body is not None:
-            run_gh("api", "-X", "PATCH", f"repos/{repo}/pulls/{args.pr}",
-                   "-f", "body=" + new_pr_body)
+    # Третья категория находок (#462) и закрытые находки реестра (#1262) —
+    # ОБА живут в теле PR (тело переживает прокрутку и не пропадает среди
+    # прочих комментариев, тот же выбор носителя для обоих), поэтому обе
+    # правки сливаются в ОДИН PATCH, не два подряд (второй PATCH на базе
+    # ответа pulls/{pr} ДО первого стёр бы его результат — тело не
+    # перечитывается между двумя вызовами).
+    # Реестр находок (#1262) — id, которые модель считает исправленными в
+    # этом раунде (на СЫРОМ answer, тот же выбор, что class_signal выше:
+    # НАХОДКА-ЗАКРЫТА не несёт секретов, редактировать нечего). Маркер живёт
+    # в теле PR (review_findings.merge_resolved_marker), не в шапке
+    # комментария — after_merge уже читает pull["body"] без сетевого
+    # запроса, второй источник (сканирование истории комментариев) не
+    # заводится.
+    resolved_findings = review_findings.parse_resolved_ids(answer)
+    current_body = pull_after_files.get("body") or ""
+    checklist_body = review_checklist.merge_checklist(current_body, remarks) if remarks else None
+    body_with_checklist = checklist_body if checklist_body is not None else current_body
+    resolved_body = (review_findings.merge_resolved_marker(body_with_checklist, resolved_findings)
+                     if resolved_findings else None)
+    new_pr_body = resolved_body if resolved_body is not None else checklist_body
+    if new_pr_body is not None:
+        run_gh("api", "-X", "PATCH", f"repos/{repo}/pulls/{args.pr}",
+               "-f", "body=" + new_pr_body)
+        if checklist_body is not None:
             print(f"checklist: {len(remarks)} замечаний слито в тело PR")
+        if resolved_body is not None:
+            print(f"resolved-findings: {len(resolved_findings)} находок отмечено исправленными")
 
     # Отпечаток диффа (#252) — в шапку комментария, чтобы check_pr.py на
     # следующем пуше мог сравнить и сохранить метку, если PR не изменился
@@ -1442,7 +1553,8 @@ def cmd_verdict(args: argparse.Namespace) -> int:
                           remarks=remarks, chain_provider=args.chain_provider,
                           reset_hint=args.reset_hint, reason_tag_value=reason_tag_value,
                           class_signal=class_signal,
-                          chain_retry_useful=chain_retry_useful and verdict == "error")
+                          chain_retry_useful=chain_retry_useful and verdict == "error",
+                          resolved_findings=resolved_findings)
     run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/comments",
            "-f", "body=" + body)
 

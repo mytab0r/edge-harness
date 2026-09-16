@@ -2,6 +2,19 @@
 """Хвост чеклиста ревью наследует область родившего PR — на деле не наследует
 (сирота A, аудит владельца 2026-09-11).
 
+ВЕСТИГИАЛЬНЫЙ с #1262 (2026-09-14): `scheduler.py::after_merge` БОЛЬШЕ НЕ
+заводит новые задачи-хвосты (носитель незакрытых находок ревью сменился на
+файловый реестр, `scripts/lib/review_findings.py`, — см. ADR 0007, дельта
+2026-09-14). Этот модуль и его workflow (`checklist-tail-triage.yml`)
+дообслуживают только УЖЕ существующие задачи-хвосты до их переноса в реестр
+и закрытия (`openspec/changes/review-findings-registry/tasks.md`, этап 2/3);
+после того как все они закрыты — кандидат на удаление отдельной задачей.
+Историческое описание ниже (2026-09-11) остаётся верным ДЛЯ СВОЕГО времени
+— ссылки на `review_checklist.tail_issue_body`/`tail_issue_title` относятся
+к формату, который эти функции производили ДО удаления (#1262); актуальный
+формат заголовка — `review_checklist.tail_issue_title` (одно место правды,
+алиас ниже).
+
 Факт (замер владельца 2026-09-11, начало аудита): за 5 дней `after_merge`
 (scripts/orchestra/scheduler.py) завела 46 задач «Хвост чеклиста ревью PR
 #N», закрыто — 0. Число растёт с каждым слитым PR, у которого остался
@@ -98,14 +111,26 @@ _TR_SPEC = importlib.util.spec_from_file_location("task_ref", _LIB / "task_ref.p
 task_ref = importlib.util.module_from_spec(_TR_SPEC)
 _TR_SPEC.loader.exec_module(task_ref)  # type: ignore[union-attr]
 
+_RC_SPEC = importlib.util.spec_from_file_location("review_checklist", _LIB / "review_checklist.py")
+review_checklist = importlib.util.module_from_spec(_RC_SPEC)
+_RC_SPEC.loader.exec_module(review_checklist)  # type: ignore[union-attr]
+
 TASK_LABEL = "task"
 
-# Зеркало формата scripts/lib/review_checklist.py::tail_issue_title —
-# синхронность с фактическим форматом держит
-# test_tail_title_re_matches_real_tail_issue_title (кормит регулярку
-# результатом самой функции, не пересказом), не копия строки-литерала
-# наугад.
-TAIL_TITLE_RE = re.compile(r"^Хвост чеклиста ревью PR #(\d+)$")
+
+def tail_issue_title(pr: int) -> str:
+    """Заголовок задачи-хвоста — формат, который `create_pool_issue` в
+    `scheduler.py::after_merge` заводил ДО #1262 (носитель сменился на
+    файловый реестр `scripts/lib/review_findings.py` — новые хвосты этим
+    форматом больше не заводятся). Владелец формата — `review_checklist.py`
+    (одно место правды, находка ревью PR #1268: третья копия литерала здесь
+    расходилась бы с миграцией при первой правке); здесь — только алиас
+    для вестигиальных вызовов этого модуля и его тестов."""
+    return review_checklist.tail_issue_title(pr)
+
+
+# Регэксп того же формата — из того же единственного места, не вторая копия.
+TAIL_TITLE_RE = review_checklist.TAIL_TITLE_RE
 
 # Маркер «этот хвост уже разобран» — ставится независимо от результата
 # (нашлась ли area:*-метка у родителя), чтобы обычный пульс не гонял сеть
