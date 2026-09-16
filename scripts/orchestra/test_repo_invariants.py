@@ -4102,3 +4102,196 @@ def test_build_report_wires_invariant_22(monkeypatch):
     assert findings[22][0]["pr"] == 261
     assert any("🚨" in line and "[22]" in line for line in lines)
     assert any("#261" in line for line in lines)
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Инвариант 23 (#1277): производитель задач пула без измеримого потребителя
+# ═════════════════════════════════════════════════════════════════════════
+#
+# Прод-форма: `search/issues` — реальный ответ GitHub Search API
+# (items[] с number/title/body/state/created_at/closed_at/labels/assignees).
+# Тест на «мёртвый транспорт → unknown» (issue #1096/#1109, шаг 2 для
+# инварианта 23): проверка не должна молчать за 💚, когда Search API
+# недоступен. Раньше (до миграции на check_result) инвариант 23 не существовал
+# — это тест миграции по протоколу check_result (тот же приём, что
+# test_wasted_ai_review_unknown_reason_names_pr_step_and_denominator для
+# инварианта 8 и test_recurring_worker_failure_unknown_when_runs_history_unavailable
+# для инварианта 10).
+
+
+def search_issues_response(items: list[dict]) -> dict:
+    """Прод-форма ответа `search/issues` (dict с ключом items[])."""
+    return {"items": items}
+
+
+def checklist_tail_issue(number: int, created_at: str, body: str = "PR слит с незакрытыми пунктами чеклиста"):
+    return {
+        "number": number,
+        "title": f"Хвост чеклиста ревью PR #{number - 86}",
+        "state": "OPEN",
+        "created_at": created_at,
+        "closed_at": None,
+        "body": body,
+        "labels": [{"name": "task"}],
+        "assignees": [],
+    }
+
+
+def test_pool_producer_orphaned_unknown_when_search_unavailable(monkeypatch):
+    """Третий исход (issue #1096): Search API недоступен целиком — КАЖДЫЙ
+    из девяти производителей получает unknown() с одной и той же причиной,
+    не ok() и не violation(). Это тест миграции на check_result: убрать
+    вызов unknown() в ветке except RuntimeError внутри
+    check_pool_producer_orphaned — этот тест обязан покраснеть (реальная
+    мутация, не описание)."""
+    fake = FakeGh({
+        "search/issues": RuntimeError("gh api: HTTP 503: Service Unavailable"),
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 15, 12, 0)
+    results = ri.check_pool_producer_orphaned("mytab0r/edge-harness", now)
+    for producer in ri.producer_orphan_watch.PRODUCER_IDS:
+        result = results[producer]
+        assert result.status == ri.check_result.STATUS_UNKNOWN, f"{producer}: expected unknown, got {result.status}"
+        assert "фетч задач пула за окно не удался" in result.reason
+
+
+def test_pool_producer_orphaned_unknown_when_search_malformed(monkeypatch):
+    """Находка ai-review PR #1140 (F3): форма ответа не по контракту (нет
+    ключа items, или значение под ключом не список) — раньше молча читалось
+    как «нарушений нет», теперь unknown()."""
+    fake = FakeGh({
+        "search/issues": {"message": "secondary rate limit"},  # нет items
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 15, 12, 0)
+    results = ri.check_pool_producer_orphaned("mytab0r/edge-harness", now)
+    for producer in ri.producer_orphan_watch.PRODUCER_IDS:
+        result = results[producer]
+        assert result.status == ri.check_result.STATUS_UNKNOWN, f"{producer}: expected unknown, got {result.status}"
+
+
+def test_pool_producer_orphaned_violation_dead_producer(monkeypatch):
+    """Живая улика issue #1277: checklist-tail — 12 задач за окно, 0 закрыто,
+    старейшая открытая > 24ч — violation(). Прод-форма issue — реальная
+    фикстура (те же поля, что снимает gh api graphql)."""
+    issues = [checklist_tail_issue(n, f"2026-09-{6+i//3:02d}T12:00:00Z") for n in range(574, 586)]
+    fake = FakeGh({"search/issues": search_issues_response(issues)})
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 15, 12, 0)
+    results = ri.check_pool_producer_orphaned("mytab0r/edge-harness", now)
+    result = results["checklist-tail"]
+    assert result.status == ri.check_result.STATUS_VIOLATION
+    assert result.violations[0]["producer"] == "checklist-tail"
+    assert result.violations[0]["total"] == 12
+    assert result.violations[0]["close_rate"] == 0.0
+    # Здоровый производитель молчит
+    for producer in ["failure-watch", "stall-detector", "dependabot-alert-watch",
+                     "upstream-drift", "health-audit", "merge-health-watch", "task-replacement"]:
+        assert results[producer].status == ri.check_result.STATUS_OK
+
+
+def test_pool_producer_orphaned_ok_healthy_producer(monkeypatch):
+    """Здоровый производитель (failure-watch, 94% закрытия) — ok()."""
+    issues = [
+        {"number": 100+i, "title": f"CI-провал класс-{i}", "state": "CLOSED" if i < 13 else "OPEN",
+         "created_at": f"2026-09-{1+i//5:02d}T12:00:00Z", "closed_at": "2026-09-14T12:00:00Z" if i < 13 else None,
+         "body": "тело", "labels": [{"name": "task"}, {"name": "ci-failure"}], "assignees": []}
+        for i in range(15)
+    ]
+    fake = FakeGh({"search/issues": search_issues_response(issues)})
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 15, 12, 0)
+    results = ri.check_pool_producer_orphaned("mytab0r/edge-harness", now)
+    assert results["failure-watch"].status == ri.check_result.STATUS_OK
+
+
+def test_pool_producer_orphaned_unknown_young_producer(monkeypatch):
+    """Молодой производитель (N=1 < MIN_SAMPLE_SIZE=10) — unknown(), не ok().
+    Это требование 3: «данных недостаточно» ≠ «здоров». """
+    issues = [{"number": 200, "title": "Dependabot алерт", "state": "OPEN",
+               "created_at": "2026-09-14T12:00:00Z", "closed_at": None,
+               "body": "тело", "labels": [{"name": "task"}, {"name": "dependabot-alert"}], "assignees": []}]
+    fake = FakeGh({"search/issues": search_issues_response(issues)})
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 15, 12, 0)
+    results = ri.check_pool_producer_orphaned("mytab0r/edge-harness", now)
+    assert results["dependabot-alert-watch"].status == ri.check_result.STATUS_UNKNOWN
+    assert "1 задач" in results["dependabot-alert-watch"].reason
+
+
+def test_pool_producer_orphaned_chunked_query_avoids_1000_limit(monkeypatch):
+    """Проверка, что fetch_producer_pool_issues режет запрос на чанки по 7 дней
+    с перекрытием, а не делает один запрос на 30 дней (который упрется в
+    1000-результатный лимит Search API при текущем притоке ~45-50 задач/сутки).
+    FakeGh фиксирует вызовы — проверяем, что было >1 вызова search/issues."""
+    issues_per_chunk = 20
+    num_chunks = 5  # 30 дней / 7 дней ≈ 5 чанков
+    all_issues = [checklist_tail_issue(600 + i, f"2026-09-{1+i//5:02d}T12:00:00Z")
+                  for i in range(num_chunks * issues_per_chunk)]
+    # Разбиваем на чанки для FakeGh — каждый чанк возвращается отдельным ответом
+    # FakeGh маршрутизирует по фрагменту query, поэтому создаём отдельные маршруты
+    # для каждого чанка по created: диапазону.
+    routes = {}
+    window_start = now = utc(2026, 9, 15, 12, 0) - ri.producer_orphan_watch.WINDOW_DAYS
+    chunk_days = ri._PRODUCER_WATCH_CHUNK_DAYS
+    overlap_days = 1
+    chunk_start = window_start
+    issue_idx = 0
+    while chunk_start < now:
+        chunk_end = min(chunk_start + ri.timedelta(days=chunk_days), now)
+        since_str = chunk_start.strftime("%Y-%m-%d")
+        until_str = chunk_end.strftime("%Y-%m-%d")
+        chunk_issues = all_issues[issue_idx:issue_idx + issues_per_chunk]
+        issue_idx += issues_per_chunk
+        query_fragment = f"created:>={since_str} created:<={until_str}"
+        routes[f"search/issues?q=repo:mytab0r/edge-harness label:task is:issue {query_fragment}"] = search_issues_response(chunk_issues)
+        chunk_start = chunk_end - ri.timedelta(days=overlap_days)
+
+    fake = FakeGh(routes)
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 15, 12, 0)
+    issues = ri.fetch_producer_pool_issues("mytab0r/edge-harness", now)
+    # Должно быть несколько вызовов search/issues (не один монолитный)
+    search_calls = [c for c in fake.calls if "search/issues" in c]
+    assert len(search_calls) >= 2, f"ожидалось несколько чанков, вызовов: {len(search_calls)}"
+    # Все issues собраны (дедуп по number работает)
+    assert len(issues) == len(all_issues)
+
+
+def test_invariant_23_in_migrated_registry_and_escalating():
+    """Инвариант 23 несет check_result.CheckResult и должен быть в обоих
+    реестрах: CHECK_RESULT_MIGRATED_INVARIANTS (чтобы assert_check_result...
+    не падал) И ESCALATING_INVARIANTS (чтобы эскалировать нарушения)."""
+    assert 23 in ri.CHECK_RESULT_MIGRATED_INVARIANTS
+    assert 23 in ri.ESCALATING_INVARIANTS
+
+
+def test_pool_producer_orphaned_mutation_guard(monkeypatch):
+    """Мутация: закомментировать ветку if close_rate <= dead_close_rate_max:
+    return check_result.violation(...) в evaluate_producer, вернуть ok() —
+    test_pool_producer_orphaned_violation_dead_producer обязан покраснеть.
+    Здесь — прямая проверка того же факта на уровне evaluate_producer
+    (не через check_pool_producer_orphaned, чтобы не запускать Search API)."""
+    # Используем фикстуру checklist-tail из producer_orphan_watch тестов
+    import importlib.util
+    from pathlib import Path
+    import json
+    _DIR = Path(__file__).resolve().parent.parent / "lib"
+    _POW_SPEC = importlib.util.spec_from_file_location(
+        "producer_orphan_watch", _DIR / "producer_orphan_watch.py")
+    pow_mod = importlib.util.module_from_spec(_POW_SPEC)
+    _POW_SPEC.loader.exec_module(pow_mod)
+    _CR_SPEC = importlib.util.spec_from_file_location("check_result", _DIR / "check_result.py")
+    cr = importlib.util.module_from_spec(_CR_SPEC)
+    _CR_SPEC.loader.exec_module(cr)
+
+    with open(_DIR / "fixtures_producer_orphan_watch_1277.json", encoding="utf-8") as f:
+        fixtures = json.load(f)
+    TAIL_12 = fixtures["tail_12"]
+    NOW = utc(2026, 9, 15, 12, 0)
+    stats = pow_mod.compute_stats(TAIL_12, NOW)
+    result = pow_mod.evaluate_producer(stats["checklist-tail"])
+    assert result.status == cr.STATUS_VIOLATION
+    # Мутационная проверка: если бы evaluate_producer возвращал ok() безусловно,
+    # этот assert упал бы — доказательство, что проверка работает.

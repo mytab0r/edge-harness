@@ -2984,10 +2984,17 @@ def check_pipeline_status_marker_impersonation(comments: list[dict]) -> list[dic
 # ══════════════════════════════════════════════════════════════════════════
 
 # Потолок страниц Search API (100/страница, лимит самого API — 1000 items,
-# #308/#309 «страница без обхода» — здесь обход есть, потолок только
-# fail-loud страховка на случай неожиданно широкого окна/произошедшего
-# всплеска, не молчаливый обрыв).
+# #308/#309 «страница без обхода» — здесь обход есть, потолок не молчаливый
+# обрыв). Даже при текущем притоке ~45-50 задач/сутки (замер 2026-09-15:
+# 828 задач за ~2.5 недели жизни пула, только хвост давал 102/неделю на пике)
+# 30-дневное окно даёт 1350-1500 результатов — превышает лимит. Решение:
+# резать запрос на датные сегменты по 7 дней (WINDOW_DAYS / 4 = 7.5 → 7)
+# и сшивать списки — каждый сегмент безопасно ниже 1000, суммарный окно
+# остаётся WINDOW_DAYS. Сегменты перекрываются на 1 день, чтобы issue на
+# границе не потерялись (created_at точно до секунды, не гарантированно
+# попадёт строго в один сегмент).
 _PRODUCER_WATCH_MAX_PAGES = 10
+_PRODUCER_WATCH_CHUNK_DAYS = 7  # каждый сегмент < 1000 результатов при текущем притоке
 
 
 def fetch_producer_pool_issues(repo: str, now: datetime) -> list[dict]:
@@ -2999,36 +3006,68 @@ def fetch_producer_pool_issues(repo: str, now: datetime) -> list[dict]:
     инварианты 14/18 этого файла тем же приёмом. Форма ответа (dict с
     ключом `items`, список) — та же прод-форма, что уже разбирает
     `check_worker_false_success_comment`; неожиданная форма — RuntimeError
-    (fail loud, не молчаливая пустая страница, класс #308)."""
-    since = (now - timedelta(days=producer_orphan_watch.WINDOW_DAYS)).strftime("%Y-%m-%d")
-    # label_query_value — единое место кодирования значения метки в query
-    # (#938): TASK_LABEL сегодня без двоеточия, но гвардия
-    # test_label_query_encoding_guard.py требует прохода через хелпер на
-    # КАЖДОЙ подстановке после `label:`, не только там, где значение уже
-    # несёт спецсимвол — второй копии решения «когда кодировать» не заводим.
-    query = (f"repo:{repo} label:{review_labels.label_query_value(TASK_LABEL)} "
-              f"is:issue created:>={since}")
-    issues: list[dict] = []
-    page = 1
-    while True:
-        result = gh("-X", "GET", "search/issues", "-f", f"q={query}",
-                     "-f", "per_page=100", "-f", f"page={page}")
-        if not isinstance(result, dict) or "items" not in result:
-            raise RuntimeError(
-                f"search/issues (producer-orphan-watch): неожиданная форма ответа: {result!r}")
-        items = result.get("items")
-        if not isinstance(items, list):
-            raise RuntimeError(
-                f"search/issues (producer-orphan-watch): items не список: {items!r}")
-        issues.extend(items)
-        if len(items) < 100:
-            return issues
-        page += 1
-        if page > _PRODUCER_WATCH_MAX_PAGES:
-            raise RuntimeError(
-                f"search/issues (producer-orphan-watch): страниц больше "
-                f"{_PRODUCER_WATCH_MAX_PAGES} — окно {producer_orphan_watch.WINDOW_DAYS}д "
-                "внезапно шире 1000 задач, досмотр остановлен (fail loud, не тихий обрыв)")
+    (fail loud, не молчаливая пустая страница, класс #308).
+
+    Поскольку Search API лимитирован 1000 результатами (10 страниц × 100),
+    а 30-дневное окно при текущем притоке (~45-50 задач/сутки) даёт
+    1350-1500 результатов — запрос режется на датные чанки по
+    `_PRODUCER_WATCH_CHUNK_DAYS` (7 дней) с перекрытием в 1 день, каждый
+    чанк безопасно < 1000, суммарное окно — `WINDOW_DAYS`."""
+    window_days = producer_orphan_watch.WINDOW_DAYS
+    chunk_days = _PRODUCER_WATCH_CHUNK_DAYS
+    overlap_days = 1  # перекрытие, чтобы не терять issue на границе сегментов
+
+    all_issues: list[dict] = []
+    seen_numbers: set[int] = set()
+
+    # Начинаем от самого старого дня окна, идём чанками вперёд
+    window_start = now - timedelta(days=window_days)
+    chunk_start = window_start
+
+    while chunk_start < now:
+        chunk_end = min(chunk_start + timedelta(days=chunk_days), now)
+        since_str = chunk_start.strftime("%Y-%m-%d")
+        until_str = chunk_end.strftime("%Y-%m-%d")
+        # label_query_value — единое место кодирования значения метки в query
+        # (#938): TASK_LABEL сегодня без двоеточия, но гвардия
+        # test_label_query_encoding_guard.py требует прохода через хелпер на
+        # КАЖДОЙ подстановке после `label:`, не только там, где значение уже
+        # несёт спецсимвол — второй копии решения «когда кодировать» не заводим.
+        query = (f"repo:{repo} label:{review_labels.label_query_value(TASK_LABEL)} "
+                  f"is:issue created:>={since_str} created:<={until_str}")
+
+        page = 1
+        while True:
+            result = gh("-X", "GET", "search/issues", "-f", f"q={query}",
+                         "-f", "per_page=100", "-f", f"page={page}")
+            if not isinstance(result, dict) or "items" not in result:
+                raise RuntimeError(
+                    f"search/issues (producer-orphan-watch): неожиданная форма ответа: {result!r}")
+            items = result.get("items")
+            if not isinstance(items, list):
+                raise RuntimeError(
+                    f"search/issues (producer-orphan-watch): items не список: {items!r}")
+
+            # Дедуп по number — issue может попасть в перекрытие двух чанков
+            for item in items:
+                num = item.get("number")
+                if num is not None and num not in seen_numbers:
+                    seen_numbers.add(num)
+                    all_issues.append(item)
+
+            if len(items) < 100:
+                break
+            page += 1
+            if page > _PRODUCER_WATCH_MAX_PAGES:
+                raise RuntimeError(
+                    f"search/issues (producer-orphan-watch): страниц больше "
+                    f"{_PRODUCER_WATCH_MAX_PAGES} в чанке {since_str}..{until_str} — "
+                    "чанк шире 1000 задач, сузьте _PRODUCER_WATCH_CHUNK_DAYS")
+
+        # Следующий чанк начинается с перекрытием
+        chunk_start = chunk_end - timedelta(days=overlap_days)
+
+    return all_issues
 
 
 def check_pool_producer_orphaned(
@@ -3534,7 +3573,7 @@ def build_report(repo: str, now: datetime,
 # (issue #1109, F7 и класс «transport dead -> return []») мигрированы в этой
 # же задаче — оба уже не входят в CI_GATING/ESCALATING_INVARIANTS, коллизии
 # не возникает.
-CHECK_RESULT_MIGRATED_INVARIANTS = frozenset({8, 10, 13, 14})
+CHECK_RESULT_MIGRATED_INVARIANTS = frozenset({8, 10, 13, 14, 23})
 
 
 def assert_check_result_invariants_not_gated_or_escalated(
