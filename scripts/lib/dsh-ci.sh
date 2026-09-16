@@ -101,6 +101,19 @@ ANTHROPIC_OAUTH_POOL_PORT=47291
 # его перешагнула (прогон 35046585539, задача #770).
 DSH_PROMPT_MAX_BYTES="${DSH_PROMPT_MAX_BYTES:-126976}"
 
+# #1318: тот же предел, но как размер ОДНОГО куска нарезки. Взят заметно ниже
+# MAX_ARG_STRLEN (128 КиБ) не «на всякий случай», а потому что точка реза
+# ищется НАЗАД от границы до подходящего пробела: запас гарантирует, что
+# поиск не упрётся в начало куска на тексте с длинными строками.
+DSH_PROMPT_CHUNK_BYTES="${DSH_PROMPT_CHUNK_BYTES:-100000}"
+
+# Общий потолок на ВСЕ аргументы вместе (ARG_MAX, ~2 МиБ на Linux, считается
+# вместе с environment). Величина другая, чем MAX_ARG_STRLEN, и нарезкой не
+# лечится — поэтому у неё своя проверка и свой текст отказа. 1 МиБ — половина
+# типичного ARG_MAX, запас на environment job'а GitHub Actions (там десятки
+# переменных, включая секреты и каталоги путей).
+DSH_PROMPT_TOTAL_MAX_BYTES="${DSH_PROMPT_TOTAL_MAX_BYTES:-1048576}"
+
 # Имя apiKeyEnv-переменной провайдера llm-pi-ai.providers.anthropic-pool —
 # ОДНО место правды для имени (используется и как ключ env, и в YAML-патче
 # ниже). Значение — НЕ секрет: сама аутентификация идёт через реальный
@@ -948,6 +961,51 @@ PATCH
 #                             чтобы уменьшать ОБЩИЙ бюджет ожидания на
 #                             следующего провайдера, а не выдавать каждому
 #                             полный бюджет заново (см. dsh_run_with_provider_chain)
+# ── Промпт несколькими аргументами, без потери байта (#1318) ───────────────
+#
+# Заполняет массив DSH_PROMPT_ARGV кусками промпта так, чтобы
+# `args.join(" ")` на стороне dsh-headless (lib/startup.js: задача объявлена
+# `[task...]` и собирается именно join'ом) дал ИСХОДНЫЙ текст байт-в-байт.
+#
+# Отсюда единственно допустимая точка реза — ОДИНОЧНЫЙ пробел: он снимается
+# здесь и возвращается join'ом. Резать по переводу строки нельзя: join вернул
+# бы на его место пробел, и текст изменился бы молча (ровно тот silent-wrong,
+# который в этом репозитории дороже падения).
+#
+# Второе ограничение — кусок не должен начинаться с `-`: commander на стороне
+# dsh принял бы его за неизвестную опцию. Поэтому подходящим считается пробел,
+# за которым идёт НЕ дефис.
+#
+# Промпт короче куска — ровно один элемент массива, то есть побайтно прежний
+# вызов: до #1318 так шли все прогоны, и эта ветка сохраняет их поведение.
+dsh_prompt_argv_chunks() { # prompt_text -> заполняет массив DSH_PROMPT_ARGV
+  local text=$1 chunk_max="${DSH_PROMPT_CHUNK_BYTES:-100000}"
+  DSH_PROMPT_ARGV=()
+  DSH_PROMPT_SPLIT_FAILED=0
+  # LC_ALL=C: длины и индексы обязаны быть В БАЙТАХ, а не в символах —
+  # предел ядра байтовый, а промпт кириллический (символ = два байта).
+  local LC_ALL=C LANG=C
+  while [ "${#text}" -gt "$chunk_max" ]; do
+    local cut=-1 i
+    # Назад от границы до пробела, за которым не дефис.
+    for (( i = chunk_max; i > 0; i-- )); do
+      if [ "${text:i:1}" = " " ] && [ "${text:i+1:1}" != "-" ]; then
+        cut=$i
+        break
+      fi
+    done
+    if [ "$cut" -lt 1 ]; then
+      # Кусок без единого годного пробела — резать нечем, не режем молча.
+      DSH_PROMPT_SPLIT_FAILED=1
+      DSH_PROMPT_ARGV=("$1")
+      return 0
+    fi
+    DSH_PROMPT_ARGV+=("${text:0:cut}")
+    text="${text:cut+1}"
+  done
+  DSH_PROMPT_ARGV+=("$text")
+}
+
 dsh_run_with_retry() { # answer_file err_file prompt_text
   local answer_file=$1 err_file=$2 prompt_text=$3
   local max_wait="${DSH_RATE_LIMIT_MAX_WAIT_SECS:-1800}"
@@ -969,26 +1027,55 @@ dsh_run_with_retry() { # answer_file err_file prompt_text
   # Отказ НАШ (форма вызова), а не провайдеров, поэтому ловим его ДО первой
   # попытки и не тратим на него ни одного провайдера.
   #
-  # Апстрим другого пути не даёт: dsh-headless принимает задачу только
-  # positional (`[task...]`, lib/startup.js пакета @deepseek-ai/dsh-headless
-  # 0.1.1-rc.2 — ни --task-file, ни stdin), поэтому лечение — на нашей
-  # стороне: короче промпт.
+  # #1318: первая версия этой проверки (#1315) считала предел непреодолимым и
+  # отказывала. Замер показал, что тогда конвейер просто умирает на обычных
+  # задачах: фиксированная часть промпта (AGENTS.md 36674 + PROTOCOL.md 53937
+  # + WORKER-PLAYBOOK.md 17055 = 107666 байт) съедает бюджет почти целиком, и
+  # на саму задачу остаётся ~19 КБ — задача #1184 дала 133199 байт и легла
+  # (прогоны worker.yml 35072416907/35074809844/35079314952 подряд).
+  #
+  # Резать содержимое не нужно: задача у dsh-headless объявлена ВАРИАДИКОМ
+  # (`.argument("[task...]")`) и собирается обратно как `program.args.join(" ")`
+  # — lib/startup.js пакета @deepseek-ai/dsh-headless 0.1.1-rc.2. Предел
+  # MAX_ARG_STRLEN действует на ОДИН аргумент, поэтому промпт уходит
+  # НЕСКОЛЬКИМИ аргументами (dsh_prompt_argv_chunks), а join склеивает их
+  # обратно байт-в-байт: резать разрешено только по ОДИНОЧНОМУ пробелу,
+  # который join и вернёт на место.
+  #
+  # Проверка ниже остаётся страховкой на то, чего нарезка не лечит: общий
+  # ARG_MAX (все аргументы плюс environment) — величина другая и больше на
+  # порядок, поэтому и порог у неё свой.
   local prompt_bytes
   prompt_bytes=$(printf '%s' "$prompt_text" | wc -c)
-  if [ "$prompt_bytes" -gt "$DSH_PROMPT_MAX_BYTES" ]; then
+  if [ "$prompt_bytes" -gt "$DSH_PROMPT_TOTAL_MAX_BYTES" ]; then
     DSH_RUN_RC=126
     DSH_RUN_FAILURE_REASON="prompt_too_long"
     DSH_RUN_WAITED_SECS=0
     DSH_RUN_LAST_ATTEMPT_ELAPSED_SECS=0
     DSH_RUN_LAST_ATTEMPT_TIMEOUT_SECS="$timeout_secs"
-    echo "::error::промпт ${prompt_bytes} байт при пределе ${DSH_PROMPT_MAX_BYTES} на ОДИН аргумент командной строки (MAX_ARG_STRLEN ядра, 128 КиБ) — dsh принимает задачу только позиционным аргументом, поэтому вызов физически не состоится ни у одного провайдера. Это НАШ отказ, не провайдера: ни одна попытка не делается, повтор без укорачивания промпта бессмыслен. Лечение — сократить источник промпта (docs/runbooks/switch-llm-provider.md, #1315)" >&2
+    echo "::error::промпт ${prompt_bytes} байт при общем пределе ${DSH_PROMPT_TOTAL_MAX_BYTES} на ВСЕ аргументы командной строки (ARG_MAX ядра за вычетом запаса на environment) — нарезка по аргументам (#1318) этот предел не лечит, он про сумму. Это НАШ отказ, не провайдера: ни одна попытка не делается, повтор без укорачивания промпта бессмыслен. Лечение — сократить источник промпта (docs/runbooks/switch-llm-provider.md, #1315/#1318)" >&2
     return 0
+  fi
+  # #1318: нарезка считается ОДИН раз на вызов, а не на каждую попытку —
+  # промпт между попытками не меняется.
+  dsh_prompt_argv_chunks "$prompt_text"
+  if [ "${DSH_PROMPT_SPLIT_FAILED:-0}" = "1" ] && [ "$prompt_bytes" -gt "$DSH_PROMPT_MAX_BYTES" ]; then
+    DSH_RUN_RC=126
+    DSH_RUN_FAILURE_REASON="prompt_too_long"
+    DSH_RUN_WAITED_SECS=0
+    DSH_RUN_LAST_ATTEMPT_ELAPSED_SECS=0
+    DSH_RUN_LAST_ATTEMPT_TIMEOUT_SECS="$timeout_secs"
+    echo "::error::промпт ${prompt_bytes} байт не режется на аргументы: в первых ${DSH_PROMPT_CHUNK_BYTES} байтах нет ни одного пробела, по которому можно резать без потери байта (за пробелом не должно идти '-'). Резать по переводу строки нельзя — join на стороне dsh поставил бы туда пробел и тихо изменил текст. Это НАШ отказ, не провайдера: ни одной попытки не делается (#1318)" >&2
+    return 0
+  fi
+  if [ "${#DSH_PROMPT_ARGV[@]}" -gt 1 ]; then
+    echo "промпт ${prompt_bytes} байт передан ${#DSH_PROMPT_ARGV[@]} аргументами (предел ядра ${DSH_PROMPT_MAX_BYTES} на ОДИН аргумент; dsh склеит их обратно join(\" \"), #1318)"
   fi
   while :; do
     echo "dsh: попытка $attempt (суммарно уже ждал ${waited}с из бюджета ${max_wait}с)"
     attempt_start=$(date +%s)
     set +e
-    timeout "$timeout_secs" dsh --profile headless "$prompt_text" \
+    timeout "$timeout_secs" dsh --profile headless "${DSH_PROMPT_ARGV[@]}" \
       >"$answer_file" 2>"$err_file"
     rc=$?
     set -e
