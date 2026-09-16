@@ -889,8 +889,19 @@ fi
 # держать её занятой зря.
 if [ "$WORKER_TASK_FAILURE_REASON" = "quota_exhausted" ] || \
    [ "$WORKER_TASK_FAILURE_REASON" = "rate_limit_retry_budget_exceeded" ] || \
+   [ "$WORKER_TASK_FAILURE_REASON" = "prompt_too_long" ] || \
    [ "$WORKER_TASK_FAILURE_REASON" = "all_providers_exhausted" ]; then
   case "$WORKER_TASK_FAILURE_REASON" in
+    prompt_too_long)
+      # #1315: отказ НАШ (промпт не помещается в аргумент execve), но это
+      # ровно та же категория «не сбой агента»: агент не вызывался вовсе.
+      # Задача возвращается в пул тем же путём — держать её занятой не за что.
+      #
+      # ЧЕСТНАЯ ГРАНИЦА, названная вслух: отказ детерминированный для ЭТОЙ
+      # задачи — следующий воркер соберёт тот же промпт и упрётся так же.
+      # Автоматического укорачивания промпта здесь нет; серию повторов
+      # останавливает предохранитель конвейера (#120), а не этот код.
+      reason="промпт задачи не помещается в аргумент командной строки dsh (предел ядра 128 КиБ на один аргумент, MAX_ARG_STRLEN) — агент не вызывался ВООБЩЕ, ни один провайдер не тронут; повтор без укорачивания промпта даст тот же отказ (#1315, docs/runbooks/switch-llm-provider.md)" ;;
     quota_exhausted)
       reason="квота провайдера исчерпана надолго (RATE_LIMIT: Weekly/Monthly Limit Exhausted, код возврата $rc) — повтор внутри этого прогона не поможет, нужно ждать вне CI или сменить провайдера (docs/runbooks/switch-llm-provider.md)" ;;
     rate_limit_retry_budget_exceeded)
