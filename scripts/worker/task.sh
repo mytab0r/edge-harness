@@ -939,7 +939,7 @@ COMMENT
   )
   gh issue comment "$number" --body "$comment" >/dev/null
   telegram_report "worker: задача #$number — цепочка провайдеров отказала, не сбой агента ($reason). Задача возвращена в пул" || true
-  die "Цепочка провайдеров отказала: $reason"
+  exit 0
 fi
 
 # pr_status здесь бывает двух родов (#876): "empty"/"absent" (pr_outcome_rc=1)
