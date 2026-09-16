@@ -76,7 +76,12 @@
 - [0016. Конкуренция за код не устраняется приёмом регистрации: границы параллельной работы](decisions/0016-parallel-work-on-shared-code-boundaries.md)
 - [0017. Второй гейт морды dsh-edge: e2e-смоук на PR против локального воркера](decisions/0017-dsh-edge-pr-smoke-local-worker.md)
 - [0018. Алерт «пульс не бьётся» живёт в DO (Cloudflare), не в GitHub Actions](decisions/0018-pulse-alert-lives-in-do.md)
+- [0020. Номер ADR/research-документа не назначается вручную без арбитра](decisions/0020-decision-doc-numbering-guard.md)
+- [0021. Триаж застрявшего в конфликте PR: шесть измеримых величин](decisions/0021-stalled-pr-merge-conflict-triage.md)
 - [0022. Связывание контекста между каналами: три точечных приёма вместо общего носителя](decisions/0022-cross-channel-context-transfer.md)
+- [0023. Рецепт мутации — исполняемый opt-in формат, не текстовый линт](decisions/0023-mutation-recipe-execution-guard.md)
+- [0024. Триаж застрявшего PR: метод ADR 0021 не покрывал очередь — четыре дефекта и правки](decisions/0024-stalled-pr-triage-method-fix.md)
+- [0025. Классификация классов дефектов — в источнике, не постфактум-кластеризацией](decisions/0025-defect-class-source-classification.md)
 
 ## Операционные процедуры
 

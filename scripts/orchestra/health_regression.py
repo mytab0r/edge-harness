@@ -105,13 +105,36 @@ def deviation_pct(value: float, baseline: float, direction: str) -> float:
     return max(0.0, (value - baseline) / baseline * 100.0)
 
 
+def _is_reliable_sample(row: dict, metric: str) -> bool:
+    """`merge_throughput`, снятый ДО фикса issue #1155, систематически
+    занижен/нулевой (окно «сегодня, с полуночи до момента снимка», не
+    полные предыдущие сутки) — эти точки не «плохое значение метрики», это
+    брак измерения, и медиана-baseline, построенная из них, лжёт в сторону
+    заниженного порога регрессии (реальные будущие просадки не поймаются).
+
+    Различитель — наличие `merge_throughput_window_start` (issue #1155,
+    `pipeline_health.build_snapshot`), которое появляется ТОЛЬКО у снимков,
+    посчитанных исправленным окном; не дата снимка (см. PR #1155 — решение
+    «начать новый ряд» вместо пересчёта задним числом: пересчёт истории
+    потребовал бы записи на прод-ветку `data/pipeline-health` вне
+    санкционированного суточного пульса, что не входит в эту задачу)."""
+    if metric != "merge_throughput":
+        return True
+    return "merge_throughput_window_start" in row
+
+
 def classify_metric(rows: list[dict], metric: str) -> Classification:
     """`rows` — снимки в ХРОНОЛОГИЧЕСКОМ порядке (старые → новые), тот же
     порядок, что `pipeline_health.read_rows` отдаёт по построению (append-only
     JSONL). Точки с `None` по этой метрике (честное «нет данных» дня) не
-    участвуют — они не «0», это отсутствие наблюдения."""
+    участвуют — они не «0», это отсутствие наблюдения. Точки `merge_throughput`
+    без метки нового окна (`_is_reliable_sample`) — брак измерения до фикса
+    #1155, тоже не участвуют (не «0», не «нет данных» — «известно неверно»)."""
     label, direction = METRICS[metric]
-    dated_values = [(row["date"], row[metric]) for row in rows if row.get(metric) is not None]
+    dated_values = [
+        (row["date"], row[metric]) for row in rows
+        if row.get(metric) is not None and _is_reliable_sample(row, metric)
+    ]
     if len(dated_values) < MIN_SAMPLES_FOR_BASELINE:
         return Classification(
             "insufficient_data", metric, label, direction,

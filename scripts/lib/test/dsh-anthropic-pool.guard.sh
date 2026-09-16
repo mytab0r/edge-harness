@@ -394,7 +394,11 @@ write_fixture_package() {
   # index.js — ensureProvider() и окружающий forward()/401-403-ветка —
   # ТОЧНАЯ копия dsh-anthropic-oauth-pool-0.1.0.tgz (релиз
   # dsh-plugins-suite-v1), инспектирована живьём при разборе #1097/#1130.
+  # Строка import — тоже точная копия верхушки реального lib/index.js
+  # (#1192: PATCH_IMPORT_CLASSIFY трогает именно её).
   cat >"$dir/lib/index.js" <<'INDEX_JS'
+import { createRefreshCoordinator, selectAccount, updateQuotaFromHeaders, available } from './pool.js'
+
 const name = "dsh-anthropic-oauth-pool"
 
 function apply(ctx) {
@@ -497,6 +501,21 @@ export function createRefreshCoordinator({ readAccount, writeAccount, refreshTok
   }
 }
 POOL_JS
+  # accounts.js — ТОЧНАЯ копия importAccount из релизного ассета: #1311
+  # (патч 6) снимает в ней требование refreshToken, и без этого файла патч
+  # отказал бы на фикстуре громко, а не молча (проверено: отказ выглядит как
+  # «lib/accounts.js не найден»).
+  cat >"$dir/lib/accounts.js" <<'ACCOUNTS_JS'
+export function importAccount(id, source) {
+  const json = JSON.parse(fs.readFileSync(source, 'utf8'))
+  const oauth = json.claudeAiOauth || json.oauth
+  if (!oauth?.accessToken || !oauth?.refreshToken) throw new Error('Source has no usable claudeAiOauth credentials')
+  writeAccount(id, { id, oauth })
+  const config = readConfig()
+  if (!config.accounts.some((a) => a.id === id)) config.accounts.push({ id, enabled: true, weight: 1 })
+  writeConfig(config)
+}
+ACCOUNTS_JS
 }
 
 (
@@ -700,5 +719,772 @@ BEHAVIOR_MJS
   cat "$BEHAVIOR_LOG"
 ) || fail "14) патч превентивного рефреша долгоживущих токенов не подтверждён поведенчески"
 echo "GUARD(anthropic-pool): 14) патченный pool.js — без expiresAt рефреша нет, с expiresAt в прошлом рефреш есть, короткоживущие токены не задеты — ок (#1130)"
+
+# ── 15) #1192: 4-й патч (classifyPoolUnavailable/reason/accounts) применился
+#       к прод-форме фикстуры — расширение секции 11a теми же приёмами:
+#       живой вызов classifyPoolUnavailable в else-ветке, обновлённый import
+#       из pool.js, экспортированная функция в pool.js. ────────────────────
+(
+  FIXTURE_DIR="$(mktemp -d)"
+  write_fixture_package "$FIXTURE_DIR"
+  grep -q "import { createRefreshCoordinator, selectAccount, updateQuotaFromHeaders, available } from './pool.js'" "$FIXTURE_DIR/lib/index.js" || { echo "::error::15) фикстура index.js сама не содержит ожидаемую строку import — тест сломан до патча" >&2; exit 1; }
+  if ! python3 "$REPO/scripts/lib/patch_anthropic_pool_plugin.py" "$FIXTURE_DIR" >"$FIXTURE_DIR/patch.log" 2>&1; then
+    echo "::error::15) патч не применился к прод-форме фикстуры: $(cat "$FIXTURE_DIR/patch.log")" >&2; exit 1
+  fi
+  grep -q "available, classifyPoolUnavailable } from './pool.js'" "$FIXTURE_DIR/lib/index.js" || { echo "::error::15) import classifyPoolUnavailable не добавлен в index.js" >&2; exit 1; }
+  grep -q "const { reason, accounts } = classifyPoolUnavailable(\[...runtime.values()\])" "$FIXTURE_DIR/lib/index.js" || { echo "::error::15) else-ветка pool_unavailable не зовёт classifyPoolUnavailable" >&2; exit 1; }
+  grep -q "retryAt: next?.cooldownUntil || null, reason, accounts } }))" "$FIXTURE_DIR/lib/index.js" || { echo "::error::15) reason/accounts не попали в JSON-тело pool_unavailable" >&2; exit 1; }
+  grep -q "^export function classifyPoolUnavailable(accounts) {" "$FIXTURE_DIR/lib/pool.js" || { echo "::error::15) pool.js не содержит экспортированную classifyPoolUnavailable" >&2; exit 1; }
+) || fail "15) патч 4 (reason/accounts у pool_unavailable) не применился к прод-форме"
+echo "GUARD(anthropic-pool): 15) патч 4 (classifyPoolUnavailable/reason/accounts) применился к прод-форме — ок (#1192)"
+
+# ── 16) #1192 (мутация): форма else-ветки pool_unavailable изменилась (как
+#       если бы апстрим переписал плагин) — точное совпадение обязано
+#       провалиться громко, а НЕ применить патч частично. Проверяем
+#       атомарность: ни index.js, ни pool.js не изменились (все 6
+#       _replace_required идут на content-буферах ДО первой записи файла). ──
+(
+  FIXTURE_DIR="$(mktemp -d)"
+  write_fixture_package "$FIXTURE_DIR"
+  python3 -c "
+import sys
+path = sys.argv[1]
+with open(path, encoding='utf-8') as f:
+    content = f.read()
+marker = \"type: 'pool_unavailable', message: lastError?.message || 'No Anthropic account is available', retryAt: next?.cooldownUntil || null\"
+assert marker in content, 'fixture setup broken'
+content = content.replace(marker, \"type: 'pool_unavailable', reason_message: lastError?.message || 'No Anthropic account is available', retryAt: next?.cooldownUntil || null\")
+with open(path, 'w', encoding='utf-8') as f:
+    f.write(content)
+" "$FIXTURE_DIR/lib/index.js"
+  ORIGINAL_INDEX_JS="$(cat "$FIXTURE_DIR/lib/index.js")"
+  ORIGINAL_POOL_JS="$(cat "$FIXTURE_DIR/lib/pool.js")"
+  if python3 "$REPO/scripts/lib/patch_anthropic_pool_plugin.py" "$FIXTURE_DIR" >"$FIXTURE_DIR/patch.log" 2>&1; then
+    echo "::error::16) патч ОБЯЗАН был отказать на изменённой форме else-ветки pool_unavailable, но применился молча" >&2; exit 1
+  fi
+  grep -qi "PATCH_MARKER_NOT_FOUND\[pool_unavailable_reason\]" "$FIXTURE_DIR/patch.log" || { echo "::error::16) отказ патча не назвал причину PATCH_MARKER_NOT_FOUND[pool_unavailable_reason]: $(cat "$FIXTURE_DIR/patch.log")" >&2; exit 1; }
+  [ "$(cat "$FIXTURE_DIR/lib/index.js")" = "$ORIGINAL_INDEX_JS" ] || { echo "::error::16) index.js изменился, хотя патч должен был отказать ДО записи любого файла" >&2; exit 1; }
+  [ "$(cat "$FIXTURE_DIR/lib/pool.js")" = "$ORIGINAL_POOL_JS" ] || { echo "::error::16) pool.js изменился, хотя патч 4-й (pool_unavailable_reason) не совпал первым в index.js — атомарность нарушена (pool_classify_export не должен был примениться)" >&2; exit 1; }
+) || fail "16) патч не падает громко на изменённой форме else-ветки pool_unavailable (мутация #1192)"
+echo "GUARD(anthropic-pool): 16) мутация формы pool_unavailable -> патч отказывает громко (PATCH_MARKER_NOT_FOUND), ОБА файла не тронуты (атомарность) — ок (#1192)"
+
+# ── 17) #1192: ПОВЕДЕНЧЕСКОЕ доказательство classifyPoolUnavailable — не
+#       текстовый grep (уже сделан в 15), а РЕАЛЬНЫЙ вызов патченной функции
+#       в node с синтетическими аккаунтами. Доказывает: 401/403 ->
+#       auth_rejected; 429 (без auth_rejected рядом) -> rate_limited;
+#       исключение без HTTP-ответа -> network_error; ничего не пробовалось
+#       ЛИБО последний записанный ответ вне {401,403,429} (например 200) ->
+#       unknown; auth_rejected ИМЕЕТ ПРИОРИТЕТ над rate_limited, когда оба
+#       класса присутствуют одновременно (владелец не должен быть пропущен
+#       только потому, что ДРУГОЙ аккаунт всего лишь упёрся в лимит). ───────
+(
+  FIXTURE_ROOT="$(mktemp -d)"
+  EXTRACT_DIR="$FIXTURE_ROOT/anthropic-oauth-pool-extracted/package"
+  write_fixture_package "$EXTRACT_DIR"
+  export DSH_ANTHROPIC_POOL_ACTIVE=1
+  export DSH_ANTHROPIC_POOL_EXTRACTED="$EXTRACT_DIR"
+  export DSH_ANTHROPIC_POOL_PKG="$FIXTURE_ROOT/original.tgz"
+  : >"$DSH_ANTHROPIC_POOL_PKG"
+  dsh_patch_anthropic_pool_plugin || { echo "::error::17) dsh_patch_anthropic_pool_plugin отказала на валидной фикстуре" >&2; exit 1; }
+
+  cat >"$EXTRACT_DIR/lib/classify-check.mjs" <<'CLASSIFY_MJS'
+import { classifyPoolUnavailable } from './pool.js'
+
+const authOnly = classifyPoolUnavailable([{ id: 'a1', lastStatus: 401 }, { id: 'a2', lastStatus: 403 }])
+const rateOnly = classifyPoolUnavailable([{ id: 'a1', lastStatus: 429 }])
+const networkOnly = classifyPoolUnavailable([{ id: 'a1', lastError: 'fetch failed: ECONNRESET' }])
+const nothing = classifyPoolUnavailable([{ id: 'a1' }])
+const mixedAuthWins = classifyPoolUnavailable([{ id: 'a1', lastStatus: 429 }, { id: 'a2', lastStatus: 401 }])
+// Находка ai-review PR #1193, раунд 4: класс unknown ШИРЕ, чем «ни разу не
+// пробовался» — записанный lastStatus вне {401,403,429} (например 200 из
+// прошлого вызова, живущий в runtime-состоянии так же, как 401) тоже даёт
+// unknown. Поведение фиксируется кейсом, чтобы докстринг и код не разошлись.
+const stale200 = classifyPoolUnavailable([{ id: 'a1', lastStatus: 200 }])
+
+const checks = [
+  ['authOnly.reason', authOnly.reason, 'auth_rejected'],
+  ['authOnly.accounts[0].class', authOnly.accounts[0].class, 'auth_rejected'],
+  ['authOnly.accounts[1].class', authOnly.accounts[1].class, 'auth_rejected'],
+  ['rateOnly.reason', rateOnly.reason, 'rate_limited'],
+  ['networkOnly.reason', networkOnly.reason, 'network_error'],
+  ['nothing.reason', nothing.reason, 'unknown'],
+  ['mixedAuthWins.reason', mixedAuthWins.reason, 'auth_rejected'],
+  ['stale200.reason', stale200.reason, 'unknown'],
+]
+let failed = false
+for (const [label, got, want] of checks) {
+  const ok = got === want
+  console.log(`${ok ? 'OK' : 'FAIL'}: ${label}=${got} (want ${want})`)
+  if (!ok) failed = true
+}
+if (failed) process.exit(1)
+console.log(`OK: classifyPoolUnavailable — все ${checks.length} проверок прошли, 4 класса (auth_rejected/rate_limited/network_error/unknown) различены верно, auth_rejected приоритетнее rate_limited`)
+CLASSIFY_MJS
+  CLASSIFY_LOG="$FIXTURE_ROOT/classify.log"
+  if ! node "$EXTRACT_DIR/lib/classify-check.mjs" >"$CLASSIFY_LOG" 2>&1; then
+    { echo "::error::17) поведенческая проверка classifyPoolUnavailable провалилась:"; cat "$CLASSIFY_LOG"; } >&2
+    exit 1
+  fi
+  cat "$CLASSIFY_LOG"
+) || fail "17) classifyPoolUnavailable не подтверждена поведенчески"
+echo "GUARD(anthropic-pool): 17) classifyPoolUnavailable — auth_rejected/rate_limited/network_error/unknown различены, auth_rejected приоритетнее — ок (#1192)"
+
+# ── 18) #1192: dsh_pool_unavailable_owner_note — прод-форма stderr (реальный
+#       вид «dsh: SERVER: 503 {...}» из живого прогона worker.yml 34792555573,
+#       дополненный полем reason нашим же патчем). ВОСЕМЬ stderr-форм, каждая —
+#       РАЗНЫЙ факт, не гадание: auth_rejected называет "владелец нужен",
+#       rate_limited — "владелец НЕ нужен" (два сообщения обязаны различаться
+#       буквально, не одним и тем же текстом с другой меткой); поле reason
+#       отсутствует (форма до патча/апстрим сменился) -> честный пробел
+#       «не классифицирована», а не подстановка одной из гипотез; чужой
+#       reason ДО и ПОСЛЕ тела (находка ai-review PR #1193, раунд 4: вырезка
+#       тела обязана держаться в пределах строки тела — причина пула не может
+#       прийти из чужой строки stderr). ─────────────────────────────────────
+(
+  WORK18="$(mktemp -d)"
+  cat >"$WORK18/err_auth.txt" <<'EOF'
+dsh: SERVER: 503 {"type":"error","error":{"type":"pool_unavailable","message":"No Anthropic account is available","retryAt":1789345764948,"reason":"auth_rejected","accounts":[{"id":"anthropic-1","class":"auth_rejected","lastStatus":401,"cooldownUntil":1789345764948},{"id":"anthropic-2","class":"auth_rejected","lastStatus":403,"cooldownUntil":1789345764948}]}}
+EOF
+  cat >"$WORK18/err_rate.txt" <<'EOF'
+dsh: SERVER: 503 {"type":"error","error":{"type":"pool_unavailable","message":"No Anthropic account is available","retryAt":1789345764948,"reason":"rate_limited","accounts":[{"id":"anthropic-1","class":"rate_limited","lastStatus":429,"cooldownUntil":1789345764948}]}}
+EOF
+  cat >"$WORK18/err_network.txt" <<'EOF'
+dsh: SERVER: 503 {"type":"error","error":{"type":"pool_unavailable","message":"fetch failed: ECONNRESET","retryAt":null,"reason":"network_error","accounts":[{"id":"anthropic-1","class":"network_error","lastStatus":null,"cooldownUntil":1789345764948}]}}
+EOF
+  cat >"$WORK18/err_unknown.txt" <<'EOF'
+dsh: SERVER: 503 {"type":"error","error":{"type":"pool_unavailable","message":"No Anthropic account is available","retryAt":null,"reason":"unknown","accounts":[]}}
+EOF
+  # Прод-форма ДО патча #1192 (живой прогон 34792555573 — ровно этот текст) —
+  # тело pool_unavailable ЕСТЬ, поле reason отсутствует физически.
+  cat >"$WORK18/err_no_reason.txt" <<'EOF'
+dsh: SERVER: 503 {"type":"error","error":{"type":"pool_unavailable","message":"No Anthropic account is available","retryAt":1789345764948}}
+EOF
+  # Отказ пула СОВСЕМ ДРУГОЙ природы (таймаут до локального прокси) — тела
+  # pool_unavailable в stderr нет вовсе. Находка ai-review PR #1193: сообщение
+  # не имеет права утверждать «поле reason отсутствует В ОТВЕТЕ ПУЛА», если
+  # само тело pool_unavailable не было замечено вовсе — это разные факты.
+  cat >"$WORK18/err_unrelated.txt" <<'EOF'
+dsh: connect ECONNREFUSED 127.0.0.1:47291
+EOF
+  # Чужой reason ПОСЛЕ тела (находка ai-review PR #1193, раунд 4): тело
+  # pool_unavailable БЕЗ reason, НИЖЕ — несвязанная строка чужого компонента
+  # со СВОИМ "reason":"auth_rejected". Причина обязана остаться честным
+  # пробелом «тело есть, без поля reason», а не стать «владелец нужен» —
+  # иначе скоуп вырезки шире строки тела и чужой факт приписан пулу.
+  cat >"$WORK18/err_foreign_after.txt" <<'EOF'
+dsh: SERVER: 503 {"type":"error","error":{"type":"pool_unavailable","message":"No Anthropic account is available","retryAt":1789345764948}}
+2026-09-14T00:24:00Z cache-backend {"level":"error","reason":"auth_rejected","msg":"backend rejected credentials"}
+EOF
+  # Чужой reason ДО тела — тот же класс с другой стороны (чеклист ai-review
+  # PR #1193, раунд 3): тело само несёт auth_rejected, чужая строка ВЫШЕ со
+  # своим rate_limited не должна перебить факт тела.
+  cat >"$WORK18/err_foreign_before.txt" <<'EOF'
+2026-09-14T00:23:00Z cache-backend {"level":"warn","reason":"rate_limited","msg":"retry budget drained"}
+dsh: SERVER: 503 {"type":"error","error":{"type":"pool_unavailable","message":"No Anthropic account is available","retryAt":1789345764948,"reason":"auth_rejected","accounts":[{"id":"anthropic-1","class":"auth_rejected","lastStatus":401,"cooldownUntil":1789345764948}]}}
+EOF
+
+  note_auth=$(dsh_pool_unavailable_owner_note "$WORK18/err_auth.txt")
+  note_rate=$(dsh_pool_unavailable_owner_note "$WORK18/err_rate.txt")
+  note_network=$(dsh_pool_unavailable_owner_note "$WORK18/err_network.txt")
+  note_unknown=$(dsh_pool_unavailable_owner_note "$WORK18/err_unknown.txt")
+  note_no_reason=$(dsh_pool_unavailable_owner_note "$WORK18/err_no_reason.txt")
+  note_unrelated=$(dsh_pool_unavailable_owner_note "$WORK18/err_unrelated.txt")
+  note_foreign_after=$(dsh_pool_unavailable_owner_note "$WORK18/err_foreign_after.txt")
+  note_foreign_before=$(dsh_pool_unavailable_owner_note "$WORK18/err_foreign_before.txt")
+
+  echo "18) auth_rejected:   $note_auth"
+  echo "18) rate_limited:    $note_rate"
+  echo "18) network_error:   $note_network"
+  echo "18) unknown:         $note_unknown"
+  echo "18) без reason:      $note_no_reason"
+  echo "18) не пул вовсе:    $note_unrelated"
+  echo "18) чужой reason после тела: $note_foreign_after"
+  echo "18) чужой reason до тела:    $note_foreign_before"
+
+  [[ "$note_auth" == *"владелец нужен"* ]] || { echo "::error::18) auth_rejected обязан назвать «владелец нужен»: $note_auth" >&2; exit 1; }
+  [[ "$note_auth" == *"ANTHROPIC_OAUTH_1"* && "$note_auth" == *"ANTHROPIC_OAUTH_2"* ]] || { echo "::error::18) auth_rejected обязан назвать имена секретов на перевыпуск: $note_auth" >&2; exit 1; }
+  [[ "$note_rate" == *"владелец НЕ нужен"* ]] || { echo "::error::18) rate_limited обязан назвать «владелец НЕ нужен»: $note_rate" >&2; exit 1; }
+  [[ "$note_rate" == *"2026-09-14"* ]] || { echo "::error::18) rate_limited обязан назвать ретрай, вычисленный из retryAt (эпоха 1789345764948мс): $note_rate" >&2; exit 1; }
+  [ "$note_auth" != "$note_rate" ] || { echo "::error::18) auth_rejected и rate_limited дали ОДИНАКОВЫЙ текст — ровно та проблема, ради которой заведена задача #1192" >&2; exit 1; }
+  [[ "$note_network" == *"не подтверждено"* ]] || { echo "::error::18) network_error обязан честно назвать «не подтверждено»: $note_network" >&2; exit 1; }
+  [[ "$note_unknown" == *"не подтверждено"* ]] || { echo "::error::18) unknown (плагин сам не смог классифицировать) обязан назвать «не подтверждено»: $note_unknown" >&2; exit 1; }
+  # Находка ai-review PR #1193, раунд 4: класс unknown шире, чем «ни разу не
+  # пробовался», — формулировка не имеет права утверждать факт «ответа не
+  # было», который по записанному состоянию не проверялся.
+  [[ "$note_unknown" != *"не получил ответ"* ]] || { echo "::error::18) unknown НЕ должен утверждать «ответа не было» — в recorded-состоянии мог быть ответ вне 401/403/429: $note_unknown" >&2; exit 1; }
+  # Мутация класса «алерт не гадает»: без поля reason сообщение обязано
+  # признать пробел, а НЕ выбрать одну из гипотез (auth_rejected/rate_limited)
+  # наугад.
+  [[ "$note_no_reason" == *"не классифицирована"* ]] || { echo "::error::18) без поля reason (прод-форма ДО патча) сообщение обязано признать пробел, не угадывать: $note_no_reason" >&2; exit 1; }
+  [[ "$note_no_reason" != *"владелец нужен"* && "$note_no_reason" != *"владелец НЕ нужен"* ]] || { echo "::error::18) без поля reason сообщение НЕ должно утверждать о владельце ни в одну сторону (это и есть гадание) — $note_no_reason" >&2; exit 1; }
+  [[ "$note_no_reason" == *"тело pool_unavailable есть"* ]] || { echo "::error::18) без поля reason (тело pool_unavailable ЕСТЬ) сообщение обязано это отличать от «тела вовсе не было»: $note_no_reason" >&2; exit 1; }
+  # Отказ пула другой природы — тела pool_unavailable в stderr нет вовсе;
+  # сообщение НЕ должно утверждать «поле reason отсутствует В ОТВЕТЕ ПУЛА»
+  # (это факт, который в этом случае не проверялся — ai-review PR #1193).
+  [[ "$note_unrelated" == *"не классифицирована"* ]] || { echo "::error::18) без тела pool_unavailable сообщение обязано признать пробел, не угадывать: $note_unrelated" >&2; exit 1; }
+  [[ "$note_unrelated" != *"владелец нужен"* && "$note_unrelated" != *"владелец НЕ нужен"* ]] || { echo "::error::18) без тела pool_unavailable сообщение НЕ должно утверждать о владельце ни в одну сторону — $note_unrelated" >&2; exit 1; }
+  [[ "$note_unrelated" == *"pool_unavailable в stderr не найдено"* ]] || { echo "::error::18) без тела pool_unavailable сообщение обязано назвать именно ЭТОТ факт (не «поле reason отсутствует В ответе», которого не было): $note_unrelated" >&2; exit 1; }
+  [ "$note_unrelated" != "$note_no_reason" ] || { echo "::error::18) «тела нет вовсе» и «тело есть, поля reason нет» дали ОДИНАКОВЫЙ текст — разные факты, разные сообщения" >&2; exit 1; }
+  # Чужой reason ПОСЛЕ тела (находка ai-review PR #1193, раунд 4): причина
+  # читается ТОЛЬКО из строки тела — чужая строка ниже не приписывает пулу
+  # «владелец нужен», класс остаётся честным пробелом.
+  [[ "$note_foreign_after" == *"не классифицирована"* ]] || { echo "::error::18) чужой reason ПОСЛЕ тела: сообщение обязано держать честный пробел, не принимать чужой reason: $note_foreign_after" >&2; exit 1; }
+  [[ "$note_foreign_after" == *"тело pool_unavailable есть"* ]] || { echo "::error::18) чужой reason ПОСЛЕ тела: тело-то БЫЛО, факт «тело есть» обязан сохраниться: $note_foreign_after" >&2; exit 1; }
+  [[ "$note_foreign_after" != *"владелец нужен"* && "$note_foreign_after" != *"владелец НЕ нужен"* ]] || { echo "::error::18) чужой reason ПОСЛЕ тела принят за причину пула — скоуп вырезки шире строки тела (находка ai-review PR #1193, раунд 4): $note_foreign_after" >&2; exit 1; }
+  [ "$note_foreign_after" != "$note_auth" ] || { echo "::error::18) «чужой reason после тела» дал тот же текст, что реальный auth_rejected — чужой факт неотличим от факта тела" >&2; exit 1; }
+  # Чужой reason ДО тела: факт тела (auth_rejected) обязан победить, чужой
+  # rate_limited строкой выше не перебивает его.
+  [[ "$note_foreign_before" == *"владелец нужен"* ]] || { echo "::error::18) чужой reason ДО тела: факт ТЕЛА (auth_rejected) обязан остаться причиной: $note_foreign_before" >&2; exit 1; }
+  [[ "$note_foreign_before" != *"rate_limited"* ]] || { echo "::error::18) чужой reason ДО тела (rate_limited) перебил факт тела (auth_rejected) — причина читается не из тела: $note_foreign_before" >&2; exit 1; }
+) || fail "18) dsh_pool_unavailable_owner_note не различает исходы, гадает при отсутствии reason либо берёт причину не из строки тела"
+echo "GUARD(anthropic-pool): 18) dsh_pool_unavailable_owner_note — восемь stderr-форм, каждый факт свой; чужой reason до/после тела не приписывается пулу, без reason — честный пробел — ок (#1192, раунды 3-4)"
+
+# ── 19) #1192 (сквозной): dsh_run_with_pool_then_chain печатает ОБА факта
+#       (текст отказа + причину «владелец нужен/не нужен») И честно
+#       откатывается на цепочку — рабочая деградация (класс #1067/#838) не
+#       сломана добавлением reason. Мок пула отвечает прод-формой ответа
+#       ПОСЛЕ патча #1192 (с полем reason), мок цепочки отвечает успехом. ───
+(
+  export DSH_ANTHROPIC_POOL_ACTIVE=1
+  export SMOKE_MODE_primary_model=ok
+  rm -f "$CHAIN_CALLED_MARK"; : >"$ANSWER"; : >"$ERR"
+  dsh() {
+    case "${1:-}" in
+      --profile)
+        if grep -q 'provider: anthropic-pool' "$HOME/.dsh/profiles/headless/cordis.patch.yml" 2>/dev/null; then
+          echo 'dsh: SERVER: 503 {"type":"error","error":{"type":"pool_unavailable","message":"No Anthropic account is available","retryAt":1789345764948,"reason":"auth_rejected","accounts":[{"id":"anthropic-1","class":"auth_rejected","lastStatus":401,"cooldownUntil":1789345764948}]}}' >&2
+          return 1
+        else
+          touch "$CHAIN_CALLED_MARK"; echo "smoke: ответ от $DEEPSEEK_MODEL"; return 0
+        fi ;;
+      *) echo "::error::SMOKE(19): dsh-заглушка не знает вызов: $*" >&2; return 99 ;;
+    esac
+  }
+  export -f dsh
+  POOL_LOG19="$WORK/pool-warning-19.txt"
+  dsh_run_with_pool_then_chain "$ANSWER" "$ERR" "промпт smoke" >"$POOL_LOG19" 2>&1
+  [ "$DSH_RUN_RC" = "0" ] || { echo "::error::19) ожидался успех после отката на цепочку, получено rc=$DSH_RUN_RC: $(cat "$POOL_LOG19")" >&2; exit 1; }
+  [ "$DSH_CHAIN_PROVIDER" = "PRIMARY" ] || { echo "::error::19) DSH_CHAIN_PROVIDER='$DSH_CHAIN_PROVIDER', ожидался PRIMARY (деградация на цепочку сломана)" >&2; exit 1; }
+  [ -f "$CHAIN_CALLED_MARK" ] || { echo "::error::19) цепочка обязана была запуститься после отказа пула" >&2; exit 1; }
+  grep -q "pool_unavailable" "$POOL_LOG19" || { echo "::error::19) предупреждение потеряло исходный текст отказа (регресс #1067): $(cat "$POOL_LOG19")" >&2; exit 1; }
+  grep -q "владелец нужен" "$POOL_LOG19" || { echo "::error::19) предупреждение не назвало «владелец нужен» для auth_rejected: $(cat "$POOL_LOG19")" >&2; exit 1; }
+  grep -q "перевыпуск секретов ANTHROPIC_OAUTH_1 ANTHROPIC_OAUTH_2" "$POOL_LOG19" || { echo "::error::19) предупреждение не назвало конкретные секреты на перевыпуск: $(cat "$POOL_LOG19")" >&2; exit 1; }
+) || fail "19) сквозной путь: reason виден в предупреждении, откат на цепочку не сломан"
+echo "GUARD(anthropic-pool): 19) dsh_run_with_pool_then_chain — reason виден владельцу, откат на цепочку честный (класс #1067/#838 не сломан) — ок (#1192)"
+# ── 20) #1288 (живой инцидент, прогон worker.yml 34893177035): пул отдаёт
+#      прод-форму отказа ДОСЛОВНО из этого инцидента — `retryAt` уже в
+#      прошлом к моменту прогона гвардии (фиксированная дата инцидента,
+#      2026-09-14T20:35:14Z) — эффективный остаток отрицателен, что попадает
+#      в ветку «близко» (клампится к 0, ретраим немедленно, не «далеко»).
+#      Второй вызов пула отвечает успехом -> цепочка НЕ вызывается вовсе,
+#      несмотря на то что первая попытка пула провалилась.
+#
+# MUTATION-PROOF
+# ref: c1df957
+# paths: scripts/lib/dsh-ci.sh
+# run: bash scripts/lib/test/dsh-anthropic-pool.guard.sh
+# expect: 20) прод-форма ответа пула из инцидента #1288 (34893177035) не приводит к повтору того же провайдера
+#
+# (ref — голова main ДО этого фикса, c1df957 (#1192/#1193): там
+# dsh_run_with_pool_then_chain не читает retryAt вовсе и откатывается на
+# цепочку одной попыткой — секция 20 красная с DSH_CHAIN_PROVIDER='PRIMARY'
+# вместо 'anthropic-oauth-pool'. Прежний ref 8cd752e6 после ребейза не
+# годится: он старше #1192, откат к нему вырезал бы и
+# dsh_pool_unavailable_owner_note, гвардия умирала бы на секциях 15-19
+# main, не доходя до секции 20 — живая находка обязательной проверки test
+# на ребейзнутом хеде.) ────
+POOL_RETRY_CALL_LOG="$WORK/pool-retry-calls.log"
+# Дословное тело ответа пула из инцидента #1288 (прогон 34893177035,
+# 20:30:30): retryAt=1789418114634мс = 2026-09-14T20:35:14Z.
+POOL_BODY_INCIDENT_1288='dsh: SERVER: 503 {"type":"error","error":{"type":"pool_unavailable","message":"No Anthropic account is available","retryAt":1789418114634}}'
+dsh_pool_retry_stub() {
+  case "${1:-}" in
+    --profile)
+      if grep -q 'provider: anthropic-pool' "$HOME/.dsh/profiles/headless/cordis.patch.yml" 2>/dev/null; then
+        echo call >>"$POOL_RETRY_CALL_LOG"
+        local n; n=$(wc -l <"$POOL_RETRY_CALL_LOG")
+        local body_var="SMOKE_POOL_BODY_$n"
+        local body="${!body_var:-}"
+        if [ -z "$body" ]; then
+          echo "smoke: ответ от anthropic-oauth-pool (попытка $n)"
+          return 0
+        fi
+        echo "$body" >&2
+        return 1
+      else
+        touch "$CHAIN_CALLED_MARK"
+        echo "smoke: ответ от $DEEPSEEK_MODEL"
+        return 0
+      fi ;;
+    *) echo "::error::SMOKE(retryAt): dsh-заглушка не знает вызов: $*" >&2; return 99 ;;
+  esac
+}
+(
+  dsh() { dsh_pool_retry_stub "$@"; }
+  export -f dsh
+  export DSH_ANTHROPIC_POOL_ACTIVE=1
+  export SMOKE_POOL_BODY_1="$POOL_BODY_INCIDENT_1288"
+  unset SMOKE_POOL_BODY_2 2>/dev/null || true
+  export SMOKE_MODE_primary_model=ok
+  rm -f "$CHAIN_CALLED_MARK" "$POOL_RETRY_CALL_LOG"; : >"$ANSWER"; : >"$ERR"
+  LOG="$WORK/log20.txt"
+  dsh_run_with_pool_then_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+  OUT="$(cat "$LOG")"
+  [ "$DSH_RUN_RC" = "0" ] || { echo "::error::20) ожидался успех пула на повторе, получено rc=$DSH_RUN_RC: $OUT" >&2; exit 1; }
+  [ "$DSH_CHAIN_PROVIDER" = "anthropic-oauth-pool" ] || { echo "::error::20) DSH_CHAIN_PROVIDER='$DSH_CHAIN_PROVIDER', ожидался anthropic-oauth-pool" >&2; exit 1; }
+  [ ! -f "$CHAIN_CALLED_MARK" ] || { echo "::error::20) цепочка не должна была вызываться — retryAt близко, пул обязан был ответить на повторе" >&2; exit 1; }
+  [ "$(wc -l <"$POOL_RETRY_CALL_LOG")" = "2" ] || { echo "::error::20) пул обязан быть вызван РОВНО дважды (первая попытка + повтор после retryAt): $(cat "$POOL_RETRY_CALL_LOG")" >&2; exit 1; }
+  [[ "$OUT" == *"пул сам назвал момент возврата через"* ]] || { echo "::error::20) сообщение обязано честно назвать факт retryAt: $OUT" >&2; exit 1; }
+  [[ "$OUT" == *"жду и повторяю тем же провайдером (#1288)"* ]] || { echo "::error::20) сообщение обязано назвать намерение повторить тот же провайдер: $OUT" >&2; exit 1; }
+) || fail "20) прод-форма ответа пула из инцидента #1288 (34893177035) не приводит к повтору того же провайдера"
+echo "GUARD(anthropic-pool): 20) retryAt прод-формы инцидента #1288 близко -> пул повторён, цепочка не тронута — ок"
+
+# ── 21) Бюджет ожидания retryAt — СУММАРНЫЙ, не per-попытка: первый
+#      close-retryAt (20с) при бюджете 30с укладывается (30>20), второй
+#      (50с) — уже НЕ укладывается в остаток (30-20=10 < 50) -> третьей
+#      попытки пула нет, честный откат на цепочку с остатком бюджета в
+#      сообщении. ─────────────────────────────────────────────────────────
+(
+  dsh() { dsh_pool_retry_stub "$@"; }
+  export -f dsh
+  export DSH_ANTHROPIC_POOL_ACTIVE=1
+  export DSH_POOL_RETRY_AT_MAX_WAIT_SECS=30
+  now_ms=$(( $(date +%s) * 1000 ))
+  # Первый retryAt (20с) укладывается в полный бюджет (30с); второй (50с) —
+  # НЕ укладывается в остаток (30-~20=~10 < 50), даже с учётом того, что
+  # `sleep` в этой гвардии — заглушка-no-op (реальное время между попытками
+  # не проходит, оба retryAt считаются от одной и той же точки «сейчас») и
+  # с учётом накладных расходов на процессы между вызовом `date` здесь и
+  # внутри `_dsh_pool_retry_at_wait_secs` (секунды на Windows Git Bash из-за
+  # спавна процессов patch_profile/jq/grep) — разрыв 20с/50с выбран заведомо
+  # больше любого реалистичного дребезга.
+  export SMOKE_POOL_BODY_1="dsh: SERVER: 503 {\"type\":\"error\",\"error\":{\"type\":\"pool_unavailable\",\"message\":\"No Anthropic account is available\",\"retryAt\":$((now_ms + 20000))}}"
+  export SMOKE_POOL_BODY_2="dsh: SERVER: 503 {\"type\":\"error\",\"error\":{\"type\":\"pool_unavailable\",\"message\":\"No Anthropic account is available\",\"retryAt\":$((now_ms + 50000))}}"
+  export SMOKE_MODE_primary_model=ok
+  rm -f "$CHAIN_CALLED_MARK" "$POOL_RETRY_CALL_LOG"; : >"$ANSWER"; : >"$ERR"
+  LOG="$WORK/log21.txt"
+  dsh_run_with_pool_then_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+  OUT="$(cat "$LOG")"
+  [ "$DSH_RUN_RC" = "0" ] || { echo "::error::21) ожидался успех после отката на цепочку, получено rc=$DSH_RUN_RC: $OUT" >&2; exit 1; }
+  [ "$DSH_CHAIN_PROVIDER" = "PRIMARY" ] || { echo "::error::21) DSH_CHAIN_PROVIDER='$DSH_CHAIN_PROVIDER', ожидался PRIMARY (откат на цепочку после исчерпания бюджета)" >&2; exit 1; }
+  [ -f "$CHAIN_CALLED_MARK" ] || { echo "::error::21) цепочка обязана была запуститься — суммарный бюджет исчерпан" >&2; exit 1; }
+  [ "$(wc -l <"$POOL_RETRY_CALL_LOG")" = "2" ] || { echo "::error::21) пул обязан быть вызван РОВНО дважды (первый retryAt уложился, второй — уже нет): $(cat "$POOL_RETRY_CALL_LOG")" >&2; exit 1; }
+  [[ "$OUT" == *"жду и повторяю тем же провайдером (#1288)"* ]] || { echo "::error::21) первый retryAt (20с) обязан был уложиться в бюджет и вызвать повтор: $OUT" >&2; exit 1; }
+  # Находка ai-review PR #1292 (некритичное): текст обязан называть ОСТАТОК
+  # бюджета, а не полный бюджет — «дольше бюджета ожидания 30с» при
+  # retryAt=50с и остатке 10с противоречило бы собственной скобке (тот же
+  # класс «Алерт не гадает», AGENTS.md).
+  [[ "$OUT" == *"это дольше остатка бюджета ожидания ("*"с из 30с, уже ждал "*"с)"* ]] || { echo "::error::21) второй retryAt (50с) обязан честно назвать превышение ОСТАТКА суммарного бюджета (Xс из 30с), не полного бюджета заново: $OUT" >&2; exit 1; }
+) || fail "21) суммарный бюджет ожидания retryAt не учитывает уже потраченное на предыдущих повторах"
+echo "GUARD(anthropic-pool): 21) бюджет ожидания retryAt суммируется по повторам, не выдаётся заново — ок (#1288)"
+
+# ── 22) retryAt ДАЛЕКО за пределами бюджета уже на ПЕРВОЙ попытке -> пул
+#      вызывается ровно один раз (без ожидания), честный откат на цепочку
+#      называет и факт retryAt, и то, что порог превышен. ─────────────────
+(
+  dsh() { dsh_pool_retry_stub "$@"; }
+  export -f dsh
+  export DSH_ANTHROPIC_POOL_ACTIVE=1
+  export DSH_POOL_RETRY_AT_MAX_WAIT_SECS=300
+  now_ms=$(( $(date +%s) * 1000 ))
+  # #1288: далёкое будущее (часы вперёд) — потолок ожидания обязателен, его
+  # превышение (в т.ч. когда retryAt может оказаться враньём/далёким
+  # будущим) — законный повод идти дальше, а не ждать это время целиком.
+  export SMOKE_POOL_BODY_1="dsh: SERVER: 503 {\"type\":\"error\",\"error\":{\"type\":\"pool_unavailable\",\"message\":\"No Anthropic account is available\",\"retryAt\":$((now_ms + 14400000))}}"
+  export SMOKE_MODE_primary_model=ok
+  rm -f "$CHAIN_CALLED_MARK" "$POOL_RETRY_CALL_LOG"; : >"$ANSWER"; : >"$ERR"
+  LOG="$WORK/log22.txt"
+  dsh_run_with_pool_then_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+  OUT="$(cat "$LOG")"
+  [ "$DSH_RUN_RC" = "0" ] || { echo "::error::22) ожидался успех после отката на цепочку, получено rc=$DSH_RUN_RC: $OUT" >&2; exit 1; }
+  [ "$DSH_CHAIN_PROVIDER" = "PRIMARY" ] || { echo "::error::22) DSH_CHAIN_PROVIDER='$DSH_CHAIN_PROVIDER', ожидался PRIMARY" >&2; exit 1; }
+  [ -f "$CHAIN_CALLED_MARK" ] || { echo "::error::22) цепочка обязана была запуститься" >&2; exit 1; }
+  [ "$(wc -l <"$POOL_RETRY_CALL_LOG")" = "1" ] || { echo "::error::22) пул НЕ обязан быть вызван повторно — retryAt (4 часа) дальше бюджета (300с) уже на первой попытке: $(cat "$POOL_RETRY_CALL_LOG")" >&2; exit 1; }
+  [[ "$OUT" == *"пул назвал момент возврата через"* ]] || { echo "::error::22) сообщение обязано назвать факт retryAt: $OUT" >&2; exit 1; }
+  # Находка ai-review PR #1292 (некритичное): здесь ожиданий ещё не было
+  # (остаток = полному бюджету, ждал 0с) — текст обязан называть остаток.
+  [[ "$OUT" == *"это дольше остатка бюджета ожидания (300с из 300с, уже ждал 0с)"* ]] || { echo "::error::22) сообщение обязано честно назвать превышение ОСТАТКА бюджета (300с из 300с): $OUT" >&2; exit 1; }
+) || fail "22) далёкий retryAt не откатывается на цепочку честно"
+echo "GUARD(anthropic-pool): 22) retryAt дальше бюджета ожидания -> без ожидания, честный откат на цепочку — ок (#1288)"
+
+# ── 23) pool_unavailable БЕЗ поля retryAt (null — прод-форма плагина, когда
+#      ни у одного аккаунта нет известного cooldownUntil, lib/index.js:
+#      `next?.cooldownUntil || null`) -> ответ не разобран, откат на
+#      цепочку СТАРЫМ путём (не пытаемся угадывать время ожидания). ───────
+(
+  dsh() { dsh_pool_retry_stub "$@"; }
+  export -f dsh
+  export DSH_ANTHROPIC_POOL_ACTIVE=1
+  export SMOKE_POOL_BODY_1='dsh: SERVER: 503 {"type":"error","error":{"type":"pool_unavailable","message":"No Anthropic account is available","retryAt":null}}'
+  export SMOKE_MODE_primary_model=ok
+  rm -f "$CHAIN_CALLED_MARK" "$POOL_RETRY_CALL_LOG"; : >"$ANSWER"; : >"$ERR"
+  LOG="$WORK/log23.txt"
+  dsh_run_with_pool_then_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+  OUT="$(cat "$LOG")"
+  [ "$DSH_RUN_RC" = "0" ] || { echo "::error::23) ожидался успех после отката на цепочку, получено rc=$DSH_RUN_RC: $OUT" >&2; exit 1; }
+  [ "$DSH_CHAIN_PROVIDER" = "PRIMARY" ] || { echo "::error::23) DSH_CHAIN_PROVIDER='$DSH_CHAIN_PROVIDER', ожидался PRIMARY" >&2; exit 1; }
+  [ "$(wc -l <"$POOL_RETRY_CALL_LOG")" = "1" ] || { echo "::error::23) пул НЕ обязан быть вызван повторно — retryAt отсутствует (null), ждать нечего: $(cat "$POOL_RETRY_CALL_LOG")" >&2; exit 1; }
+  [[ "$OUT" == *"отказал (rc=1), причина:"*"пробую цепочку"* ]] || { echo "::error::23) без разобранного retryAt сообщение обязано остаться старым (регрессия #838): $OUT" >&2; exit 1; }
+  [[ "$OUT" != *"пул сам назвал момент возврата"* ]] || { echo "::error::23) retryAt=null не должен трактоваться как разобранный: $OUT" >&2; exit 1; }
+) || fail "23) pool_unavailable без retryAt должен откатываться старым путём, не гадая время ожидания"
+echo "GUARD(anthropic-pool): 23) pool_unavailable без retryAt -> ответ не разобран, откат старым путём — ок (#1288)"
+
+# ── 24) Блокер ai-review PR #1292: пул УПОРНО отвечает retryAt В ПРОШЛОМ
+#      (прод-форма плагина: cooldown +60с/+15с ставится в момент отказа
+#      аккаунта ВНУТРИ прохода forward — когда проход дольше самого
+#      короткого кулдауна, retryAt оказывается в прошлом, секция 11
+#      фикстуры выше). Прошлое/нулевое retryAt клампится к нулю, ожидание
+#      НЕ тратит бюджет — без отдельного потолка повторов цикл «занят →
+#      повтор немедленно» не кончается никогда (живой замер ревьюера:
+#      582 вызова пула за 15с, rc=124). Здесь пять тел с прошлым retryAt
+#      подряд: потолок DSH_POOL_RETRY_AT_MAX_RETRIES=2 обязан остановить
+#      цикл на РОВНО трёх вызовах пула (исходная + два повтора) и честно
+#      уйти на цепочку — не на шестом вызове (когда кончились бы тела).
+#      Мутация (снять счётчик повторов: `pool_retry_at_retries + 1` → `+ 0`),
+#      исполненная на ребейзнутом хеде, даёт ДВА наблюдаемых исхода (находка
+#      ai-review PR #1292, второй раунд; оба прогонены, не по памяти):
+#      полный прогон гвардии ВИСНЕТ на секции 19 #1192 — её стаб вечно
+#      отвечает телом с УЖЕ ПРОШЕДШИМ retryAt, цикл без счётчика не кончается,
+#      процесс убит по таймауту (rc=124, вывод обрывается после секции 18);
+#      в изоляции от того ствига (прогон без секции 19) секция 24 краснеет
+#      числом вызовов — 6 вместо 3. Дословные выводы обоих прогонов — в
+#      PR #1292. ────────
+(
+  dsh() { dsh_pool_retry_stub "$@"; }
+  export -f dsh
+  export DSH_ANTHROPIC_POOL_ACTIVE=1
+  export DSH_POOL_RETRY_AT_MAX_RETRIES=2
+  now_ms=$(( $(date +%s) * 1000 ))
+  # Пять тел подряд с retryAt на 5с в прошлом — тел ХВАТИЛО БЫ на шесть
+  # вызовов пула без потолка (исходная + пять повторов), поэтому точное
+  # «ровно 3» отличает работающий потолок от исчерпания тел заглушки.
+  for k in 1 2 3 4 5; do
+    export SMOKE_POOL_BODY_$k="dsh: SERVER: 503 {\"type\":\"error\",\"error\":{\"type\":\"pool_unavailable\",\"message\":\"No Anthropic account is available\",\"retryAt\":$((now_ms - 5000))}}"
+  done
+  export SMOKE_MODE_primary_model=ok
+  rm -f "$CHAIN_CALLED_MARK" "$POOL_RETRY_CALL_LOG"; : >"$ANSWER"; : >"$ERR"
+  LOG="$WORK/log24.txt"
+  dsh_run_with_pool_then_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+  OUT="$(cat "$LOG")"
+  [ "$DSH_RUN_RC" = "0" ] || { echo "::error::24) ожидался успех после отката на цепочку, получено rc=$DSH_RUN_RC: $OUT" >&2; exit 1; }
+  [ "$DSH_CHAIN_PROVIDER" = "PRIMARY" ] || { echo "::error::24) DSH_CHAIN_PROVIDER='$DSH_CHAIN_PROVIDER', ожидался PRIMARY — цикл повторов пула обязан кончиться потолком, не успехом пула" >&2; exit 1; }
+  [ -f "$CHAIN_CALLED_MARK" ] || { echo "::error::24) цепочка обязана была запуститься — потолок повторов исчерпан" >&2; exit 1; }
+  [ "$(wc -l <"$POOL_RETRY_CALL_LOG")" = "3" ] || { echo "::error::24) пул обязан быть вызван РОВНО трижды (исходная + DSH_POOL_RETRY_AT_MAX_RETRIES=2 повтора), получено $(wc -l <"$POOL_RETRY_CALL_LOG") — прошлое retryAt не тратит бюджет, без потолка цикл бесконечен: $(cat "$POOL_RETRY_CALL_LOG")" >&2; exit 1; }
+  [[ "$OUT" == *"исчерпан потолок повторов пула (2 из 2"* ]] || { echo "::error::24) сообщение обязано честно назвать факт исчерпания потолка повторов с числами: $OUT" >&2; exit 1; }
+  [[ "$OUT" == *"пробую цепочку"* ]] || { echo "::error::24) сообщение обязано назвать намерение уйти на цепочку: $OUT" >&2; exit 1; }
+) || fail "24) пул, упорно отвечающий retryAt в прошлом, обязан упереться в потолок повторов и уйти на цепочку"
+echo "GUARD(anthropic-pool): 24) прошлое retryAt пять подряд -> потолок повторов (3 вызова), честный откат на цепочку — ок (блокер ai-review PR #1292)"
+
+# ── 25) Блокер ai-review PR #1292 (второй раунд): многострочный stderr —
+#      ЧУЖИЕ JSON-строки ДО и ПОСЛЕ тела pool_unavailable (реальная форма:
+#      клиент пишет лог-строки вокруг ответа, #1193 раунд 4). Жадная вырезка
+#      «tr '\n' ' ' | grep -oE '\{.*\}'» брала от первой { до последней } и
+#      ломалась на таком шуме (rc=1, «не разобран») — фикс #1288 молча
+#      выключался ровно на многострочном stderr, прогон неотличим от
+#      дофиксного. Вырезка теперь ПОСТРОЧНАЯ с якорем, одно место правды с
+#      dsh_pool_unavailable_owner_note (_dsh_pool_unavailable_body): шум до
+#      и после не мешает, retryAt разбирается, пул повторён. Мутация (вернуть
+#      tr-жадную вырезку в _dsh_pool_retry_at_wait_secs) красит эту секцию —
+#      «цепочка не должна была вызываться». ─────────────────────────────────
+(
+  dsh() { dsh_pool_retry_stub "$@"; }
+  export -f dsh
+  export DSH_ANTHROPIC_POOL_ACTIVE=1
+  now_ms=$(( $(date +%s) * 1000 ))
+  export SMOKE_POOL_BODY_1="$(printf '%s\n%s\n%s' \
+    "{\"level\":\"info\",\"msg\":\"request started\",\"retryAt\":$((now_ms + 14400000)),\"extra\":{\"a\":1}}" \
+    "dsh: SERVER: 503 {\"type\":\"error\",\"error\":{\"type\":\"pool_unavailable\",\"message\":\"No Anthropic account is available\",\"retryAt\":$((now_ms + 10000))}}" \
+    '{"level":"error","msg":"upstream unavailable","retryAt":"NOT_A_NUMBER"}')"
+  unset SMOKE_POOL_BODY_2 2>/dev/null || true
+  export SMOKE_MODE_primary_model=ok
+  rm -f "$CHAIN_CALLED_MARK" "$POOL_RETRY_CALL_LOG"; : >"$ANSWER"; : >"$ERR"
+  LOG="$WORK/log25.txt"
+  dsh_run_with_pool_then_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+  OUT="$(cat "$LOG")"
+  [ "$DSH_RUN_RC" = "0" ] || { echo "::error::25) ожидался успех пула на повторе, получено rc=$DSH_RUN_RC: $OUT" >&2; exit 1; }
+  [ "$DSH_CHAIN_PROVIDER" = "anthropic-oauth-pool" ] || { echo "::error::25) DSH_CHAIN_PROVIDER='$DSH_CHAIN_PROVIDER', ожидался anthropic-oauth-pool — шум до/после тела не должен ломать разбор" >&2; exit 1; }
+  [ ! -f "$CHAIN_CALLED_MARK" ] || { echo "::error::25) цепочка не должна была вызываться — тело с retryAt среди шума обязано разобраться: $OUT" >&2; exit 1; }
+  [ "$(wc -l <"$POOL_RETRY_CALL_LOG")" = "2" ] || { echo "::error::25) пул обязан быть вызван РОВНО дважды (разбор + повтор): $(cat "$POOL_RETRY_CALL_LOG")" >&2; exit 1; }
+) || fail "25) тело pool_unavailable среди чужих JSON-строк до/после не разбирается"
+echo "GUARD(anthropic-pool): 25) многострочный stderr (шум до/после тела) -> retryAt разобран, пул повторён — ок (блокер ai-review PR #1292, раунд 2)"
+
+# ── 26) #1310: поаккаунтная разбивка (`accounts`, добавлена #1192 ради
+#      различения «какой ключ живой») ДОХОДИТ ДО ЛОГА. Живой дефект: текстовый
+#      хвост режется до 200 символов (#1067) и обрывается ровно на
+#      `"accounts":[{"id":"anthropic-1","c` — прогоны worker.yml 34942030597
+#      (2026-09-15T08:04:16Z) и 35010410097 (19:28:38Z). Тело здесь —
+#      ДОСЛОВНАЯ прод-форма второго из них, дополненная полем accounts в том
+#      виде, в каком его пишет патченный плагин (сценарий 17 выше доказывает
+#      этот вид отдельно). Мутация: убери pool_accounts_note из сообщения —
+#      предупреждение снова расскажет «rate_limited», не сказав, что именно
+#      anthropic-2 в этом процессе не пробовался ни разу.
+(
+  export DSH_ANTHROPIC_POOL_ACTIVE=1
+  export SMOKE_MODE_primary_model=ok
+  rm -f "$CHAIN_CALLED_MARK"; : >"$ANSWER"; : >"$ERR"
+  dsh() {
+    case "${1:-}" in
+      --profile)
+        if grep -q 'provider: anthropic-pool' "$HOME/.dsh/profiles/headless/cordis.patch.yml" 2>/dev/null; then
+          echo 'dsh: RATE_LIMIT: 503 {"type":"error","error":{"type":"pool_unavailable","message":"No Anthropic account is available","retryAt":0,"reason":"rate_limited","accounts":[{"id":"anthropic-1","class":"rate_limited","lastStatus":429,"cooldownUntil":1789500803738},{"id":"anthropic-2","class":"unknown","lastStatus":null,"cooldownUntil":null}]}}' >&2
+          return 1
+        else
+          touch "$CHAIN_CALLED_MARK"; echo "smoke: ответ от $DEEPSEEK_MODEL"; return 0
+        fi ;;
+      *) echo "::error::SMOKE(26): dsh-заглушка не знает вызов: $*" >&2; return 99 ;;
+    esac
+  }
+  export -f dsh
+  POOL_LOG26="$WORK/pool-warning-26.txt"
+  DSH_RATE_LIMIT_MAX_WAIT_SECS=0 dsh_run_with_pool_then_chain "$ANSWER" "$ERR" "промпт smoke" >"$POOL_LOG26" 2>&1
+  [ "$DSH_RUN_RC" = "0" ] || { echo "::error::26) ожидался успех после отката на цепочку, получено rc=$DSH_RUN_RC: $(cat "$POOL_LOG26")" >&2; exit 1; }
+  grep -q "аккаунты: anthropic-1: rate_limited (HTTP 429)" "$POOL_LOG26" \
+    || { echo "::error::26) разбивка по аккаунтам не доехала до лога — ровно тот дефект, ради которого #1192 клал accounts в тело: $(cat "$POOL_LOG26")" >&2; exit 1; }
+  grep -q "anthropic-2: unknown" "$POOL_LOG26" \
+    || { echo "::error::26) ВТОРОЙ аккаунт обязан быть назван: агрегат reason=rate_limited верен и когда второй ключ не пробовался вовсе: $(cat "$POOL_LOG26")" >&2; exit 1; }
+) || fail "26) поаккаунтная разбивка пула не доехала до лога"
+echo "GUARD(anthropic-pool): 26) accounts[] из тела pool_unavailable доходит до лога целиком — видно, какой из двух ключей живой (#1310) — ок"
+
+# ── 27) #1310: разбивки нет в теле (плагин без патча #1192 / старая форма) —
+#      честный пробел, не выдуманный факт и не падение.
+NO_ACC_ERR="$WORK/err-27.txt"
+printf '%s\n' 'dsh: SERVER: 503 {"type":"error","error":{"type":"pool_unavailable","message":"No Anthropic account is available","retryAt":null}}' >"$NO_ACC_ERR"
+[ -z "$(dsh_pool_accounts_note "$NO_ACC_ERR")" ] \
+  || fail "27) тела без accounts обязано давать ПУСТО, а не выдуманную разбивку: $(dsh_pool_accounts_note "$NO_ACC_ERR")"
+printf '%s\n' 'dsh: TRANSPORT: connection refused' >"$NO_ACC_ERR"
+[ -z "$(dsh_pool_accounts_note "$NO_ACC_ERR")" ] \
+  || fail "27) отказ вообще без тела pool_unavailable обязан давать ПУСТО"
+echo "GUARD(anthropic-pool): 27) нет accounts в теле -> честный пробел, не выдуманный факт (#1310) — ок"
+
+# ── 28) #1311: предполётная проверка называет КАЖДЫЙ аккаунт по имени и по
+#      факту, а не одним агрегатом. Поведенческая, с настоящим HTTP-сервером
+#      на loopback: фикстура-«плагин» несёт те же КОНСТАНТЫ в той же форме,
+#      что настоящий lib/index.js (константы проверка читает оттуда, а не
+#      дублирует у себя), поэтому её эндпоинты указывают на этот сервер.
+#      Сценарий воспроизводит ровно живую ситуацию 2026-09-15: один аккаунт
+#      под квотой (429), второй выбывает на рефреше (Anthropic ротирует
+#      refreshToken, снимок в секрете отстал), третий живой.
+PREFLIGHT_WORK="$(mktemp -d)"
+PKG="$PREFLIGHT_WORK/package"
+mkdir -p "$PKG/lib"
+cat >"$PREFLIGHT_WORK/server.mjs" <<'SERVER'
+import http from 'node:http'
+import fs from 'node:fs'
+const server = http.createServer(async (req, res) => {
+  if (req.method === 'POST' && req.url.startsWith('/oauth/token')) {
+    const chunks = []; for await (const c of req) chunks.push(c)
+    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+    if (body.refresh_token === 'refresh-live') {
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify({ access_token: 'access-fresh', refresh_token: 'refresh-live-2', expires_in: 3600 }))
+      return
+    }
+    // Прод-форма отказа ротированного/отозванного refresh-токена.
+    res.statusCode = 400; res.setHeader('content-type', 'application/json')
+    res.end(JSON.stringify({ error: 'invalid_grant' })); return
+  }
+  if (req.url.startsWith('/v1/models')) {
+    const auth = req.headers.authorization || ''
+    if (auth === 'Bearer access-quota') {
+      res.statusCode = 429
+      res.setHeader('anthropic-ratelimit-unified-5h-reset', String(Math.floor(Date.now() / 1000) + 285))
+      res.end('{}'); return
+    }
+    if (auth === 'Bearer access-fresh') { res.setHeader('content-type', 'application/json'); res.end('{"data":[]}'); return }
+    res.statusCode = 401; res.end('{}'); return
+  }
+  res.statusCode = 404; res.end('{}')
+})
+server.listen(0, '127.0.0.1', () => fs.writeFileSync(process.argv[2], String(server.address().port)))
+SERVER
+PORT_FILE="$PREFLIGHT_WORK/port.txt"
+node "$PREFLIGHT_WORK/server.mjs" "$PORT_FILE" &
+PREFLIGHT_SERVER_PID=$!
+trap 'kill "$PREFLIGHT_SERVER_PID" 2>/dev/null || true' EXIT
+# `command sleep` — в обход заглушки sleep(){ :; } в шапке этого файла:
+# здесь нужно НАСТОЯЩЕЕ ожидание старта процесса, а не мгновенный no-op.
+for _ in $(seq 1 50); do [ -s "$PORT_FILE" ] && break; command sleep 0.2; done
+[ -s "$PORT_FILE" ] || fail "28) фикстурный HTTP-сервер не поднялся"
+PREFLIGHT_PORT="$(cat "$PORT_FILE")"
+# Форма констант — ДОСЛОВНО как в lib/index.js плагина (см. constFromPlugin в
+# scripts/lib/anthropic_pool_preflight.mjs): это и есть предмет связи.
+{
+  printf "const API_BASE = 'http://127.0.0.1:%s'\n" "$PREFLIGHT_PORT"
+  printf "const TOKEN_URL = 'http://127.0.0.1:%s/oauth/token'\n" "$PREFLIGHT_PORT"
+  printf "const CLIENT_ID = 'test-client-id'\n"
+  printf "const OAUTH_BETAS = ['oauth-2025-04-20', 'claude-code-20250219']\n"
+} >"$PKG/lib/index.js"
+# Мини-реализация контракта accounts.js (readConfig/readAccount/writeAccount/
+# writeConfig над DSH_ANTHROPIC_POOL_DIR) — тот же формат файлов, что у
+# настоящего модуля, включая обёртку claudeAiOauth.
+cat >"$PKG/lib/accounts.js" <<'ACC'
+import fs from 'node:fs'
+import path from 'node:path'
+const dir = () => process.env.DSH_ANTHROPIC_POOL_DIR
+const cfg = () => path.join(dir(), 'pool.json')
+export function readConfig() {
+  try { return JSON.parse(fs.readFileSync(cfg(), 'utf8')) } catch { return { strategy: 'least-used', accounts: [] } }
+}
+export function writeConfig(config) { fs.writeFileSync(cfg(), JSON.stringify(config, null, 2) + '\n') }
+export function readAccount(id) {
+  const value = JSON.parse(fs.readFileSync(path.join(dir(), id + '.json'), 'utf8'))
+  const oauth = value.claudeAiOauth || value.oauth
+  if (!oauth) throw new Error(`No claudeAiOauth in account ${id}`)
+  return { id, oauth }
+}
+export function writeAccount(id, value) {
+  fs.writeFileSync(path.join(dir(), id + '.json'), JSON.stringify({ claudeAiOauth: value.oauth }, null, 2) + '\n')
+}
+ACC
+POOL_DIR="$PREFLIGHT_WORK/accounts"
+mkdir -p "$POOL_DIR"
+# anthropic-1: живой accessToken под квотой Anthropic (429) — expiresAt в
+# будущем, рефреш не нужен, до сети доходит сам токен.
+printf '%s\n' '{"claudeAiOauth":{"accessToken":"access-quota","refreshToken":"refresh-live","expiresAt":99999999999999}}' >"$POOL_DIR/anthropic-1.json"
+# anthropic-2: снимок отстал — refreshToken уже ротирован живой сессией.
+printf '%s\n' '{"claudeAiOauth":{"accessToken":"access-stale","refreshToken":"refresh-rotated-away","expiresAt":1}}' >"$POOL_DIR/anthropic-2.json"
+# anthropic-3: рефреш проходит, доступ живой.
+printf '%s\n' '{"claudeAiOauth":{"accessToken":"access-stale","refreshToken":"refresh-live","expiresAt":1}}' >"$POOL_DIR/anthropic-3.json"
+printf '%s\n' '{"strategy":"least-used","accounts":[{"id":"anthropic-1","enabled":true},{"id":"anthropic-2","enabled":true},{"id":"anthropic-3","enabled":true}]}' >"$POOL_DIR/pool.json"
+PRE_LOG="$PREFLIGHT_WORK/preflight.txt"
+DSH_ANTHROPIC_POOL_DIR="$POOL_DIR" node "$REPO/scripts/lib/anthropic_pool_preflight.mjs" "$PKG" >"$PRE_LOG" 2>&1 \
+  || fail "28) предполётная проверка обязана завершаться кодом 0 при любом исходе: $(cat "$PRE_LOG")"
+PRE_OUT="$(cat "$PRE_LOG")"
+grep -q "аккаунт anthropic-1: RATE_LIMITED" "$PRE_LOG" \
+  || fail "28) аккаунт под квотой обязан быть назван RATE_LIMITED поимённо: $PRE_OUT"
+grep -q "аккаунт anthropic-2: REFRESH_FAILED" "$PRE_LOG" \
+  || fail "28) выбывший на рефреше аккаунт обязан быть назван REFRESH_FAILED, а не утонуть в агрегате соседа (#1311): $PRE_OUT"
+grep -q "аккаунт anthropic-3: OK" "$PRE_LOG" \
+  || fail "28) живой аккаунт обязан быть назван пригодным: $PRE_OUT"
+grep -q "пригодных аккаунтов 1 из 3" "$PRE_LOG" || fail "28) сводка обязана называть числа: $PRE_OUT"
+grep -q "refresh-anthropic-pool.md" "$PRE_LOG" || fail "28) сообщение обязано назвать рунбук лечения (газ): $PRE_OUT"
+grep -q "ротирует refreshToken" "$PRE_LOG" || fail "28) сообщение обязано назвать частую ПРИЧИНУ, а не только факт: $PRE_OUT"
+for secret in access-quota access-stale refresh-live refresh-rotated-away access-fresh refresh-live-2; do
+  grep -q "$secret" "$PRE_LOG" && fail "28) значение токена ($secret) утекло в лог предполётной проверки: $PRE_OUT"
+done
+# Непригодные ПРЯМО СЕЙЧАС выключены на этот прогон; под квотой — НЕ выключен
+# (его cooldown пул посчитает сам, квота может отпустить в середине прогона).
+python3 - "$POOL_DIR/pool.json" <<'PYCHK' || fail "28) состояние pool.json после предполётной проверки неверно"
+import json, sys
+rows = {a["id"]: a.get("enabled", True) for a in json.load(open(sys.argv[1]))["accounts"]}
+assert rows["anthropic-2"] is False, rows
+assert rows["anthropic-1"] is True, rows
+assert rows["anthropic-3"] is True, rows
+PYCHK
+echo "GUARD(anthropic-pool): 28) предполётная проверка называет каждый аккаунт по имени и факту (квота / мёртвый refreshToken / живой), токены в лог не текут, непригодный выключен на прогон (#1311) — ок"
+
+# ── 29) #1311: форма констант плагина изменилась — проверка падает ГРОМКО, а
+#      не подставляет своё значение эндпоинта (тот же принцип, что у
+#      scripts/lib/patch_anthropic_pool_plugin.py).
+printf "%s\n" "const SOMETHING_ELSE = 'x'" >"$PKG/lib/index.js"
+if DSH_ANTHROPIC_POOL_DIR="$POOL_DIR" node "$REPO/scripts/lib/anthropic_pool_preflight.mjs" "$PKG" >"$PREFLIGHT_WORK/shape.txt" 2>&1; then
+  fail "29) изменившаяся форма констант плагина обязана валить проверку, а не молча подставлять свой эндпоинт: $(cat "$PREFLIGHT_WORK/shape.txt")"
+fi
+grep -q "PLUGIN_SHAPE_CHANGED" "$PREFLIGHT_WORK/shape.txt" \
+  || fail "29) отказ обязан называть класс PLUGIN_SHAPE_CHANGED: $(cat "$PREFLIGHT_WORK/shape.txt")"
+echo "GUARD(anthropic-pool): 29) форма констант плагина изменилась -> громкий отказ, не молчаливая подстановка (#1311) — ок"
+# Сервер фикстуры НЕ гасим здесь: сценарий 31 ниже ходит в него же (гасится
+# там). Ранее kill стоял тут, и 31 падал с NETWORK_ERROR — поймано прогоном.
+
+# ── 30) #1311, ПОВЕДЕНЧЕСКОЕ доказательство патчей 5/6: аккаунт с ОДНИМ
+#      долгоживущим токеном и БЕЗ refreshToken рабочий. До патча
+#      createRefreshCoordinator валил его ПЕРВОЙ же строкой («has no Claude
+#      OAuth credentials»), ДО всякой проверки срока — то есть такой токен
+#      отвергался на каждом запросе, падал в ветку catch forward() и выходил
+#      наружу агрегатом pool_unavailable, неотличимым от исчерпанной квоты
+#      соседа. Проверяются ОБА направления: без срока — работаем без рефреша;
+#      срок истёк и рефрешить нечем — отказ с ТОЧНЫМ текстом.
+(
+  FIXTURE_ROOT30="$(mktemp -d)"
+  EXTRACT30="$FIXTURE_ROOT30/anthropic-oauth-pool-extracted/package"
+  write_fixture_package "$EXTRACT30"
+  export DSH_ANTHROPIC_POOL_ACTIVE=1
+  export DSH_ANTHROPIC_POOL_EXTRACTED="$EXTRACT30"
+  export DSH_ANTHROPIC_POOL_PKG="$FIXTURE_ROOT30/original.tgz"
+  : >"$DSH_ANTHROPIC_POOL_PKG"
+  dsh_patch_anthropic_pool_plugin >/dev/null 2>&1 || { echo "::error::30) патч не применился к фикстуре" >&2; exit 1; }
+  cat >"$EXTRACT30/lib/norefresh-check.mjs" <<'NOREFRESH_MJS'
+import { createRefreshCoordinator } from './pool.js'
+
+function coordinatorFor(oauth, onRefresh) {
+  return createRefreshCoordinator({
+    readAccount: async (id) => ({ id, oauth }),
+    writeAccount: async () => {},
+    refreshToken: async () => { onRefresh(); return { access_token: 'NEW', expires_in: 3600 } },
+  })
+}
+
+// 1) Долгоживущий токен: есть accessToken, НЕТ refreshToken, НЕТ expiresAt.
+let refreshed = false
+const account = await coordinatorFor({ accessToken: 'long-lived' }, () => { refreshed = true })('acc')
+if (refreshed) { console.error('FAIL: рефреш случился, хотя рефрешить нечем и срок не объявлен'); process.exit(1) }
+if (account?.oauth?.accessToken !== 'long-lived') { console.error('FAIL: аккаунт не вернулся как есть'); process.exit(1) }
+
+// 2) Срок ИСТЁК по метке самого токена, а refreshToken нет — честный отказ с
+//    точным текстом, не общее «нет credentials».
+let message = ''
+try {
+  await coordinatorFor({ accessToken: 'stale', expiresAt: Date.now() - 1000 }, () => {})('acc')
+} catch (error) { message = String(error?.message || error) }
+if (!message.includes('expired') || !message.includes('refreshToken')) {
+  console.error(`FAIL: текст отказа не называет истёкший срок и отсутствие refreshToken: ${message}`); process.exit(1)
+}
+
+// 3) Нет accessToken — работать нечем, отказ остаётся.
+let noAccess = ''
+try { await coordinatorFor({ refreshToken: 'r' }, () => {})('acc') }
+catch (error) { noAccess = String(error?.message || error) }
+if (!noAccess.includes('access token')) { console.error(`FAIL: отсутствие accessToken обязано отвергаться: ${noAccess}`); process.exit(1) }
+
+console.log('OK: долгоживущий токен без refreshToken работает; истёкший без рефреша отвергается точным текстом; без accessToken — отказ')
+NOREFRESH_MJS
+  LOG30="$FIXTURE_ROOT30/norefresh.log"
+  if ! node "$EXTRACT30/lib/norefresh-check.mjs" >"$LOG30" 2>&1; then
+    { echo "::error::30) поведенческая проверка патча 5 провалилась:"; cat "$LOG30"; } >&2; exit 1
+  fi
+  cat "$LOG30"
+  # Патч 6: импорт такого секрета больше не отвергается.
+  grep -q "if (!oauth?.accessToken) throw new Error('Source has no claudeAiOauth.accessToken')" "$EXTRACT30/lib/accounts.js" \
+    || { echo "::error::30) патч 6 не снял требование refreshToken в importAccount" >&2; exit 1; }
+) || fail "30) долгоживущий токен без refreshToken не подтверждён поведенчески"
+echo "GUARD(anthropic-pool): 30) один долгоживущий токен без refreshToken — рабочий аккаунт, а не «нет credentials» (#1311) — ок"
+
+# ── 31) #1311: та же форма аккаунта в предполётной проверке. Регресс, который
+#      эта проверка обязана не допустить: превентивный рефреш при отсутствии
+#      expiresAt (класс #1130) — он пометил бы ЕДИНСТВЕННЫЙ рабочий токен как
+#      REFRESH_FAILED и выключил бы его на весь прогон.
+POOL_DIR31="$PREFLIGHT_WORK/accounts-31"
+mkdir -p "$POOL_DIR31"
+printf '%s\n' '{"claudeAiOauth":{"accessToken":"access-fresh"}}' >"$POOL_DIR31/anthropic-1.json"
+# anthropic-2 — та же форма «срок неизвестен», но refreshToken ЕСТЬ: именно
+# на ней виден класс #1130 в чистом виде. С превентивным рефрешем (мутация
+# `!oauth.expiresAt || …`) этот аккаунт был бы обновлён без нужды, сжигая
+# рефреш-цикл на каждом прогоне и ротируя токен владельца.
+printf '%s\n' '{"claudeAiOauth":{"accessToken":"access-fresh","refreshToken":"refresh-live"}}' >"$POOL_DIR31/anthropic-2.json"
+printf '%s\n' '{"strategy":"least-used","accounts":[{"id":"anthropic-1","enabled":true},{"id":"anthropic-2","enabled":true}]}' >"$POOL_DIR31/pool.json"
+{
+  printf "const API_BASE = 'http://127.0.0.1:%s'\n" "$PREFLIGHT_PORT"
+  printf "const TOKEN_URL = 'http://127.0.0.1:%s/oauth/token'\n" "$PREFLIGHT_PORT"
+  printf "const CLIENT_ID = 'test-client-id'\n"
+  printf "const OAUTH_BETAS = ['oauth-2025-04-20', 'claude-code-20250219']\n"
+} >"$PKG/lib/index.js"
+PRE_LOG31="$PREFLIGHT_WORK/preflight31.txt"
+DSH_ANTHROPIC_POOL_DIR="$POOL_DIR31" node "$REPO/scripts/lib/anthropic_pool_preflight.mjs" "$PKG" >"$PRE_LOG31" 2>&1 \
+  || fail "31) предполётная проверка обязана завершаться кодом 0: $(cat "$PRE_LOG31")"
+grep -q "аккаунт anthropic-1: OK" "$PRE_LOG31" \
+  || fail "31) долгоживущий токен без refreshToken обязан быть признан пригодным, а не REFRESH_FAILED (регресс класса #1130): $(cat "$PRE_LOG31")"
+grep -q "рефреш не требовался" "$PRE_LOG31" \
+  || fail "31) сообщение обязано называть, что рефреша не было (а не молчать): $(cat "$PRE_LOG31")"
+grep -q "аккаунт anthropic-2: OK — токен из секрета, рефреш не требовался" "$PRE_LOG31" \
+  || fail "31) аккаунт с refreshToken, но БЕЗ expiresAt не должен рефрешиться превентивно (класс #1130): $(cat "$PRE_LOG31")"
+grep -q "выключены на этот прогон" "$PRE_LOG31" \
+  && fail "31) рабочий аккаунт выключен предполётной проверкой — ровно тот регресс, ради которого этот сценарий: $(cat "$PRE_LOG31")"
+python3 - "$POOL_DIR31/pool.json" <<'PYCHK31' || fail "31) аккаунт обязан остаться enabled"
+import json, sys
+rows = {a["id"]: a.get("enabled", True) for a in json.load(open(sys.argv[1]))["accounts"]}
+assert rows["anthropic-1"] is True, rows
+PYCHK31
+echo "GUARD(anthropic-pool): 31) предполётная проверка НЕ рефрешит токен без expiresAt и не гасит единственный рабочий аккаунт (#1311, класс #1130) — ок"
+kill "$PREFLIGHT_SERVER_PID" 2>/dev/null || true
 
 echo "GUARD(anthropic-pool): быстрый провайдер Claude (#838), инвариант #860 «пул только в worker/hands» — гвардия зелёная"
