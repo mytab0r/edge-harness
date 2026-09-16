@@ -468,7 +468,7 @@ def _ref_missing(error: "GhError") -> bool:
     return error.status == 422 and "does not exist" in str(error).lower()
 
 
-def release_full(repo: str, task: int) -> str:
+def release_full(repo: str, task: int, holder: str | None = None) -> str:
     """Снять аренду ПОЛНОСТЬЮ — и назначение, и замок, не только замок (#422).
 
     Обычный `release()` возвращает только замок; assignee уходит лишь через
@@ -478,7 +478,16 @@ def release_full(repo: str, task: int) -> str:
     исчерпан надолго, или бюджет ретрая кончился) — держать assignee до
     таймера значило бы зря прятать свободную задачу от остальных каналов.
     Логика снятия assignee — та же, что уже использует `reap_stale`
-    (DELETE issues/{N}/assignees), вынесена сюда, а не продублирована."""
+    (DELETE issues/{N}/assignees), вынесена сюда, а не продублирована.
+
+    holder=None (умолчание, поведение для scheduler/после слияния/TTL-сборщика) —
+    форс-снятие БЕЗ проверки владения: эти пути авторитетны независимо от того,
+    кто держит замок. holder=<id> (путь CLI `release-full <N>`, #1190) — снятие
+    ТОЛЬКО если текущий замок держит именно этот holder; иначе `ForeignLockError`
+    (чужой/неизвестный держатель назван в сообщении) — то же правило, что у
+    `release()` без --force. Это и есть газ для «тормоза»: раньше `release-full`
+    молча снимал чужой/неопределённый замок (#1190), теперь оно проверяемо
+    безопасно по умолчанию для CLI, а scheduler-пути остаются форс-снятием."""
     issue = gh(f"repos/{repo}/issues/{task}")
     assignees = issue.get("assignees") or []
     lines = []
@@ -494,7 +503,7 @@ def release_full(repo: str, task: int) -> str:
             lines.append(f"⚠️ назначение не снято ({who}): {error}")
     else:
         lines.append("назначения не было")
-    lines.append(release(repo, task))
+    lines.append(release(repo, task, holder=holder))
     return "; ".join(lines)
 
 
@@ -587,9 +596,10 @@ def current_actor() -> str:
 def main(argv: list[str]) -> int:
     usage = ("использование: claim_task.py claim <N> | release <N> [--force] | "
              "release-full <N> | status | locks (locks — номера задач под замком через "
-             "пробел, для выбора пула; release-full — снять и замок, и назначение, #422; "
-             "release без --force снимает только СВОЙ замок (#1190, held по current_holder()) "
-             "— чужой/неизвестный держатель отказывает, назвав держателя; --force — явный обход)")
+             "пробел, для выбора пула; release без --force и release-full снимают "
+             "ТОЛЬКО СВОЙ замок (#1190, held по current_holder()) — чужой/неизвестный "
+             "держатель отказывает, назвав держателя; release --force и прямые вызовы "
+             "release()/release_full() без holder (scheduler/merged/TTL) — форс-снятие)")
     if len(argv) < 2:
         print(f"::error::{usage}", file=sys.stderr)
         return EXIT_ERROR
@@ -631,7 +641,17 @@ def main(argv: list[str]) -> int:
             print(detail)
             return EXIT_OK
         if command == "release-full" and len(argv) == 3 and argv[2].isdigit():
-            print(release_full(repo, int(argv[2])))
+            task = int(argv[2])
+            # CLI release-full (#1190): снимает только СВОЙ замок (holder=current_holder()).
+            # Чужой/неизвестный держатель — ForeignLockError, EXIT_BUSY (как release без --force).
+            # --force для release-full не нужен: scheduler/после слияния/TTL зовут
+            # release_full() напрямую без holder (форс-снятие), а не через CLI.
+            try:
+                detail = release_full(repo, task, holder=current_holder())
+            except ForeignLockError as error:
+                print(f"::error::{error}", file=sys.stderr)
+                return EXIT_BUSY
+            print(detail)
             return EXIT_OK
         if command == "locks":
             print(" ".join(str(task) for task in locked_tasks(repo)))

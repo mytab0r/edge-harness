@@ -721,6 +721,67 @@ def test_release_full_assignee_removal_is_dry_run_via_write_guard(monkeypatch):
     assert not any("DELETE" in c and "issues/5/assignees" in c for c in server.calls)
 
 
+def test_release_full_with_matching_holder_succeeds(monkeypatch):
+    # CLI release-full (#1190): с правильным holder снимает замок и назначение.
+    routes = {
+        "issues/5/assignees": ok_no_body(),
+        "repos/o/r/issues/5": {"number": 5, "assignees": [{"login": "mytab0r"}]},
+    }
+    server = install(monkeypatch, FakeServer(routes))
+    server.add_ref("refs/locks/task-5", sha="lock-sha")
+    server.commit_messages["lock-sha"] = "lock: task #5 claimed...\nholder: tree:/work/A"
+    detail = ct.release_full("o/r", 5, holder="tree:/work/A")
+    assert "назначение снято" in detail and "mytab0r" in detail
+    assert "снят" in detail
+    assert "refs/locks/task-5" not in server.existing_refs
+
+
+def test_release_full_with_foreign_holder_refuses(monkeypatch):
+    # CLI release-full (#1190): чужой holder — ForeignLockError, замок не тронут.
+    routes = {
+        "issues/5/assignees": ok_no_body(),
+        "repos/o/r/issues/5": {"number": 5, "assignees": [{"login": "mytab0r"}]},
+    }
+    server = install(monkeypatch, FakeServer(routes))
+    server.add_ref("refs/locks/task-5", sha="lock-sha")
+    server.commit_messages["lock-sha"] = "lock: task #5 claimed...\nholder: tree:/work/A"
+    with pytest.raises(ct.ForeignLockError, match="tree:/work/A"):
+        ct.release_full("o/r", 5, holder="tree:/work/B")
+    assert "refs/locks/task-5" in server.existing_refs
+    # Замок не удалён — DELETE git/refs/locks/task-5 не ушёл (assignee DELETE — это видимость, он может уйти до проверки holder)
+    assert not any("-X" in c and "DELETE" in c and "git/refs/locks/task-5" in c for c in server.calls)
+
+
+def test_release_full_with_unknown_holder_lock_refuses(monkeypatch):
+    # Третье состояние: замок старого формата без holder — отказ по умолчанию.
+    routes = {
+        "issues/5/assignees": ok_no_body(),
+        "repos/o/r/issues/5": {"number": 5, "assignees": [{"login": "mytab0r"}]},
+    }
+    server = install(monkeypatch, FakeServer(routes))
+    server.add_ref("refs/locks/task-5", sha="legacy-sha")  # без commit_messages записи
+    with pytest.raises(ct.ForeignLockError, match="старого формата"):
+        ct.release_full("o/r", 5, holder="tree:/work/B")
+    assert not any("-X" in c and "DELETE" in c and "git/refs/locks/task-5" in c for c in server.calls)
+
+
+def test_release_full_without_holder_is_force_behavior(monkeypatch):
+    # scheduler/merged/TTL зовут release_full() без holder — форс-снятие,
+    # поведение НЕ меняется. Мутация: если бы holder=None стал проверяться —
+    # этот тест упал бы ForeignLockError.
+    routes = {
+        "issues/5/assignees": ok_no_body(),
+        "repos/o/r/issues/5": {"number": 5, "assignees": [{"login": "mytab0r"}]},
+    }
+    server = install(monkeypatch, FakeServer(routes))
+    server.add_ref("refs/locks/task-5", sha="lock-sha")
+    server.commit_messages["lock-sha"] = "lock: task #5 claimed...\nholder: tree:/work/A"
+    detail = ct.release_full("o/r", 5)  # holder не передан
+    assert "назначение снято" in detail and "mytab0r" in detail
+    assert "снят" in detail
+    assert "refs/locks/task-5" not in server.existing_refs
+
+
 def test_collect_stale_expired_lock_is_dry_run_via_write_guard(monkeypatch):
     """Тот же класс для collect_stale: протухший замок под гейтом обязан
     остаться нетронутым, а действие — честно назвать DRY-RUN, не «снят»."""
@@ -868,6 +929,35 @@ def test_cli_release_foreign_lock_error_is_busy_not_broken(monkeypatch):
 
     monkeypatch.setattr(ct, "release", fake_release)
     assert ct.main(["x", "release", "5"]) == ct.EXIT_BUSY
+
+
+def test_cli_release_full_default_passes_current_holder(monkeypatch):
+    # CLI release-full (#1190): без --force обязан передать holder=current_holder()
+    # в release_full() — снимает только СВОЙ замок. Мутация: убери holder из
+    # main() — этот тест покраснеет (seen['holder'] останется None).
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setenv("CLAIM_HOLDER", "tree:/work/mine")
+    seen = {}
+
+    def fake_release_full(repo, task, holder=None):
+        seen["holder"] = holder
+        return "назначение снято; снят"
+
+    monkeypatch.setattr(ct, "release_full", fake_release_full)
+    assert ct.main(["x", "release-full", "5"]) == ct.EXIT_OK
+    assert seen == {"holder": "tree:/work/mine"}
+
+
+def test_cli_release_full_foreign_lock_error_is_busy_not_broken(monkeypatch):
+    # ForeignLockError из release_full — это «не смог снять чужое», не
+    # «инструмент сломан»: CLI обязан дать EXIT_BUSY (1), а не EXIT_ERROR (2).
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    def fake_release_full(repo, task, holder=None):
+        raise ct.ForeignLockError(f"замок task-{task} принадлежит держателю run:OTHER")
+
+    monkeypatch.setattr(ct, "release_full", fake_release_full)
+    assert ct.main(["x", "release-full", "5"]) == ct.EXIT_BUSY
 
 
 def test_cli_release_rejects_unknown_flag(monkeypatch):
