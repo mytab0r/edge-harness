@@ -58,9 +58,10 @@ PR #358), не заявление ЭТОГО PR о себе. Подробнос�
 
 Как и штатная приёмка (`accept_merged_tasks`), категория улики по составу
 файлов слитого PR (`scheduler.classify_acceptance`/`deploy_evidence`/
-`script_evidence`/`docs_missing` — переиспользованы, не продублированы,
-`scheduler.py` не правится этим модулем, только читается тем же приёмом,
-что уже применяет `repo_invariants.py`). Плюс ТРИ узких дополнения,
+`dsh_edge_deploy_evidence`/`combined_deploy_evidence`/`script_evidence`/
+`docs_missing` — переиспользованы, не продублированы, `scheduler.py` не
+правится этим модулем, только читается тем же приёмом, что уже применяет
+`repo_invariants.py`). Плюс ТРИ узких дополнения,
 специфичных для ВТОРОГО источника (у него нет собственной ветки, значит нет
 и презумпции «эта работа для этой задачи», которую даёт совпадение имени
 ветки при обычной приёмке):
@@ -469,10 +470,11 @@ def merge_commit_on_main(repo: str, merge_commit_sha: str | None) -> bool:
 def compute_evidence(repo: str, repo_root: Path, pull: dict) -> tuple[str, str]:
     """('ok'|'docs'|'fail'|'pending', детали) — те же категории и функции,
     что штатная приёмка (`scheduler.classify_acceptance`/`deploy_evidence`/
-    `script_evidence`/`docs_missing`), плюс гвардия-каталога (см. докстринг
-    модуля). RuntimeError (инфраструктурный сбой, не «улика красная») не
-    гасится — поднимается вызывающему, тот эскалирует, а не тихо считает
-    провалом (тот же приём, что и accept_merged_tasks)."""
+    `dsh_edge_deploy_evidence`/`combined_deploy_evidence`/`script_evidence`/
+    `docs_missing`), плюс гвардия-каталога и проверка архивации change
+    (см. докстринг модуля). RuntimeError (инфраструктурный сбой, не «улика
+    красная») не гасится — поднимается вызывающему, тот эскалирует, а не тихо
+    считает провалом (тот же приём, что и accept_merged_tasks)."""
     files_payload = review_labels.list_pr_files(repo, pull["number"], gh)
     filenames = [entry["filename"] for entry in files_payload]
     category = scheduler.classify_acceptance(filenames)
@@ -487,6 +489,12 @@ def compute_evidence(repo: str, repo_root: Path, pull: dict) -> tuple[str, str]:
     elif category == scheduler.ACCEPT_DEPLOY:
         merged_at = parse_time(pull["merged_at"])
         base = scheduler.deploy_evidence(repo, merged_at, pull.get("merge_commit_sha"))
+    elif category == scheduler.ACCEPT_DEPLOY_DSH_EDGE:
+        merged_at = parse_time(pull["merged_at"])
+        base = scheduler.dsh_edge_deploy_evidence(repo, merged_at, pull.get("merge_commit_sha"))
+    elif category == scheduler.ACCEPT_DEPLOY_BOTH:
+        merged_at = parse_time(pull["merged_at"])
+        base = scheduler.combined_deploy_evidence(repo, merged_at, pull.get("merge_commit_sha"))
     else:
         base = scheduler.script_evidence(repo, pull["head"]["sha"])
 

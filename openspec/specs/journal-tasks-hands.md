@@ -204,6 +204,7 @@
 
         18.2.2. Материальная улика — те же категории и функции штатной
             приёмки (`classify_acceptance`/`deploy_evidence`/
+            `dsh_edge_deploy_evidence`/`combined_deploy_evidence`/
             `script_evidence`/`docs_missing`, только читаются), плюс ТРИ
             проверки второго источника: коммит слияния — предок main
             (compare API, класс #925: «зелёный прогон» не цитируется для

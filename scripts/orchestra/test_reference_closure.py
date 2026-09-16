@@ -279,6 +279,55 @@ def test_referenced_change_archived_none_when_no_path_mentioned():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# compute_evidence — dispatches to correct scheduler evidence function
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_compute_evidence_dispatches_to_dsh_edge_deploy_evidence(monkeypatch):
+    # ACCEPT_DEPLOY_DSH_EDGE category should call dsh_edge_deploy_evidence
+    calls = []
+
+    def mock_classify(filenames):
+        return rc.scheduler.ACCEPT_DEPLOY_DSH_EDGE
+
+    def mock_dsh_edge_evidence(repo, merged_at, merge_commit_sha):
+        calls.append(("dsh_edge", repo, merged_at, merge_commit_sha))
+        return "ok", "deploy-dsh-edge ok"
+
+    monkeypatch.setattr(rc.scheduler, "classify_acceptance", mock_classify)
+    monkeypatch.setattr(rc.scheduler, "dsh_edge_deploy_evidence", mock_dsh_edge_evidence)
+    monkeypatch.setattr(rc.review_labels, "list_pr_files", lambda repo, pr, gh: [{"filename": "dsh-edge/something.ts"}])
+
+    pull = {"number": 123, "merged_at": "2026-09-12T00:00:00Z", "head": {"sha": "abc123"}, "merge_commit_sha": "merge123"}
+    state, detail = rc.compute_evidence("owner/repo", Path("/tmp"), pull)
+
+    assert state == "ok"
+    assert calls == [("dsh_edge", "owner/repo", rc.parse_time("2026-09-12T00:00:00Z"), "merge123")]
+
+
+def test_compute_evidence_dispatches_to_combined_deploy_evidence(monkeypatch):
+    # ACCEPT_DEPLOY_BOTH category should call combined_deploy_evidence
+    calls = []
+
+    def mock_classify(filenames):
+        return rc.scheduler.ACCEPT_DEPLOY_BOTH
+
+    def mock_combined_evidence(repo, merged_at, merge_commit_sha):
+        calls.append(("combined", repo, merged_at, merge_commit_sha))
+        return "ok", "both ok"
+
+    monkeypatch.setattr(rc.scheduler, "classify_acceptance", mock_classify)
+    monkeypatch.setattr(rc.scheduler, "combined_deploy_evidence", mock_combined_evidence)
+    monkeypatch.setattr(rc.review_labels, "list_pr_files", lambda repo, pr, gh: [{"filename": "dsh-edge/x.ts"}, {"filename": "scripts/y.py"}])
+
+    pull = {"number": 124, "merged_at": "2026-09-12T01:00:00Z", "head": {"sha": "def456"}, "merge_commit_sha": "merge456"}
+    state, detail = rc.compute_evidence("owner/repo", Path("/tmp"), pull)
+
+    assert state == "ok"
+    assert calls == [("combined", "owner/repo", rc.parse_time("2026-09-12T01:00:00Z"), "merge456")]
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # Дожатая проверка контрпримеров владельца — #389/#901 не становятся
 # кандидатами этого механизма (никакой сети, только структура текста)
 # ══════════════════════════════════════════════════════════════════════════

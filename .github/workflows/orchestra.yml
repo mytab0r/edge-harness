@@ -135,7 +135,8 @@ jobs:
       # also_closes_targets; русские слова GitHub как директиву не
       # распознаёт, автозакрытия при мерже нет — запрет Closes/Fixes/Resolves
       # не задет). Улика — те же категории, что у штатной приёмки
-      # (classify_acceptance/deploy_evidence/script_evidence/docs_missing),
+      # (classify_acceptance/deploy_evidence/dsh_edge_deploy_evidence/
+      # combined_deploy_evidence/script_evidence/docs_missing),
       # плюс «коммит слияния — предок main» (класс #925); потолок закрытий
       # за прогон, газ и честная граница — докстринг
       # scripts/orchestra/reference_closure.py. Гейт квоты — как у соседних
