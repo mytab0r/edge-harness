@@ -923,6 +923,31 @@ assert_log "повтор внутри этого прогона не помож�
 assert_not_log "Повтор ИМЕЕТ смысл" "worker-chain-quota-red: при реальной квоте повтор смысла не имеет — сообщение не должно звать повторять"
 echo "SMOKE: worker-chain-quota-red — ок (#1307)"
 
+# ── #1322: НАШ отказ (prompt_too_long) не смеет называться провайдерским ─────
+# Парный к двум сценариям выше: там шапка «остановлен провайдером» ВЕРНА и
+# обязана остаться (иначе «починить» этот сценарий можно было бы, вычеркнув
+# фразу отовсюду); здесь она ЛОЖЬ — агент не вызывался, ни один провайдер не
+# тронут, отказ наш. Прод-форма отказа берётся настоящая: предел общего
+# размера аргументов занижается до 10 байт, поэтому обычный промпт воркера
+# упирается в ту же ветку dsh_run_with_retry (DSH_RUN_FAILURE_REASON=
+# prompt_too_long), что и живой прогон 35079314952 на задаче #1184 —
+# не пересказ класса, а он сам.
+scenario_start
+WORKER_LOGIN="mytab0r" \
+WORKER_TASK="123" \
+RUNNER_TEMP="$TMP/rt-w-prompt-too-long" \
+GH_TOKEN="smoke-pat-token" \
+TELEGRAM_BOT_TOKEN="smoke-tg-token" \
+TELEGRAM_CHAT_ID="42" \
+GH_ISSUE_JSON='{"number":123,"title":"Smoke: промпт длиннее предела execve","body":"## Цель\nпрогон\n\n## Критерий готовности\nсессия","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
+DSH_PROMPT_TOTAL_MAX_BYTES="10" \
+  run_client_expect_fail "worker-prompt-too-long-red" "$REPO/scripts/worker/task.sh"
+assert_log "остановлен НАШИМ ограничением" "worker-prompt-too-long-red: отказ НАШ (агент не вызывался) — шапка обязана называть это, а не винить провайдера (#1322)"
+assert_not_log "остановлен провайдером" "worker-prompt-too-long-red: шапка «остановлен провайдером» противоречит телу («ни один провайдер не тронут») — класс #1322"
+assert_not_log "цепочка провайдеров отказала" "worker-prompt-too-long-red: цепочка не отказывала, она не запускалась — Telegram и die-строка не смеют говорить иначе (#1322)"
+assert_log "ни один провайдер не тронут" "worker-prompt-too-long-red: тело обязано сохранить факт #1315"
+echo "SMOKE: worker-prompt-too-long-red — ок (#1322)"
+
 scenario_start
 WORKER_LOGIN="mytab0r" \
 WORKER_TASK="123" \
