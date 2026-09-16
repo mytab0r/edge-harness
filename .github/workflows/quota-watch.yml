@@ -81,7 +81,7 @@ jobs:
       - name: Тесты сторожа квот
         run: |
           pip install --quiet pytest pyyaml
-          python -m pytest scripts/measure/test_quota_alert.py scripts/measure/test_quota_watch.py -q
+          python -m pytest scripts/measure/test_quota_alert.py scripts/measure/test_quota_watch.py scripts/measure/test_measure_trigger_cadence.py -q
 
       # Гейт против шага замера ниже (found: ревью PR #607) — ИМЕНА шагов
       # («id: gate» + `steps.gate.outputs.proceed`, и точный текст этого
