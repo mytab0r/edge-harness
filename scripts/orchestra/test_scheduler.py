@@ -4955,44 +4955,64 @@ def test_claim_task_release_writes_for_real_in_ci_via_wired_guard(monkeypatch):
     assert "DELETE" in calls[0] and "task-5" in calls[0]
 
 
-# ── Чеклист некритичных замечаний ревью — задача-хвост при слиянии (#462) ─────
-# Незакрытые пункты НЕ блокируют мерж (иначе некритичное стало бы критичным),
-# но и не теряются молча — одна задача-хвост со ссылкой на PR, не issue на
-# каждый пункт (scripts/lib/review_checklist.py).
+# ── Реестр незакрытых находок ревью при слиянии (#1262, объединяет #1217) ────
+# Незакрытые пункты чеклиста НЕ блокируют мерж (иначе некритичное стало бы
+# критичным), но и не теряются молча — переносятся в файловый реестр
+# (scripts/lib/review_findings.py, ветка данных data/review-findings), НЕ в
+# задачу пула (старое поведение до #1262 — см. тест-гвардию
+# test_after_merge_never_calls_create_pool_issue_for_review_findings ниже).
 
-def _checklist_body(*, unchecked=("Не сделано",), checked=()):
+def _checklist_body(*, unchecked=("Не сделано",), checked=(), file="scripts/lib/foo.py"):
     lines = [sch.review_checklist.CHECKLIST_BEGIN, sch.review_checklist.CHECKLIST_TITLE, ""]
-    lines += [f"- [ ] **{t}**" for t in unchecked]
-    lines += [f"- [x] **{t}**" for t in checked]
+    file_tag = f" `{file}`" if file else ""
+    lines += [f"- [ ] **{t}**{file_tag}" for t in unchecked]
+    lines += [f"- [x] **{t}**{file_tag}" for t in checked]
     lines.append(sch.review_checklist.CHECKLIST_END)
     return "Описание PR.\n\n" + "\n".join(lines) + "\n"
 
 
-def test_after_merge_files_tail_issue_for_unresolved_checklist(monkeypatch):
+def _registry_routes(stored=None, sha="regsha"):
+    """Маршруты FakeGh для реестра находок: GET текущего содержимого (или
+    404 — реестра ещё нет) + PUT (порядок как в test_review_findings.py:
+    PUT-фрагмент — подстрока GET-фрагмента, обязан идти ПЕРВЫМ)."""
+    import base64
+    routes = {f"-X PUT repos/{REPO}/contents/{sch.review_findings.REGISTRY_PATH}": {"content": {"sha": "newsha"}}}
+    if stored is None:
+        routes[f"repos/{REPO}/contents/{sch.review_findings.REGISTRY_PATH}"] = RuntimeError(
+            f"gh api repos/{REPO}/contents/{sch.review_findings.REGISTRY_PATH}: "
+            "HTTP 404: Not Found (https://api.github.com/...)")
+        routes[f"repos/{REPO}/git/ref/heads/{sch.review_findings.REGISTRY_BRANCH}"] = RuntimeError(
+            "git/ref/heads: HTTP 404: Not Found (https://api.github.com/...)")
+        routes[f"repos/{REPO}/git/ref/heads/main"] = {"object": {"sha": "mainsha"}}
+        routes[f"-X POST repos/{REPO}/git/refs"] = {"ref": f"refs/heads/{sch.review_findings.REGISTRY_BRANCH}"}
+    else:
+        text = sch.review_findings.dump_registry(stored)
+        routes[f"repos/{REPO}/contents/{sch.review_findings.REGISTRY_PATH}"] = {
+            "content": base64.b64encode(text.encode("utf-8")).decode("ascii"), "sha": sha}
+    return routes
+
+
+def test_after_merge_moves_unresolved_checklist_into_findings_registry(monkeypatch):
     merged = pull(163, pr_body=_checklist_body(unchecked=("Первое", "Второе"), checked=("Третье",)))
-    fake = FakeGh({
-        "pulls/163/files": [],
-        "issues?state=open&labels=task&per_page=100": [],
-        f"-X POST repos/{REPO}/issues -f title={sch.review_checklist.tail_issue_title(163)}": {"number": 900},
-    })
+    fake = FakeGh({"pulls/163/files": [], **_registry_routes()})
     monkeypatch.setattr(sch, "gh", fake)
     monkeypatch.setattr(sch, "update_remaining_pulls", lambda *a, **k: ([], []))
 
     observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
 
     assert hard_failure is False
-    assert any("#900" in line and "2" in line for line in actions)
-    posts = [c for c in fake.calls if c.startswith("-X POST") and f"repos/{REPO}/issues " in c]
-    assert len(posts) == 1
-    assert "Первое" in posts[0] and "Второе" in posts[0]
-    assert "Третье" not in posts[0]   # отмеченный пункт не попадает в хвост
+    assert any("+2" in line and "-0" in line for line in actions)
+    puts = [c for c in fake.calls if c.startswith("-X PUT")]
+    assert len(puts) == 1
+    # ОДНА issue пула НЕ заведена — гвардия ниже доказывает это мутацией;
+    # здесь же прямая проверка отсутствия POST на issues.
+    assert not any(c.startswith("-X POST") and f"repos/{REPO}/issues " in c for c in fake.calls)
 
 
-def test_after_merge_no_checklist_no_tail_issue(monkeypatch):
-    # Тело PR без секции чеклиста вовсе — unresolved_items пуст, ни списка
-    # открытых задач, ни POST issue не запрашивается (мутация: FakeGh упал бы
-    # AssertionError на непредусмотренном маршруте, если бы код всё равно лез
-    # в сеть).
+def test_after_merge_no_checklist_no_registry_write(monkeypatch):
+    # Тело PR без секции чеклиста и без маркера закрытых находок — ни одного
+    # обращения к реестру (мутация: FakeGh упал бы AssertionError на
+    # непредусмотренном маршруте, если бы код всё равно лез в сеть).
     merged = pull(163, pr_body="Обычное описание без чеклиста.")
     fake = FakeGh({"pulls/163/files": []})
     monkeypatch.setattr(sch, "gh", fake)
@@ -5001,17 +5021,58 @@ def test_after_merge_no_checklist_no_tail_issue(monkeypatch):
     observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
 
     assert hard_failure is False
-    assert not any("хвост чеклиста" in line for line in observations + actions)
+    assert not any("реестр находок" in line for line in observations + actions)
+    assert not any("contents/" in c for c in fake.calls)
 
 
-def test_after_merge_tail_issue_idempotent_by_title(monkeypatch):
-    # Хвост уже заведён (открытая задача с тем же заголовком) — повторный
-    # прогон after_merge не плодит вторую issue.
+def test_after_merge_skips_items_without_file_and_reports_it(monkeypatch):
+    # Пункт БЕЗ ФАЙЛ (чеклист, начатый до #1262, или ЗАМЕЧАНИЕ без
+    # обязательного поля) — не переносится в реестр, но виден в отчёте, не
+    # тихая потеря (review_checklist.unresolved_findings/review_findings.
+    # sync_after_merge докстринг про skipped).
+    merged = pull(163, pr_body=_checklist_body(unchecked=("Старый пункт",), file=None))
+    fake = FakeGh({"pulls/163/files": []})
+    monkeypatch.setattr(sch, "gh", fake)
+    monkeypatch.setattr(sch, "update_remaining_pulls", lambda *a, **k: ([], []))
+
+    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+
+    assert hard_failure is False
+    assert not any(c.startswith("-X PUT") for c in fake.calls)
+    assert any("без ФАЙЛ" in line for line in observations)
+
+
+def test_after_merge_closes_findings_marked_resolved_in_pr_body(monkeypatch):
+    # Маркер `<!-- ai-review:resolved-findings:N -->` (review_findings.
+    # merge_resolved_marker, записан cmd_verdict при вердикте) — читается
+    # БЕЗ отдельного сетевого запроса, только из уже полученного pull["body"].
+    stored = sch.review_findings.empty_registry()
+    sch.review_findings.add_finding(stored, "a.py", "Старая находка", "", 100, "t")
+    body = "Описание.\n\n<!-- ai-review:resolved-findings:1 -->\n"
+    merged = pull(163, pr_body=body)
+    fake = FakeGh({"pulls/163/files": [], **_registry_routes(stored=stored)})
+    monkeypatch.setattr(sch, "gh", fake)
+    monkeypatch.setattr(sch, "update_remaining_pulls", lambda *a, **k: ([], []))
+
+    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+
+    assert hard_failure is False
+    assert any("+0" in line and "-1" in line for line in actions)
+
+
+def test_after_merge_survives_broken_json_registry_with_loud_observation(monkeypatch):
+    # Битый JSON реестра — RuntimeError из load_registry (не голый
+    # json.JSONDecodeError, ревью PR #1268): ловится тем же except RuntimeError,
+    # что и сетевые отказы, и превращается в видимое ⚠️, НЕ уронив after_merge.
+    # Без этого мерж (уже состоявшийся к моменту вызова) убивал бы отчёт пульса
+    # и цикл слияний остальных PR — дельта-спека требует обратного.
+    import base64
     merged = pull(163, pr_body=_checklist_body(unchecked=("Первое",)))
-    existing = {"title": sch.review_checklist.tail_issue_title(163), "number": 501}
+    broken = {
+        "content": base64.b64encode(b"{not json").decode("ascii"), "sha": "regsha"}
     fake = FakeGh({
         "pulls/163/files": [],
-        "issues?state=open&labels=task&per_page=100": [existing],
+        f"repos/{REPO}/contents/{sch.review_findings.REGISTRY_PATH}": broken,
     })
     monkeypatch.setattr(sch, "gh", fake)
     monkeypatch.setattr(sch, "update_remaining_pulls", lambda *a, **k: ([], []))
@@ -5019,9 +5080,55 @@ def test_after_merge_tail_issue_idempotent_by_title(monkeypatch):
     observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
 
     assert hard_failure is False
-    posts = [c for c in fake.calls if c.startswith("-X POST") and f"repos/{REPO}/issues " in c]
-    assert posts == []
-    assert any("уже заведена" in line for line in observations)
+    assert any("не обновлён" in line and "битый JSON" in line
+               for line in observations + actions)
+
+
+def test_after_merge_never_calls_create_pool_issue_for_review_findings(monkeypatch):
+    # Гвардия против регрессии в старое поведение (#1262, критерий 1):
+    # after_merge на незакрытом чеклисте НЕ имеет права звать
+    # pool_issue.create_pool_issue вовсе. Мутация: верни старый вызов внутри
+    # after_merge — этот тест краснеет первым же обращением к заглушке.
+    #
+    # Доказательство — ДВЕ исполненные мутации, обе на этом дереве, не по
+    # памяти (AGENTS.md «Рецепт мутации — исполни, не вспоминай»; находка
+    # ревью PR #1268: блок ниже доказывает СВОЙСТВО «старый код не пройдёт
+    # тест вообще», а свойство критерия «возврат вызова → краснеет» — это
+    # прямая мутация здесь):
+    #
+    # 1) Прямая (критерий 1): вернуть вызов create_pool_issue внутрь
+    # after_merge — тест краснеет ЗАГУШКОЙ, дословный вывод исполнения
+    # 2026-09-14:
+    #   E       AssertionError: after_merge не должен звать create_pool_issue для находок ревью (#1262)
+    #   E       AssertionError: after_merge не должен звать create_pool_issue для находок ревью (#1262)
+    #   scripts/orchestra/test_scheduler.py: AssertionError
+    #   =========================== short test summary info ============================
+    #   FAILED scripts/orchestra/test_scheduler.py::test_after_merge_never_calls_create_pool_issue_for_review_findings - AssertionError: after_merge не должен звать create_pool_issue для находок ревью (#1262)
+    #   1 failed, 369 deselected in 0.35s
+    #
+    # 2) Историческая (блок MUTATION-PROOF ниже): scheduler.py на ref
+    # 66d12179 (состояние ДО #1262) не несёт review_findings вовсе — тест
+    # падает AttributeError на первой же попытке построить маршруты реестра,
+    # до того как дело доходит до заглушки create_pool_issue. Это даже более
+    # сильный красный, чем регрессия вызова: старая версия физически не может
+    # пройти этот тест.
+    #
+    # MUTATION-PROOF
+    # ref: 66d12179c62af09e44b2e4d5ddb0755914ae1e95
+    # paths: scripts/orchestra/scheduler.py
+    # run: python -X utf8 -m pytest scripts/orchestra/test_scheduler.py -k test_after_merge_never_calls_create_pool_issue_for_review_findings -q
+    # expect: AttributeError: module 'scheduler' has no attribute 'review_findings'
+    def _forbidden(*a, **k):
+        raise AssertionError("after_merge не должен звать create_pool_issue для находок ревью (#1262)")
+
+    monkeypatch.setattr(sch.pool_issue, "create_pool_issue", _forbidden)
+    merged = pull(163, pr_body=_checklist_body(unchecked=("Первое",)))
+    fake = FakeGh({"pulls/163/files": [], **_registry_routes()})
+    monkeypatch.setattr(sch, "gh", fake)
+    monkeypatch.setattr(sch, "update_remaining_pulls", lambda *a, **k: ([], []))
+
+    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+    assert hard_failure is False
 
 
 # ── Авто-возобновление предохранителя по мержу (#220) ────────────────────────────
