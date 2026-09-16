@@ -2669,17 +2669,23 @@ def test_failure_watch_treats_timed_out_as_failure_and_ignores_cancelled(monkeyp
     assert "actions/runs/222" not in " ".join(created[0])
 
 
-def test_worker_yml_cannot_reach_timed_out_reaper_always_cuts_first():
-    # Ревизия #1184 (находка B), структурное доказательство на прод-YAML/
-    # прод-константе, не на пересказе: рипер scheduler.reap_stalled_worker_run
-    # отменяет in_progress-прогон worker.yml на WORKER_STALL_MINUTES=295 —
-    # СТРОГО раньше собственного timeout-minutes worker.yml (340). GitHub
-    # присваивает отменённому прогону conclusion=cancelled, не timed_out —
-    # значит worker.yml физически не может дать FAILURE_WATCH_RUN_CONCLUSIONS
-    # значение timed_out. Мутация: подними WORKER_STALL_MINUTES выше
-    # timeout-minutes worker.yml (или удали кап рипера) — этот тест покраснеет,
-    # сигнализируя, что комментарий у FAILURE_WATCH_RUN_CONCLUSIONS и
-    # FAILURE_WATCH_PER_PAGE (оба ссылаются на этот факт) больше не верны.
+def test_worker_yml_stale_run_reaper_cuts_before_timeout():
+    # Ревизия #1184 (находка B) + уточнение PR #1189: рипер
+    # scheduler.reap_stalled_worker_run отменяет ТОЛЬКО зависшие (тишина сессии ≥
+    # WORKER_SILENCE_MINUTES ИЛИ задача не коррелирована и возраст ≥
+    # WORKER_STALL_MINUTES) in_progress-прогоны worker.yml — GitHub присваивает
+    # им conclusion=cancelled, не timed_out. Ассерт ниже проверяет, что
+    # фоллбэк-возрастной порог рипера (WORKER_STALL_MINUTES=295) строго меньше
+    # job-level timeout-minutes worker.yml (340) — это гарантирует, что
+    # зависший БЕЗ коррелированной живой сессии прогон не доживёт до timed_out.
+    # Живой по сессии прогон (сессия растёт, markers пишутся) рипер по дизайну
+    # #1089 НЕ трогает: возрастной потолок для него НЕ применяется, он идёт до
+    # стены GitHub и получает timed_out — путь структурно открыт, просто замер
+    # показывает 0/100 (не наблюдается, не «физически не может»).
+    # Мутация: подними WORKER_STALL_MINUTES выше timeout-minutes worker.yml —
+    # тест покраснеет, сигнализируя, что зависший фоллбэк-прогон мог бы дожить
+    # до timed_out, и комментарии у FAILURE_WATCH_RUN_CONCLUSIONS/
+    # FAILURE_WATCH_PER_PAGE устарели.
     repo_root = Path(__file__).resolve().parents[2]
     workflow_dir = repo_root / ".github" / "workflows"
     worker_yml = (workflow_dir / "worker.yml").read_text(encoding="utf-8")
@@ -2697,10 +2703,11 @@ def test_worker_yml_cannot_reach_timed_out_reaper_always_cuts_first():
         sys.path.remove(str(scheduler_path.parent))
 
     assert sch.WORKER_STALL_MINUTES < worker_timeout_minutes, (
-        f"рипер (WORKER_STALL_MINUTES={sch.WORKER_STALL_MINUTES}) обязан резать "
-        f"строго раньше собственного капа worker.yml ({worker_timeout_minutes}) — "
-        "иначе worker.yml способен реально дожить до timed_out, и комментарий "
-        "у FAILURE_WATCH_RUN_CONCLUSIONS устарел в другую сторону"
+        f"фоллбэк-порог рипера (WORKER_STALL_MINUTES={sch.WORKER_STALL_MINUTES}) "
+        f"обязан резать строго раньше собственного капа worker.yml "
+        f"({worker_timeout_minutes}) — иначе зависший фоллбэк-прогон способен "
+        "дожить до timed_out, и комментарии у FAILURE_WATCH_RUN_CONCLUSIONS/"
+        "FAILURE_WATCH_PER_PAGE устарели"
     )
 
     # hands.yml — контрольный пример: у него нет рипера (единственный вызов

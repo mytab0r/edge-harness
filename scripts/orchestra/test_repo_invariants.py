@@ -2624,6 +2624,49 @@ def test_worker_false_success_marker_matches_task_sh_template():
     )
 
 
+def test_worker_false_success_comment_ignores_marker_in_code_spans(monkeypatch):
+    # PR #1189 (находка А): локальная сверка не должна считать вхождения
+    # маркера внутри markdown code spans (`` `...` `` / ```` ```...``` ````) —
+    # прод-комментарий воркера фразу в бэктики не заворачивает, а обсуждение
+    # PR/задачи вполне может её процитировать. Цитата в бэктиках — не нарушение.
+    fake = FakeGh({
+        "search/issues": {"items": [
+            {"number": 999, "html_url": "https://github.com/mytab0r/edge-harness/issues/999",
+             "title": "обсуждение с цитатой"},
+        ]},
+        "issues/999/comments": [
+            {"created_at": "2026-10-01T00:00:00Z",
+             "body": "Инвариант ищет `справился (провайдер: )` — это новая форма после #1184"},
+            {"created_at": "2026-10-01T00:00:00Z",
+             "body": "```\n🤖 Автономный воркер справился (провайдер: ). PR открыт: ...\n```"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    assert ri.check_worker_false_success_comment(REPO) == ri.check_result.ok()
+
+
+def test_worker_false_success_comment_still_flags_bare_marker(monkeypatch):
+    # Голое вхождение (не в бэктиках) ПОЗЖЕ даты отсечки — это нарушение.
+    fake = FakeGh({
+        "search/issues": {"items": [
+            {"number": 998, "html_url": "https://github.com/mytab0r/edge-harness/issues/998",
+             "title": "настоящий регресс"},
+        ]},
+        "issues/998/comments": [
+            {"created_at": "2026-10-01T00:00:00Z",
+             "body": "Обсуждение: новый маркер — справился (провайдер: ) — появился в логе"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    result = ri.check_worker_false_success_comment(REPO)
+    assert result.status == ri.check_result.STATUS_VIOLATION
+    assert result.violations == [{
+        "issue": 998,
+        "url": "https://github.com/mytab0r/edge-harness/issues/998",
+        "title": "настоящий регресс",
+    }]
+
+
 def test_worker_false_success_comment_unknown_on_network_failure(monkeypatch):
     # issue #1096, F6: Search недоступен целиком — раньше тихий [] (то же
     # 💚, что у доказанного «нарушений нет»); теперь check_result.unknown()

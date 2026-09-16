@@ -2119,6 +2119,41 @@ WORKER_FALSE_SUCCESS_MARKER = "справился (провайдер: )"
 WORKER_FALSE_SUCCESS_FIX_LANDED_AT = datetime(2026, 9, 12, tzinfo=timezone.utc)
 
 
+def _strip_code_spans(text: str) -> str:
+    """Удаляет markdown code spans (`` `...` `` и ```` ```...``` ````)
+    из текста — локальная сверка инварианта 14 не должна срабатывать на
+    цитатах маркера в обсуждениях (PR #1189: ложное срабатывание на
+    цитировании нового литерала в бэктиках). Прод-комментарий воркера
+    фразу в бэктики не заворачивает."""
+    # Сначала убираем fenced code blocks (```...``` или ~~~...~~~)
+    text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+    text = re.sub(r"~~~.*?~~~", "", text, flags=re.DOTALL)
+    # Затем inline code spans (`...`) — нежадный, без вложенных бэктиков
+    text = re.sub(r"`[^`]*`", "", text)
+    return text
+
+
+def _marker_present_outside_code_spans(marker: str, body: str) -> bool:
+    """Аналог pulse_guard._marker_present, но игнорирует вхождения внутри
+    markdown code spans. Используется инвариантом 14 для локальной сверки
+    кандидата (PR #1189: избежать ложного срабатывания на цитатах в бэктиках)."""
+    stripped = _strip_code_spans(body)
+    return pulse_guard._marker_present(marker, stripped)
+
+
+def _marker_times_outside_code_spans(repo: str, issue_number: int, marker: str) -> list[datetime]:
+    """Локальная версия issue_marker_times, игнорирующая markdown code spans."""
+    try:
+        payload = pulse_guard.all_issue_comments(repo, issue_number)
+    except RuntimeError:
+        raise
+    return [
+        pulse_guard.parse_time(comment["created_at"])
+        for comment in payload
+        if _marker_present_outside_code_spans(marker, comment.get("body") or "")
+    ]
+
+
 def check_worker_false_success_comment(repo: str) -> check_result.CheckResult:
     """Инвариант 14 (issue #876, живой инцидент — прогон worker.yml
     34498185823, задача #140, 2026-09-10): комментарий «Автономный воркер
@@ -2195,7 +2230,7 @@ def check_worker_false_success_comment(repo: str) -> check_result.CheckResult:
         if number is None:
             continue
         try:
-            confirmed = issue_marker_times(repo, number, WORKER_FALSE_SUCCESS_MARKER)
+            confirmed = _marker_times_outside_code_spans(repo, number, WORKER_FALSE_SUCCESS_MARKER)
         except RuntimeError:
             unchecked += 1
             continue

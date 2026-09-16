@@ -489,11 +489,15 @@ FAILURE_WATCH_WINDOW_MINUTES = 30
 # `timed_out` — ВКЛЮЧЁН, но ревизия #1184 (находка B) поправляет ЧЬЁ
 # обоснование это на самом деле: держать его ради worker.yml было НЕВЕРНО —
 # scheduler.reap_stalled_worker_run (scheduler.py, WORKER_STALL_MINUTES=295)
-# отменяет каждый его in_progress-прогон раньше, чем тот доживёт до
-# собственного timeout-minutes=340 (.github/workflows/worker.yml) — GitHub
-# присваивает такому прогону conclusion=cancelled, не timed_out; замер по
-# репозиторию подтвердил: 0 прогонов timed_out среди последних 100
-# завершённых worker.yml и 0 по всему репо (`actions/runs?status=timed_out`).
+# отменяет ТОЛЬКО зависшие (тишина сессии ≥ WORKER_SILENCE_MINUTES ИЛИ
+# задача не коррелирована и возраст ≥ WORKER_STALL_MINUTES) in_progress-
+# прогоны — GitHub присваивает им conclusion=cancelled, не timed_out.
+# Живой по сессии harness-<N> прогон (сессия растёт, markers пишутся) рипер
+# по дизайну #1089 НЕ трогает: возрастной потолок для него НЕ применяется,
+# он идёт до жёсткой стены GitHub — timeout-minutes=340 job'а worker.yml —
+# и получает conclusion=timed_out. Путь структурно открыт, просто замер по
+# репозиторию (0 из последних 100 worker.yml и 0 по всему репо) показывает:
+# «сегодня не наблюдается», а не «физически не может».
 # `timed_out` живой не ради worker.yml, а ради ОСТАЛЬНЫХ шести
 # WATCHED_WORKFLOWS — ни у одного нет своего рипера: hands.yml
 # (timeout-minutes=70), orchestra.yml/deploy-worker.yml/
@@ -538,13 +542,14 @@ FAILURE_WATCH_MAX_JOBS_PER_RUN = 3
 # считается БЕЗОТНОСИТЕЛЬНО окна свежести: это просто N новейших завершённых.
 # 100, а не 20: worker.yml при WIP_LIMIT=12 и пульсе каждые 15 минут даёт
 # 20+ завершённых за несколько часов, а провал с самым старым created_at —
-# долгий прогон, поставленный в очередь ЗА ЧАСЫ до провала (у worker.yml сам
-# такой провал сегодня всегда failure/cancelled, не timed_out — ревизия
-# #1184, см. комментарий у FAILURE_WATCH_RUN_CONCLUSIONS; у остальных
-# WATCHED_WORKFLOWS без рипера это может быть и timed_out) — вытеснялся бы за
-# страницу 20 молча: ни задачи, ни наблюдения, пока не выйдет из окна.
-# Прецедент одной страницы 100 в этом же файле — heartbeat_check/
-# real_orchestra_ticks; цена та же, один запрос на workflow.
+# долгий прогон, поставленный в очередь ЗА ЧАСЫ до провала (у worker.yml
+# зависший прогон рипер отменяет до стены → cancelled; живой по сессии
+# доживает до timeout-minutes=340 → timed_out, но такого замером не
+# наблюдалось; у остальных WATCHED_WORKFLOWS без рипера это может быть и
+# timed_out) — вытеснялся бы за страницу 20 молча: ни задачи, ни
+# наблюдения, пока не выйдет из окна. Прецедент одной страницы 100 в этом же
+# файле — heartbeat_check/real_orchestra_ticks; цена та же, один запрос на
+# workflow.
 FAILURE_WATCH_PER_PAGE = 100
 
 # ── Суточный потолок автозаведения (issue разбора петель, доклад #477) ───────
