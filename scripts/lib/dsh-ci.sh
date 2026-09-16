@@ -85,6 +85,22 @@ ANTHROPIC_OAUTH_ACCOUNT_SECRETS=(ANTHROPIC_OAUTH_1 ANTHROPIC_OAUTH_2)
 # job — один процесс dsh за раз, порт свободен (своя ВМ раннера).
 ANTHROPIC_OAUTH_POOL_PORT=47291
 
+# Потолок длины промпта в БАЙТАХ (#1315). Это не наша политика, а предел ядра
+# Linux на ОДИН аргумент execve: MAX_ARG_STRLEN = 32 страницы = 131072 байта,
+# величина отдельная от общего ARG_MAX и не поднимаемая ulimit'ом. dsh
+# принимает задачу только позиционным аргументом (lib/startup.js пакета
+# @deepseek-ai/dsh-headless: `[task...]`, ни --task-file, ни stdin), поэтому
+# промпт длиннее физически не доедет ни до одного провайдера — execve вернёт
+# E2BIG раньше сети.
+#
+# Берём с запасом 4 КиБ: на том же execve лежат ещё argv[0..2]
+# (`timeout`, секунды, `dsh`, `--profile`, `headless`) и весь environment
+# job'а, а E2BIG считает их вместе. Запас обоснован не «на глаз»: штатный
+# промпт воркера ~111 КБ (строка «Промпт собран: … байт» в логах прогонов) —
+# то есть до предела оставалось ~20 КБ, и первая же задача с крупным диффом
+# его перешагнула (прогон 35046585539, задача #770).
+DSH_PROMPT_MAX_BYTES="${DSH_PROMPT_MAX_BYTES:-126976}"
+
 # Имя apiKeyEnv-переменной провайдера llm-pi-ai.providers.anthropic-pool —
 # ОДНО место правды для имени (используется и как ключ env, и в YAML-патче
 # ниже). Значение — НЕ секрет: сама аутентификация идёт через реальный
@@ -442,7 +458,7 @@ dsh_install_anthropic_pool() { # $1 — рабочий каталог
 # dsh_mount_anthropic_pool монтирует именно его.
 dsh_patch_anthropic_pool_plugin() {
   [ "${DSH_ANTHROPIC_POOL_ACTIVE:-0}" = "1" ] || return 0
-  echo "::group::Патч плагина anthropic-oauth-pool: нейтрализация self-регистрации + фикс рефреша долгоживущих токенов (#1097/#1130)"
+  echo "::group::Патч плагина anthropic-oauth-pool: нейтрализация self-регистрации + фикс рефреша долгоживущих токенов + причина pool_unavailable (#1097/#1130/#1192)"
   local script_dir patched_tgz
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   if [ ! -d "$DSH_ANTHROPIC_POOL_EXTRACTED" ]; then
@@ -450,7 +466,7 @@ dsh_patch_anthropic_pool_plugin() {
     echo "::endgroup::"; return 1
   fi
   if ! python3 "$script_dir/patch_anthropic_pool_plugin.py" "$DSH_ANTHROPIC_POOL_EXTRACTED"; then
-    echo "::error::патч плагина не применился (см. вывод выше) — self-регистрация и/или превентивный рефреш долгоживущих токенов НЕ пофиксены (#1097/#1130)"
+    echo "::error::патч плагина не применился (см. вывод выше) — НЕ пофиксены: self-регистрация и/или превентивный рефреш долгоживущих токенов (#1097/#1130) и/или причина pool_unavailable не прокидывается (#1192)"
     echo "::endgroup::"; return 1
   fi
   patched_tgz="$(dirname "$DSH_ANTHROPIC_POOL_EXTRACTED")/dsh-anthropic-oauth-pool-patched.tgz"
@@ -522,11 +538,24 @@ dsh_import_anthropic_accounts() {
       skipped=$((skipped + 1))
       continue
     fi
-    if ! jq -e '(.claudeAiOauth // .oauth // {}) as $o | (($o.accessToken // "") | length > 0) and (($o.refreshToken // "") | length > 0)' >/dev/null 2>&1 <<<"$value"; then
-      echo "::warning::секрет $secret_name — валидный JSON, но без claudeAiOauth.accessToken/refreshToken, аккаунт $account_id пропущен (#859)"
+    # #1311: обязателен ТОЛЬКО accessToken. refreshToken до этой правки был
+    # обязательным здесь, в bin/dsh-anthropic-pool.js (accounts.js плагина) и
+    # в pool.js — три гейта подряд отвергали долгоживущий токен без рефреша,
+    # хотя ровно такой токен работает (docs/research/32-claude-oauth-provider.md:
+    # llm-pi-ai держит `sk-ant-oat` Bearer'ом без всякого рефреша; #1130:
+    # «долгоживущий accessToken владельца, которому вообще не нужен рефреш»).
+    # Два нижних гейта снимают патчи 5/6 (patch_anthropic_pool_plugin.py),
+    # этот — здесь.
+    if ! jq -e '(.claudeAiOauth // .oauth // {}) as $o | ($o.accessToken // "") | length > 0' >/dev/null 2>&1 <<<"$value"; then
+      echo "::warning::секрет $secret_name — валидный JSON, но без claudeAiOauth.accessToken, аккаунт $account_id пропущен (#859/#1311)"
       unset "$secret_name"
       skipped=$((skipped + 1))
       continue
+    fi
+    if ! jq -e '(.claudeAiOauth // .oauth // {}) as $o | ($o.refreshToken // "") | length > 0' >/dev/null 2>&1 <<<"$value"; then
+      # Не отказ: факт называется, чтобы при будущем 401 было видно, что
+      # автоматического восстановления у этого аккаунта нет по построению.
+      echo "::notice::секрет $secret_name несёт accessToken без refreshToken — это рабочий случай долгоживущего токена (#1311); автоматического обновления у аккаунта $account_id не будет, при отказе доступа нужен новый токен от владельца"
     fi
 
     creds_file=$(mktemp)
@@ -559,6 +588,38 @@ dsh_import_anthropic_accounts() {
     return 0
   fi
   echo "::endgroup::"
+}
+
+# ── Предполётная проверка аккаунтов пула (#1311) ───────────────────────────
+#
+# Вызывать ПОСЛЕ dsh_import_anthropic_accounts (нужны файлы аккаунтов) и до
+# первого прогона. Отвечает в логе на вопрос, на который агрегат
+# `pool_unavailable`/`reason` ответить не может в принципе: КАКОЙ ИМЕННО из
+# аккаунтов пригоден сейчас и почему непригодны остальные.
+#
+# Живая цена отсутствия: прогоны worker.yml 34942030597/35010410097
+# (2026-09-15) час подряд печатали `reason: rate_limited` и звали «ждать
+# сброса квоты», в то время как владелец в это же время работал на втором
+# аккаунте. Класс отказа «аккаунт выбыл на рефреше» (ветка catch вокруг
+# ensureFresh, lib/index.js плагина: cooldown 15с + lastError) стоит в
+# приоритете classifyPoolUnavailable НИЖЕ `rate_limited` соседа и снаружи
+# неотличим от квоты.
+#
+# НЕ гейт: любой исход возвращает 0 и ничего не роняет — пул не критичный
+# провайдер (design.md anthropic-oauth-pool-standalone), а проверка нужна
+# ради факта в логе и ради того, чтобы пул не тратил попытку на заведомо
+# непригодный аккаунт. Отказ самой проверки (node упал, сеть недоступна) —
+# ::warning::, работа продолжается ровно как раньше.
+dsh_pool_preflight() {
+  [ "${DSH_ANTHROPIC_POOL_ACTIVE:-0}" = "1" ] || return 0
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  echo "::group::Предполётная проверка аккаунтов Claude (#1311)"
+  if ! node "$script_dir/anthropic_pool_preflight.mjs" "$DSH_ANTHROPIC_POOL_EXTRACTED"; then
+    echo "::warning::предполётная проверка аккаунтов пула не отработала — прогон продолжается как раньше, но какой из аккаунтов пригоден, в логе не сказано (#1311)"
+  fi
+  echo "::endgroup::"
+  return 0
 }
 
 # Монтаж — тот же паттерн, что dsh_mount_plugins_suite (структурная проверка
@@ -896,6 +957,33 @@ dsh_run_with_retry() { # answer_file err_file prompt_text
   local waited=0 attempt=1 wait_left rc
   local attempt_start attempt_elapsed
   DSH_RUN_FAILURE_REASON=""
+  # #1315 (живой инцидент, прогон worker.yml 35046585539, задача #770): промпт
+  # уходит в dsh ПОЗИЦИОННЫМ АРГУМЕНТОМ, а Linux ограничивает ОДИН аргумент
+  # 128 КиБ (MAX_ARG_STRLEN = 32 страницы, отдельно от общего ARG_MAX). Промпт
+  # воркера штатно ~111 КБ — то есть впритык; на задаче с крупным диффом он
+  # перевалил, execve вернул E2BIG, и это выглядело так:
+  #   dsh завершился с кодом 126 … /usr/bin/timeout: Argument list too long
+  # Восемь провайдеров подряд «отказали» за 78 секунд, не дойдя до сети ни
+  # разу, а итог честно сказал «транзиентных отказов: 8, повтор ИМЕЕТ смысл» —
+  # и это была неправда: повтор не поможет никогда, промпт не станет короче.
+  # Отказ НАШ (форма вызова), а не провайдеров, поэтому ловим его ДО первой
+  # попытки и не тратим на него ни одного провайдера.
+  #
+  # Апстрим другого пути не даёт: dsh-headless принимает задачу только
+  # positional (`[task...]`, lib/startup.js пакета @deepseek-ai/dsh-headless
+  # 0.1.1-rc.2 — ни --task-file, ни stdin), поэтому лечение — на нашей
+  # стороне: короче промпт.
+  local prompt_bytes
+  prompt_bytes=$(printf '%s' "$prompt_text" | wc -c)
+  if [ "$prompt_bytes" -gt "$DSH_PROMPT_MAX_BYTES" ]; then
+    DSH_RUN_RC=126
+    DSH_RUN_FAILURE_REASON="prompt_too_long"
+    DSH_RUN_WAITED_SECS=0
+    DSH_RUN_LAST_ATTEMPT_ELAPSED_SECS=0
+    DSH_RUN_LAST_ATTEMPT_TIMEOUT_SECS="$timeout_secs"
+    echo "::error::промпт ${prompt_bytes} байт при пределе ${DSH_PROMPT_MAX_BYTES} на ОДИН аргумент командной строки (MAX_ARG_STRLEN ядра, 128 КиБ) — dsh принимает задачу только позиционным аргументом, поэтому вызов физически не состоится ни у одного провайдера. Это НАШ отказ, не провайдера: ни одна попытка не делается, повтор без укорачивания промпта бессмыслен. Лечение — сократить источник промпта (docs/runbooks/switch-llm-provider.md, #1315)" >&2
+    return 0
+  fi
   while :; do
     echo "dsh: попытка $attempt (суммарно уже ждал ${waited}с из бюджета ${max_wait}с)"
     attempt_start=$(date +%s)
@@ -1063,6 +1151,24 @@ dsh_require_provider_chain() { # [consumer_id]
     echo "::error::vars.DSH_PROVIDER_CHAIN пуст — нужен хотя бы один провайдер" >&2
     return 1
   fi
+  # #1309: элемент обязан нести хотя бы один непустой id модели — в поле
+  # `model` (прежняя форма) или в списке `models`. Без этой проверки запись с
+  # опечаткой в имени поля доезжала бы до цикла и тратила попытку на модель
+  # "null", а сообщение говорило бы «id не подтверждён» — формально верно, но
+  # уводит от настоящей причины (AGENTS.md, «Fail loud, не silent-wrong»).
+  local bad
+  bad=$(jq -r '
+    to_entries[]
+    | .key as $i | .value as $e
+    | (if ($e.models? | type) == "array"
+       then [ $e.models[] | if type == "string" then . else (.id // .model) end ]
+       else [ $e.model ] end) as $ids
+    | select(($ids | map(select(type == "string" and length > 0)) | length) == 0)
+    | "#\($i) (\($e.name // "без имени"))"' <<<"$DSH_PROVIDER_CHAIN" 2>/dev/null) || bad=""
+  if [ -n "$bad" ]; then
+    echo "::error::цепочка провайдеров: у элемента(ов) $(tr '\n' ' ' <<<"$bad") нет ни одного id модели — нужно поле \"model\" либо непустой список \"models\" (docs/runbooks/switch-llm-provider.md, «Несколько моделей на один ключ», #1309)" >&2
+    return 1
+  fi
 }
 
 # Класс отказа → переход на следующего провайдера. failure_reason — уже
@@ -1193,7 +1299,24 @@ dsh_chain_should_advance() { # err_file failure_reason rc
     quota_exhausted|rate_limit_retry_budget_exceeded)
       DSH_CHAIN_CLASS_NOTE="$reason"
       return 0 ;;
+    prompt_too_long)
+      # #1315: отказ НАШ и одинаковый для всех — промпт не поместился в
+      # аргумент execve. Следующий провайдер получит ровно тот же промпт и
+      # ровно тот же E2BIG, поэтому переход по цепочке — чистая трата восьми
+      # попыток (живой прогон 35046585539: 8 «транзиентных» за 78с, ни одна
+      # не дошла до сети). Единственная в этой функции ветка «стоп»: она про
+      # НАС, не про провайдера, — именно то различие, которого #1084 не
+      # находил среди провайдерских классов.
+      DSH_CHAIN_CLASS_NOTE="промпт не помещается в аргумент командной строки — отказ наш, одинаковый у всех провайдеров (#1315)"
+      return 1 ;;
   esac
+  # #1315, страховка: если предварительная проверка длины почему-то не
+  # сработала (промпт собран иначе, предел ядра другой), живая прод-форма
+  # отказа execve видна в stderr дословно — не считаем её транзиентом.
+  if grep -qE 'Argument list too long' "$err_file"; then
+    DSH_CHAIN_CLASS_NOTE="execve отверг аргументы (Argument list too long) — отказ наш, одинаковый у всех провайдеров (#1315)"
+    return 1
+  fi
   # #880 (некритичная находка ai-review): GNU `timeout` возвращает 124 и
   # когда САМ убивает процесс по сроку, и когда ребёнок дсш сам вышел с
   # кодом 124 по собственной причине — по коду возврата эти формы
@@ -1361,6 +1484,87 @@ dsh_model_confirmed() { # model_id
   jq -e --arg h "$hash" 'any(.[]?; .model_sha256 == $h)' "$DSH_CONFIRMED_MODELS_FILE" >/dev/null 2>&1
 }
 
+# ── Кандидаты моделей ОДНОГО элемента цепочки (#1309) ───────────────────────
+#
+# Один элемент цепочки = один аккаунт (base_url + secret_env). До #1309 у
+# него была РОВНО одна модель, и снятый провайдером id (живой класс: NVIDIA
+# NIM отдавал HTTP 410 Gone на `deepseek-ai/deepseek-v4-pro-0813`, прогоны
+# worker.yml 34991038287/35010410097 2026-09-15) сжигал весь элемент целиком —
+# хотя АККАУНТ был жив и на том же эндпоинте лежали другие рабочие модели.
+# Ротация аккаунтов (следующий элемент цепочки) и ротация МОДЕЛЕЙ внутри
+# аккаунта — разные оси отказа: «этот ключ исчерпан» лечится сменой ключа,
+# «этого id больше нет в каталоге» — сменой id, и подменять одно другим
+# значит терять живой аккаунт на каждой ротации каталога провайдера.
+#
+# Форма элемента РАСШИРЕНА, не заменена — обе читаются одним местом правды:
+#   {"model": "id", "max_output_tokens": N}                  — как было (один кандидат)
+#   {"models": ["id1", "id2"], "max_output_tokens": N}       — общий потолок на всех
+#   {"models": [{"id": "id1", "max_output_tokens": N1}, …]}  — свой потолок у каждой
+# Смешение допустимо: `models` побеждает, `model` при её наличии не читается
+# вовсе (одно место правды на элемент — иначе два списка кандидатов в одной
+# записи расходятся молча). Отсутствие `max_output_tokens` у кандидата —
+# значение элемента, отсутствие у элемента — 131072 (прежний дефолт, не
+# новая величина).
+dsh_entry_model_candidates() { # entry_json -> JSON-массив [{model,max_output_tokens}]
+  jq -c '
+    (.max_output_tokens // 131072) as $dflt
+    | if (.models? | type) == "array" and ((.models | length) > 0) then
+        [ .models[]
+          | if type == "string" then {model: ., max_output_tokens: $dflt}
+            else {model: (.id // .model), max_output_tokens: (.max_output_tokens // $dflt)}
+            end ]
+      else
+        [ {model: .model, max_output_tokens: $dflt} ]
+      end' <<<"$1"
+}
+
+# Первая модель первого элемента цепочки — та, которой воркер/руки
+# ЗАТРАВЛИВАЮТ профиль до первого `dsh` и которую bootstrap-событие журнала
+# называет кандидатом (#805). Отдельная функция, а не `jq -r '.[0].model'` по
+# месту: с #1309 у элемента может не быть поля `model` вовсе, и три копии
+# разбора в task.sh/dsh_task.sh разошлись бы молча (AGENTS.md, «Одно место
+# правды»).
+dsh_chain_head_model() { # chain_json -> id модели chain[0]
+  dsh_entry_model_candidates "$(jq -c '.[0]' <<<"$1")" | jq -r '.[0].model'
+}
+
+dsh_chain_head_max_tokens() { # chain_json -> потолок ответа для chain[0]
+  dsh_entry_model_candidates "$(jq -c '.[0]' <<<"$1")" | jq -r '.[0].max_output_tokens'
+}
+
+# Отказ привязан к ID МОДЕЛИ, а не к аккаунту (#1309). Разделение осей: пока
+# провайдер отвечает «такой модели нет / она снята / её параметры не те» —
+# аккаунт жив, и правильный следующий шаг это ДРУГАЯ МОДЕЛЬ того же
+# аккаунта, а не следующий аккаунт. Прод-формы (все четыре — дословно из
+# живых прогонов, не пересказ):
+#   dsh: HTTP_410: DeepSeek API error (HTTP 410)      — id снят провайдером
+#                                                       (worker.yml 35010410097)
+#   dsh: HTTP_404: modelCode does not exist           — id не существует
+#                                                       (прогон 33572445063, PR #190)
+#   dsh: INVALID_REQUEST: max_tokens (131072) exceeds model's maximum output
+#     tokens (65536) for model nemotron-3-ultra       — потолок ЭТОЙ модели
+#                                                       (worker.yml 34730173870)
+#   UNKNOWN_MODEL                                     — id не принят каталогом
+#                                                       (worker.yml 34753001158, #1130)
+#
+# Функция НЕ решает, переключаться ли на следующего ПРОВАЙДЕРА — это
+# по-прежнему dsh_chain_should_advance, и её решение не меняется ни для
+# одного класса: при единственном кандидате (форма `model`, вся цепочка до
+# #1309) поведение побайтно прежнее — модельного шага просто нет.
+_dsh_failure_is_model_scoped() { # err_file
+  grep -qE 'HTTP_410:|HTTP_404:|UNKNOWN_MODEL|INVALID_REQUEST: max_tokens' "$1" 2>/dev/null
+}
+
+# Исход ОДНОГО провайдера — машиночитаемая запись для итоговой сводки
+# (#1307). Пишется РОВНО один раз на провайдера, в том же месте, где принято
+# решение о нём: иначе сводка считалась бы вторым разбором тех же строк
+# (AGENTS.md, «Классификация классов дефектов — в источнике, не
+# постфактум-кластеризацией», ADR 0025).
+_dsh_chain_record_outcome() { # name class detail
+  DSH_CHAIN_OUTCOMES="${DSH_CHAIN_OUTCOMES}${1}	${2}	${3}
+"
+}
+
 # Прогон по цепочке: пробует провайдеров ПО ПОРЯДКУ, пока один не ответит
 # (rc=0) или список не кончится. Ретрай короткого RATE_LIMIT ВНУТРИ одного
 # провайдера — не отменяется, остаётся заботой dsh_run_with_retry; чейн решает
@@ -1436,17 +1640,33 @@ dsh_model_confirmed() { # model_id
 #   DSH_RUN_FAILURE_REASON  — "" на успехе | quota_exhausted/rate_limit_retry_budget_exceeded
 #                             последнего провайдера | all_providers_exhausted (список кончился)
 #   DSH_CHAIN_PROVIDER      — имя провайдера, ответившего успехом (пусто на отказе)
+#   DSH_CHAIN_MODEL         — id модели, ответившей успехом (#1309; пусто на отказе)
 #   DSH_CHAIN_TRIED         — имена всех опробованных провайдеров через ", "
+#   DSH_CHAIN_MODELS_TRIED  — "провайдер/модель" каждой реальной попытки через ", "
+#                             (#1309 — у элемента может быть несколько моделей;
+#                             DSH_CHAIN_TRIED намеренно остаётся списком АККАУНТОВ)
 #   DSH_CHAIN_RESET_HINT    — "имя: дата" для каждого провайдера с известной датой
 #                             сброса, через "; " (пусто — ни один не назвал дату)
+#   DSH_CHAIN_OUTCOMES      — по строке на провайдера: "имя<TAB>класс<TAB>деталь"
+#   DSH_CHAIN_OUTCOME_SUMMARY — одна строка с ЧИСЛАМИ по классам (#1307)
+#   DSH_CHAIN_RETRY_USEFUL  — 1, если хотя бы один провайдер не получил
+#                             настоящей попытки (наш бюджет/транзиент) — повтор
+#                             имеет смысл; 0 — все реально без квоты (#1307)
 dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_used]
   local answer_file=$1 err_file=$2 prompt_text=$3 initial_rl_used="${4:-0}"
-  local count i=0 stop=0 entry name base_url model secret_env max_tokens key reset_hint cap_note
+  local count i=0 stop=0 entry name base_url secret_env key reset_hint cap_note
   local quota_state_json
+  local candidates cand_count ci cand model max_tokens
+  local confirmed_any model_scoped_last provider_outcome provider_rl_used
   count=$(jq 'length' <<<"$DSH_PROVIDER_CHAIN")
   DSH_CHAIN_PROVIDER=""
+  DSH_CHAIN_MODEL=""
   DSH_CHAIN_TRIED=""
+  DSH_CHAIN_MODELS_TRIED=""
   DSH_CHAIN_RESET_HINT=""
+  DSH_CHAIN_OUTCOMES=""
+  DSH_CHAIN_OUTCOME_SUMMARY=""
+  DSH_CHAIN_RETRY_USEFUL=0
   # #857: персистентное состояние квоты, разобрано ОДИН раз за весь прогон
   # цепочки (не на каждой итерации) — см. dsh_quota_state_validate выше.
   quota_state_json=$(dsh_quota_state_validate)
@@ -1474,13 +1694,12 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
   # chain_rl_budget — не второй, независимый бюджет, а ограничение сверху
   # НА ТУ ЖЕ самую переменную rl_remaining.
   local provider_wait_cap="${DSH_RATE_LIMIT_PROVIDER_CAP_SECS:-300}"
+  local provider_cap_left
   while [ "$i" -lt "$count" ] && [ "$stop" -eq 0 ]; do
     entry=$(jq -c ".[$i]" <<<"$DSH_PROVIDER_CHAIN")
     name=$(jq -r '.name' <<<"$entry")
     base_url=$(jq -r '.base_url' <<<"$entry")
-    model=$(jq -r '.model' <<<"$entry")
     secret_env=$(jq -r '.secret_env' <<<"$entry")
-    max_tokens=$(jq -r '.max_output_tokens // 131072' <<<"$entry")
     # #857: персистентная квота ДО секрета/подтверждения модели — самый
     # дешёвый гейт первым, не тратит jq-разбор на провайдера, который всё
     # равно будет пропущен. continue (не stop=1) — "all_providers_exhausted"
@@ -1491,6 +1710,7 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
       echo "::notice::цепочка провайдеров: $name пропущен — квота до $DSH_QUOTA_GATE_RESET (vars.DSH_PROVIDER_QUOTA_UNTIL, #857)" >&2
       DSH_CHAIN_TRIED="${DSH_CHAIN_TRIED:+$DSH_CHAIN_TRIED, }$name (пропущен: квота до $DSH_QUOTA_GATE_RESET)"
       DSH_CHAIN_RESET_HINT="${DSH_CHAIN_RESET_HINT:+$DSH_CHAIN_RESET_HINT; }$name: $DSH_QUOTA_GATE_RESET"
+      _dsh_chain_record_outcome "$name" "quota_gate" "квота до $DSH_QUOTA_GATE_RESET"
       i=$((i + 1))
       continue
     fi
@@ -1498,48 +1718,260 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
     key="${!secret_env:-}"
     if [ -z "$key" ]; then
       echo "::warning::цепочка провайдеров: $name пропущен — секрет $secret_env не передан этим workflow'ом" >&2
+      _dsh_chain_record_outcome "$name" "no_secret" "секрет $secret_env не передан"
       i=$((i + 1))
       continue
     fi
-    if ! dsh_model_confirmed "$model"; then
-      echo "::error::цепочка провайдеров: $name пропущен — id модели '$model' НЕ подтверждён живым запросом к /v1/models (реестр $DSH_CONFIRMED_MODELS_FILE не несёт его хэш). Рунбук (docs/runbooks/switch-llm-provider.md, «Узнать точный id модели») запрещает экстраполяцию — сверь буква-в-букву и допиши подтверждение в реестр." >&2
+    # #1309: кандидаты моделей ЭТОГО аккаунта по порядку. Прежняя форма
+    # элемента (одна `model`) даёт ровно один кандидат — весь цикл ниже
+    # вырождается в то же самое, чем он был до #1309.
+    candidates=$(dsh_entry_model_candidates "$entry")
+    cand_count=$(jq 'length' <<<"$candidates")
+    confirmed_any=0
+    model_scoped_last=0
+    provider_outcome=""
+    # #1309 + #1121: потолок доли считается на ПРОВАЙДЕРА, а не на кандидата
+    # модели — иначе запись с тремя моделями получила бы три потолка подряд
+    # (3×300с) и вернула бы ровно ту монополию бюджета, которую #1121
+    # закрывал. Обнуляется на каждом провайдере, растёт по кандидатам.
+    provider_rl_used=0
+    ci=0
+    while [ "$ci" -lt "$cand_count" ]; do
+      cand=$(jq -c ".[$ci]" <<<"$candidates")
+      model=$(jq -r '.model' <<<"$cand")
+      max_tokens=$(jq -r '.max_output_tokens // 131072' <<<"$cand")
+      ci=$((ci + 1))
+      if ! dsh_model_confirmed "$model"; then
+        echo "::error::цепочка провайдеров: $name пропущен — id модели '$model' НЕ подтверждён живым запросом к /v1/models (реестр $DSH_CONFIRMED_MODELS_FILE не несёт его хэш). Рунбук (docs/runbooks/switch-llm-provider.md, «Узнать точный id модели») запрещает экстраполяцию — сверь буква-в-букву и допиши подтверждение в реестр." >&2
+        continue
+      fi
+      confirmed_any=1
+      model_scoped_last=0
+      DSH_CHAIN_MODELS_TRIED="${DSH_CHAIN_MODELS_TRIED:+$DSH_CHAIN_MODELS_TRIED, }$name/$model"
+      rl_true_remaining=$((chain_rl_budget - chain_rl_used))
+      [ "$rl_true_remaining" -lt 0 ] && rl_true_remaining=0
+      rl_remaining="$rl_true_remaining"
+      cap_note=""
+      provider_cap_left=$((provider_wait_cap - provider_rl_used))
+      [ "$provider_cap_left" -lt 0 ] && provider_cap_left=0
+      if [ "$rl_remaining" -gt "$provider_cap_left" ]; then
+        rl_remaining="$provider_cap_left"
+        cap_note=", провайдеру выделено не больше ${rl_remaining}с (потолок ${provider_wait_cap}с на провайдера, #1121)"
+      fi
+      echo "цепочка провайдеров: пробую $name ($base_url, $model), остаток общего бюджета RATE_LIMIT: ${rl_true_remaining}с из ${chain_rl_budget}с (#877)${cap_note}"
+      export DEEPSEEK_BASE_URL="$base_url" DEEPSEEK_MODEL="$model" DEEPSEEK_API_KEY="$key"
+      DSH_MAX_TOKENS="$max_tokens" dsh_patch_profile headless
+      DSH_RATE_LIMIT_MAX_WAIT_SECS="$rl_remaining" dsh_run_with_retry "$answer_file" "$err_file" "$prompt_text"
+      chain_rl_used=$((chain_rl_used + ${DSH_RUN_WAITED_SECS:-0}))
+      provider_rl_used=$((provider_rl_used + ${DSH_RUN_WAITED_SECS:-0}))
+      if [ "$DSH_RUN_RC" -eq 0 ]; then
+        DSH_CHAIN_PROVIDER="$name"
+        DSH_CHAIN_MODEL="$model"
+        DSH_RUN_FAILURE_REASON=""
+        provider_outcome="ok"
+        stop=1
+        break
+      fi
+      reset_hint=$(dsh_extract_reset_hint "$err_file")
+      [ -n "$reset_hint" ] && DSH_CHAIN_RESET_HINT="${DSH_CHAIN_RESET_HINT:+$DSH_CHAIN_RESET_HINT; }$name: $reset_hint"
+      # #1309: отказ, привязанный к ID МОДЕЛИ, а не к аккаунту — следующая
+      # модель ТОГО ЖЕ провайдера, аккаунт не расходуется. Ключевое: это
+      # проверяется ДО dsh_chain_should_advance, но НЕ подменяет её — если
+      # кандидаты кончились, решение о переходе к следующему аккаунту
+      # принимает она же, тем же кодом, что и до #1309.
+      if _dsh_failure_is_model_scoped "$err_file"; then
+        model_scoped_last=1
+        if [ "$ci" -lt "$cand_count" ]; then
+          echo "::warning::цепочка провайдеров: $name — модель '$model' отвергнута самим провайдером (rc=$DSH_RUN_RC, отказ привязан к id модели, не к аккаунту): пробую следующую модель ЭТОГО же провайдера, аккаунт не расходуется (#1309)" >&2
+          continue
+        fi
+      fi
+      if dsh_chain_should_advance "$err_file" "$DSH_RUN_FAILURE_REASON" "$DSH_RUN_RC"; then
+        echo "::warning::цепочка провайдеров: $name — rc=$DSH_RUN_RC, класс отказа: $DSH_CHAIN_CLASS_NOTE — пробую следующего" >&2
+      else
+        echo "::error::цепочка провайдеров: $name — rc=$DSH_RUN_RC, класс НЕ переключаемый (stderr: $DSH_CHAIN_CLASS_NOTE), дальше по цепочке не иду (следующие провайдеры не тронуты)" >&2
+        provider_outcome="stop"
+        stop=1
+      fi
+      break
+    done
+    # Исход провайдера классифицируется ЗДЕСЬ, в источнике решения (#1307).
+    if [ -z "$provider_outcome" ]; then
+      if [ "$confirmed_any" = 0 ]; then
+        provider_outcome="unconfirmed_model"
+      elif [ "$model_scoped_last" = 1 ]; then
+        provider_outcome="dead_model"
+      else
+        case "$DSH_RUN_FAILURE_REASON" in
+          quota_exhausted) provider_outcome="quota" ;;
+          rate_limit_retry_budget_exceeded) provider_outcome="our_budget" ;;
+          *) provider_outcome="transient" ;;
+        esac
+      fi
+    fi
+    _dsh_chain_record_outcome "$name" "$provider_outcome" "${DSH_CHAIN_CLASS_NOTE:-}"
+    # i НЕ растёт при stop=1: признак «весь список пройден» ниже (i >= count)
+    # обязан остаться ложным, когда цепочка остановлена решением, а не
+    # исчерпанием списка — та же семантика, что была до #1307/#1309.
+    if [ "$stop" -eq 0 ]; then
       i=$((i + 1))
-      continue
     fi
-    rl_true_remaining=$((chain_rl_budget - chain_rl_used))
-    [ "$rl_true_remaining" -lt 0 ] && rl_true_remaining=0
-    rl_remaining="$rl_true_remaining"
-    cap_note=""
-    if [ "$rl_remaining" -gt "$provider_wait_cap" ]; then
-      rl_remaining="$provider_wait_cap"
-      cap_note=", провайдеру выделено не больше ${rl_remaining}с (потолок ${provider_wait_cap}с на провайдера, #1121)"
-    fi
-    echo "цепочка провайдеров: пробую $name ($base_url, $model), остаток общего бюджета RATE_LIMIT: ${rl_true_remaining}с из ${chain_rl_budget}с (#877)${cap_note}"
-    export DEEPSEEK_BASE_URL="$base_url" DEEPSEEK_MODEL="$model" DEEPSEEK_API_KEY="$key"
-    DSH_MAX_TOKENS="$max_tokens" dsh_patch_profile headless
-    DSH_RATE_LIMIT_MAX_WAIT_SECS="$rl_remaining" dsh_run_with_retry "$answer_file" "$err_file" "$prompt_text"
-    chain_rl_used=$((chain_rl_used + ${DSH_RUN_WAITED_SECS:-0}))
-    if [ "$DSH_RUN_RC" -eq 0 ]; then
-      DSH_CHAIN_PROVIDER="$name"
-      DSH_RUN_FAILURE_REASON=""
-      stop=1
-      continue
-    fi
-    reset_hint=$(dsh_extract_reset_hint "$err_file")
-    [ -n "$reset_hint" ] && DSH_CHAIN_RESET_HINT="${DSH_CHAIN_RESET_HINT:+$DSH_CHAIN_RESET_HINT; }$name: $reset_hint"
-    if dsh_chain_should_advance "$err_file" "$DSH_RUN_FAILURE_REASON" "$DSH_RUN_RC"; then
-      echo "::warning::цепочка провайдеров: $name — rc=$DSH_RUN_RC, класс отказа: $DSH_CHAIN_CLASS_NOTE — пробую следующего" >&2
-      i=$((i + 1))
-      continue
-    fi
-    echo "::error::цепочка провайдеров: $name — rc=$DSH_RUN_RC, класс НЕ переключаемый (stderr: $DSH_CHAIN_CLASS_NOTE), дальше по цепочке не иду (следующие провайдеры не тронуты)" >&2
-    stop=1
   done
   if [ -z "$DSH_CHAIN_PROVIDER" ] && [ "$i" -ge "$count" ]; then
     DSH_RUN_FAILURE_REASON="all_providers_exhausted"
-    echo "::error::цепочка провайдеров исчерпана целиком ($DSH_CHAIN_TRIED)${DSH_CHAIN_RESET_HINT:+ — сброс: $DSH_CHAIN_RESET_HINT}" >&2
+    _dsh_chain_report_exhausted "$count"
   fi
   DSH_CHAIN_ACTIVE="$_prev_chain_active"
+}
+
+# Итог цепочки числами, а не одной фразой (#1307, живой разбор прогона
+# ai-review 34965204800 и worker.yml 35010410097). Прежнее сообщение —
+# «цепочка провайдеров исчерпана целиком (GLM, OpenRouter-2, …)» — склеивало
+# несовместимые классы: из восьми провайдений РЕАЛЬНО без квоты был ОДИН
+# (GLM, сброс 2026-09-17), пять отвалились по НАШЕМУ исчерпанному бюджету
+# ожидания (пул съел его целиком, см. dsh_run_with_pool_then_chain), два
+# несли мёртвый id модели. Владелец читал «исчерпана целиком» и делал вывод
+# «ждать сброса до 17-го», хотя шесть из восьми не были опробованы
+# по-настоящему. AGENTS.md, «Алерт не гадает»: данные для различения уже
+# лежат в DSH_CHAIN_OUTCOMES — сообщение обязано их назвать, а не предлагать
+# читателю догадаться.
+_dsh_chain_report_exhausted() { # count
+  local total=$1 quota=0 budget=0 config=0 transient=0 other=0
+  local names_quota="" names_budget="" names_config="" names_transient=""
+  local cls nm
+  while IFS=$'\t' read -r nm cls _; do
+    [ -n "$nm" ] || continue
+    case "$cls" in
+      quota|quota_gate)
+        quota=$((quota + 1)); names_quota="${names_quota:+$names_quota, }$nm" ;;
+      our_budget)
+        budget=$((budget + 1)); names_budget="${names_budget:+$names_budget, }$nm" ;;
+      no_secret|unconfirmed_model|dead_model)
+        config=$((config + 1)); names_config="${names_config:+$names_config, }$nm ($cls)" ;;
+      transient)
+        transient=$((transient + 1)); names_transient="${names_transient:+$names_transient, }$nm" ;;
+      *)
+        other=$((other + 1)) ;;
+    esac
+  done <<<"$DSH_CHAIN_OUTCOMES"
+  DSH_CHAIN_OUTCOME_SUMMARY="реально без квоты: $quota из $total; не пробованы по-настоящему (наш бюджет ожидания исчерпан): $budget; мёртвая конфигурация (нет секрета/неподтверждённый id/снятая моделью): $config; транзиентных отказов: $transient"
+  if [ "$((budget + transient))" -gt 0 ]; then
+    DSH_CHAIN_RETRY_USEFUL=1
+  else
+    DSH_CHAIN_RETRY_USEFUL=0
+  fi
+  if [ "$quota" -eq "$total" ]; then
+    # Единственный случай, где прежняя формулировка верна буквально.
+    echo "::error::цепочка провайдеров исчерпана целиком ($DSH_CHAIN_TRIED)${DSH_CHAIN_RESET_HINT:+ — сброс: $DSH_CHAIN_RESET_HINT} — все $total реально без квоты, повтор до сброса бессмысленен" >&2
+    return 0
+  fi
+  local action=""
+  [ "$budget" -gt 0 ] && action="${action:+$action; }освободить бюджет ожидания RATE_LIMIT (DSH_RATE_LIMIT_MAX_WAIT_SECS/DSH_RATE_LIMIT_PROVIDER_CAP_SECS) — у $budget провайдер(а/ов) ($names_budget) лимит не снялся в отведённой им доле бюджета: это НАШ тормоз, а не их квота"
+  [ "$config" -gt 0 ] && action="${action:+$action; }починить конфигурацию: $names_config (docs/runbooks/switch-llm-provider.md, «Узнать точный id модели»)"
+  [ "$transient" -gt 0 ] && action="${action:+$action; }повторить прогон — $transient транзиентный(х) отказ(ов) ($names_transient)"
+  [ "$quota" -gt 0 ] && action="${action:+$action; }дождаться сброса квоты у: $names_quota${DSH_CHAIN_RESET_HINT:+ ($DSH_CHAIN_RESET_HINT)}"
+  echo "::error::цепочка провайдеров не дала ответа, но НЕ «исчерпана целиком»: $DSH_CHAIN_OUTCOME_SUMMARY. Опробованы: $DSH_CHAIN_TRIED. Действие: ${action:-причину установить не удалось — ни один класс исхода не распознан, см. лог выше}" >&2
+}
+
+# #1288 (живой инцидент, прогон worker.yml 34893177035, 20:28:57→23:39:14 =
+# 11417с/3ч10мин): пул отказал в 20:30:30 телом
+# `{"type":"error","error":{"type":"pool_unavailable","message":"No Anthropic
+# account is available","retryAt":1789418114634}}` — `retryAt` (мс с эпохи)
+# называл момент возврата 20:35:14, через 284с/4м44с. Отказ был прочитан
+# только как факт «пул недоступен» — момент возврата, лежавший в том же теле
+# ответа, никто не разобрал, и прогон вместо ожидания 284с потратил все
+# 11417с на резервную цепочку (три провайдера дали rate_limit_retry_budget_
+# exceeded, GLM провисел полный DSH_TIMEOUT_SECS=7200с). AGENTS.md, «Алерт не
+# гадает»: пул сам назвал факт, его нужно читать, не переспрашивать отказом.
+#
+# `retryAt` разбирается ТОЛЬКО из тела с `"type":"pool_unavailable"` (не из
+# произвольного JSON, где поле `retryAt` могло бы значить что угодно другое)
+# — см. `_dsh_pool_retry_at_wait_secs` ниже. Четыре исхода вместо одного:
+#   1. Пул отказал НЕ формой pool_unavailable (сеть, 401/403, битый JSON,
+#      просто текст) — как и раньше: одна попытка, откат на цепочку.
+#   2. pool_unavailable + retryAt, момент близко (≤ DSH_POOL_RETRY_AT_MAX_
+#      WAIT_SECS остатка бюджета ожидания) — ждём РОВНО названное время и
+#      повторяем ТОТ ЖЕ пул (не цепочку) — прод-сценарий #1288 живёт здесь;
+#      повторов НЕ БОЛЬШЕ DSH_POOL_RETRY_AT_MAX_RETRIES (см. ниже).
+#   3. pool_unavailable + retryAt, момент дальше бюджета ожидания, ИЛИ поле
+#      отсутствует/не число — откат на цепочку, но сообщение честно называет,
+#      какой из двух случаев это был (не молчит, AGENTS.md «Алерт не гадает»).
+#   4. Повторы из п.2 исчерпаны (пул продолжает отвечать занятостью — в т.ч.
+#      с retryAt в прошлом/нуле, чьё «ожидание» не тратит бюджет вовсе) —
+#      откат на цепочку, сообщение называет потолок повторов (блокер ai-review
+#      PR #1292, вердикт rework: без потолка цикл не кончается никогда).
+#
+# DSH_POOL_RETRY_AT_MAX_WAIT_SECS (необязательный, по умолчанию 300с) —
+# СУММАРНЫЙ бюджет ожидания retryAt за весь вызов этой функции (не за одну
+# попытку — пул может отдать НОВЫЙ retryAt на повторе, цикл ниже вычитает
+# уже проспанное, как dsh_run_with_retry вычитает RATE_LIMIT-ожидание из
+# max_wait). Порог 300с — тот же уже принятый в этом файле для «сколько
+# разумно ждать один провайдер, прежде чем считать его подвисшим»
+# (DSH_RATE_LIMIT_PROVIDER_CAP_SECS, #1121, тот же дефолт 300с) — не новая
+# цифра «на глаз» (AGENTS.md, «Порог обоснуй замером»), а переиспользование
+# уже обоснованного порядка величины. Обоснование числом на живых данных:
+# наблюдаемый retryAt инцидента #1288 — 284с, порог даёт ~16с запаса поверх
+# единственного известного образца (честная оговорка — второго образца
+# retryAt в репозитории нет, «не подтверждено» для распределения этой
+# величины в общем случае). Цена ожидания против цены отказа от него —
+# несимметрична на два порядка: до 300с ожидания против 11417с (3ч10мин),
+# которые тот же прогон #1288 потратил на резервную цепочку без этого фикса
+# — даже если бы бюджет ожидания был выжжен впустую (пул НЕ ответил и на
+# повторе), проигрыш ограничен бюджетом (≤300с ожидания) ПЛЮС попытками
+# пула — названы ОБЕ границы: норма по #1288/#1067 — секунды-десятки секунд
+# на попытку; худший случай — DSH_POOL_RETRY_AT_MAX_RETRIES+1 полных попыток
+# dsh_run_with_retry, каждая до DSH_TIMEOUT_SECS (7200с в worker.yml), т.е.
+# ЧАСЫ (см. следующий абзац про «три полные попытки»), и сверку с
+# 68-минутным запасом worker.yml надо считать по этой, большей, цифре.
+# Общий
+# 340-минутный потолок job'а (worker.yml, обоснование #1160/PR #1247: худший
+# легитимный прогон ≈272 мин, ~68 мин запаса) этот бюджет не задевает — 300с
+# на два порядка меньше свободного запаса.
+#
+# DSH_POOL_RETRY_AT_MAX_RETRIES (необязательный, по умолчанию 2) — потолок
+# ПОВТОРОВ пула, отдельный от бюджета ожидания: retryAt в прошлом/нуле
+# клампится к нулю, `sleep 0` НЕ расходует суммарный бюджет, и без отдельного
+# счётчика цикл «пул занят → повтор немедленно» не кончается никогда (блокер
+# ai-review PR #1292, вердикт rework; живой замер ревьюера: заглушка, вечно
+# отвечающая телом инцидента с retryAt = now−5с, дала 582 вызова пула за
+# 15с — процесс убит по таймауту, до цепочки дело не дошло). Значение 2 —
+# исходная попытка плюс два повтора: закрывает прод-сценарий #1288 (одно
+# ожидание 284с + повтор) с запасом ещё на одну занятость, худший случай
+# ограничен тремя полными попытками dsh_run_with_retry. Замерной базы для
+# распределения ИМЕННО ЧИСЛА повторов нет, «не подтверждено» — потолок
+# переопределяется переменной без правки кода.
+#
+# Честная граница: `retryAt` — заявление ПУЛА, не факт, который мы можем
+# проверить иначе, кроме как повторным запросом. Пул может ошибиться или
+# сообщить время, которое всё равно окажется занятым, — цикл ниже не ждёт
+# ДОЛЬШЕ суммарного бюджета И не делает БОЛЬШЕ DSH_POOL_RETRY_AT_MAX_RETRIES
+# повторов ни при каких повторных retryAt (два газа на одном тормозе,
+# AGENTS.md «тормоз без газа не принимается») и, исчерпав любой из них,
+# честно откатывается на цепочку — не то же самое, что «ждать/повторять,
+# пока пул не ответит», а именно ограниченная, разово обоснованная попытка
+# не тратить резерв зря.
+# Единая вырезка тела pool_unavailable из stderr (класс «жадная вырезка»,
+# раунд 4 PR #1193): ПОСТРОЧНО, якорем `"type":"pool_unavailable"`, последнее
+# вхождение — grep физически не выходит за пределы строки тела, чужой JSON
+# до/после тела не прилипает. Одно место правды на
+# dsh_pool_unavailable_owner_note и _dsh_pool_retry_at_wait_secs. redact()
+# первым звеном маскирует производные секрета (#743), структуру тела не ломает.
+_dsh_pool_unavailable_body() { # err_file -> подстрока от якоря до конца строки тела
+  redact <"$1" 2>/dev/null | grep -oE '"type":"pool_unavailable".*' 2>/dev/null | tail -1
+}
+
+_dsh_pool_retry_at_wait_secs() { # err_file -> секунды до retryAt на stdout, rc=0 если разобрано
+  local err_file=$1 pool_body retry_at_ms now_ms
+  pool_body=$(_dsh_pool_unavailable_body "$err_file")
+  [ -n "$pool_body" ] || return 1
+  # Поля читаются тем же приёмом, что reason в dsh_pool_unavailable_owner_note:
+  # вырезанная строка НЕ валидный JSON (обрезана якорем с обеих сторон), jq
+  # сюда не годится — только ограниченные грепы по конкретным полям.
+  retry_at_ms=$(printf '%s' "$pool_body" | grep -oE '"retryAt":[0-9]+' | head -1 | grep -oE '[0-9]+') || retry_at_ms=""
+  [[ "$retry_at_ms" =~ ^[0-9]+$ ]] || return 1
+  now_ms=$(( $(date +%s) * 1000 ))
+  echo $(( (retry_at_ms - now_ms) / 1000 ))
+  return 0
 }
 
 # ── Быстрый провайдер первым, цепочка — фоллбэком (#838) ────────────────────
@@ -1552,7 +1984,9 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
 # ОДНИМ прогоном (сам пул уже перебирает все свои аккаунты на 429/401/403
 # внутри одного HTTP-вызова, lib/index.js::forward плагина — повторять этот
 # перебор снаружи циклом бессмысленно), при отказе — штатная
-# dsh_run_with_provider_chain вызывается КАК ЕСТЬ, без изменений.
+# dsh_run_with_provider_chain вызывается КАК ЕСТЬ, без изменений. Отдельно —
+# #1288 выше: явный `retryAt` пула повторяет ТОТ ЖЕ пул, не переходит на
+# цепочку раньше времени.
 #
 # Пул неактивен (DSH_ANTHROPIC_POOL_ACTIVE=0, нет секретов) — сразу цепочка,
 # нулевое изменение поведения для конфигурации без пула.
@@ -1561,37 +1995,235 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
 # (DSH_RUN_RC/DSH_RUN_FAILURE_REASON/DSH_CHAIN_PROVIDER/DSH_CHAIN_TRIED/
 # DSH_CHAIN_RESET_HINT) — вызывающие (worker/hands/ai-review) читают ровно те
 # же переменные, что и раньше, независимо от того, ответил пул или цепочка.
+# ── Причина pool_unavailable — различить, нужен ли владелец (#1192) ─────────
+#
+# «pool_unavailable» сам по себе — агрегат «ни один аккаунт не доступен», он
+# НЕ говорит, почему: 401/403 (креды отвергнуты Anthropic, нужен перевыпуск
+# секретов ВЛАДЕЛЬЦЕМ) и 429 (лимит Anthropic, само пройдёт) выглядели
+# снаружи одинаковым текстом. Патч плагина (classifyPoolUnavailable,
+# lib/pool.js, scripts/lib/patch_anthropic_pool_plugin.py) кладёт
+# машиночитаемое поле `reason` прямо в JSON-тело ответа — читаем его отсюда,
+# не гадаем по тексту (AGENTS.md, «Алерт не гадает»). Поле извлекается
+# регэкспом по СЫРОМУ stderr (не через jq на всю строку) — префикс "dsh:
+# SERVER: 503 " и то, что JSON лежит внутри чужого текстового сообщения, не
+# гарантируют валидный самостоятельный JSON-объект при наивной вырезке
+# подстроки.
+#
+# Четыре исхода, каждый — ФАКТ, не гипотеза:
+#   auth_rejected  — аккаунт(ы) отвергнуты Anthropic (401/403), владелец нужен;
+#   rate_limited   — аккаунт(ы) исчерпали лимит (429), само пройдёт;
+#   network_error  — исключение при попытке (не HTTP-ответ), не подтверждено;
+#   unknown — в записанном состоянии аккаунтов нет ни 401/403, ни 429, ни
+#     ошибки (аккаунт мог ни разу не пробоваться, либо последний ответ был
+#     вне этих классов), не подтверждено;
+#   поле reason отсутствует в теле — плагин сам не смог классифицировать,
+#     либо патч не применился/апстрим сменил форму — так и сказано, без
+#     подстановки одной из гипотез выше вместо честного пробела.
+#
+# Отказ пула МОЖЕТ вообще не быть отказом `pool_unavailable` (таймаут,
+# ошибка соединения с локальным прокси, что угодно другое) — сообщение
+# «поле reason отсутствует» иначе утверждало бы факт (тело pool_unavailable
+# было и не несло reason), который в этом случае не проверялся: сначала
+# смотрим, есть ли в stderr вообще тело `pool_unavailable`, и только тогда
+# говорим про отсутствующее поле — иначе честно называем, что тела не нашли.
+#
+# `reason` вырезается ИЗ ТЕЛА pool_unavailable, не из всего err_file целиком
+# (находка ai-review PR #1193, третий раунд): stderr может нести и чужой,
+# не относящийся к пулу JSON/текст со СВОИМ полем `reason` — поиск по всему
+# файлу подобрал бы его, приписав пулу чужой факт. `pool_body` — строка,
+# содержащая `"type":"pool_unavailable"` (прод-форма — один
+# `dsh: SERVER: 503 {...}` на строку); grep ПОСТРОЧЕН, поэтому `.*` в
+# регэкспе физически не может выйти за пределы строки тела — находка
+# ai-review PR #1193, четвёртый раунд: прежний `tr '\n' ' '` схлопывал весь
+# err_file в ОДНУ строку ДО вырезки, и жадный `.*` забирал хвост файла,
+# принимая чужой `reason` из любой последующей строки stderr за причину
+# пула. `reason`/`retryAt` читаются только из вырезанной строки тела.
+dsh_pool_unavailable_owner_note() { # err_file
+  local err_file=$1 pool_reason pool_retry_at retry_note note has_body=0 pool_body
+  # Вырезка тела — общая с _dsh_pool_retry_at_wait_secs (#1288): одно место
+  # правды, построчный якорь вместо жадной вырезки (раунд 4 PR #1193).
+  pool_body=$(_dsh_pool_unavailable_body "$err_file") || pool_body=""
+  if [ -n "$pool_body" ]; then
+    has_body=1
+    pool_reason=$(printf '%s' "$pool_body" | grep -oE '"reason":"[a-z_]+"' | head -1 | sed -E 's/.*"reason":"([a-z_]+)".*/\1/') || pool_reason=""
+  else
+    pool_reason=""
+  fi
+  case "$pool_reason" in
+    auth_rejected)
+      note="ПРИЧИНА: аккаунт(ы) пула отвергнуты Anthropic (401/403) — нужен перевыпуск секретов ${ANTHROPIC_OAUTH_ACCOUNT_SECRETS[*]}, владелец нужен"
+      ;;
+    rate_limited)
+      pool_retry_at=$(printf '%s' "$pool_body" | grep -oE '"retryAt":[0-9]+' | head -1 | grep -oE '[0-9]+') || pool_retry_at=""
+      retry_note=""
+      if [ -n "$pool_retry_at" ]; then
+        retry_note=", ретрай ~$(jq -nr --argjson ms "$pool_retry_at" '($ms/1000)|gmtime|strftime("%Y-%m-%d %H:%M:%SZ")' 2>/dev/null || printf '%s' "$pool_retry_at")"
+      fi
+      note="ПРИЧИНА: аккаунт(ы) пула исчерпали лимит Anthropic (429)${retry_note}, само пройдёт, владелец НЕ нужен"
+      ;;
+    network_error)
+      note="ПРИЧИНА: сетевая ошибка при обращении к Anthropic (не 401/403/429) — владелец, вероятно, не нужен, но не подтверждено (проверь сеть/таймауты)"
+      ;;
+    unknown)
+      # Нейтральная формулировка (находка ai-review PR #1193, раунд 4): класс
+      # unknown в classifyPoolUnavailable шире, чем «ни разу не пробовался», —
+      # он покрывает и записанный lastStatus вне {401,403,429} (200/5xx из
+      # прошлых вызовов живут в runtime-состоянии так же, как 401). Формулировка
+      # называет ТО, что реально проверено по записанному состоянию.
+      note="причина не установлена: в записанном состоянии аккаунтов пула нет ни 401/403, ни 429, ни ошибки (не подтверждено, нужен ли владелец)"
+      ;;
+    "")
+      if [ "$has_body" = 1 ]; then
+        note="причина не классифицирована — тело pool_unavailable есть, но без поля reason (патч classifyPoolUnavailable не применился либо форма ответа изменилась), не подтверждено, нужен ли владелец"
+      else
+        note="причина не классифицирована — тело pool_unavailable в stderr не найдено (отказ пула, возможно, по другой причине), не подтверждено, нужен ли владелец"
+      fi
+      ;;
+    *)
+      note="причина не распознана (reason='$pool_reason', неизвестный класс) — не подтверждено, нужен ли владелец"
+      ;;
+  esac
+  printf '%s' "$note"
+}
+
+# ── Поаккаунтная разбивка пула доходит до лога (#1310) ─────────────────────
+#
+# #1192 положил в тело `pool_unavailable` машиночитаемую разбивку `accounts`
+# ([{id,class,lastStatus,cooldownUntil}]) — ровно то, что отвечает на вопрос
+# «какой из двух ключей ещё живой». В лог она не попадала НИ РАЗУ: текстовый
+# хвост (`pool_err_note`, 200 символов — #1067) обрывается буквально на
+# `"accounts":[{"id":"anthropic-1","c` — дословно так в живых прогонах
+# worker.yml 34942030597 (2026-09-15T08:04:16Z) и 35010410097
+# (2026-09-15T19:28:38Z). То есть поле, добавленное ради различения
+# «отвергнут» от «исчерпан», физически не доезжало до читателя, и
+# агрегатный `reason` (плагин считает его через `some()`) оставался
+# единственным, что видно: «rate_limited» верен и когда 429 у ОДНОГО
+# аккаунта, а второй в этом процессе не пробовался вовсе.
+#
+# Разбивка вырезается ОТДЕЛЬНО от текстового хвоста и печатается целиком —
+# секретов в ней нет по построению: только id аккаунта, класс и числовой код
+# ответа (classifyPoolUnavailable, scripts/lib/patch_anthropic_pool_plugin.py).
+# Вырезка идёт из уже redact-нутого тела (_dsh_pool_unavailable_body) и
+# ограничена одним `[...]` без вложенных скобок — массив объектов без
+# вложенных массивов, прод-форма плагина.
+dsh_pool_accounts_note() { # err_file -> "anthropic-1: rate_limited (HTTP 429), anthropic-2: unknown"
+  local pool_body accounts rendered
+  pool_body=$(_dsh_pool_unavailable_body "$1") || pool_body=""
+  if [ -z "$pool_body" ]; then printf '%s' ""; return 0; fi
+  accounts=$(printf '%s' "$pool_body" | grep -oE '"accounts":\[[^]]*\]' | head -1) || accounts=""
+  if [ -z "$accounts" ]; then printf '%s' ""; return 0; fi
+  rendered=$(printf '%s' "${accounts#\"accounts\":}" | jq -r '
+      [ .[]
+        | "\(.id): \(.class)"
+          + (if .lastStatus then " (HTTP \(.lastStatus))" else "" end)
+      ] | join(", ")' 2>/dev/null) || rendered=""
+  if [ -z "$rendered" ]; then
+    rendered="разбивка по аккаунтам в теле есть, но не разобралась — форма ответа плагина изменилась (#1310)"
+  fi
+  printf '%s' "$rendered"
+  return 0
+}
+
 dsh_run_with_pool_then_chain() { # answer_file err_file prompt_text
   local answer_file=$1 err_file=$2 prompt_text=$3
-  local pool_rl_used=0 pool_err_note
+  local pool_rl_used=0 pool_err_note pool_reason_note pool_accounts_note
+  # #1307 (живой инцидент, прогоны worker.yml 34942030597 и 35010410097
+  # 2026-09-15): пул шёл через dsh_run_with_retry БЕЗ потолка доли
+  # провайдера — тем же вызовом, что цепочка делает с
+  # DSH_RATE_LIMIT_PROVIDER_CAP_SECS (#1121), но без него. Тело отказа пула
+  # (`dsh: RATE_LIMIT: 503 {"type":"error",…"pool_unavailable"…}`) несёт
+  # литерал `RATE_LIMIT:`, поэтому dsh_run_with_retry считал его обычным
+  # временным лимитом и выжигал ВЕСЬ общий бюджет (1800с) на десяти
+  # попытках; ветка retryAt (#1288) запускала пул ЗАНОВО — и снова с полным
+  # бюджетом, потому что DSH_RATE_LIMIT_MAX_WAIT_SECS в этом цикле не
+  # уменьшался. Замер: 07:31:18→08:41:56 = 70 минут сна до первой попытки
+  # цепочки, после чего все восемь провайдеров получили «остаток общего
+  # бюджета RATE_LIMIT: 0с из 1800с» и сдавались на первом же ответе
+  # (`rate_limit_retry_budget_exceeded` у пяти из восьми) — комментарий ниже
+  # обещал «пул — 1-я из 10 попыток прогона, не отдельная ось», код этого не
+  # обеспечивал.
+  #
+  # Теперь пул — такой же потребитель ОДНОЙ доли, как любой элемент цепочки:
+  # не больше DSH_RATE_LIMIT_PROVIDER_CAP_SECS (300с) СУММАРНО за все свои
+  # попытки, включая повторы по retryAt, и не больше того, что осталось от
+  # общего бюджета. Остаток уходит цепочке ровно тем же initial_rl_used, что
+  # и раньше.
+  local pool_rl_budget="${DSH_RATE_LIMIT_MAX_WAIT_SECS:-1800}"
+  local pool_wait_cap="${DSH_RATE_LIMIT_PROVIDER_CAP_SECS:-300}"
+  local pool_share pool_budget_left
+  local pool_retry_at_budget="${DSH_POOL_RETRY_AT_MAX_WAIT_SECS:-300}"
+  local pool_retry_at_max_retries="${DSH_POOL_RETRY_AT_MAX_RETRIES:-2}"
+  local pool_retry_at_waited=0 pool_retry_at_retries=0 retry_at_wait budget_left
   if [ "${DSH_ANTHROPIC_POOL_ACTIVE:-0}" = "1" ]; then
-    echo "быстрый провайдер: пробую Anthropic OAuth Pool (failover между аккаунтами — внутри одного вызова, lib/index.js плагина)"
-    _dsh_patch_profile_anthropic_pool headless
-    dsh_run_with_retry "$answer_file" "$err_file" "$prompt_text"
-    if [ "$DSH_RUN_RC" -eq 0 ]; then
-      DSH_CHAIN_PROVIDER="anthropic-oauth-pool"
-      DSH_CHAIN_TRIED="anthropic-oauth-pool"
-      DSH_CHAIN_RESET_HINT=""
-      DSH_RUN_FAILURE_REASON=""
-      return 0
-    fi
-    # #877/#880: пул — 1-я из 10 попыток прогона, не отдельная ось бюджета
-    # RATE_LIMIT — потраченное им ожидание обязано вычитаться из общего
-    # бюджета цепочки, иначе она получит полный бюджет заново (находка
-    # ai-review PR #880 на первой версии этого фикса).
-    pool_rl_used="${DSH_RUN_WAITED_SECS:-0}"
-    # #1067 (живой инцидент, прогон worker.yml 34735752165): раньше это
-    # сообщение называло только rc — сам stderr пула читался бы из ТОГО ЖЕ
-    # $err_file, что цепочка ниже перезаписывает на своей первой попытке
-    # (dsh_run_with_retry всегда открывает err_file `>`, не дописывает) —
-    # причина отказа пула терялась НАВСЕГДА, ни в одном логе прогона её не
-    # найти (AGENTS.md, «Алерт не гадает»: rc=1 без единого слова причины —
-    # то же самое гадание, только без вопросительного знака). Хвост читаем
-    # ЗДЕСЬ, до перезаписи, тем же приёмом, что dsh_chain_should_advance уже
-    # применяет к провайдерам цепочки (200 символов, redact).
-    pool_err_note=$(tr '\n' ' ' <"$err_file" | cut -c1-200 | redact)
-    [ -n "$pool_err_note" ] || pool_err_note="stderr пуст — диагностику дать не может"
-    echo "::warning::быстрый провайдер Claude (anthropic-oauth-pool) отказал (rc=$DSH_RUN_RC), причина: $pool_err_note — пробую цепочку vars.DSH_PROVIDER_CHAIN/манифеста использования (#838)"
+    while :; do
+      pool_budget_left=$((pool_rl_budget - pool_rl_used))
+      [ "$pool_budget_left" -lt 0 ] && pool_budget_left=0
+      pool_share=$((pool_wait_cap - pool_rl_used))
+      [ "$pool_share" -lt 0 ] && pool_share=0
+      [ "$pool_share" -gt "$pool_budget_left" ] && pool_share="$pool_budget_left"
+      echo "быстрый провайдер: пробую Anthropic OAuth Pool (failover между аккаунтами — внутри одного вызова, lib/index.js плагина), доля общего бюджета RATE_LIMIT: ${pool_share}с (потолок ${pool_wait_cap}с на провайдера из ${pool_rl_budget}с, остальное остаётся цепочке, #1307)"
+      _dsh_patch_profile_anthropic_pool headless
+      DSH_RATE_LIMIT_MAX_WAIT_SECS="$pool_share" dsh_run_with_retry "$answer_file" "$err_file" "$prompt_text"
+      if [ "$DSH_RUN_RC" -eq 0 ]; then
+        DSH_CHAIN_PROVIDER="anthropic-oauth-pool"
+        DSH_CHAIN_TRIED="anthropic-oauth-pool"
+        DSH_CHAIN_RESET_HINT=""
+        DSH_RUN_FAILURE_REASON=""
+        return 0
+      fi
+      # #877/#880: пул — 1-я из 10 попыток прогона, не отдельная ось бюджета
+      # RATE_LIMIT — потраченное им ожидание обязано вычитаться из общего
+      # бюджета цепочки, иначе она получит полный бюджет заново (находка
+      # ai-review PR #880 на первой версии этого фикса).
+      pool_rl_used=$(( pool_rl_used + ${DSH_RUN_WAITED_SECS:-0} ))
+      # #1067 (живой инцидент, прогон worker.yml 34735752165): раньше это
+      # сообщение называло только rc — сам stderr пула читался бы из ТОГО ЖЕ
+      # $err_file, что цепочка ниже перезаписывает на своей первой попытке
+      # (dsh_run_with_retry всегда открывает err_file `>`, не дописывает) —
+      # причина отказа пула терялась НАВСЕГДА, ни в одном логе прогона её не
+      # найти (AGENTS.md, «Алерт не гадает»: rc=1 без единого слова причины —
+      # то же самое гадание, только без вопросительного знака). Хвост читаем
+      # ЗДЕСЬ, до перезаписи, тем же приёмом, что dsh_chain_should_advance уже
+      # применяет к провайдерам цепочки (200 символов, redact).
+      pool_err_note=$(tr '\n' ' ' <"$err_file" | cut -c1-200 | redact)
+      [ -n "$pool_err_note" ] || pool_err_note="stderr пуст — диагностику дать не может"
+      # #1192: reason читаем ДО той же перезаписи err_file, которой посвящён
+      # комментарий #1067 выше — тем же приёмом («здесь, до перезаписи»).
+      # Ребейз на c1df957 (#1192/#1193): note владельца печатается на КАЖДОМ
+      # исходе пула, а не только на финальном откате — владелец видит
+      # auth_rejected («владелец нужен») уже в первом предупреждении. ЭТО
+      # НЕ ГЕЙТ: код ниже reason не читает и ожидание по нему не отменяет —
+      # при auth_rejected ожидание/повторы могут оказаться заведомо
+      # безнадёжными, вред ограничен потолками (бюджет 300с, ≤2 повтора);
+      # гейт по reason — отдельное решение, не сделано в этом PR.
+      pool_reason_note=$(dsh_pool_unavailable_owner_note "$err_file")
+      # #1310: разбивка по аккаунтам — читается ЗДЕСЬ же, до перезаписи
+      # err_file цепочкой, тем же приёмом, что reason выше.
+      pool_accounts_note=$(dsh_pool_accounts_note "$err_file")
+      [ -n "$pool_accounts_note" ] && pool_accounts_note=" — аккаунты: $pool_accounts_note"
+      if retry_at_wait=$(_dsh_pool_retry_at_wait_secs "$err_file"); then
+        budget_left=$((pool_retry_at_budget - pool_retry_at_waited))
+        if [ "$budget_left" -gt 0 ] && [ "$retry_at_wait" -le "$budget_left" ]; then
+          # Блокер ai-review PR #1292: retryAt в прошлом/нуле клампится к нулю
+          # ниже, `sleep 0` не тратит бюджет — бюджет здесь НЕ ограничивает
+          # цикл; единственный газ на этом пути — счётчик повторов.
+          if [ "$pool_retry_at_retries" -ge "$pool_retry_at_max_retries" ]; then
+            echo "::warning::быстрый провайдер Claude (anthropic-oauth-pool) занят (rc=$DSH_RUN_RC), причина: $pool_err_note — $pool_reason_note$pool_accounts_note — пул сам назвал момент возврата через ${retry_at_wait}с, исчерпан потолок повторов пула ($pool_retry_at_retries из $pool_retry_at_max_retries, остаток бюджета ожидания ${budget_left}с из ${pool_retry_at_budget}с) — не жду, пробую цепочку vars.DSH_PROVIDER_CHAIN/манифеста использования (#1288)"
+            break
+          fi
+          [ "$retry_at_wait" -gt 0 ] || retry_at_wait=0
+          echo "::warning::быстрый провайдер Claude (anthropic-oauth-pool) занят (rc=$DSH_RUN_RC), причина: $pool_err_note — $pool_reason_note$pool_accounts_note — пул сам назвал момент возврата через ${retry_at_wait}с (бюджет ожидания ${pool_retry_at_budget}с, уже ждал ${pool_retry_at_waited}с) — жду и повторяю тем же провайдером (#1288)"
+          sleep "$retry_at_wait"
+          pool_retry_at_waited=$((pool_retry_at_waited + retry_at_wait))
+          pool_retry_at_retries=$((pool_retry_at_retries + 1))
+          continue
+        fi
+        echo "::warning::быстрый провайдер Claude (anthropic-oauth-pool) занят (rc=$DSH_RUN_RC), причина: $pool_err_note — $pool_reason_note$pool_accounts_note — пул назвал момент возврата через ${retry_at_wait}с, это дольше остатка бюджета ожидания (${budget_left}с из ${pool_retry_at_budget}с, уже ждал ${pool_retry_at_waited}с) — не жду, пробую цепочку vars.DSH_PROVIDER_CHAIN/манифеста использования (#1288)"
+        break
+      fi
+      echo "::warning::быстрый провайдер Claude (anthropic-oauth-pool) отказал (rc=$DSH_RUN_RC), причина: $pool_err_note — $pool_reason_note$pool_accounts_note — пробую цепочку vars.DSH_PROVIDER_CHAIN/манифеста использования (#838)"
+      break
+    done
   fi
   dsh_run_with_provider_chain "$answer_file" "$err_file" "$prompt_text" "$pool_rl_used"
   if [ "${DSH_ANTHROPIC_POOL_ACTIVE:-0}" = "1" ]; then

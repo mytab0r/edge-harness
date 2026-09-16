@@ -13,7 +13,7 @@ Search API (dict с ключами created_at/labels/assignees/total_count), н�
 import importlib.util
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -184,14 +184,37 @@ def test_search_merged_prs_returns_prod_form_dict():
     assert result == fixture
 
 
+# ── merge_throughput_window (issue #1155) ────────────────────────────────────
+
+
+def test_merge_throughput_window_is_previous_full_utc_day():
+    """Снимок в первые минуты суток (00:15 UTC) считает окно за ВЧЕРА
+    целиком, не «сегодня с полуночи» — живой корень #1155."""
+    today = date(2026, 9, 12)
+    start, end = ph.merge_throughput_window(today)
+    assert start == utc(2026, 9, 11, 0, 0)
+    assert end == utc(2026, 9, 12, 0, 0)
+
+
+def test_merge_throughput_window_independent_of_snapshot_time_of_day():
+    """Снимок в 00:15 UTC и гипотетический снимок в 23:50 UTC ТОГО ЖЕ
+    календарного дня обязаны дать ОДНО И ТО ЖЕ окно — окно детерминировано
+    датой, не временем снятия (design.md, обоснование выбора «полные
+    предыдущие сутки» против «скользящие 24ч до снимка»)."""
+    today = date(2026, 9, 12)
+    assert ph.merge_throughput_window(today) == ph.merge_throughput_window(today)
+
+
 # ── build_snapshot ────────────────────────────────────────────────────────
 
 
 def test_build_snapshot_assembles_all_fields():
     now = utc(2026, 9, 9, 12, 0)
+    window = (utc(2026, 9, 8, 0, 0), utc(2026, 9, 9, 0, 0))
     snapshot = ph.build_snapshot(
         now.date(),
         merged_search={"total_count": 5},
+        merge_window=window,
         open_pulls=[{"created_at": "2026-09-08T12:00:00Z"}],
         task_issues=[_issue(1)],
         worker_runs=[{"conclusion": "success"}],
@@ -202,6 +225,8 @@ def test_build_snapshot_assembles_all_fields():
     )
     assert snapshot["date"] == "2026-09-09"
     assert snapshot["merge_throughput"] == 5
+    assert snapshot["merge_throughput_window_start"] == "2026-09-08T00:00:00+00:00"
+    assert snapshot["merge_throughput_window_end"] == "2026-09-09T00:00:00+00:00"
     assert snapshot["pr_age_p50_hours"] == 24.0
     assert snapshot["backlog_total"] == 1
     assert snapshot["worker_success_rate"] == 100.0
@@ -287,6 +312,47 @@ def test_collect_wires_all_sources_without_do_or_rate_env(monkeypatch):
     assert snapshot["do_rows_read_pct"] is None  # честное «нет данных», токенов нет
     assert snapshot["gh_rate_remaining_pct"] == 90.0
     assert any("search/issues" in call for call in fake.calls)
+
+
+def test_collect_merge_throughput_survives_snapshot_shortly_after_midnight(monkeypatch):
+    """Живой корень #1155, прод-форма данных: снимок в 00:15 UTC 2026-09-12
+    ОБЯЗАН посчитать 16 слияний за 2026-09-11 целиком (реальное число,
+    снятое прямым запросом `gh api search/issues
+    q=repo:mytab0r/edge-harness+is:pr+merged:2026-09-11..2026-09-11` —
+    `total_count=16`), а не 0, которые давал старый запрос
+    `merged:2026-09-12..2026-09-12` в первые 15 минут суток.
+
+    `FakeGh` роутит ТОЛЬКО по окну предыдущих полных суток — если `collect()`
+    откатится к старому окну «сегодня..сегодня», ни один маршрут не
+    совпадёт и `search/issues` бросит `AssertionError`.
+
+    MUTATION-PROOF
+    ref: be498f4bd058c718d8fc2347f0c399adfe584a76
+    paths: scripts/measure/pipeline_health.py
+    run: python -X utf8 -m pytest scripts/measure/test_pipeline_health.py -k test_collect_merge_throughput_survives_snapshot_shortly_after_midnight -q
+    expect: нет маршрута для
+    """
+    repo = "mytab0r/edge-harness"
+    now = utc(2026, 9, 12, 0, 15)
+    fake = FakeGh({
+        "merged:2026-09-11T00:00:00..2026-09-12T00:00:00": {
+            "total_count": 16, "incomplete_results": False, "items": [],
+        },
+        "pulls?state=open": [],
+        "issues?state=open&labels=task": [],
+        "actions/workflows/worker.yml/runs": {"workflow_runs": []},
+        "actions/workflows/orchestra.yml/runs": {"workflow_runs": []},
+        "rate_limit": {"resources": {"core": {"limit": 1000, "remaining": 1000}}},
+    })
+    monkeypatch.setattr(ph.pulse_guard, "gh", fake)
+    monkeypatch.delenv("CLOUDFLARE_API_TOKEN", raising=False)
+    monkeypatch.delenv("CLOUDFLARE_ACCOUNT_ID", raising=False)
+
+    snapshot = ph.collect(repo, fake, now)
+
+    assert snapshot["merge_throughput"] == 16
+    assert snapshot["merge_throughput_window_start"] == "2026-09-11T00:00:00+00:00"
+    assert snapshot["merge_throughput_window_end"] == "2026-09-12T00:00:00+00:00"
 
 
 def test_gh_rate_remaining_pct_none_on_failure(monkeypatch):

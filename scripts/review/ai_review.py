@@ -94,12 +94,26 @@ _spec.loader.exec_module(review_labels)
 
 # Третья категория находок — чеклист некритичных замечаний в теле PR (#462):
 # парсинг блока ЗАМЕЧАНИЕ и слияние с телом PR — общее место правды с
-# after_merge в scheduler.py (тот же файл читает unresolved_items при
+# after_merge в scheduler.py (тот же файл читает unresolved_findings при
 # слиянии), поэтому живёт в lib, не дублируется здесь второй копией регэкспа.
 _rc_spec = importlib.util.spec_from_file_location(
     "review_checklist", SCRIPT_DIR.parent / "lib" / "review_checklist.py")
 review_checklist = importlib.util.module_from_spec(_rc_spec)
 _rc_spec.loader.exec_module(review_checklist)
+
+# Реестр незакрытых находок ревью, ключ файл (#1262, объединяет #1217):
+# gather собирает выписку по файлам этого PR ($findings_section, contents:
+# read достаточно для чтения ветки данных data/review-findings); verdict
+# разбирает НАХОДКА-ЗАКРЫТА из ответа модели в МАРКЕР ТЕЛА PR
+# (review_findings.merge_resolved_marker, отдельный PATCH pull["body"]) —
+# сам реестр не пишет (нет contents: write у job'а verdict, #939), читает
+# after_merge маркер из тела же при слиянии (parse_resolved_marker, без
+# сети), мутация реестра — только там. Носитель «шапка комментария» отвергнут
+# design.md (развилка 3): лишний GET истории комментариев на каждое слияние.
+_rf_spec = importlib.util.spec_from_file_location(
+    "review_findings", SCRIPT_DIR.parent / "lib" / "review_findings.py")
+review_findings = importlib.util.module_from_spec(_rf_spec)
+_rf_spec.loader.exec_module(review_findings)
 
 AI_OK = review_labels.AI_OK
 AI_CHANGES = review_labels.AI_CHANGES
@@ -131,6 +145,13 @@ _cp_spec = importlib.util.spec_from_file_location(
     "check_pr", SCRIPT_DIR / "check_pr.py")
 check_pr = importlib.util.module_from_spec(_cp_spec)
 _cp_spec.loader.exec_module(check_pr)
+
+# Классификация класса дефекта в источнике (#1237): контракт КЛАСС, словарь
+# известных/кандидатов, третье состояние (см. докстринг defect_classes.py).
+_dc_spec = importlib.util.spec_from_file_location(
+    "defect_classes", SCRIPT_DIR / "defect_classes.py")
+defect_classes = importlib.util.module_from_spec(_dc_spec)
+_dc_spec.loader.exec_module(defect_classes)
 
 # Контракт ответа модели. Строка ВЕРДИКТ обязана быть последней непустой и
 # единственной — двусмысленность это error, а не одобрение. Модель периодически
@@ -318,7 +339,8 @@ def size_question_section(added: int) -> str:
 
 
 def error_reason(answer: str, dsh_rc: str, failure_reason: str = "",
-                  reset_hint: str = "", empty_rework: bool = False) -> str:
+                  reset_hint: str = "", empty_rework: bool = False,
+                  outcome_summary: str = "", retry_useful: bool = False) -> str:
     """Причина verdict=error — теперь ПЯТЬ состояний, не смешиваемые в одно
     (класс silent-wrong прогона 33572445063: ошибка провайдера читалась как
     «модель нарушила контракт»; #419 добавил различение внутри самого
@@ -425,6 +447,23 @@ def error_reason(answer: str, dsh_rc: str, failure_reason: str = "",
                 "результат")
     if failure_reason == "all_providers_exhausted":
         when = reset_hint.strip() if reset_hint else "дата неизвестна — ни один провайдер её не назвал"
+        # #1307: «все исчерпаны» — верно ТОЛЬКО когда каждый провайдер реально
+        # без квоты. Живой разбор (прогон ai-review 34965204800, worker.yml
+        # 35010410097): из восьми реально без квоты был один, пять отвалились
+        # по НАШЕМУ исчерпанному бюджету ожидания, два несли мёртвый id —
+        # а текст звал «ждать сброса», и оркестратор придерживал автоповтор
+        # (#196) до даты того единственного. Разбор по классам приходит
+        # готовым из dsh_run_with_provider_chain (DSH_CHAIN_OUTCOME_SUMMARY),
+        # здесь он НЕ пересчитывается вторым разбором тех же строк.
+        if retry_useful:
+            detail = outcome_summary.strip() or (
+                "разбор по классам недоступен — сводка не доехала из ai_dsh.sh")
+            return (f"ревью не состоялось — ни один провайдер цепочки не ответил "
+                    f"(код возврата {dsh_rc}), но цепочка НЕ исчерпана квотой: "
+                    f"{detail}. Названный сброс: {when}. Действие: повтор ИМЕЕТ "
+                    "смысл — часть провайдеров не получила настоящей попытки "
+                    "(наш бюджет ожидания/транзиент), см. разбор выше и "
+                    "docs/runbooks/switch-llm-provider.md (#1307)")
         return (f"ревью не состоялось — все провайдеры цепочки исчерпаны/недоступны "
                 f"(код возврата {dsh_rc}), ближайший сброс: {when} — действие: "
                 "ждать сброса вне CI, либо добавить нового провайдера в "
@@ -610,6 +649,19 @@ def findings_of(answer: str, tasks: list[dict] | None = None,
         stripped = line.strip()
         if VERDICT_RE.match(stripped):
             continue
+        # Строка КЛАСС (#1237) — машинный трейлер находки п.1 «блокирует
+        # мерж», не часть текста, который читает человек в комментарии PR;
+        # снимается тем же приёмом, что строка ВЕРДИКТ выше (findings_of не
+        # знает о defect_classes.classify() — просто убирает строки по форме
+        # defect_classes.CLASS_LINE_RE, третье место правды не заводим).
+        if defect_classes.CLASS_LINE_RE.match(stripped):
+            continue
+        # Строка НАХОДКА-ЗАКРЫТА (#1262) — тот же машинный трейлер, что
+        # КЛАСС: выше: уходит в маркер ТЕЛА PR (merge_resolved_marker
+        # в cmd_verdict, читает after_merge из pull["body"] при слиянии),
+        # не в прозу, которую видит человек.
+        if review_findings.RESOLVED_LINE_RE.match(stripped):
+            continue
         if in_task:
             if stripped == TASK_CLOSE:
                 in_task = False
@@ -635,7 +687,10 @@ def build_comment(number: int, sha: str, verdict: str, findings: str,
                   remarks: list[dict] | None = None,
                   chain_provider: str | None = None,
                   reset_hint: str | None = None,
-                  reason_tag_value: str | None = None) -> str:
+                  reason_tag_value: str | None = None,
+                  class_signal: "defect_classes.ClassSignal | None" = None,
+                  chain_retry_useful: bool = False,
+                  resolved_findings: list[int] | None = None) -> str:
     """Канонический комментарий-вердикт. Шапка-факты — САМЫЕ ПЕРВЫЕ строки,
     до первого пустой строки (инвариант: file_tasks.py парсит ТОЛЬКО эту
     зону и фенсы задач, проза и заборы не могут притвориться фактами).
@@ -671,14 +726,40 @@ def build_comment(number: int, sha: str, verdict: str, findings: str,
     #431): факт `reason:` в шапке, который scheduler.trigger_ai_review читает
     для решения о бюджете автоповторов ЭТОЙ эпохи. None (verdict != "error"
     или вызов без классификации) не добавляет строку — та же обратная
-    совместимость, что у diff_fp."""
+    совместимость, что у diff_fp.
+
+    class_signal (#1237) — defect_classes.ClassSignal с трёх-состояньным
+    полем `.state` (not_named/candidate/known) и списками slug'ов; строка
+    `class:` добавляется, только если состояние не "not_named" — молчание на
+    approve-вердиктах без блокирующих находок (у них полю КЛАСС неоткуда
+    взяться, п.1 контракта их не касается) не раздувает шапку сотнями пустых
+    строк.
+
+    resolved_findings (#1262, реестр находок ревью) — id находок реестра
+    (review_findings.py), которые модель отметила НАХОДКА-ЗАКРЫТА в этом
+    раунде: сам факт живёт в ТЕЛЕ PR (review_findings.merge_resolved_marker,
+    отдельный PATCH — тот же выбор носителя, что чеклист ЗАМЕЧАНИЕ выше:
+    after_merge уже читает pull["body"] без отдельного сетевого запроса,
+    сканировать историю комментариев ради этого поля было бы лишним GET на
+    каждое слияние), здесь — только упоминание для человека в прозе
+    комментария, не машинный факт шапки. Пусто/None — строка не
+    добавляется."""
     diff_line = f"diff: {diff_fp}\n" if diff_fp else ""
     provider_line = f"provider: {chain_provider}\n" if chain_provider else ""
     reset_line = f"reset-at: {reset_hint}\n" if reset_hint else ""
+    # #1307: `reset-at` сам по себе НЕ значит «до этой даты ничего не
+    # получится» — он может принадлежать одному провайдеру из восьми. Факт
+    # ниже говорит оркестратору (scheduler.trigger_ai_review), что остальные
+    # не были опробованы по-настоящему и авто-повтор придерживать нечем.
+    retry_useful_line = "chain-retry-useful: 1\n" if chain_retry_useful else ""
     reason_line = f"reason: {reason_tag_value}\n" if reason_tag_value else ""
+    class_line = ""
+    if class_signal is not None and class_signal.state != defect_classes.STATE_NOT_NAMED:
+        slugs = ",".join(class_signal.known + class_signal.candidates)
+        class_line = f"class: {class_signal.state}={slugs}\n"
     head = (
         f"pr: {number}\nhead: {sha}\nreviewer: {verdict}\n"
-        f"{diff_line}{provider_line}{reset_line}{reason_line}\n"
+        f"{diff_line}{provider_line}{reset_line}{retry_useful_line}{reason_line}{class_line}\n"
         f"🤖 AI-ревью — второй гейт конвейера (#18). Вердикт: {verdict}."
     )
     backlog, tail, unscoped = partition_tasks(tasks)
@@ -703,6 +784,12 @@ def build_comment(number: int, sha: str, verdict: str, findings: str,
         body += (
             "\n\nНекритичные замечания (не блокируют мерж) — в чеклисте тела PR:\n"
             f"{titles}"
+        )
+    if resolved_findings:
+        ids = ", ".join(f"#{i}" for i in resolved_findings)
+        body += (
+            "\n\nНаходки реестра, отмеченные исправленными в этом раунде "
+            f"(закроются в реестре при слиянии): {ids}"
         )
     if backlog:
         close = "`" * len(TASK_FENCE[: TASK_FENCE.index("з")])  # ровно столько же бэктиков, сколько в открывающем
@@ -820,6 +907,76 @@ def rules_section() -> str:
     )
 
 
+def defect_classes_section(repo: str) -> str:
+    """$defect_classes_section (#1237) — известные классы + кандидаты
+    (см. defect_classes.py). Чтение кандидатов — сетевой вызов (комментарии
+    репозитория, несколько страниц, defect_classes.MAX_CANDIDATE_READ_PAGES,
+    issue #1255); сбой чтения не должен ронять gather целиком (дифф-ревью
+    важнее словаря-кандидатов) — деградирует на
+    defect_classes.render_prompt_section_unavailable, которая называет
+    причину явно (AGENTS.md, «алерт не гадает»), не молчит «кандидатов нет»
+    вместо настоящего «не прочитано».
+
+    Сигнал инертности (issue #1240/#1255, см. докстринг defect_classes.py):
+    ненулевое число доверенных rework-вердиктов в срезе без единой
+    class-строки — контракт КЛАСС не исполняется вовсе, не «повторов пока не
+    было»; печатается отдельным ::warning::, не молчит внутри пустого
+    списка кандидатов (те два состояния неразличимы по одной пустоте)."""
+    try:
+        scan = defect_classes.recent_candidate_stats(repo, gh)
+    except RuntimeError as error:
+        print(f"::warning::gather: кандидаты классов дефектов не прочитаны ({error}) — "
+              "промпт получит только утверждённые классы")
+        return defect_classes.render_prompt_section_unavailable(str(error))
+    if scan.rework_verdicts_seen and not scan.rework_with_class_seen:
+        print(f"::warning::gather: среди {scan.rework_verdicts_seen} последних доверенных "
+              "rework-вердиктов ни один не несёт строку class: — похоже, контракт КЛАСС "
+              "не исполняется (не путать с «повторов пока не было», #1240/#1255)")
+    return defect_classes.render_prompt_section(scan.candidates)
+
+
+def findings_section(repo: str, files: list[dict]) -> str:
+    """$findings_section (#1262, объединяет #1217): выписка открытых находок
+    реестра (review_findings.py, ветка данных data/review-findings) по
+    файлам, которые трогает этот PR. Сбой чтения — не должен ронять gather
+    целиком (тот же приём, что defect_classes_section выше): деградирует на
+    review_findings.render_unavailable, которая называет причину явно
+    (AGENTS.md, «алерт не гадает»), не молчит «находок нет» вместо
+    настоящего «не прочитано»."""
+    try:
+        registry, _sha = review_findings.fetch_registry(gh, repo)
+    except RuntimeError as error:
+        print(f"::warning::gather: реестр находок ревью не прочитан ({error}) — "
+              "промпт получит явное «недоступно», не пустой список")
+        return review_findings.render_unavailable(str(error))
+    filenames = [f["filename"] for f in files]
+    found = review_findings.open_findings_for_files(registry, filenames)
+    return review_findings.render_findings_section(found)
+
+
+def remark_files_outside_diff(remarks: list[dict], files: list[dict]) -> list[tuple[str, str]]:
+    """Пути из полей ФАЙЛ блоков ЗАМЕЧАНИЕ, которых НЕТ среди файлов этого PR
+    (#1262, чеклист ревью PR #1268): путь, выданный моделью мимо диффа,
+    при слиянии тихо ключует находку в реестре навсегда недостижимой — файл,
+    который никто никогда не тронет, не покажет находку ни на одном ревью.
+
+    Различить «легальная находка про файл вне диффа» (вызывающий в другом
+    модуле) и «галлюцинация пути» по списку файлов PR нельзя — поэтому это
+    ::warning:: с фактом и последствием, НЕ молчаливый перевод в skipped
+    (потеря половины находки, которую автор ещё вправе поправить в теле PR
+    до слияния) и НЕ угадывание вердикта. Возвращает список пар
+    (file, title) вне диффа; печать ::warning:: — в cmd_verdict, чтобы
+    держать побочный вывод у одного вызывающего (тот же приём, что
+    _verdict_label_and_age — чистая функция + печать снаружи)."""
+    pr_files = {f["filename"] for f in files}
+    warned = []
+    for remark in remarks:
+        file = (remark.get("file") or "").strip()
+        if file and file not in pr_files:
+            warned.append((file, remark.get("title") or ""))
+    return warned
+
+
 def cmd_gather(args: argparse.Namespace) -> int:
     repo = os.environ["GITHUB_REPOSITORY"]
     pull = gh(f"repos/{repo}/pulls/{args.pr}")
@@ -918,6 +1075,8 @@ def cmd_gather(args: argparse.Namespace) -> int:
         "task_section": task_section(pull, repo),
         "size_section": size_question_section(added),
         "rules_section": rules_section(),
+        "defect_classes_section": defect_classes_section(repo),
+        "findings_section": findings_section(repo, files),
     }
     # Гвардия silent-wrong: если какой-то плейсхолдер шаблона не попал в мэппинг
     # (опечатка, переименование, удаление ключа) — safe_substitute молча оставит
@@ -1199,9 +1358,24 @@ def cmd_verdict(args: argparse.Namespace) -> int:
               "scope": t.get("scope")}
              for t in tasks]
     tasks = [t for t in tasks if t["title"]]
-    remarks = [{"title": redact(r["title"]).strip(), "body": redact(r["body"]).strip()}
+    remarks = [{"title": redact(r["title"]).strip(), "file": r.get("file"),
+                "body": redact(r["body"]).strip()}
                for r in remarks]
     remarks = [r for r in remarks if r["title"]]
+
+    # Классификация класса дефекта (#1237) — на СЫРОМ answer, до redact():
+    # slug состоит из русских/латинских букв и дефисов (SLUG_RE), redact
+    # маскирует только формы секретов, находку не тронет, но считать на
+    # исходном тексте — не тратить время на редактирование ради поля, которое
+    # заведомо не несёт секретов. Отсутствие поля — НЕ ошибка контракта (см.
+    # docstring defect_classes.classify): старые ответы без строки КЛАСС
+    # (контракт используют параллельные PR, #1237 п.8) разбираются как
+    # state=not_named, verdict не трогается.
+    class_signal = defect_classes.classify(answer)
+    if verdict == "rework" and class_signal.state == defect_classes.STATE_NOT_NAMED:
+        print("::warning::ai-review: вердикт rework без единой строки КЛАСС — "
+              "блокирующие находки не классифицированы (#1237), промоушен "
+              "кандидатов не получит сигнала с этого PR")
 
     # rework без единой находки — нарушение контракта (#210), не валидный
     # ai:changes-requested: см. докстринг rework_without_findings. Проверяется
@@ -1217,8 +1391,13 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     # не смешиваются ни в логе, ни в тексте для человека (silent-wrong класс:
     # ошибка провайдера не должна выглядеть как «модель ответила криво», а
     # временный RATE_LIMIT — как настоящая поломка, #419).
+    # #1307: признак «повтор имеет смысл» приходит строкой ("1"/"0"/пусто) —
+    # сравнение со строкой, а не bool(str): непустая "0" истинна как объект.
+    chain_retry_useful = str(getattr(args, "chain_retry_useful", "")).strip() == "1"
     reason = (error_reason(answer, args.dsh_rc, args.failure_reason, args.reset_hint,
-                            empty_rework=empty_rework)
+                            empty_rework=empty_rework,
+                            outcome_summary=getattr(args, "chain_outcome_summary", ""),
+                            retry_useful=chain_retry_useful)
               if verdict == "error" else None)
     if reason and not findings.strip():
         findings = reason
@@ -1262,6 +1441,19 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     # files, уже сверенным с головой ВЫШЕ, поэтому не может прийти из уехавшей
     # головы (тот же баг, что и протухший diff_fp, закрыт одной сверкой).
     added = sum(f["additions"] for f in files)
+
+    # ФАЙЛ мимо диффа (#1262, чеклист ревью PR #1268): путь вне списка файлов
+    # PR не молчит — при слиянии он стал бы ключом находки в реестре, которую
+    # никто никогда не увидит (файл, который не трогают, не попадает в
+    # выписку findings_section). Не skipped: легальную находку про файл вне
+    # диффа от галлюцинации пути здесь не отличить, а автор ещё вправе
+    # поправить пункт в теле PR до слияния — ему предупреждение и адресовано.
+    for file, title in remark_files_outside_diff(remarks, files):
+        print(f"::warning::verdict: ФАЙЛ «{file}» из блока ЗАМЕЧАНИЕ "
+              f"«{title[:80]}» не входит в список файлов этого PR — если путь "
+              "не существует в репозитории, перенесённая при слиянии находка "
+              "так и останется невидимой для будущих ревью; проверь/поправь "
+              "путь в пункте чеклиста тела PR")
 
     # Диффы сверх check_pr.LARGE_DIFF_HUGE_LINES: суждение модели о размере
     # ЗАМЕНЯЕТ эскалацию владельцу (мандат 2026-09-11, #939, отменяет #204
@@ -1324,16 +1516,33 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     # принято суждением модели до этой строки.
     apply_large_ok(repo, args.pr, added, labels_after, verdict)
 
-    # Третья категория находок (#462): блоки ЗАМЕЧАНИЕ сливаются в чеклист
-    # ТЕЛА PR, не в комментарий — тело переживает прокрутку и не пропадает
-    # среди прочих комментариев. merge_checklist сама решает, нужен ли PATCH
-    # вовсе (None — новых пунктов нет, отмеченные автором чекбоксы не трогаем).
-    if remarks:
-        new_pr_body = review_checklist.merge_checklist(pull_after_files.get("body") or "", remarks)
-        if new_pr_body is not None:
-            run_gh("api", "-X", "PATCH", f"repos/{repo}/pulls/{args.pr}",
-                   "-f", "body=" + new_pr_body)
+    # Третья категория находок (#462) и закрытые находки реестра (#1262) —
+    # ОБА живут в теле PR (тело переживает прокрутку и не пропадает среди
+    # прочих комментариев, тот же выбор носителя для обоих), поэтому обе
+    # правки сливаются в ОДИН PATCH, не два подряд (второй PATCH на базе
+    # ответа pulls/{pr} ДО первого стёр бы его результат — тело не
+    # перечитывается между двумя вызовами).
+    # Реестр находок (#1262) — id, которые модель считает исправленными в
+    # этом раунде (на СЫРОМ answer, тот же выбор, что class_signal выше:
+    # НАХОДКА-ЗАКРЫТА не несёт секретов, редактировать нечего). Маркер живёт
+    # в теле PR (review_findings.merge_resolved_marker), не в шапке
+    # комментария — after_merge уже читает pull["body"] без сетевого
+    # запроса, второй источник (сканирование истории комментариев) не
+    # заводится.
+    resolved_findings = review_findings.parse_resolved_ids(answer)
+    current_body = pull_after_files.get("body") or ""
+    checklist_body = review_checklist.merge_checklist(current_body, remarks) if remarks else None
+    body_with_checklist = checklist_body if checklist_body is not None else current_body
+    resolved_body = (review_findings.merge_resolved_marker(body_with_checklist, resolved_findings)
+                     if resolved_findings else None)
+    new_pr_body = resolved_body if resolved_body is not None else checklist_body
+    if new_pr_body is not None:
+        run_gh("api", "-X", "PATCH", f"repos/{repo}/pulls/{args.pr}",
+               "-f", "body=" + new_pr_body)
+        if checklist_body is not None:
             print(f"checklist: {len(remarks)} замечаний слито в тело PR")
+        if resolved_body is not None:
+            print(f"resolved-findings: {len(resolved_findings)} находок отмечено исправленными")
 
     # Отпечаток диффа (#252) — в шапку комментария, чтобы check_pr.py на
     # следующем пуше мог сравнить и сохранить метку, если PR не изменился
@@ -1342,9 +1551,21 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     diff_fp = review_labels.diff_fingerprint(files)
     body = build_comment(args.pr, args.head, verdict, findings, tasks, diff_fp=diff_fp,
                           remarks=remarks, chain_provider=args.chain_provider,
-                          reset_hint=args.reset_hint, reason_tag_value=reason_tag_value)
+                          reset_hint=args.reset_hint, reason_tag_value=reason_tag_value,
+                          class_signal=class_signal,
+                          chain_retry_useful=chain_retry_useful and verdict == "error",
+                          resolved_findings=resolved_findings)
     run_gh("api", "-X", "POST", f"repos/{repo}/issues/{args.pr}/comments",
            "-f", "body=" + body)
+
+    # Кандидат класса дефекта (#1237) уже лежит в шапке комментария выше
+    # (`class:`, build_comment) — отдельной записи в реестр здесь больше НЕТ
+    # (issue #1255: job `verdict` не имеет `issues: write`, #939, а отдельный
+    # POST на issue #1238 падал 403 при исправно опубликованном главном
+    # комментарии — silent-wrong divergence между эмиссией и записью).
+    # gather (job `review`) агрегирует кандидатов из уже опубликованных
+    # комментариев-вердиктов напрямую (defect_classes.recent_candidate_stats) —
+    # см. докстринг defect_classes.py «Носитель».
 
     if verdict == "error":
         tail = redact("\n".join((answer or "").splitlines()[-12:]))
@@ -1394,6 +1615,13 @@ def main() -> int:
     # / chain_reset_hint.txt, ai_dsh.sh) — оба необязательны, тот же принцип.
     verdict.add_argument("--chain-provider", default="")
     verdict.add_argument("--reset-hint", default="")
+    # #1307: разбор исхода цепочки ПО КЛАССАМ (DSH_CHAIN_OUTCOME_SUMMARY) и
+    # признак «повтор имеет смысл» (DSH_CHAIN_RETRY_USEFUL) — оба приходят из
+    # ai_dsh.sh файлами chain_outcome_summary.txt/chain_retry_useful.txt.
+    # Необязательны по тому же принципу, что --dsh-rc/--reset-hint: ручной
+    # запуск без них теряет уточнение, но не падает.
+    verdict.add_argument("--chain-outcome-summary", default="")
+    verdict.add_argument("--chain-retry-useful", default="")
     verdict.set_defaults(func=cmd_verdict)
 
     args = parser.parse_args()

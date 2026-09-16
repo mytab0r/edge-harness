@@ -54,7 +54,10 @@ cat >"$CONFIRMED_MODELS_FIXTURE" <<JSON
 [
   {"name":"PRIMARY","model_sha256":"$(hash_of primary-model)","confirmed_at":"2026-09-08","evidence":"smoke fixture"},
   {"name":"SECONDARY","model_sha256":"$(hash_of secondary-model)","confirmed_at":"2026-09-08","evidence":"smoke fixture"},
-  {"name":"TERTIARY","model_sha256":"$(hash_of tertiary-model)","confirmed_at":"2026-09-13","evidence":"smoke fixture (#1121/#1124)"}
+  {"name":"TERTIARY","model_sha256":"$(hash_of tertiary-model)","confirmed_at":"2026-09-13","evidence":"smoke fixture (#1121/#1124)"},
+  {"name":"MULTI-DEAD","model_sha256":"$(hash_of dead-model)","confirmed_at":"2026-09-15","evidence":"smoke fixture (#1309): id, который провайдер снял (410) — подтверждён реестром, но мёртв в каталоге"},
+  {"name":"MULTI-ALSO-DEAD","model_sha256":"$(hash_of also-dead-model)","confirmed_at":"2026-09-15","evidence":"smoke fixture (#1309)"},
+  {"name":"MULTI-LIVE","model_sha256":"$(hash_of live-model)","confirmed_at":"2026-09-15","evidence":"smoke fixture (#1309): второй кандидат того же аккаунта, живой"}
 ]
 JSON
 export DSH_CONFIRMED_MODELS_FILE="$CONFIRMED_MODELS_FIXTURE"
@@ -131,6 +134,29 @@ dsh() {
           # ЭТОЙ записи — дословная прод-форма Ollama Cloud.
           echo "dsh: INVALID_REQUEST: max_tokens (131072) exceeds model's maximum output tokens (65536) for model nemotron-3-ultra" >&2
           return 1 ;;
+        rate-limit-then-410)
+          # #1309: ЕДИНСТВЕННАЯ достижимая последовательность, в которой один
+          # аккаунт тратит ожидание И переходит на следующую свою модель:
+          # провайдер под нагрузкой отвечает 429 несколько раз, а потом
+          # оказывается, что сам id снят из каталога. Обе строки — дословные
+          # прод-формы (см. заголовок файла и режимы always-rate-limit/http410
+          # выше); синтетическая здесь только их ПОСЛЕДОВАТЕЛЬНОСТЬ, которая и
+          # есть предмет фикстуры. Счётчик — файл, а не переменная: заглушка
+          # вызывается в подоболочках.
+          local counter="$WORK/calls-${DEEPSEEK_MODEL}"
+          local calls=$(( $(cat "$counter" 2>/dev/null || echo 0) + 1 ))
+          echo "$calls" >"$counter"
+          if [ "$calls" -le 2 ]; then
+            echo "dsh: RATE_LIMIT: Rate limit reached for requests" >&2
+          else
+            echo "dsh: HTTP_410: DeepSeek API error (HTTP 410)" >&2
+          fi
+          return 1 ;;
+        http410)
+          # #1309, живой прогон worker.yml 35010410097 (2026-09-15) — дословно:
+          # id модели снят провайдером, аккаунт при этом жив.
+          echo "dsh: HTTP_410: DeepSeek API error (HTTP 410)" >&2
+          return 1 ;;
         stream-closed)
           # #1084, живой случай — прогон worker.yml 2026-09-13T09:39Z: GLM
           # оборвал SSE-поток без терминального [DONE] — дословная прод-форма.
@@ -172,6 +198,7 @@ ERR="$WORK/err.txt"
 
 reset_scenario() {
   unset SMOKE_MODE_primary_model SMOKE_MODE_secondary_model 2>/dev/null || true
+  rm -f "$WORK"/calls-* 2>/dev/null || true
   : >"$ANSWER"; : >"$ERR"
 }
 
@@ -562,4 +589,239 @@ LOG="$WORK/log19.txt"
 ) || fail "19) сценарий с потолком на провайдера провалился"
 echo "SMOKE(chain): 19) потолок доли ОДНОГО провайдера из общего бюджета RATE_LIMIT — второй провайдер получает реальный шанс, не 0с (#1121/#1124) — ок"
 
-echo "SMOKE(chain): все сценарии цепочки провайдеров целы — гвардия класса #727/#737/#743/#857/#877/#880/#1062/#1084/#1121 зелёная"
+# Номер 20 намеренно пропущен: он занят открытым PR #1306 (HTTP_410 как
+# именованный терминальный класс в dsh_chain_should_advance). Сценарии ниже
+# трогают ДРУГИЕ функции (модельный цикл, сводка исхода, доля пула) и с ним
+# не конфликтуют по смыслу — только по номеру, если занять тот же.
+
+# ── 21) #1309: мёртвый id модели НЕ сжигает живой аккаунт. У PRIMARY два
+# кандидата: первый отвечает HTTP 410 Gone (дословная прод-форма прогона
+# worker.yml 35010410097), второй — успехом. Цепочка обязана остаться на ТОМ
+# ЖЕ аккаунте: SECONDARY не тронут вовсе. Мутация: убери модельную ветку в
+# dsh_run_with_provider_chain — ответит SECONDARY, и обе проверки ниже
+# (DSH_CHAIN_PROVIDER и DSH_CHAIN_TRIED) покраснеют.
+reset_scenario
+MULTI_CHAIN='[
+  {"name":"PRIMARY","base_url":"https://primary.test/v1","models":["dead-model","live-model"],"secret_env":"PRIMARY_KEY","max_output_tokens":4096},
+  {"name":"SECONDARY","base_url":"https://secondary.test/v1","model":"secondary-model","secret_env":"SECONDARY_KEY","max_output_tokens":4096}
+]'
+SMOKE_MODE_dead_model="http410"
+SMOKE_MODE_live_model="ok"
+SMOKE_MODE_secondary_model="ok"
+LOG="$WORK/log21.txt"
+( export DSH_PROVIDER_CHAIN="$MULTI_CHAIN"
+  dsh_run_with_provider_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+  OUT="$(cat "$LOG")"
+  [ "$DSH_RUN_RC" = "0" ] || { echo "::error::21) вторая модель того же аккаунта отвечает успехом, получено rc=$DSH_RUN_RC" >&2; exit 1; }
+  [ "$DSH_CHAIN_PROVIDER" = "PRIMARY" ] || { echo "::error::21) аккаунт меняться не должен — мёртв был ID МОДЕЛИ, получено '$DSH_CHAIN_PROVIDER'" >&2; exit 1; }
+  [ "$DSH_CHAIN_MODEL" = "live-model" ] || { echo "::error::21) ответить обязана вторая модель того же аккаунта: '$DSH_CHAIN_MODEL'" >&2; exit 1; }
+  [ "$DSH_CHAIN_TRIED" = "PRIMARY" ] || { echo "::error::21) SECONDARY не должен быть тронут вовсе (аккаунт PRIMARY жив): '$DSH_CHAIN_TRIED'" >&2; exit 1; }
+  [ "$DSH_CHAIN_MODELS_TRIED" = "PRIMARY/dead-model, PRIMARY/live-model" ] || { echo "::error::21) обе модели обязаны быть учтены по порядку: '$DSH_CHAIN_MODELS_TRIED'" >&2; exit 1; }
+  [[ "$OUT" == *"пробую следующую модель ЭТОГО же провайдера"* ]] || { echo "::error::21) сообщение обязано назвать факт смены МОДЕЛИ, а не аккаунта: $OUT" >&2; exit 1; }
+  grep -q "ответ от live-model" "$ANSWER" || { echo "::error::21) answer.txt не от второй модели" >&2; exit 1; }
+) || fail "21) модельный фолбэк внутри аккаунта провалился"
+echo "SMOKE(chain): 21) мёртвый id модели -> следующая модель ТОГО ЖЕ аккаунта, аккаунт не расходуется (#1309) — ок"
+
+# ── 22) #1309: кандидаты КОНЧИЛИСЬ — решение о переходе к следующему аккаунту
+# принимает та же dsh_chain_should_advance, что и до #1309 (модельный цикл её
+# не подменяет). Оба кандидата PRIMARY мертвы -> отвечает SECONDARY.
+reset_scenario
+DEAD_CHAIN='[
+  {"name":"PRIMARY","base_url":"https://primary.test/v1","models":["dead-model","also-dead-model"],"secret_env":"PRIMARY_KEY","max_output_tokens":4096},
+  {"name":"SECONDARY","base_url":"https://secondary.test/v1","model":"secondary-model","secret_env":"SECONDARY_KEY","max_output_tokens":4096}
+]'
+SMOKE_MODE_dead_model="http410"
+SMOKE_MODE_also_dead_model="http410"
+SMOKE_MODE_secondary_model="ok"
+LOG="$WORK/log22.txt"
+( export DSH_PROVIDER_CHAIN="$DEAD_CHAIN"
+  dsh_run_with_provider_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+  [ "$DSH_RUN_RC" = "0" ] || { echo "::error::22) SECONDARY отвечает успехом, получено rc=$DSH_RUN_RC" >&2; exit 1; }
+  [ "$DSH_CHAIN_PROVIDER" = "SECONDARY" ] || { echo "::error::22) кандидаты PRIMARY кончились — обязан быть переход на SECONDARY: '$DSH_CHAIN_PROVIDER'" >&2; exit 1; }
+  [ "$DSH_CHAIN_MODELS_TRIED" = "PRIMARY/dead-model, PRIMARY/also-dead-model, SECONDARY/secondary-model" ] \
+    || { echo "::error::22) обязаны быть опробованы обе модели PRIMARY и затем SECONDARY: '$DSH_CHAIN_MODELS_TRIED'" >&2; exit 1; }
+) || fail "22) исчерпание кандидатов внутри аккаунта провалилось"
+echo "SMOKE(chain): 22) все модели аккаунта мертвы -> переход на следующий аккаунт как раньше (#1309) — ок"
+
+# ── 23) #1309: обе формы элемента читаются ОДНИМ местом правды. Прежняя форма
+# ({model, max_output_tokens}) обязана давать ровно один кандидат — иначе вся
+# цепочка до #1309 поменяла бы поведение молча.
+one=$(dsh_entry_model_candidates '{"name":"X","model":"solo","max_output_tokens":777}')
+[ "$(jq -c . <<<"$one")" = '[{"model":"solo","max_output_tokens":777}]' ] \
+  || fail "23) форма {model} обязана давать ровно один кандидат: $one"
+many=$(dsh_entry_model_candidates '{"name":"X","models":["a","b"],"max_output_tokens":777}')
+[ "$(jq -c . <<<"$many")" = '[{"model":"a","max_output_tokens":777},{"model":"b","max_output_tokens":777}]' ] \
+  || fail "23) форма {models:[строки]} обязана наследовать потолок элемента: $many"
+mixed=$(dsh_entry_model_candidates '{"name":"X","models":[{"id":"a","max_output_tokens":10},"b"],"max_output_tokens":777}')
+[ "$(jq -c . <<<"$mixed")" = '[{"model":"a","max_output_tokens":10},{"model":"b","max_output_tokens":777}]' ] \
+  || fail "23) свой потолок кандидата обязан побеждать потолок элемента: $mixed"
+[ "$(dsh_chain_head_model "$MULTI_CHAIN")" = "dead-model" ] || fail "23) затравка профиля обязана брать ПЕРВОГО кандидата chain[0]"
+[ "$(dsh_chain_head_max_tokens "$MULTI_CHAIN")" = "4096" ] || fail "23) затравка профиля обязана брать потолок chain[0]"
+echo "SMOKE(chain): 23) {model} и {models:[…]} — одно место правды, обратная совместимость побайтная (#1309) — ок"
+
+# ── 24) #1307: итог цепочки называет ЧИСЛА по классам, а не одну фразу
+# «исчерпана целиком». Три провайдера, три РАЗНЫХ класса: PRIMARY реально без
+# квоты, SECONDARY выжигает остаток бюджета (наш бюджет, не квота), TERTIARY
+# несёт мёртвый id модели. Живой прототип — прогон worker.yml 35010410097:
+# 1 реально без квоты из 8, 5 по нашему бюджету, 2 мёртвых id.
+reset_scenario
+MIXED_CHAIN='[
+  {"name":"PRIMARY","base_url":"https://primary.test/v1","model":"primary-model","secret_env":"PRIMARY_KEY","max_output_tokens":4096},
+  {"name":"SECONDARY","base_url":"https://secondary.test/v1","model":"secondary-model","secret_env":"SECONDARY_KEY","max_output_tokens":4096},
+  {"name":"TERTIARY","base_url":"https://tertiary.test/v1","model":"tertiary-model","secret_env":"TERTIARY_KEY","max_output_tokens":4096}
+]'
+export TERTIARY_KEY="tertiary-test-key"
+SMOKE_MODE_primary_model="quota"
+SMOKE_MODE_secondary_model="always-rate-limit"
+SMOKE_MODE_tertiary_model="http410"
+LOG="$WORK/log24.txt"
+( export DSH_PROVIDER_CHAIN="$MIXED_CHAIN"
+  DSH_RATE_LIMIT_MAX_WAIT_SECS=30 \
+  DSH_RATE_LIMIT_INITIAL_DELAY_SECS=30 \
+  DSH_RATE_LIMIT_MAX_DELAY_SECS=30 \
+    dsh_run_with_provider_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+  OUT="$(cat "$LOG")"
+  [ "$DSH_RUN_FAILURE_REASON" = "all_providers_exhausted" ] || { echo "::error::24) контракт причины не меняется: '$DSH_RUN_FAILURE_REASON'" >&2; exit 1; }
+  [[ "$OUT" != *"провайдеров исчерпана целиком"* ]] || { echo "::error::24) УТВЕРЖДЕНИЕ «цепочка провайдеров исчерпана целиком» при одном реально исчерпанном из трёх — это и есть дефект #1307: $OUT" >&2; exit 1; }
+  [[ "$OUT" == *"НЕ «исчерпана целиком»"* ]] || { echo "::error::24) сообщение обязано прямо опровергнуть прежнюю формулировку, а не просто её не печатать: $OUT" >&2; exit 1; }
+  [[ "$OUT" == *"реально без квоты: 1 из 3"* ]] || { echo "::error::24) сводка обязана назвать число реально исчерпанных: $OUT" >&2; exit 1; }
+  [[ "$OUT" == *"не пробованы по-настоящему (наш бюджет ожидания исчерпан): 1"* ]] || { echo "::error::24) сводка обязана назвать число непробованных по нашему бюджету: $OUT" >&2; exit 1; }
+  [[ "$OUT" == *"мёртвая конфигурация"*": 1"* ]] || { echo "::error::24) сводка обязана назвать число мёртвых конфигураций: $OUT" >&2; exit 1; }
+  [[ "$OUT" == *"Действие:"* ]] || { echo "::error::24) сообщение обязано назвать действие, следующее из разбора: $OUT" >&2; exit 1; }
+  [ "$DSH_CHAIN_RETRY_USEFUL" = "1" ] || { echo "::error::24) повтор имеет смысл (не все без квоты) — DSH_CHAIN_RETRY_USEFUL='$DSH_CHAIN_RETRY_USEFUL'" >&2; exit 1; }
+) || fail "24) честный разбор исхода цепочки провалился"
+echo "SMOKE(chain): 24) итог цепочки — числа по классам и действие, не «исчерпана целиком» (#1307) — ок"
+
+# ── 25) #1307, обратный случай: ВСЕ реально без квоты — прежняя формулировка
+# верна буквально и обязана остаться, а повтор обязан быть назван
+# бессмысленным. Без этой пары сценарий 24 можно было бы «починить»
+# вычёркиванием фразы отовсюду.
+reset_scenario
+SMOKE_MODE_primary_model="quota"
+SMOKE_MODE_secondary_model="quota"
+LOG="$WORK/log25.txt"
+dsh_run_with_provider_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+OUT="$(cat "$LOG")"
+[[ "$OUT" == *"провайдеров исчерпана целиком"* ]] || fail "25) все реально без квоты — прежняя формулировка обязана остаться: $OUT"
+[[ "$OUT" == *"все 2 реально без квоты"* ]] || fail "25) сообщение обязано назвать число: $OUT"
+[ "$DSH_CHAIN_RETRY_USEFUL" = "0" ] || fail "25) все без квоты — повтор бессмысленен, DSH_CHAIN_RETRY_USEFUL='$DSH_CHAIN_RETRY_USEFUL'"
+echo "SMOKE(chain): 25) все провайдеры реально без квоты -> «исчерпана целиком» остаётся верной, повтор назван бессмысленным (#1307) — ок"
+
+# ── 26) #1307, живой инцидент (прогоны worker.yml 34942030597 и 35010410097,
+# 2026-09-15): пул шёл БЕЗ потолка доли провайдера и выжигал весь общий
+# бюджет ожидания — цепочка получала 0с и сдавалась на первом же ответе
+# каждого провайдера. Здесь: общий бюджет 60с, потолок 20с; пул в вечном
+# RATE_LIMIT. PRIMARY обязан увидеть РЕАЛЬНЫЙ остаток (40с из 60с), а не 0с.
+# Мутация: сними DSH_RATE_LIMIT_MAX_WAIT_SECS="$pool_share" у вызова пула —
+# строка «остаток общего бюджета RATE_LIMIT: 0с из 60с» вернётся, проверка
+# покраснеет (ровно то, что показывал живой лог).
+reset_scenario
+export DSH_ANTHROPIC_POOL_ACTIVE=1
+DEEPSEEK_MODEL="pool-model"
+SMOKE_MODE_pool_model="always-rate-limit"
+SMOKE_MODE_primary_model="ok"
+LOG="$WORK/log26.txt"
+DSH_RATE_LIMIT_MAX_WAIT_SECS=60 \
+DSH_RATE_LIMIT_INITIAL_DELAY_SECS=10 \
+DSH_RATE_LIMIT_MAX_DELAY_SECS=10 \
+DSH_RATE_LIMIT_PROVIDER_CAP_SECS=20 \
+  dsh_run_with_pool_then_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+OUT="$(cat "$LOG")"
+unset DSH_ANTHROPIC_POOL_ACTIVE
+[ "$DSH_RUN_RC" = "0" ] || fail "26) PRIMARY отвечает успехом после отказа пула, получено $DSH_RUN_RC"
+[ "$DSH_CHAIN_PROVIDER" = "PRIMARY" ] || fail "26) ожидался PRIMARY после отказа пула, получено '$DSH_CHAIN_PROVIDER'"
+[[ "$OUT" == *"доля общего бюджета RATE_LIMIT: 20с (потолок 20с на провайдера из 60с"* ]] \
+  || fail "26) пул обязан получить ДОЛЮ (20с), а не весь бюджет: $OUT"
+[[ "$OUT" == *"остаток общего бюджета RATE_LIMIT: 40с из 60с"* ]] \
+  || fail "26) цепочке обязан остаться реальный остаток (40с из 60с), а не 0с — это и есть дефект #1307: $OUT"
+echo "SMOKE(chain): 26) пул делит потолок доли провайдера наравне с цепочкой, не монополизирует бюджет (#1307) — ок"
+
+# ── 27) #1309: элемент без единого id модели — fail loud ДО любого вызова,
+# а не «id не подтверждён» на модели "null" (это формально верно, но уводит
+# от настоящей причины — опечатки в имени поля).
+BROKEN_CHAIN='[{"name":"NO-MODEL","base_url":"https://x.test/v1","secret_env":"PRIMARY_KEY","max_output_tokens":4096}]'
+( export DSH_PROVIDER_CHAIN="$BROKEN_CHAIN"
+  unset PLUGINS_SUITE_URL 2>/dev/null || true
+  LOG="$WORK/log27.txt"
+  if dsh_require_provider_chain >"$LOG" 2>&1; then
+    echo "::error::27) элемент без model/models обязан падать громко" >&2; exit 1
+  fi
+  grep -q "нет ни одного id модели" "$LOG" || { echo "::error::27) сообщение обязано называть причину: $(cat "$LOG")" >&2; exit 1; }
+  grep -q "NO-MODEL" "$LOG" || { echo "::error::27) сообщение обязано называть ИМЯ элемента: $(cat "$LOG")" >&2; exit 1; }
+) || fail "27) fail loud на элементе без id модели не сработал"
+# Обратная сторона: обе валидные формы проходят (иначе «починить» проверку
+# можно было бы, запретив список целиком).
+( export DSH_PROVIDER_CHAIN="$MULTI_CHAIN"; unset PLUGINS_SUITE_URL 2>/dev/null || true
+  dsh_require_provider_chain >/dev/null 2>&1 ) || fail "27) форма {models:[…]} обязана проходить валидацию"
+( export DSH_PROVIDER_CHAIN="$CHAIN"; unset PLUGINS_SUITE_URL 2>/dev/null || true
+  dsh_require_provider_chain >/dev/null 2>&1 ) || fail "27) прежняя форма {model} обязана проходить валидацию"
+echo "SMOKE(chain): 27) элемент без id модели -> fail loud с именем элемента, обе валидные формы проходят (#1309) — ок"
+
+# ── 28) #1309 + #1121: потолок доли бюджета — на ПРОВАЙДЕРА, не на каждую его
+# модель. Достижимая последовательность: PRIMARY/dead-model дважды отвечает
+# 429 (тратит 20с = весь потолок аккаунта), на третий вызов отдаёт HTTP 410 —
+# id снят, и цепочка переходит на ВТОРУЮ модель ТОГО ЖЕ аккаунта. Вторая
+# модель в вечном 429: с потолком НА ПРОВАЙДЕРА ей достаётся 0с (аккаунт свою
+# долю уже израсходовал), и SECONDARY видит реальные 40с из 60с. Без общего
+# счётчика (потолок на каждую модель) вторая модель получила бы ещё 20с, и
+# SECONDARY увидел бы 20с — ровно та монополия бюджета, которую закрывал
+# #1121, только через новую ось. Мутация исполнена: provider_cap_left →
+# provider_wait_cap даёт «20с из 60с», проверка краснеет.
+reset_scenario
+MULTI_RL_CHAIN='[
+  {"name":"PRIMARY","base_url":"https://primary.test/v1","models":["dead-model","also-dead-model"],"secret_env":"PRIMARY_KEY","max_output_tokens":4096},
+  {"name":"SECONDARY","base_url":"https://secondary.test/v1","model":"secondary-model","secret_env":"SECONDARY_KEY","max_output_tokens":4096}
+]'
+SMOKE_MODE_dead_model="rate-limit-then-410"
+SMOKE_MODE_also_dead_model="always-rate-limit"
+SMOKE_MODE_secondary_model="ok"
+LOG="$WORK/log28.txt"
+( export DSH_PROVIDER_CHAIN="$MULTI_RL_CHAIN"
+  DSH_RATE_LIMIT_MAX_WAIT_SECS=60 \
+  DSH_RATE_LIMIT_INITIAL_DELAY_SECS=10 \
+  DSH_RATE_LIMIT_MAX_DELAY_SECS=10 \
+  DSH_RATE_LIMIT_PROVIDER_CAP_SECS=20 \
+    dsh_run_with_provider_chain "$ANSWER" "$ERR" "промпт smoke" >"$LOG" 2>&1
+  OUT="$(cat "$LOG")"
+  [ "$DSH_CHAIN_PROVIDER" = "SECONDARY" ] || { echo "::error::28) ожидался успех SECONDARY, получено '$DSH_CHAIN_PROVIDER'" >&2; exit 1; }
+  [[ "$DSH_CHAIN_MODELS_TRIED" == "PRIMARY/dead-model, PRIMARY/also-dead-model, SECONDARY/secondary-model" ]] \
+    || { echo "::error::28) фикстура сломана — обе модели PRIMARY обязаны быть опробованы: '$DSH_CHAIN_MODELS_TRIED'" >&2; exit 1; }
+  [[ "$OUT" == *"пробую SECONDARY"*"остаток общего бюджета RATE_LIMIT: 40с из 60с"* ]] \
+    || { echo "::error::28) аккаунт PRIMARY обязан потратить не больше ОДНОГО потолка (20с) на ВСЕХ своих кандидатов — SECONDARY ожидал 40с из 60с: $OUT" >&2; exit 1; }
+) || fail "28) потолок доли провайдера с несколькими моделями провалился"
+echo "SMOKE(chain): 28) потолок доли — на ПРОВАЙДЕРА, а не на каждую его модель (#1309 + #1121) — ок"
+
+# ── 29) #1315, живой инцидент (прогон worker.yml 35046585539, задача #770):
+# промпт длиннее предела ядра на ОДИН аргумент execve. dsh принимает задачу
+# только позиционным аргументом, поэтому вызов не состоится ни у одного
+# провайдера: в живом логе это было восемь «транзиентных отказов» за 78 секунд
+# и совет «повтор ИМЕЕТ смысл», который был неправдой. Проверяется: ни одна
+# попытка не делается (dsh() не вызван), цепочка НЕ идёт по провайдерам,
+# сообщение называет наш отказ и предел.
+reset_scenario
+SMOKE_MODE_primary_model="ok"
+SMOKE_MODE_secondary_model="ok"
+LOG="$WORK/log29.txt"
+LONG_PROMPT="$(head -c 200000 /dev/zero | tr '\0' 'x')"
+DSH_PROMPT_MAX_BYTES=1000 \
+  dsh_run_with_provider_chain "$ANSWER" "$ERR" "$LONG_PROMPT" >"$LOG" 2>&1
+OUT="$(cat "$LOG")"
+[ "$DSH_RUN_RC" != "0" ] || fail "29) слишком длинный промпт обязан быть отказом, получено rc=$DSH_RUN_RC"
+[ "$DSH_RUN_FAILURE_REASON" = "prompt_too_long" ] || fail "29) причина обязана быть prompt_too_long: '$DSH_RUN_FAILURE_REASON'"
+[ "$DSH_CHAIN_TRIED" = "PRIMARY" ] || fail "29) цепочка обязана остановиться на ПЕРВОМ провайдере (отказ наш, одинаковый у всех): '$DSH_CHAIN_TRIED'"
+[[ "$OUT" != *"попытка 1"* ]] || fail "29) ни одной попытки dsh быть не должно — вызов заведомо не состоится: $OUT"
+[[ "$OUT" == *"MAX_ARG_STRLEN"* ]] || fail "29) сообщение обязано назвать предел ядра: $OUT"
+[[ "$OUT" == *"класс НЕ переключаемый"* ]] || fail "29) отказ обязан быть НЕ переключаемым: следующий провайдер получит тот же промпт: $OUT"
+[[ "$OUT" != *"повторить прогон"* ]] || fail "29) совет «повторить» при непоместившемся промпте — ровно та ложь, ради которой сценарий (#1315): $OUT"
+echo "SMOKE(chain): 29) промпт длиннее предела execve -> ни одной попытки, наш отказ назван, цепочка не сожжена (#1315) — ок"
+
+# ── 30) #1315, обратная сторона: промпт В ПРЕДЕЛАХ лимита идёт как обычно —
+# иначе «починить» сценарий 29 можно было бы, запретив вызовы вовсе.
+reset_scenario
+SMOKE_MODE_primary_model="ok"
+DSH_PROMPT_MAX_BYTES=1000 dsh_run_with_provider_chain "$ANSWER" "$ERR" "короткий промпт"
+[ "$DSH_RUN_RC" = "0" ] || fail "30) промпт в пределах лимита обязан пройти как обычно, получено rc=$DSH_RUN_RC"
+[ "$DSH_CHAIN_PROVIDER" = "PRIMARY" ] || fail "30) ожидался обычный успех PRIMARY: '$DSH_CHAIN_PROVIDER'"
+echo "SMOKE(chain): 30) промпт в пределах лимита -> обычный путь не задет (#1315) — ок"
+
+echo "SMOKE(chain): все сценарии цепочки провайдеров целы — гвардия класса #727/#737/#743/#857/#877/#880/#1062/#1084/#1121/#1307/#1309 зелёная"

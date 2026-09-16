@@ -3,7 +3,7 @@
 (scripts/orchestra/checklist_tail_labels.py, сирота A аудита 2026-09-11).
 
 Кормятся прод-формой: заголовок хвоста — реальный результат
-`review_checklist.tail_issue_title` (не переписанная строка), номера
+`ctl.tail_issue_title` (не переписанная строка), номера
 PR/задач и их метки — форма, которую реально отдаёт `gh api repos/.../
 pulls/{n}` (нужен только `head.ref`) и `gh api repos/.../issues/{n}`
 (нужны только `number`/`labels`), проверено живым замером 2026-09-11:
@@ -32,11 +32,6 @@ SCRIPT = _DIR / "checklist_tail_labels.py"
 spec = importlib.util.spec_from_file_location("checklist_tail_labels", SCRIPT)
 ctl = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ctl)  # type: ignore[union-attr]
-
-_RC_SPEC = importlib.util.spec_from_file_location(
-    "review_checklist", _DIR.parent / "lib" / "review_checklist.py")
-review_checklist = importlib.util.module_from_spec(_RC_SPEC)
-_RC_SPEC.loader.exec_module(review_checklist)  # type: ignore[union-attr]
 
 
 def patch_gh(monkeypatch, fake):
@@ -70,7 +65,7 @@ def labels(*names):
 def tail_issue(number, pr_number, existing_labels=("task",)):
     return {
         "number": number,
-        "title": review_checklist.tail_issue_title(pr_number),
+        "title": ctl.tail_issue_title(pr_number),
         "labels": labels(*existing_labels),
     }
 
@@ -82,7 +77,7 @@ def pull(head_ref):
 # ── Синхронность регулярки с настоящим форматом заголовка ──────────────────
 
 def test_tail_title_re_matches_real_tail_issue_title():
-    title = review_checklist.tail_issue_title(942)
+    title = ctl.tail_issue_title(942)
     match = ctl.TAIL_TITLE_RE.match(title)
     assert match is not None
     assert int(match.group(1)) == 942
