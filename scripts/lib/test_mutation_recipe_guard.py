@@ -329,7 +329,13 @@ def test_scan_of_last_20_merged_pr_test_files_finds_zero_blocks_and_zero_violati
     candidate_files = [
         "scripts/orchestra/test_reachability_guard.py",
         "scripts/orchestra/test_pulse_guard.py",
-        "scripts/orchestra/test_scheduler.py",
+        # scripts/orchestra/test_scheduler.py ВЫПАЛ из корпуса прозы
+        # 2026-09-14 (#1262, PR #1268): его гвардия
+        # test_after_merge_never_calls_create_pool_issue_for_review_findings
+        # несёт НАСТОЯЩИЙ блок MUTATION-PROOF (исполняется второй половиной
+        # этой же гвардии — git grep-сканом по дереву). Держать файл в этой
+        # фикстуре значило бы требовать «0 блоков» там, где блок легален.
+        # Вернуть файл сюда можно только вместе с удалением того блока.
         "scripts/lib/test_check_result_migrations.py",
         "scripts/orchestra/test_stale_blocked_guard.py",
         "scripts/lib/test_provider_quota_state_guard.py",

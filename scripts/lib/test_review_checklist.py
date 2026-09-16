@@ -16,17 +16,29 @@ _spec.loader.exec_module(rc)  # type: ignore[union-attr]
 
 # ── parse_remarks: блок ЗАМЕЧАНИЕ / КОНЕЦ ЗАМЕЧАНИЯ ───────────────────────────
 
-def test_parse_remarks_extracts_title_and_body():
+def test_parse_remarks_extracts_title_file_and_body():
     answer = (
         "Проза перед блоком.\n\n"
         "ЗАМЕЧАНИЕ: docs/foo.md — устаревшее число\n"
+        "ФАЙЛ: docs/foo.md\n"
         "Порог в коде строгий, поправь формулировку.\n"
         "КОНЕЦ ЗАМЕЧАНИЯ\n\n"
         "ВЕРДИКТ: approve"
     )
     remarks = rc.parse_remarks(answer)
     assert remarks == [{"title": "docs/foo.md — устаревшее число",
+                         "file": "docs/foo.md",
                          "body": "Порог в коде строгий, поправь формулировку."}]
+
+
+def test_parse_remarks_without_file_line_keeps_body_intact():
+    # Контракт требует ФАЙЛ второй строкой, но отсутствие строки — не
+    # ошибка парсинга (обратная совместимость, см. docstring модуля):
+    # file=None, а сама строка уходит в тело, не теряется.
+    answer = "ЗАМЕЧАНИЕ: Без файла\nПервая строка тела.\nКОНЕЦ ЗАМЕЧАНИЯ\nВЕРДИКТ: approve"
+    remarks = rc.parse_remarks(answer)
+    assert remarks == [{"title": "Без файла", "file": None,
+                         "body": "Первая строка тела."}]
 
 
 def test_parse_remarks_drops_unclosed_block():
@@ -50,12 +62,19 @@ def test_parse_remarks_multiple_blocks():
 
 def test_merge_checklist_appends_new_section_when_none_exists():
     body = "Описание PR без чеклиста."
-    remarks = [{"title": "Замечание раз", "body": "Поправь X."}]
+    remarks = [{"title": "Замечание раз", "file": None, "body": "Поправь X."}]
     new_body = rc.merge_checklist(body, remarks)
     assert new_body is not None
     assert "Описание PR без чеклиста." in new_body
     assert rc.CHECKLIST_BEGIN in new_body and rc.CHECKLIST_END in new_body
     assert "- [ ] **Замечание раз** — Поправь X." in new_body
+
+
+def test_merge_checklist_renders_file_tag_between_title_and_detail():
+    remarks = [{"title": "Замечание с файлом", "file": "scripts/lib/foo.py",
+                "body": "Поправь X."}]
+    new_body = rc.merge_checklist("Описание.", remarks)
+    assert "- [ ] **Замечание с файлом** `scripts/lib/foo.py` — Поправь X." in new_body
 
 
 def test_merge_checklist_no_new_remarks_no_existing_section_is_noop():
@@ -71,7 +90,7 @@ def test_merge_checklist_preserves_checked_items_across_rounds():
         "- [x] **Старое замечание** — уже сделано\n"
         f"{rc.CHECKLIST_END}\n"
     )
-    new_remarks = [{"title": "Новое замечание", "body": "Сделай Y."}]
+    new_remarks = [{"title": "Новое замечание", "file": None, "body": "Сделай Y."}]
     new_body = rc.merge_checklist(body, new_remarks)
     assert new_body is not None
     assert "- [x] **Старое замечание** — уже сделано" in new_body   # МУТАЦИЯ: если merge
@@ -91,7 +110,7 @@ def test_merge_checklist_dedupes_by_exact_title_keeps_existing_state():
         "- [x] **Дубль — с тире в заголовке** — было тело раньше\n"
         f"{rc.CHECKLIST_END}\n"
     )
-    remarks = [{"title": "Дубль — с тире в заголовке",
+    remarks = [{"title": "Дубль — с тире в заголовке", "file": None,
                 "body": "Новое тело, которое не должно попасть."}]
     new_body = rc.merge_checklist(body, remarks)
     # Ничего нового не добавлено (заголовок уже был) — merge_checklist вправе
@@ -108,46 +127,38 @@ def test_merge_checklist_returns_none_when_all_remarks_already_present():
         "- [ ] **Уже здесь**\n"
         f"{rc.CHECKLIST_END}\n"
     )
-    remarks = [{"title": "Уже здесь", "body": ""}]
+    remarks = [{"title": "Уже здесь", "file": None, "body": ""}]
     assert rc.merge_checklist(body, remarks) is None
 
 
-# ── unresolved_items: подсчёт незакрытых пунктов на момент слияния ──────────
+# ── unresolved_findings: структурная форма для переноса в реестр (#1262) ─────
 
-def test_unresolved_items_returns_only_unchecked():
+def test_unresolved_findings_returns_structured_unchecked_items():
     body = (
         f"{rc.CHECKLIST_BEGIN}\n{rc.CHECKLIST_TITLE}\n\n"
-        "- [ ] **Не сделано**\n"
-        "- [x] **Сделано**\n"
-        "- [X] **Тоже сделано заглавной X**\n"
+        "- [ ] **Не сделано** `scripts/lib/foo.py` — детали\n"
+        "- [x] **Сделано** `scripts/lib/bar.py` — детали\n"
         f"{rc.CHECKLIST_END}\n"
     )
-    assert rc.unresolved_items(body) == ["Не сделано"]
+    assert rc.unresolved_findings(body) == [
+        {"title": "Не сделано", "file": "scripts/lib/foo.py", "detail": "детали"},
+    ]
 
 
-def test_unresolved_items_empty_without_section():
-    assert rc.unresolved_items("Обычное описание PR без чеклиста.") == []
-
-
-def test_unresolved_items_empty_when_all_checked():
+def test_unresolved_findings_file_is_none_for_legacy_items_without_tag():
+    # Чеклист, начатый ДО #1262 (пункты без `` `файл` `` сегмента) —
+    # unresolved_findings не роняется на старом формате, file=None (см.
+    # docstring review_findings.sync_after_merge про пропуск таких пунктов
+    # при переносе в реестр, не тихую потерю).
     body = (
         f"{rc.CHECKLIST_BEGIN}\n{rc.CHECKLIST_TITLE}\n\n"
-        "- [x] **Всё сделано**\n"
+        "- [ ] **Старый формат** — без файла\n"
         f"{rc.CHECKLIST_END}\n"
     )
-    assert rc.unresolved_items(body) == []
+    assert rc.unresolved_findings(body) == [
+        {"title": "Старый формат", "file": None, "detail": "без файла"},
+    ]
 
 
-# ── tail_issue_*: текст задачи-хвоста ────────────────────────────────────────
-
-def test_tail_issue_title_is_stable_per_pr():
-    assert rc.tail_issue_title(163) == rc.tail_issue_title(163)
-    assert rc.tail_issue_title(163) != rc.tail_issue_title(164)
-
-
-def test_tail_issue_body_lists_all_unresolved_and_links_pr():
-    body = rc.tail_issue_body("o/r", 163, ["Пункт раз", "Пункт два"])
-    assert "PR #163" in body
-    assert "https://github.com/o/r/pull/163" in body
-    assert "- [ ] Пункт раз" in body
-    assert "- [ ] Пункт два" in body
+def test_unresolved_findings_empty_without_section():
+    assert rc.unresolved_findings("Обычное описание PR без чеклиста.") == []
