@@ -102,6 +102,14 @@ FAILURE_CONCLUSIONS = ("failure", "cancelled")
 # Подряд красных прогонов worker.yml, после которых авто-диспетч останавливается.
 WORKER_FAILURE_PAUSE_AFTER = 3
 
+# Потолок страниц для окна поиска атрибуции С АНКЕРОМ (last_worker_run,
+# since=...; issue #1274, живой случай PR #804/задача #720, 2026-09-12→14):
+# по 100 прогонов на страницу — 500 прогонов при слоте worker.yml,
+# сериализованном одним concurrency-group (AGENTS.md: ~18-33 прогона/сутки),
+# это 15-27 суток истории — кратно больше измеренной задержки эскалации
+# (двое суток, 43 прогона по ДРУГИМ задачам между диспатчем и перепроверкой).
+LAST_RUN_LOOKUP_PAGES = 5
+
 # Полуоткрытое состояние (#205): разомкнутый предохранитель сам не снимается —
 # зелёного прогона неоткуда взяться без диспатча. Поэтому по истечении выдержки
 # разрешается РОВНО ОДИН пробный диспатч. Выдержка растёт экспоненциально с
@@ -349,6 +357,26 @@ AI_REWORK_MARKER = "[ai-rework: авто-доводка]"
 # Номер PR — часть маркера (по образцу CONFLICT_ESCALATION_MARKER выше):
 # эскалация решается по каждому PR отдельно.
 AI_REWORK_ESCALATION_MARKER = "[ai-rework: эскалация]"
+
+# Четвёртый исход вместо «эскалация с первого раза» (issue #1274, AGENTS.md
+# «Воркеру нужны четыре исхода, не два»; живые случаи PR #1120 2026-09-13 и
+# PR #804 2026-09-14): #1027 научил dispatch_ai_review_rework РАЗЛИЧАТЬ
+# «отработал успешно, находки не закрыты» и «атрибуции нет» от честного
+# инфра-отказа, но ОТВЕЧАЛ на оба одинаково — эскалацией с первого же
+# обнаружения. Оба маркера ниже дают РОВНО один бесплатный (не по бюджету
+# AI_REWORK_MAX_ATTEMPTS) заход на отпечаток ПЕРЕД эскалацией; маркер уже
+# стоит на этом отпечатке — второе совпадение того же исхода эскалирует, с
+# текстом, называющим именно эту причину (не generic «находки ai-review»).
+AI_REWORK_SECOND_CHANCE_MARKER = "[ai-rework: находки явно]"
+AI_REWORK_UNATTRIBUTED_RETRY_MARKER = "[ai-rework: неатрибутированный повтор]"
+
+# Контракт второго захода (AI_REWORK_SECOND_CHANCE_MARKER): агент обязан
+# либо исправить находку, либо явно возразить комментарием с этим маркером
+# — молчаливое несогласие («поработал, ничего не поменял, причины не
+# сказал») не годится (AGENTS.md: «тогда это возражение и есть результат,
+# его надо донести до ревью, а не потерять»). Эскалация второго подряд
+# совпадения читает этот маркер и цитирует найденное возражение, если было.
+AI_REWORK_REBUTTAL_MARKER = "[ai-rework: возражение]"
 
 # ── Гвардия непрочитанных провалов ключевых workflow (#477) ──────────────────
 # worker.yml уже целиком под предохранителем conveyor_gate (пауза/проба) —
@@ -1160,10 +1188,19 @@ def merge_telegram_text(repo: str, pr_number: int, task_number: int, task_title:
 # ── IO-обвязка: чтение прогонов, сигналы, след в задаче ──────────────────────────
 
 
-def recent_runs(repo: str, workflow: str, per_page: int = 10, event: str | None = None) -> list[dict]:
+def recent_runs(
+    repo: str, workflow: str, per_page: int = 10, event: str | None = None,
+    page: int | None = None,
+) -> list[dict]:
+    """`page` — номер страницы GitHub-пагинации (1-based), None — как раньше
+    (первая страница, параметр вообще не передаётся). Нужен только вызывающим
+    с окном шире одной страницы (last_worker_run с `since=`, issue #1274) —
+    остальные вызовы этот параметр не передают, поведение не меняется."""
     query = f"per_page={per_page}"
     if event:
         query += f"&event={event}"
+    if page is not None:
+        query += f"&page={page}"
     payload = gh(
         f"repos/{repo}/actions/workflows/{workflow}/runs?{query}"
     ) or {}
@@ -1447,9 +1484,36 @@ def _marker_present(marker: str, body: str) -> bool:
     return re.search(pattern, body) is not None
 
 
+def comment_is_job_authored(comment: dict) -> bool:
+    """True — комментарий опубликован токеном job'а (`performed_via_github_app`
+    непустой), не личным PAT (issue #1242, доводка #1101/#1074, AGENTS.md
+    «Атрибуция событий»: различение по ТОКЕНУ, не по логину/личности автора —
+    тот же приём, что уже использует `repo_invariants.
+    check_pipeline_status_marker_impersonation`, инвариант 18).
+
+    Почему не логин: `trusted_login` (см. ниже) сравнивает `user.login` с
+    заданной строкой — работает, ПОКА единственный легитимный писатель
+    аутентифицируется штатным `GITHUB_TOKEN` (тогда `user.login ==
+    "github-actions[bot]"`). Но это НАДО знать заранее про каждого
+    конкретного писателя; сам REST-ответ несёт более прямой признак —
+    `performed_via_github_app` пусто ИМЕННО когда запрос ушёл под личным PAT,
+    независимо от того, где физически исполнялся код (внутри Actions или
+    локально: PAT остаётся PAT). Живые прод-формы (`gh api repos/mytab0r/
+    edge-harness/issues/120/comments`, 2026-09-14, issuecomment-5665006692 vs
+    issuecomment-5665003751):
+      честный маркер:  {"performed_via_github_app": {"slug": "github-actions", ...},
+                         "user": {"login": "github-actions[bot]", "type": "Bot"}}
+      поддельный:      {"performed_via_github_app": None,
+                         "user": {"login": "mytab0r", "type": "User"}}
+    Замер того же дня по всей истории #120 (1137 комментариев,
+    `--paginate`): 907 с `performed_via_github_app.slug == "github-actions"`,
+    230 с `None` — split ровно по семейству токена, без промежуточных форм."""
+    return comment.get("performed_via_github_app") is not None
+
+
 def issue_marker_times(
     repo: str, issue_number: int, marker: str, max_pages: int | None = None, *,
-    trusted_login: str | None = None,
+    trusted_login: str | None = None, require_job_token: bool = False,
 ) -> list[datetime]:
     """`trusted_login` (#1027, живой случай watchdog-issue #120 2026-09-12) —
     фильтр по логину АВТОРА комментария, не по факту «человек/агент»
@@ -1473,6 +1537,25 @@ def issue_marker_times(
     что и настоящий CI-тик — вызывающий, которому нужна гарантия «это
     записал именно job», обязан передать `trusted_login=EVENT_ACTOR_LOGIN`.
 
+    `require_job_token` (#1242) — второй, независимый фильтр: `True` требует
+    `comment_is_job_authored(comment)` вдобавок к (или вместо) `trusted_login`.
+    Нужен там, где `trusted_login` неудобен/недостаточен (писатель может
+    сменить способ аутентификации без изменения кода читателя) — эквивалент
+    по духу, но проверяет ТОКЕН публикации напрямую, а не имя, под которым
+    этот токен представляется. Оба фильтра можно комбинировать; по умолчанию
+    (`False`) поведение не меняется.
+
+    Живое доказательство пробела, который закрывает этот параметр: `#1074`
+    (2026-09-13) закрыл лазейку внутри `pulse_guard.gh()` — но это фикс в
+    коде ПИСАТЕЛЯ, а не в коде читателя. Любой прогон `scheduler.py` из
+    checkout'а СТАРШЕ этого коммита (чужая ветка/рабочее дерево, забытый
+    фоновой процесс) фикса не видит и продолжает писать тем же путём; прямой
+    `gh api`/веб-форма личным PAT фикс писателя не покрывает вовсе. Три
+    поддельных маркера легли в #120 2026-09-14, ПОСЛЕ #1074/#1101
+    (issuecomment-5663451458/5664955727/5665003751) — читатель, не зависящий
+    от версии кода писателя, единственная защита, устойчивая к обоим этим
+    случаям.
+
     `max_pages` — ограничить обход первыми N СВЕЖИМИ страницами (None — вся
     история), проброшен в `all_issue_comments` (#607): стоимость одного тика
     читателя не должна расти с историей задачи."""
@@ -1482,12 +1565,14 @@ def issue_marker_times(
         for comment in payload
         if _marker_present(marker, comment.get("body") or "")
         and (trusted_login is None or (comment.get("user") or {}).get("login") == trusted_login)
+        and (not require_job_token or comment_is_job_authored(comment))
     ]
 
 
 def issue_markers_any(
     repo: str, issue_number: int, markers: tuple[str, ...],
     max_pages: int | None = None, *, trusted_login: str | None = None,
+    require_job_token: bool = False,
 ) -> list[tuple[datetime, str]]:
     """Как issue_marker_times, но для нескольких маркеров сразу и с телом
     комментария — нужно там, где решение зависит не только от факта маркера,
@@ -1498,11 +1583,14 @@ def issue_markers_any(
 
     `trusted_login` — тот же фильтр по токену-автору, что у issue_marker_times
     (#1027), тем же способом (`None` не меняет поведение существующих
-    вызывающих)."""
+    вызывающих). `require_job_token` (#1242) — второй, независимый фильтр по
+    `performed_via_github_app`, см. docstring issue_marker_times."""
     payload = all_issue_comments(repo, issue_number, max_pages=max_pages)
     result = []
     for comment in payload:
         if trusted_login is not None and (comment.get("user") or {}).get("login") != trusted_login:
+            continue
+        if require_job_token and not comment_is_job_authored(comment):
             continue
         body = comment.get("body") or ""
         if any(_marker_present(marker, body) for marker in markers):
@@ -1941,6 +2029,16 @@ def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], list[str], bool]
     маркер паузы/пробы, не может этот маркер снять — предохранитель стоит,
     пока не истечёт backoff, хотя причина уже давно чинилась.
 
+    `require_job_token=True` в чтении маркеров (#1242, доводка #1101/#1074):
+    без него поддельный RESUME_MARKER, оставленный НЕ токеном job'а (личный
+    PAT — локальный прогон устаревшего checkout'а или прямой `gh api`, см.
+    docstring issue_marker_times), читался бы этой функцией как настоящий
+    сброс серии — «виртуальный success» снял бы паузу и разрешил диспатч,
+    хотя причина серии красных прогонов не чинилась вовсе. Тот же класс,
+    что #1027 уже закрыл для WIP-гейта (scheduler.wip_gate) — здесь
+    закрывается для предохранителя конвейера, который ЭТИМ маркером и
+    управляет напрямую.
+
     Ещё идущий прогон (conclusion=None) на голове списка при активной серии —
     отдельный класс (#899, п.2), не по этой же причине: судить, что делать
     ДАЛЬШЕ (новая проба, новый маркер), по прогону, чей исход ещё не известен,
@@ -1951,7 +2049,8 @@ def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], list[str], bool]
     last_ok = next((r for r in runs if r.get("conclusion") == "success"), None)
     last_ok_at = parse_time(last_ok["updated_at"]) if last_ok else None
     try:
-        all_markers = issue_markers_any(repo, WATCHDOG_ISSUE, (PAUSE_MARKER, RESUME_MARKER))
+        all_markers = issue_markers_any(
+            repo, WATCHDOG_ISSUE, (PAUSE_MARKER, RESUME_MARKER), require_job_token=True)
     except RuntimeError as error:
         if decide_dispatch(failures):
             return ([f"🟢 серия красных worker.yml: {failures} "
@@ -2035,7 +2134,16 @@ def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], list[str], bool]
                 f"диспатч остановлен, следующая проба не раньше чем через "
                 f"{int(remaining)} мин (маркер серии #{WATCHDOG_ISSUE} уже стоит)")
         try:
-            reminder_times = issue_marker_times(repo, WATCHDOG_ISSUE, PAUSE_REMINDER_MARKER)
+            # require_job_token=True (#1242, находка ai-review того же PR, что
+            # добавил фильтр на серийные маркеры выше): поддельное «пауза
+            # продолжается» (не токен job'а) сдвигало бы last_signal_at вперёд
+            # и молча давило напоминание о длящейся паузе (#899, п.4) на
+            # очередной интервал PAUSE_REMINDER_INTERVAL_MINUTES — чужеродный
+            # маркер подавлял бы алерт. Писатель этого маркера — сам
+            # conveyor_gate через pulse_guard.gh() (#1074), т.е. честное
+            # напоминание всегда несёт токен job'а и фильтр проходит.
+            reminder_times = issue_marker_times(
+                repo, WATCHDOG_ISSUE, PAUSE_REMINDER_MARKER, require_job_token=True)
         except RuntimeError as error:
             print(f"::warning::напоминания #{WATCHDOG_ISSUE} не прочитаны: {error}", file=sys.stderr)
             reminder_times = []

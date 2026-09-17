@@ -71,6 +71,11 @@ EXPECTED_WORKFLOWS = frozenset({
     # не читает, поэтому не входит ни в DISPATCH_CONSUMER, ни в PIPELINE_CONSUMERS.
     "branch-protection-watch.yml",
     "cf-inventory.yml",
+    # #1330: засев реестра морды. Читает DSH_EDGE_ACCESS_KEY и ключи маршрутов
+    # по именам secret_env манифеста, но НИ GH_DISPATCH_TOKEN, НИ GH_PIPELINE_PAT
+    # — в репозиторий не пишет вовсе (permissions: contents: read), поэтому не
+    # входит ни в DISPATCH_CONSUMER, ни в PIPELINE_CONSUMERS.
+    "seed-provider-registry.yml",
     # Сирота A аудита 2026-09-11 (scripts/orchestra/checklist_tail_labels.py):
     # читает только github.token (issues: write, pull-requests: read) — тот
     # же класс, что dependabot-alert-watch.yml ниже, ни GH_DISPATCH_TOKEN, ни

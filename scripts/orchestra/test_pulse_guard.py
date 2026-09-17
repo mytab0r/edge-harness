@@ -53,6 +53,25 @@ def run(conclusion, created_at="2026-08-31T10:00:00Z", run_id=1, title="worker r
     return payload
 
 
+# Прод-форма поля `performed_via_github_app` честного маркера (#1242, снято
+# живьём `gh api repos/mytab0r/edge-harness/issues/120/comments`,
+# issuecomment-5665006692, 2026-09-14) — фикстуры conveyor_gate несут его на
+# комментариях, которые тест играет как НАСТОЯЩИЙ маркер job'а (require_
+# job_token=True теперь фильтрует чтение PAUSE/RESUME по этому полю, см.
+# pulse_guard.comment_is_job_authored). Поддельный маркер (тест на пробел,
+# который этот параметр закрывает) — этого поля НЕ несёт, см.
+# test_gate_ignores_fake_resume_marker_without_job_token ниже.
+JOB_APP = {"slug": "github-actions"}
+
+
+def job_comment(created_at: str, body: str) -> dict:
+    """Комментарий #120 в прод-форме ОТ ТОКЕНА JOB'А — обёртка вокруг
+    голого dict-литерала (используемого остальными, не security-критичными
+    тестами файла), чтобы conveyor_gate/require_job_token видели маркер как
+    легитимный, не как чужеродную подделку."""
+    return {"created_at": created_at, "body": body, "performed_via_github_app": JOB_APP}
+
+
 # ── Серия красных: подсчёт подряд ────────────────────────────────────────────────
 
 
@@ -708,7 +727,7 @@ def test_gate_blocks_dispatch_after_streak_and_notifies_once(monkeypatch):
     # второй пульс той же серии: молчит (не спамит), диспатч всё ещё закрыт
     # (формат ответа issues/{N}/comments — голый массив, как у GitHub API)
     fake.routes["issues/120/comments"] = [
-        {"created_at": "2026-08-31T11:59:00Z", "body": f"x {pg.PAUSE_MARKER}"}]
+        job_comment("2026-08-31T11:59:00Z", f"x {pg.PAUSE_MARKER}")]
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: posted.append("spam"))
     monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append("spam") or True)
     _, _, allowed2 = pg.conveyor_gate("mytab0r/edge-harness", NOW)
@@ -720,7 +739,10 @@ def test_gate_allows_dispatch_when_series_reset_by_success(monkeypatch):
     fake = FakeGh({
         "workflows/worker.yml/runs": RECENT_OK,
         "issues/120/comments": [
-            {"created_at": "2026-08-31T10:00:00Z", "body": pg.PAUSE_MARKER}],
+            # Честный маркер (токен job'а, #1242): серия реально была, успех
+            # снимает её — тест проверяет ИМЕННО сброс успехом, а не то, что
+            # фильтр спрятал подделку (замечание ai-review #1242).
+            job_comment("2026-08-31T10:00:00Z", pg.PAUSE_MARKER)],
     })
     monkeypatch.setattr(pg, "gh", fake)
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
@@ -1269,7 +1291,7 @@ def test_gate_stays_open_before_backoff_then_probes_after(monkeypatch):
         "workflows/worker.yml/runs": RECENT_FAILURES,
         "runs/3/jobs": JOBS_PAYLOAD,
         "issues/120/comments": [
-            {"created_at": "2026-08-31T11:50:00Z", "body": pg.PAUSE_MARKER}],
+            job_comment("2026-08-31T11:50:00Z", pg.PAUSE_MARKER)],
     })
     monkeypatch.setattr(pg, "gh", fake)
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
@@ -1282,7 +1304,7 @@ def test_gate_stays_open_before_backoff_then_probes_after(monkeypatch):
 
     # ровно 15 минут прошло — выдержка истекла: ровно одна проба, диспатч разрешён
     fake.routes["issues/120/comments"] = [
-        {"created_at": "2026-08-31T11:45:00Z", "body": pg.PAUSE_MARKER}]
+        job_comment("2026-08-31T11:45:00Z", pg.PAUSE_MARKER)]
     posted, sent = [], []
     monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
     monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
@@ -1324,8 +1346,8 @@ def test_gate_probe_failure_grows_backoff_and_blocks_next_probe(monkeypatch):
         "workflows/worker.yml/runs": RECENT_FAILURES,
         "runs/3/jobs": JOBS_PAYLOAD,
         "issues/120/comments": [
-            {"created_at": "2026-08-31T11:45:00Z", "body": pg.PAUSE_MARKER},
-            {"created_at": "2026-08-31T11:46:00Z", "body": probe_body(1)}],
+            job_comment("2026-08-31T11:45:00Z", pg.PAUSE_MARKER),
+            job_comment("2026-08-31T11:46:00Z", probe_body(1))],
     })
     monkeypatch.setattr(pg, "gh", fake)
     # 14 минут с последней пробы (11:46 -> 12:00) — меньше выдержки попытки 2 (30 мин)
@@ -1341,8 +1363,8 @@ def test_gate_probe_failure_grows_backoff_and_blocks_next_probe(monkeypatch):
     # 20 минут с последней пробы были бы >= 15 и пропустили бы вторую пробу —
     # exp-выдержка (30 мин после первой красной пробы) обязана держать закрытым
     fake.routes["issues/120/comments"] = [
-        {"created_at": "2026-08-31T11:45:00Z", "body": pg.PAUSE_MARKER},
-        {"created_at": "2026-08-31T11:40:00Z", "body": probe_body(1)}]
+        job_comment("2026-08-31T11:45:00Z", pg.PAUSE_MARKER),
+        job_comment("2026-08-31T11:40:00Z", probe_body(1))]
     _, _, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)  # 20 минут прошло
     assert allowed is False  # exp-выдержка (30 мин) ещё не истекла
     broken_backoff_would_allow = pg.minutes_between(
@@ -1365,8 +1387,8 @@ def test_gate_in_progress_probe_does_not_falsely_reopen_dispatch(monkeypatch):
             run("failure", "2026-08-31T11:20:00Z", 1),
         ]},
         "issues/120/comments": [
-            {"created_at": "2026-08-31T11:45:00Z", "body": pg.PAUSE_MARKER},
-            {"created_at": "2026-08-31T11:46:00Z", "body": probe_body(1)}],
+            job_comment("2026-08-31T11:45:00Z", pg.PAUSE_MARKER),
+            job_comment("2026-08-31T11:46:00Z", probe_body(1))],
     })
     monkeypatch.setattr(pg, "gh", fake)
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
@@ -1394,7 +1416,7 @@ def test_gate_probe_rate_is_bounded_by_backoff_within_an_hour(monkeypatch):
     comments = []
 
     def fake_issue_comments(repo, n, text):
-        comments.append({"created_at": current_now[0].isoformat().replace("+00:00", "Z"), "body": text})
+        comments.append(job_comment(current_now[0].isoformat().replace("+00:00", "Z"), text))
 
     fake = FakeGh({
         "workflows/worker.yml/runs": RECENT_FAILURES,
@@ -1511,8 +1533,8 @@ def test_gate_does_not_stack_new_probe_while_previous_probe_still_running(monkey
             run("failure", "2026-08-31T09:45:00Z", 1),
         ]},
         "issues/120/comments": [
-            {"created_at": "2026-08-31T10:15:00Z", "body": pg.PAUSE_MARKER},
-            {"created_at": "2026-08-31T11:10:00Z", "body": probe_body(1)},
+            job_comment("2026-08-31T10:15:00Z", pg.PAUSE_MARKER),
+            job_comment("2026-08-31T11:10:00Z", probe_body(1)),
         ],
     })
     monkeypatch.setattr(pg, "gh", fake)
@@ -1551,7 +1573,7 @@ def test_gate_open_text_names_effective_failures_not_raw_zero(monkeypatch):
             run("failure", "2026-08-31T11:20:00Z", 1),
         ]},
         "issues/120/comments": [
-            {"created_at": "2026-08-31T11:50:00Z", "body": pg.PAUSE_MARKER},
+            job_comment("2026-08-31T11:50:00Z", pg.PAUSE_MARKER),
         ],
     })
     monkeypatch.setattr(pg, "gh", fake)
@@ -1609,8 +1631,8 @@ def test_gate_open_state_posts_throttled_reminder_after_interval(monkeypatch):
         "workflows/worker.yml/runs": RECENT_FAILURES,
         "runs/3/jobs": JOBS_PAYLOAD,
         "issues/120/comments": [
-            {"created_at": "2026-08-31T10:00:00Z", "body": pg.PAUSE_MARKER},
-            {"created_at": "2026-08-31T10:01:00Z", "body": probe_body(4)},
+            job_comment("2026-08-31T10:00:00Z", pg.PAUSE_MARKER),
+            job_comment("2026-08-31T10:01:00Z", probe_body(4)),
         ],
     })
     monkeypatch.setattr(pg, "gh", fake)
@@ -1632,11 +1654,58 @@ def test_gate_open_state_posts_throttled_reminder_after_interval(monkeypatch):
 
     # тот же пульс ещё раз почти сразу (напоминание уже отправлено) — тихо
     fake.routes["issues/120/comments"] = fake.routes["issues/120/comments"] + [
-        {"created_at": "2026-08-31T11:31:00Z", "body": posted[0]}]
+        job_comment("2026-08-31T11:31:00Z", posted[0])]
     posted.clear()
     sent.clear()
     _, actions3, allowed3 = pg.conveyor_gate("mytab0r/edge-harness", utc(2026, 8, 31, 11, 35))
     assert allowed3 is False and posted == [] and sent == [] and actions3 == []
+
+
+def test_gate_fake_pause_reminder_marker_cannot_suppress_alert(monkeypatch):
+    """#1242, находка ai-review (второе место того же класса): чтение
+    PAUSE_REMINDER_MARKER в conveyor_gate обязано требовать токен job'а.
+    Без фильтра поддельное «пауза продолжается» (живой envelope инцидента
+    #1242, performed_via_github_app=None) сдвигало бы last_signal_at вперёд
+    и молча давило напоминание о длящейся паузе (#899, п.4) на очередной
+    интервал PAUSE_REMINDER_INTERVAL_MINUTES — чужеродный маркер подавлял
+    бы алерт. Мутация: снять require_job_token из чтения напоминаний —
+    фаза А краснеет (напоминание в 11:31 не уйдёт: подделка 11:00 «придумана»
+    только что). Фаза Б: честное напоминание throttle по-прежнему держит —
+    фильтр не ломает легитимное подавление. Писатель маркера один (сам
+    conveyor_gate через pulse_guard.gh(), #1074) — честные всегда проходят."""
+    fake = FakeGh({
+        "workflows/worker.yml/runs": RECENT_FAILURES,
+        "runs/3/jobs": JOBS_PAYLOAD,
+        "issues/120/comments": [
+            job_comment("2026-08-31T10:00:00Z", pg.PAUSE_MARKER),
+            job_comment("2026-08-31T10:01:00Z", probe_body(4)),
+            # поддельное «пауза продолжается» — envelope инцидента, тело той
+            # же прод-формы, что пишет сам гейт
+            {**_load_fixture(FIXTURE_FAKE_WIP_CLOSE),
+             "created_at": "2026-08-31T11:00:00Z",
+             "body": pg.pause_reminder_text(3, 150.0, None)},
+        ],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    posted, sent = [], []
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
+    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
+
+    # Фаза А: 90 минут с последнего ЧЕСТНОГО сигнала — throttle истёк,
+    # напоминание обязано уйти (подделка 11:00 фильтром не считается)
+    _, actions1, _ = pg.conveyor_gate("mytab0r/edge-harness", utc(2026, 8, 31, 11, 31))
+    assert len(posted) == 1 and len(sent) == 1, (
+        "поддельное «пауза продолжается» (не токен job'а) не должно "
+        "подавлять напоминание о длящейся паузе")
+    assert any("напоминание" in line for line in actions1)
+
+    # Фаза Б: честное напоминание (ушло гейтом в 11:31) держит throttle — тихо
+    fake.routes["issues/120/comments"] = fake.routes["issues/120/comments"] + [
+        job_comment("2026-08-31T11:31:00Z", posted[0])]
+    posted.clear()
+    sent.clear()
+    _, actions2, _ = pg.conveyor_gate("mytab0r/edge-harness", utc(2026, 8, 31, 11, 35))
+    assert posted == [] and sent == [] and actions2 == []
 
 
 # ── Авто-возобновление по мержу (#220): success-маркер — виртуальный success ──────
@@ -1676,8 +1745,8 @@ def test_gate_resume_marker_reopens_dispatch_without_probe(monkeypatch):
         "workflows/worker.yml/runs": RECENT_FAILURES,
         "runs/3/jobs": JOBS_PAYLOAD,
         "issues/120/comments": [
-            {"created_at": "2026-08-31T11:45:00Z", "body": pg.pause_alert_text(3, None, "err")},
-            {"created_at": "2026-08-31T11:55:00Z", "body": resume_body()},
+            job_comment("2026-08-31T11:45:00Z", pg.pause_alert_text(3, None, "err")),
+            job_comment("2026-08-31T11:55:00Z", resume_body()),
         ],
     })
     monkeypatch.setattr(pg, "gh", fake)
@@ -1700,9 +1769,9 @@ def test_gate_resume_resets_probe_attempt_numbering(monkeypatch):
         "workflows/worker.yml/runs": RECENT_FAILURES,
         "runs/3/jobs": JOBS_PAYLOAD,
         "issues/120/comments": [
-            {"created_at": "2026-08-31T11:45:00Z", "body": pg.PAUSE_MARKER},
-            {"created_at": "2026-08-31T11:46:00Z", "body": probe_body(1)},
-            {"created_at": "2026-08-31T11:55:00Z", "body": resume_body()},
+            job_comment("2026-08-31T11:45:00Z", pg.PAUSE_MARKER),
+            job_comment("2026-08-31T11:46:00Z", probe_body(1)),
+            job_comment("2026-08-31T11:55:00Z", resume_body()),
         ],
     })
     monkeypatch.setattr(pg, "gh", fake)
@@ -1728,7 +1797,7 @@ def test_gate_reds_after_resume_form_a_fresh_series(monkeypatch):
         ]},
         "runs/4/jobs": JOBS_PAYLOAD,
         "issues/120/comments": [
-            {"created_at": "2026-08-31T11:40:00Z", "body": resume_body()},
+            job_comment("2026-08-31T11:40:00Z", resume_body()),
         ],
     })
     monkeypatch.setattr(pg, "gh", fake)
@@ -1771,6 +1840,159 @@ def test_stale_resume_marker_does_not_shadow_real_success(monkeypatch):
     observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed is True
     assert not any("мержем" in line for line in observations)
+
+
+# ── require_job_token: живая прод-форма #120 (issue #1242) ───────────────────────
+#
+# Фикстуры — НЕ пересказ, а буквальный `gh api repos/mytab0r/edge-harness/
+# issues/comments/<id>` (AGENTS.md, «Тест кормит прод-форму данных»):
+#
+# fixtures_issue120_fake_wip_close_marker.json — issuecomment-5665003751,
+# 2026-09-14T13:47:30Z, тело «✅ [статус конвейера: WIP-лимит снят]…» —
+# ОДИН из трёх поддельных маркеров живого инцидента 2026-09-14 (issue #1242),
+# оставленных ПОСЛЕ #1074/#1101: `user.login == "mytab0r"`,
+# `performed_via_github_app is None`.
+#
+# fixtures_issue120_honest_resume_marker.json — issuecomment-5629074295,
+# 2026-09-11T03:37:34Z, честный маркер `scheduler.after_merge` → `escalate`
+# → `pulse_guard.post_issue_comment` (RESUME_MARKER семейства, ровно то, что
+# читает `conveyor_gate`): `user.login == "github-actions[bot]"`,
+# `performed_via_github_app.slug == "github-actions"`.
+_FIXTURE_DIR = Path(__file__).resolve().parent
+FIXTURE_FAKE_WIP_CLOSE = _FIXTURE_DIR / "fixtures_issue120_fake_wip_close_marker.json"
+FIXTURE_HONEST_RESUME = _FIXTURE_DIR / "fixtures_issue120_honest_resume_marker.json"
+
+
+def _load_fixture(path: Path) -> dict:
+    with path.open(encoding="utf-8") as file:
+        return json.load(file)
+
+
+def test_comment_is_job_authored_on_live_fixtures():
+    """`comment_is_job_authored` — прямая проверка на прод-форме обоих
+    классов, без прохода через issue_marker_times/gh: сама функция, сырой
+    REST-ответ."""
+    assert pg.comment_is_job_authored(_load_fixture(FIXTURE_HONEST_RESUME)) is True
+    assert pg.comment_is_job_authored(_load_fixture(FIXTURE_FAKE_WIP_CLOSE)) is False
+
+
+def test_issue_marker_times_require_job_token_filters_live_fake_marker(monkeypatch):
+    """Живой поддельный маркер (issuecomment-5665003751) — без
+    require_job_token читается как обычный (поведение до #1242, не меняется
+    по умолчанию); с require_job_token=True отфильтрован полностью."""
+    fake_comment = _load_fixture(FIXTURE_FAKE_WIP_CLOSE)
+    fake = FakeGh({"issues/120/comments": [fake_comment]})
+    monkeypatch.setattr(pg, "gh", fake)
+
+    marker = "[статус конвейера: WIP-лимит снят]"
+    assert pg.issue_marker_times("mytab0r/edge-harness", 120, marker) == \
+        [pg.parse_time(fake_comment["created_at"])]
+    assert pg.issue_marker_times(
+        "mytab0r/edge-harness", 120, marker, require_job_token=True) == []
+
+
+def test_issue_markers_any_require_job_token_keeps_honest_drops_fake(monkeypatch):
+    """Оба живых комментария в одном #120: честный RESUME_MARKER проходит
+    require_job_token=True, поддельный WIP-close — нет. Доказательство на
+    смешанном, не изолированном списке (класс #308: фильтр обязан работать
+    по каждому комментарию независимо, не по факту «первый/последний»)."""
+    honest = _load_fixture(FIXTURE_HONEST_RESUME)
+    fake_wip = _load_fixture(FIXTURE_FAKE_WIP_CLOSE)
+    fake = FakeGh({"issues/120/comments": [fake_wip, honest]})
+    monkeypatch.setattr(pg, "gh", fake)
+
+    without_filter = pg.issue_markers_any(
+        "mytab0r/edge-harness", 120,
+        (pg.RESUME_MARKER, "[статус конвейера: WIP-лимит снят]"))
+    assert len(without_filter) == 2  # оба видимы без фильтра
+
+    with_filter = pg.issue_markers_any(
+        "mytab0r/edge-harness", 120,
+        (pg.RESUME_MARKER, "[статус конвейера: WIP-лимит снят]"),
+        require_job_token=True)
+    assert len(with_filter) == 1
+    assert pg.RESUME_MARKER in with_filter[0][1]  # только честный остался
+
+
+def test_conveyor_gate_ignores_fake_resume_marker_with_live_impersonation_envelope(monkeypatch):
+    """Прямое доказательство закрытия живого пробела (issue #1242): фейковый
+    envelope (user/performed_via_github_app) — буквальный, скопированный из
+    живого инцидента (issuecomment-5665003751, тот же `user.login`/`None`);
+    тело переписано на RESUME_MARKER этой же серии — семейство, которое
+    реально читает conveyor_gate (WIP-close текст выше conveyor_gate не ищет
+    вовсе, поэтому для ЭТОГО дерева фактов нужен маркер нужного семейства).
+    Подмена тела — единственное отступление от «буквальной фикстуры»: live-
+    инцидент поддельного RESUME/PAUSE маркера в истории #120 ещё не
+    случился (проверено `gh api .../issues/120/comments` 2026-09-14 —
+    только WIP-семейство подделано на сегодня), это упреждающее закрытие
+    того же класса, не постфактум.
+
+    Без require_job_token=True (мутация — снять параметр из вызова в
+    conveyor_gate) этот поддельный маркер читался бы как настоящий сброс —
+    allowed стал бы True. С фильтром — серия красных остаётся активной,
+    диспатч заперт: см. test_conveyor_gate_removed_filter_would_be_fooled
+    ниже (красный прогон без фикса, зафиксированный явно)."""
+    fake_envelope = _load_fixture(FIXTURE_FAKE_WIP_CLOSE)
+    forged_resume = dict(fake_envelope)
+    forged_resume["body"] = resume_body(pr=999, task=888)
+    forged_resume["created_at"] = "2026-08-31T11:55:00Z"
+
+    fake = FakeGh({
+        "workflows/worker.yml/runs": RECENT_FAILURES,
+        "runs/3/jobs": JOBS_PAYLOAD,
+        "issues/120/comments": [forged_resume],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    posted, sent = [], []
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
+    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
+
+    observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    assert allowed is False, (
+        "поддельный RESUME_MARKER (performed_via_github_app=None, живой "
+        "envelope инцидента #1242) не должен сбрасывать серию красных — "
+        "предохранитель обязан остаться закрыт")
+    assert any("паузе" in line for line in actions + observations)
+
+
+def test_conveyor_gate_removed_filter_would_be_fooled(monkeypatch):
+    """Поведенческое мутационное доказательство на САМОМ гейте (замечание
+    ai-review круга 2: прямой вызов читателя был тавтологией — читатель и
+    так читает). Имитация кода ДО #1242: issue_markers_any, молча
+    игнорирующая require_job_token (до появления параметра её сигнатура
+    принимала и отбрасывала бы такой аргумент точно так же). Реальный
+    conveyor_gate на том же поддельном RESUME разрешает диспатч —
+    allowed=True; соседний тест выше фиксирует запрещённое поведение с
+    фильтром (allowed=False). MUTATION-PROOF-блок — после мержа, когда
+    появится слитый ref."""
+    fake_envelope = _load_fixture(FIXTURE_FAKE_WIP_CLOSE)
+    forged_resume = dict(fake_envelope)
+    forged_resume["body"] = resume_body(pr=999, task=888)
+    forged_resume["created_at"] = "2026-08-31T11:55:00Z"
+
+    fake = FakeGh({
+        "workflows/worker.yml/runs": RECENT_FAILURES,
+        "runs/3/jobs": JOBS_PAYLOAD,
+        "issues/120/comments": [forged_resume],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+
+    real_issue_markers_any = pg.issue_markers_any
+
+    def pre_1242_issue_markers_any(repo, issue_number, markers, max_pages=None, *,
+                                   trusted_login=None, require_job_token=False):
+        # код ДО #1242: параметра require_job_token не существовало,
+        # вызывающий #1242-гейт передаёт его — имитация молчит и фильтрует
+        # НЕЧЕГО (читает всё, как до фикса)
+        return real_issue_markers_any(
+            repo, issue_number, markers, max_pages, trusted_login=trusted_login)
+
+    monkeypatch.setattr(pg, "issue_markers_any", pre_1242_issue_markers_any)
+
+    _, _, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    assert allowed is True, (
+        "без фильтра (код до #1242) поддельный RESUME обманывает сам гейт — "
+        "диспатч разрешён на серии красных; это и есть закрываемый дефект")
 
 
 def test_resume_alert_text_carries_marker_evidence():

@@ -11,6 +11,7 @@
 """
 
 import importlib.util
+import json
 import re
 import sys
 from datetime import datetime, timezone
@@ -2308,13 +2309,30 @@ def test_run_escalations_pipeline_health_dedupes_by_last_date(monkeypatch):
 
 
 def pause_marker_comment(when: str) -> dict:
-    return {"created_at": when, "body": ri.pulse_guard.PAUSE_MARKER}
+    """Честный маркер серии: `performed_via_github_app` НЕ пуст (#1242) —
+    писатель семейства один (`pulse_guard.gh()` под `github.token`, #1074),
+    поэтому инвариант 13 с require_job_token=True обязан его видеть."""
+    return {"created_at": when, "body": ri.pulse_guard.PAUSE_MARKER,
+            "performed_via_github_app": {"id": 15368, "slug": "github-actions"}}
 
 
 def probe_marker_comment(when: str, attempt: int) -> dict:
     return {"created_at": when,
             "body": ri.pulse_guard.probe_alert_text(
-                attempt, ri.pulse_guard.probe_backoff_minutes(attempt), None, "err")}
+                attempt, ri.pulse_guard.probe_backoff_minutes(attempt), None, "err"),
+            "performed_via_github_app": {"id": 15368, "slug": "github-actions"}}
+
+
+def fake_marker_comment(when: str, body: str) -> dict:
+    """Прод-форма ПОДДЕЛЬНОГО маркера: буквальный envelope живого инцидента
+    #1242 (issuecomment-5665003751 — та же фикстура, что у test_pulse_guard,
+    один источник), тело подставляется под сценарий. `user.login == "mytab0r"`,
+    `performed_via_github_app is None` — не токен job'а."""
+    comment = json.loads((_DIR / "fixtures_issue120_fake_wip_close_marker.json")
+                         .read_text(encoding="utf-8"))
+    comment["created_at"] = when
+    comment["body"] = body
+    return comment
 
 
 def test_phantom_pause_flags_active_marker_with_zero_real_failures(monkeypatch):
@@ -2470,6 +2488,64 @@ def test_phantom_pause_unknown_on_malformed_run_history_shape(monkeypatch):
     result = ri.check_conveyor_gate_phantom_pause(REPO, now)
     assert result.status == ri.check_result.STATUS_UNKNOWN
     assert "неожиданной" in result.reason
+
+
+def test_phantom_pause_ignores_fake_pause_marker_without_job_token(monkeypatch):
+    """#1242, находка ai-review этого PR: инвариант 13 — независимый пересчёт
+    решения conveyor_gate, обязан читать маркеры с тем же доверием, что и
+    сам гейт (тот с этого же PR требует require_job_token=True). Без фильтра
+    поддельный PAUSE (живой envelope инцидента #1242, performed_via_github_app
+    =None) при здоровой серии давал violation «фантомная пауза»
+    ({'failures': 0, ...}) — отчёт о паузе, которой для гейта (allowed=True)
+    не существует: гейт и инвариант расходились по построению. С фильтром —
+    здоровое состояние, согласованное с гейтом. Сама подделка при этом не
+    остаётся невидимой: её детектирует инвариант 18 (всё семейство
+    `[статус конвейера:`). Мутация: снять require_job_token из вызова в
+    check_conveyor_gate_phantom_pause — тест краснеет (нарушение вернётся)."""
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": [
+            worker_run(5, "2026-09-10T11:55:00Z", conclusion="skipped"),
+            worker_run(2, "2026-09-10T11:35:00Z"),
+            worker_run(1, "2026-09-10T11:20:00Z"),
+        ]},
+        "issues/120/comments": [
+            fake_marker_comment("2026-09-10T11:45:00Z", ri.pulse_guard.PAUSE_MARKER)],
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 10, 12, 0)
+    assert ri.check_conveyor_gate_phantom_pause(REPO, now) == ri.check_result.ok(), (
+        "поддельный PAUSE (не токен job'а) не должен порождать фантомную "
+        "паузу в независимом пересчёте — гейт с теми же данными разрешает "
+        "диспатч")
+
+
+def test_phantom_pause_fake_resume_cannot_cancel_honest_pause(monkeypatch):
+    """#1242, симметричный случай: поддельный RESUME (не токен job'а) НЕ
+    должен становиться якорем пересчёта и молча обнулять проверку честной
+    паузы. Без фильтра resume_at брался с подделки (11:50 новее честного
+    PAUSE 11:45), маркеры после якоря пусты — «серии нет», инвариант молчал,
+    хотя пауза стоит и реальных провалов нет (ровно фантом). С фильтром —
+    нарушение видно. Мутация: снять require_job_token — тест краснеет
+    (молчаливое ok() вернётся)."""
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": [
+            worker_run(5, "2026-09-10T11:55:00Z", conclusion="skipped"),
+            worker_run(2, "2026-09-10T11:35:00Z"),
+            worker_run(1, "2026-09-10T11:20:00Z"),
+        ]},
+        "issues/120/comments": [
+            pause_marker_comment("2026-09-10T11:45:00Z"),
+            fake_marker_comment("2026-09-10T11:50:00Z",
+                                f"✅ edge-harness: {ri.pulse_guard.RESUME_MARKER} #999]"),
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 10, 12, 0)
+    result = ri.check_conveyor_gate_phantom_pause(REPO, now)
+    assert result.status == ri.check_result.STATUS_VIOLATION, (
+        "поддельный RESUME не должен отменять честную паузу в пересчёте — "
+        "фантом (пауза активна, реальных провалов 0) обязан остаться виден")
+    assert result.violations[0]["failures"] == 0
 
 
 def test_phantom_pause_not_in_ci_gating():

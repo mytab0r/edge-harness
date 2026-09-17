@@ -3646,7 +3646,12 @@ def _ai_rework_base_fixture(pr_number, task_number, run_id, run_conclusion, *, d
     отдаёт `None`, а `!= "completed"` в dispatch_ai_review_rework трактует
     `None` как «ещё не завершился» — те же 4 теста этого модуля ложно
     ловили бы «эскалация отложена» вместо ожидаемого исхода, хотя
-    `run_conclusion` здесь ВСЕГДА конечный (failure/success/timed_out)."""
+    `run_conclusion` здесь ВСЕГДА конечный (failure/success/timed_out).
+
+    Маршрут `per_page=100&page=1` (не `per_page=10`, issue #1274) —
+    dispatch_ai_review_rework теперь ищет атрибуцию через `last_worker_run(
+    since=...)` с якорем последнего диспатча (расширенное окно, см.
+    last_worker_run), а не фиксированные 10 записей."""
     files = files_payload(["x.py"])
     fingerprint = sch.review_labels.diff_fingerprint(files)
     return fingerprint, {
@@ -3664,7 +3669,7 @@ def _ai_rework_base_fixture(pr_number, task_number, run_id, run_conclusion, *, d
         ],
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
-        "workflows/worker.yml/runs?per_page=10": {"workflow_runs": [
+        "workflows/worker.yml/runs?per_page=100&page=1": {"workflow_runs": [
             {"id": run_id, "status": "completed", "conclusion": run_conclusion,
              "created_at": "2026-09-12T11:00:00Z"},
         ]},
@@ -3729,18 +3734,105 @@ def test_dispatch_ai_review_rework_retries_instead_of_escalating_after_infra_fai
     assert any("повтор после инфра-отказа" in line for line in actions)
 
 
-def test_dispatch_ai_review_rework_escalates_when_worker_succeeded_but_findings_persist(monkeypatch):
-    """Исход 2 (законный): последний прогон worker.yml завершился
-    conclusion='success', но эскалация на ТЕКУЩЕМ отпечатке достижима только
-    если success-прогон не поменял отпечаток диффа — а тогда ai-review на
-    этот коммит не перезапускался (keep-path, should_run_ai_review go=False).
-    Текст обязан называть именно этот факт, не недостижимое «ai-review снова
-    нашёл нарушения на этом коммите» (находка ai-review PR #1030, второй
-    круг: «алерт не гадает» и про success-ветку тоже)."""
+def _ai_rework_second_round_fixture(
+    pr_number, task_number, run_id, run_conclusion, *,
+    first_dispatched_since, second_chance_dispatched_since, extra_pr_comments=(),
+):
+    """Второй раунд доводки (issue #1274): первый success-заход уже получил
+    бонусный заход (AI_REWORK_MARKER + AI_REWORK_SECOND_CHANCE_MARKER в ОДНОМ
+    комментарии — так их реально постит dispatch_ai_review_rework, см. хвост
+    функции), эта фикстура несёт след ВТОРОГО прогона (тот, что решает,
+    эскалировать ли теперь)."""
+    files = files_payload(["x.py"])
+    fingerprint = sch.review_labels.diff_fingerprint(files)
+    return fingerprint, {
+        "issues/120/comments?per_page=100": [],
+        f"issues/{pr_number}/timeline?per_page=100": [],
+        f"pulls/{pr_number}/files": files,
+        f"issues/{pr_number}/comments": [
+            {"created_at": first_dispatched_since,
+             "body": f"🤖 {sch.AI_REWORK_MARKER} fp:{fingerprint} Оркестратор снял назначение..."},
+            {"created_at": second_chance_dispatched_since,
+             "body": f"🤖 {sch.AI_REWORK_MARKER} fp:{fingerprint} "
+                     f"{sch.AI_REWORK_SECOND_CHANCE_MARKER} fp:{fingerprint} "
+                     "Оркестратор снял назначение с задачи и запустил worker.yml адресно "
+                     "(второй заход с явными находками ai-review) — исправь или явно "
+                     f"возрази (маркер {sch.AI_REWORK_REBUTTAL_MARKER})."},
+            *extra_pr_comments,
+        ],
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "workflows/worker.yml/runs?per_page=100&page=1": {"workflow_runs": [
+            {"id": run_id, "status": "completed", "conclusion": run_conclusion,
+             "created_at": "2026-09-13T11:00:00Z"},
+        ]},
+        f"{REPO}/issues/{task_number}/comments?per_page": [
+            {"created_at": "2026-09-13T11:00:30Z",
+             "body": f"🔒 Аренда задачи: `mytab0r` держит замок `refs/locks/task-{task_number}` "
+                     f"(TTL 24 ч по коммиту замка). Канал: worker run {run_id}."},
+            {"created_at": "2026-09-13T11:05:00Z",
+             "body": f"🤖 [worker: git-шаг] worker run {run_id}"},
+        ],
+        f"pulls/{pr_number}": {
+            "labels": [label(sch.review_labels.AI_CHANGES)],
+            "state": "open",
+        },
+        f"issues/{task_number}/assignees": None,
+        "workflows/worker.yml/dispatches": None,
+    }
+
+
+def test_dispatch_ai_review_rework_grants_second_chance_before_escalating_on_success(monkeypatch):
+    """Исход 2, ПЕРВОЕ обнаружение (issue #1274, живой случай PR #1120,
+    эскалация `[ai-rework: эскалация] #1120 fp:018597fe811f` в #120,
+    2026-09-13T12:28): worker.yml отработал успешно, но отпечаток диффа не
+    изменился — раньше это эскалировало владельцу немедленно. Правило
+    AGENTS.md «Воркеру нужны четыре исхода, не два»: ни один из трёх
+    заявленных исходов не эскалирует при первом обнаружении — здесь код
+    обязан дать ОДИН бесплатный доп. заход с явным контрактом «исправь или
+    возрази», не escalate.
+
+    Мутация: убери ветку `not second_chance_used` (верни безусловный escalate
+    на success) — этот тест покраснеет (escalated перестанет быть пустым,
+    dispatched станет False)."""
     task = issue(782, assignees=("mytab0r",))
     p = pull(1020, labels=[sch.review_labels.AI_CHANGES], ref="agent/782-fix-waiting-owner-relabel-loop")
     fingerprint, fixture = _ai_rework_base_fixture(
         1020, 782, 34600000001, "success", dispatched_since="2026-09-12T10:00:00Z")
+    fake = FakeGh(fixture)
+    patch_gh(monkeypatch, fake)
+    escalated = []
+    posted = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+
+    observations, actions, dispatched = sch.dispatch_ai_review_rework(REPO, [p], pool=[task])
+
+    assert dispatched is True
+    assert escalated == []
+    assert posted and posted[0][0] == 1020
+    assert sch.AI_REWORK_SECOND_CHANCE_MARKER in posted[0][1]
+    assert sch.AI_REWORK_REBUTTAL_MARKER in posted[0][1]
+    assert "исправь" in posted[0][1] and "возрази" in posted[0][1]
+    assert task["assignees"] == []  # доп. заход — обычный диспатч, задача освобождается
+    assert any("не в счёт эскалации" in line and "#1020" in line for line in observations)
+
+
+def test_dispatch_ai_review_rework_escalates_after_second_success_names_the_fact(monkeypatch):
+    """Исход 2, ВТОРОЕ подряд обнаружение на том же отпечатке: доп. заход с
+    явными находками (см. тест выше) тоже не сдвинул отпечаток и агент не
+    оставил возражения. Теперь эскалация законна и обязана называть именно
+    это (второй заход, без объяснения), не притворяться первым разом.
+    Текст обязан называть факт success прозой, не сырой repr, и не
+    недостижимое «ai-review снова нашёл нарушения на этом коммите» (находка
+    ai-review PR #1030 — «алерт не гадает» и про success-ветку тоже)."""
+    task = issue(782, assignees=("mytab0r",))
+    p = pull(1020, labels=[sch.review_labels.AI_CHANGES], ref="agent/782-fix-waiting-owner-relabel-loop")
+    fingerprint, fixture = _ai_rework_second_round_fixture(
+        1020, 782, 34600000011, "success",
+        first_dispatched_since="2026-09-12T10:00:00Z",
+        second_chance_dispatched_since="2026-09-13T09:00:00Z")
     fake = FakeGh(fixture)
     patch_gh(monkeypatch, fake)
     escalated = []
@@ -3754,12 +3846,151 @@ def test_dispatch_ai_review_rework_escalates_when_worker_succeeded_but_findings_
     assert not any("worker.yml/dispatches" in c for c in fake.calls)
     assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
     assert "conclusion='success'" not in escalated[0][2]  # честная проза факта, не сырой repr
-    assert "отработал успешно" in escalated[0][2]
+    assert "ВТОРОЙ раз подряд" in escalated[0][2]
+    assert "без объяснения" in escalated[0][2]  # возражения не было
     assert "снова нашёл нарушения" not in escalated[0][2]  # недостижимо честно на этой ветке
-    assert "отпечаток диффа не изменился" in escalated[0][2]
-    assert "keep-path" in escalated[0][2]
     assert any("исчерпана" in line and "#1020" in line for line in actions)
     assert task["assignees"] != []  # эскалация не трогает задачу
+
+
+def test_dispatch_ai_review_rework_provider_refusal_green_run_is_infra_retry(monkeypatch):
+    """#1286 (блокирующая находка ai-review PR #1313, класс
+    «второй-потребитель-забыт»): после #1286 провайдерный отказ воркера даёт
+    ЗЕЛЁНЫЙ conclusion (task.sh, блок провайдерного отказа, exit 0) — наивная
+    светка по conclusion принимала бы его за Исход 2 («отработал успешно»):
+    попытка сгорала в бюджет доводки, а владельцу уходило «отработал
+    успешно, но отпечаток не изменился» при том, что агент не вызывался
+    вовсе. Различитель — маркер task.sh (WORKER_PROVIDER_REFUSAL_MARKER) в
+    комментарии ЗАДАЧИ внутри окна прогона. Здесь маркер есть и свежее
+    старта прогона → инфра-путь: автоматический повтор, попытка не в счёт,
+    без эскалации.
+    Мутация: удали ветку provider_refusal_green в dispatch_ai_review_rework —
+    тест покраснеет (escalated непуст, dispatched False)."""
+    task = issue(782, assignees=("mytab0r",))
+    p = pull(1020, labels=[sch.review_labels.AI_CHANGES], ref="agent/782-fix-waiting-owner-relabel-loop")
+    fingerprint, fixture = _ai_rework_base_fixture(
+        1020, 782, 34600000010, "success", dispatched_since="2026-09-12T10:00:00Z")
+    fixture[f"{REPO}/issues/782/comments?per_page"].append(
+        {"created_at": "2026-09-12T11:02:00Z",
+         "body": "🤖 Автономный воркер остановлен провайдером, не своей ошибкой: "
+                 "цепочка провайдеров исчерпана целиком. "
+                 f"{sch.WORKER_PROVIDER_REFUSAL_MARKER}"},
+    )
+    fake = FakeGh(fixture)
+    patch_gh(monkeypatch, fake)
+    escalated = []
+    posted = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+
+    observations, actions, dispatched = sch.dispatch_ai_review_rework(REPO, [p], pool=[task])
+
+    assert dispatched is True
+    assert escalated == []  # зелёный провайдерный отказ — не законная эскалация
+    dispatch_calls = [c for c in fake.calls if "worker.yml/dispatches" in c]
+    assert len(dispatch_calls) == 1
+    assert "inputs[task]=782" in dispatch_calls[0]
+    assert any("не в счёт" in line and "провайдерный отказ" in line for line in observations)
+    assert posted and "повтор после инфра-отказа" in posted[0][1]
+    assert "2/1" not in posted[0][1]  # попытка бюджет не расходует (PR #1030, чеклист)
+
+
+def test_dispatch_ai_review_rework_refusal_marker_outside_run_window_still_escalates(monkeypatch):
+    """Тот же маркер, но СТАРЕЕ старта прогона — оставлен ПРЕДЫДУЩИМ прогоном,
+    не этим. Светка по окну обязана НЕ срабатывать: зелёный прогон без маркера
+    СВОЕГО окна остаётся Исходом 2 (issue #1274: законная эскалация — на ВТОРОМ
+    подряд совпадении, поэтому фикстура второго раунда с уже стоящим маркером
+    второго захода). Иначе один старый маркер навсегда маскировал бы настоящие
+    исходы доводки на этом PR.
+    Мутация: убери в worker_run_was_provider_refusal сравнение с началом
+    прогона (`any(marker_at >= started ...)` → `bool(times)`) — тест
+    покраснеет (эскалация не случится, пойдёт инфра-повтор)."""
+    task = issue(782, assignees=("mytab0r",))
+    p = pull(1020, labels=[sch.review_labels.AI_CHANGES], ref="agent/782-fix-waiting-owner-relabel-loop")
+    fingerprint, fixture = _ai_rework_second_round_fixture(
+        1020, 782, 34600000011, "success",
+        first_dispatched_since="2026-09-12T10:00:00Z",
+        second_chance_dispatched_since="2026-09-13T09:00:00Z")
+    fixture[f"{REPO}/issues/782/comments?per_page"].append(
+        {"created_at": "2026-09-12T09:00:00Z",  # прогон стартовал 2026-09-13T11:00
+         "body": f"🤖 ... {sch.WORKER_PROVIDER_REFUSAL_MARKER}"},
+    )
+    fake = FakeGh(fixture)
+    patch_gh(monkeypatch, fake)
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("эскалация — не обычный комментарий в PR"))
+    monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("бюджет исчерпан — задачу не трогаем"))
+
+    observations, actions, dispatched = sch.dispatch_ai_review_rework(REPO, [p], pool=[task])
+
+    assert dispatched is False
+    assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
+    assert "отработал успешно" in escalated[0][2]
+    assert "ВТОРОЙ раз подряд" in escalated[0][2]
+    assert any("исчерпана" in line and "#1020" in line for line in actions)
+
+
+def test_dispatch_ai_review_rework_second_success_escalation_surfaces_rebuttal(monkeypatch):
+    """AGENTS.md: «тогда это возражение и есть результат, его надо донести
+    до ревью, а не потерять» — если агент явно возразил находке (комментарий
+    с AI_REWORK_REBUTTAL_MARKER после второго захода), эскалация обязана
+    процитировать возражение, не молчать о нём. Возражение здесь ЦИТИРУЕТ
+    комментарий-дисПатч (в цитате есть маркер дисптча) — фильтр подлинности
+    (rebuttal_is_genuine) не имеет права его терять (некритичная находка
+    ai-review PR #1276).
+    Мутация: верни в dispatch_ai_review_rework фильтр «в теле нет
+    AI_REWORK_MARKER» вместо rebuttal_is_genuine — тест покраснеет
+    («без объяснения» вместо цитаты возражения)."""
+    task = issue(782, assignees=("mytab0r",))
+    p = pull(1020, labels=[sch.review_labels.AI_CHANGES], ref="agent/782-fix-waiting-owner-relabel-loop")
+    dispatch_quote = (
+        f"🤖 {sch.AI_REWORK_MARKER} fp:fp {sch.AI_REWORK_SECOND_CHANCE_MARKER} fp:fp "
+        "Оркестратор снял назначение с задачи и запустил worker.yml адресно "
+        "(второй заход — исправь или возрази, "
+        f"маркер {sch.AI_REWORK_REBUTTAL_MARKER}).")
+    rebuttal = (f"🙅 {sch.AI_REWORK_REBUTTAL_MARKER} находка ложная: правило X не применимо, "
+                "потому что модуль Y уже покрыт тестом Z\n\n"
+                f"> {dispatch_quote}")
+    fingerprint, fixture = _ai_rework_second_round_fixture(
+        1020, 782, 34600000012, "success",
+        first_dispatched_since="2026-09-12T10:00:00Z",
+        second_chance_dispatched_since="2026-09-13T09:00:00Z",
+        extra_pr_comments=({"created_at": "2026-09-13T11:30:00Z", "body": rebuttal},))
+    fake = FakeGh(fixture)
+    patch_gh(monkeypatch, fake)
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("эскалация — не обычный комментарий в PR"))
+    monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("бюджет исчерпан — задачу не трогаем"))
+
+    observations, actions, dispatched = sch.dispatch_ai_review_rework(REPO, [p], pool=[task])
+
+    assert dispatched is False
+    assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
+    assert "агент возразил" in escalated[0][2]
+    assert "правило X не применимо" in escalated[0][2]
+    assert "без объяснения" not in escalated[0][2]  # возражение БЫЛО — врать нельзя
+
+
+def test_rebuttal_is_genuine_distinguishes_agent_objection_from_dispatch_quote():
+    """Некритичная находка ai-review PR #1276, единица фильтра отдельно от
+    сборки текста эскалации: подлинное возражение агента, ЦИТИРУЮЩЕЕ
+    комментарий-дисПатч (в цитате есть маркер дисптча) — возражение; сам
+    дисПатч (маркер дисптча стоит в теле РАНЬШЕ маркера возражения, его
+    проза его и упоминает) — не возражение; тело без маркера возражения —
+    не возражение. Мутация: замени критерий «маркер возражения не позже
+    маркера дисптча» на «в теле нет AI_REWORK_MARKER» — первый assert
+    покраснеет."""
+    dispatch = (f"🤖 {sch.AI_REWORK_MARKER} fp:abc {sch.AI_REWORK_SECOND_CHANCE_MARKER} fp:abc "
+                "Оркестратор снял назначение (второй заход — исправь или возрази, "
+                f"маркер {sch.AI_REWORK_REBUTTAL_MARKER}).")
+    objection_quoting_dispatch = (f"🙅 {sch.AI_REWORK_REBUTTAL_MARKER} находка ложная.\n\n"
+                                  f"> {dispatch}")
+    assert sch.rebuttal_is_genuine(objection_quoting_dispatch) is True
+    assert sch.rebuttal_is_genuine(dispatch) is False
+    assert sch.rebuttal_is_genuine("просто текст без маркеров") is False
 
 
 def test_dispatch_ai_review_rework_escalation_names_attributed_non_success_conclusion(monkeypatch):
@@ -3828,7 +4059,7 @@ def test_dispatch_ai_review_rework_defers_escalation_while_own_run_in_flight(mon
     p = pull(1020, labels=[sch.review_labels.AI_CHANGES], ref="agent/782-fix-waiting-owner-relabel-loop")
     fingerprint, fixture = _ai_rework_base_fixture(
         1020, 782, run_id, None, dispatched_since="2026-09-12T10:00:00Z")
-    fixture["workflows/worker.yml/runs?per_page=10"] = {
+    fixture["workflows/worker.yml/runs?per_page=100&page=1"] = {
         "workflow_runs": [workflow_run(run_id, status)]}
     fake = FakeGh(fixture)
     patch_gh(monkeypatch, fake)
@@ -3871,6 +4102,308 @@ def test_dispatch_ai_review_rework_skips_escalation_when_pr_already_closed(monke
     assert any("закрыт" in line and "эскалация не нужна" in line for line in observations)
 
 
+def test_dispatch_ai_review_rework_extended_window_finds_run_outside_top10(monkeypatch):
+    """Живой случай PR #804/задача #720 (issue #1274, 2026-09-12→14, прод-
+    форма: реальный дисПатч `fp:77d4ede9b33a...` в 2026-09-12T12:50:14Z,
+    реальный прогон `34694760329` created_at=2026-09-12T12:50:13Z с
+    ЧЕСТНЫМ `conclusion='failure'` — проверено `gh api .../actions/runs/
+    34694760329` живьём). Между дисПатчем и перепроверкой прошло 43 прогона
+    worker.yml по ДРУГИМ задачам (слот сериализован) — фиксированное окно
+    `per_page=10` теряло целевой прогон, и `dispatch_ai_review_rework`
+    классифицировал честный `conclusion='failure'` как «атрибуции нет
+    вовсе», хотя факт был доступен, просто вне узкого окна.
+
+    Здесь целевой прогон — на СТРАНИЦЕ 2 расширенного поиска (страница 1 —
+    100 чужих более свежих прогонов, ни один не клеймит задачу #720):
+    `last_worker_run(since=...)` обязан долистать до него и вернуть честный
+    `conclusion='failure'` — Исход 1 (бесплатный автоповтор), не «дефект
+    атрибуции».
+
+    Мутация: `monkeypatch.setattr(sch, "LAST_RUN_LOOKUP_PAGES", 1)` —
+    ограничивает поиск ОДНОЙ страницей (эквивалент отката фикса), тест
+    покраснеет: наблюдение переключится с «инфраструктурный отказ прогона»
+    на «не атрибутирован даже в расширенном окне поиска»."""
+    task = issue(720, assignees=("mytab0r",))
+    p = pull(804, labels=[sch.review_labels.AI_CHANGES], ref="agent/720-issue-create-pool-issue-177-19")
+    files = files_payload(["x.py"])
+    fingerprint = sch.review_labels.diff_fingerprint(files)
+    dispatched_since = "2026-09-12T12:50:14Z"
+    target_run_id = 34694760329
+    # Страница 1 — 100 чужих прогонов ДРУГИХ задач, новее цели, ни один не
+    # клеймит #720 (никто не пишет "worker run <id>" в её комментариях).
+    page1_runs = [
+        {"id": 34700000000 + i, "status": "completed", "conclusion": "success",
+         "created_at": f"2026-09-1{3 + i % 2}T{(i % 24):02d}:00:00Z"}
+        for i in range(100)
+    ]
+    fixture = {
+        "issues/120/comments?per_page=100": [],
+        "issues/804/timeline?per_page=100": [],
+        "pulls/804/files": files,
+        "issues/804/comments": [
+            {"created_at": dispatched_since,
+             "body": f"🤖 {sch.AI_REWORK_MARKER} fp:{fingerprint} Оркестратор снял назначение..."},
+        ],
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "workflows/worker.yml/runs?per_page=100&page=1": {"workflow_runs": page1_runs},
+        "workflows/worker.yml/runs?per_page=100&page=2": {"workflow_runs": [
+            {"id": target_run_id, "status": "completed", "conclusion": "failure",
+             "created_at": "2026-09-12T12:50:13Z"},
+        ]},
+        f"{REPO}/issues/720/comments?per_page": [
+            {"created_at": "2026-09-12T12:50:30Z",
+             "body": "🔒 Аренда задачи: `mytab0r` держит замок `refs/locks/task-720` "
+                     f"(TTL 24 ч по коммиту замка). Канал: worker run {target_run_id}."},
+            {"created_at": "2026-09-12T12:51:03Z",
+             "body": f"🤖 [worker: git-шаг] worker run {target_run_id}"},
+        ],
+        "pulls/804": {"labels": [label(sch.review_labels.AI_CHANGES)], "state": "open"},
+        "issues/720/assignees": None,
+        "workflows/worker.yml/dispatches": None,
+    }
+    fake = FakeGh(fixture)
+    patch_gh(monkeypatch, fake)
+    escalated = []
+    posted = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+
+    observations, actions, dispatched = sch.dispatch_ai_review_rework(REPO, [p], pool=[task])
+
+    assert dispatched is True
+    assert escalated == []  # честный инфра-отказ этого прогона — не эскалация
+    assert posted and posted[0][0] == 804
+    assert "повтор после инфра-отказа" in posted[0][1]
+    assert any(
+        "не в счёт эскалации" in line and "conclusion='failure'" in line for line in observations
+    )
+    assert not any("не атрибутирован" in line for line in observations)
+
+
+def test_dispatch_ai_review_rework_grants_free_retry_before_escalating_unattributed(monkeypatch):
+    """Исход 3, ПЕРВОЕ обнаружение (issue #1274, живой случай PR #804/задача
+    #720, эскалация `[ai-rework: эскалация] #804 fp:77d4ede9b33a` в #120,
+    2026-09-14T21:19): даже расширенное окно поиска (см. тест выше) может
+    честно не найти НИКАКОГО прогона (аренда сгорела до следа, или прогон
+    вообще не стартовал). Как и Исход 1, это НЕ повод тратить бюджет
+    эскалации на нечестную попытку — ОДИН бесплатный повтор без
+    эскалации владельцу.
+
+    Мутация: убери ветку `not retried_already` (верни безусловный escalate
+    на run_conclusion is None) — тест покраснеет."""
+    task = issue(720, assignees=("mytab0r",))
+    p = pull(804, labels=[sch.review_labels.AI_CHANGES], ref="agent/720-issue-create-pool-issue-177-19")
+    files = files_payload(["x.py"])
+    fingerprint = sch.review_labels.diff_fingerprint(files)
+    fixture = {
+        "issues/120/comments?per_page=100": [],
+        "issues/804/timeline?per_page=100": [],
+        "pulls/804/files": files,
+        "issues/804/comments": [
+            {"created_at": "2026-09-12T12:50:14Z",
+             "body": f"🤖 {sch.AI_REWORK_MARKER} fp:{fingerprint} Оркестратор снял назначение..."},
+        ],
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        # Ни одной страницы расширенного окна не содержит клейм задачи #720 —
+        # честное «атрибуции нет вовсе», не узость окна (тот случай выше).
+        "workflows/worker.yml/runs?per_page=100&page=1": {"workflow_runs": []},
+        f"{REPO}/issues/720/comments?per_page": [
+            # Локальный захват аренды МИМО worker.yml (реальный след #804/#720,
+            # "task-branch (local)") — git-шага от worker.yml здесь нет вовсе.
+            {"created_at": "2026-09-14T12:24:15Z",
+             "body": "🔒 Аренда задачи: `unknown` держит замок `refs/locks/task-720` "
+                     "(TTL 24 ч по коммиту замка). Канал: task-branch (local)."},
+            {"created_at": "2026-09-12T12:51:03Z",
+             "body": "🤖 [worker: git-шаг] worker run 34694760329"},
+        ],
+        "pulls/804": {"labels": [label(sch.review_labels.AI_CHANGES)], "state": "open"},
+        "issues/720/assignees": None,
+        "workflows/worker.yml/dispatches": None,
+    }
+    fake = FakeGh(fixture)
+    patch_gh(monkeypatch, fake)
+    escalated = []
+    posted = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+
+    observations, actions, dispatched = sch.dispatch_ai_review_rework(REPO, [p], pool=[task])
+
+    assert dispatched is True
+    assert escalated == []
+    assert posted and posted[0][0] == 804
+    assert sch.AI_REWORK_UNATTRIBUTED_RETRY_MARKER in posted[0][1]
+    assert "не оставил следа аренды" in posted[0][1]
+    assert task["assignees"] == []
+    assert any("не в счёт эскалации" in line and "#804" in line for line in observations)
+
+
+def test_dispatch_ai_review_rework_escalates_second_unattributed_as_attribution_defect(monkeypatch):
+    """Исход 3, ВТОРОЕ подряд обнаружение: бесплатный повтор (см. тест выше)
+    тоже не оставил следа — теперь эскалация законна, и текст ОБЯЗАН назвать
+    именно дефект атрибуции («проверь, шёл ли вообще прогон»), а не
+    «посмотри находки ai-review» (это не про содержимое находок вовсе)."""
+    task = issue(720, assignees=("mytab0r",))
+    p = pull(804, labels=[sch.review_labels.AI_CHANGES], ref="agent/720-issue-create-pool-issue-177-19")
+    files = files_payload(["x.py"])
+    fingerprint = sch.review_labels.diff_fingerprint(files)
+    fixture = {
+        "issues/120/comments?per_page=100": [],
+        "issues/804/timeline?per_page=100": [],
+        "pulls/804/files": files,
+        "issues/804/comments": [
+            {"created_at": "2026-09-12T12:50:14Z",
+             "body": f"🤖 {sch.AI_REWORK_MARKER} fp:{fingerprint} Оркестратор снял назначение..."},
+            {"created_at": "2026-09-14T21:00:00Z",
+             "body": f"🤖 {sch.AI_REWORK_MARKER} fp:{fingerprint} "
+                     f"{sch.AI_REWORK_UNATTRIBUTED_RETRY_MARKER} fp:{fingerprint} "
+                     "повтор — прошлый прогон не оставил следа аренды."},
+        ],
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "workflows/worker.yml/runs?per_page=100&page=1": {"workflow_runs": []},
+        f"{REPO}/issues/720/comments?per_page": [],
+        "pulls/804": {"labels": [label(sch.review_labels.AI_CHANGES)], "state": "open"},
+        "issues/720/assignees": None,
+        "workflows/worker.yml/dispatches": None,
+    }
+    fake = FakeGh(fixture)
+    patch_gh(monkeypatch, fake)
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("бюджет исчерпан — эскалация, не комментарий"))
+    monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("эскалация не трогает задачу"))
+
+    observations, actions, dispatched = sch.dispatch_ai_review_rework(REPO, [p], pool=[task])
+
+    assert dispatched is False
+    assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
+    assert "дефект атрибуции" in escalated[0][2]
+    assert "не непрочитанные находки ai-review" in escalated[0][2]
+    assert "проверь вручную, шёл ли" in escalated[0][2]
+    assert any("дефект атрибуции" in line and "#804" in line for line in actions)
+
+
+def test_dispatch_ai_review_rework_defers_second_unattributed_while_retry_in_flight(monkeypatch):
+    """Блокирующая находка ai-review PR #1276 (класс «эскалация-до-итога-
+    прогона», та же дверь, что #1260 — второй круг): бонусный повтор Исхода 3
+    по конструкции НЕ оставляет следа аренды, поэтому дефер
+    `run.get("status") != "completed"` (по АТРИБУТИРОВАННОМУ прогону) его не
+    ловит. Пока существует прогон worker.yml, начавшийся ПОСЛЕ маркера
+    повтора и ещё не завершённый, честно неизвестно, что показал бы НАШ
+    повтор — эскалировать «два прогона подряд не оставили следа» при живом
+    втором рано: сценарий ревьюера (маркер 21:00, повтор in_progress с 21:05)
+    раньше уходил владельцу тем же пульсом.
+    Мутация: убери проверку `retry_in_flight` (ветка retried_already сразу
+    эскалирует) — тест покраснеет (escalated непуст при живом повторе)."""
+    task = issue(720, assignees=("mytab0r",))
+    p = pull(804, labels=[sch.review_labels.AI_CHANGES], ref="agent/720-issue-create-pool-issue-177-19")
+    files = files_payload(["x.py"])
+    fingerprint = sch.review_labels.diff_fingerprint(files)
+    fixture = {
+        "issues/120/comments?per_page=100": [],
+        "issues/804/timeline?per_page=100": [],
+        "pulls/804/files": files,
+        "issues/804/comments": [
+            {"created_at": "2026-09-12T12:50:14Z",
+             "body": f"🤖 {sch.AI_REWORK_MARKER} fp:{fingerprint} Оркестратор снял назначение..."},
+            {"created_at": "2026-09-14T21:00:00Z",
+             "body": f"🤖 {sch.AI_REWORK_MARKER} fp:{fingerprint} "
+                     f"{sch.AI_REWORK_UNATTRIBUTED_RETRY_MARKER} fp:{fingerprint} "
+                     "повтор — прошлый прогон не оставил следа аренды."},
+        ],
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "workflows/worker.yml/runs?per_page=100&page=1": {"workflow_runs": [
+            # Собственный повтор из сценария ревьюера: начался ПОСЛЕ маркера
+            # (21:00), ещё не завершился. Следа аренды в задаче нет (мы в
+            # ветке Исхода 3 именно поэтому) — различим только по времени.
+            {"id": 34600000999, "status": "in_progress", "conclusion": None,
+             "created_at": "2026-09-14T21:05:00Z"},
+        ]},
+        # Окно поиска доходит до конца: следа аренды нет, страница 1 целиком
+        # новее якоря диспатча — вторая страница обязана существовать и быть
+        # пустой (прод-форма: дальше страниц нет).
+        "workflows/worker.yml/runs?per_page=100&page=2": {"workflow_runs": []},
+        f"{REPO}/issues/720/comments?per_page": [],
+        "pulls/804": {"labels": [label(sch.review_labels.AI_CHANGES)], "state": "open"},
+        "issues/720/assignees": None,
+        "workflows/worker.yml/dispatches": None,
+    }
+    fake = FakeGh(fixture)
+    patch_gh(monkeypatch, fake)
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("повтор ещё идёт — эскалация рано"))
+    monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("повтор ещё идёт — задачу не трогаем"))
+
+    observations, actions, dispatched = sch.dispatch_ai_review_rework(REPO, [p], pool=[task])
+
+    assert dispatched is False
+    assert escalated == []  # повтор жив — решение отложено, не эскалация
+    assert any("не завершился" in line and "#804" in line for line in observations)
+    # Проба `pending_unattributed_retry` уже прочитала маркер повтора — ветка
+    # Исхода 3 обязана переиспользовать её результат, а не читать комментарии
+    # PR второй раз (некритичная находка ai-review PR #1276: «проба удвоила
+    # постоянное чтение комментариев PR»). Три ЛЕГАЛЬНЫХ чтения комментариев
+    # PR к этому моменту: ai_rework_attempts→ai_rework_dispatched_at, сама
+    # проба, dispatch_anchor в ветке эскалации; четвёртое — дубль ветки.
+    pr_comment_fetches = [c for c in fake.calls if "issues/804/comments?per_page" in c]
+    assert len(pr_comment_fetches) == 3
+
+
+def test_dispatch_ai_review_rework_escalates_second_unattributed_after_retry_finished(monkeypatch):
+    """Газ дефера (тормоз без газа не принимается): тот же сценарий, что в
+    тесте выше, но повтор уже ЗАВЕРШИЛСЯ (conclusion='failure', следа аренды
+    не оставил) — дефер обязан отпустить, эскалация дефекта атрибуции
+    состояться. Мутация: сделай дефер безусловным (continue всегда) — тест
+    покраснеет (эскалация никогда не уйдёт, решение зависнет)."""
+    task = issue(720, assignees=("mytab0r",))
+    p = pull(804, labels=[sch.review_labels.AI_CHANGES], ref="agent/720-issue-create-pool-issue-177-19")
+    files = files_payload(["x.py"])
+    fingerprint = sch.review_labels.diff_fingerprint(files)
+    fixture = {
+        "issues/120/comments?per_page=100": [],
+        "issues/804/timeline?per_page=100": [],
+        "pulls/804/files": files,
+        "issues/804/comments": [
+            {"created_at": "2026-09-12T12:50:14Z",
+             "body": f"🤖 {sch.AI_REWORK_MARKER} fp:{fingerprint} Оркестратор снял назначение..."},
+            {"created_at": "2026-09-14T21:00:00Z",
+             "body": f"🤖 {sch.AI_REWORK_MARKER} fp:{fingerprint} "
+                     f"{sch.AI_REWORK_UNATTRIBUTED_RETRY_MARKER} fp:{fingerprint} "
+                     "повтор — прошлый прогон не оставил следа аренды."},
+        ],
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "workflows/worker.yml/runs?per_page=100&page=1": {"workflow_runs": [
+            {"id": 34600000999, "status": "completed", "conclusion": "failure",
+             "created_at": "2026-09-14T21:05:00Z"},
+        ]},
+        "workflows/worker.yml/runs?per_page=100&page=2": {"workflow_runs": []},
+        f"{REPO}/issues/720/comments?per_page": [],
+        "pulls/804": {"labels": [label(sch.review_labels.AI_CHANGES)], "state": "open"},
+        "issues/720/assignees": None,
+        "workflows/worker.yml/dispatches": None,
+    }
+    fake = FakeGh(fixture)
+    patch_gh(monkeypatch, fake)
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("бюджет исчерпан — эскалация, не комментарий"))
+    monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("эскалация не трогает задачу"))
+
+    observations, actions, dispatched = sch.dispatch_ai_review_rework(REPO, [p], pool=[task])
+
+    assert dispatched is False
+    assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
+    assert "дефект атрибуции" in escalated[0][2]
+
+
 def test_dispatch_ai_review_rework_escalates_while_worker_active(monkeypatch):
     """Issue #1253: решение об эскалации (бюджет доводки исчерпан) не должно
     ждать освобождения воркера — эскалация не трогает воркер, только
@@ -3879,6 +4412,12 @@ def test_dispatch_ai_review_rework_escalates_while_worker_active(monkeypatch):
     авто-повтор без штрафа бюджета должен был сработать следующим свободным
     пульсом, не сработал почти двое суток, потому что старое решение
     эскалировать ждало `not worker_runs_active(repo)`.
+
+    Фикстура несёт `conclusion='timed_out'` (не входит в список бесплатных
+    исходов #1274 — эскалирует с первого раза, как раньше), чтобы проверять
+    ИМЕННО независимость решения от занятости воркера, не путая её с
+    двухшаговым контрактом Исхода 2 (success — см. тесты
+    test_dispatch_ai_review_rework_grants_second_chance_*/*_second_success_*).
 
     Воркер в этой фикстуре ЗАНЯТ прямо сейчас (in_progress run) — эскалация
     обязана состояться несмотря на это.
@@ -3890,7 +4429,7 @@ def test_dispatch_ai_review_rework_escalates_while_worker_active(monkeypatch):
     task = issue(782, assignees=("mytab0r",))
     p = pull(1020, labels=[sch.review_labels.AI_CHANGES], ref="agent/782-fix-waiting-owner-relabel-loop")
     fingerprint, fixture = _ai_rework_base_fixture(
-        1020, 782, 34600000004, "success", dispatched_since="2026-09-12T10:00:00Z")
+        1020, 782, 34600000004, "timed_out", dispatched_since="2026-09-12T10:00:00Z")
     fixture["workflows/worker.yml/runs?status=in_progress"] = {
         "workflow_runs": [workflow_run(34600000005, "in_progress")]}
     fake = FakeGh(fixture)
@@ -5184,8 +5723,13 @@ def test_after_merge_resume_series_by_merge_posts_marker(monkeypatch):
         joined = " ".join(args)
         # порядок важен: FakeGh матчит по подстроке, более частный фрагмент — раньше
         if joined.startswith(f"-X POST repos/{REPO}/issues/120/comments"):
+            # performed_via_github_app: fake_gh симулирует POST настоящего
+            # job'а (escalate() внутри resume_series_by_merge) — require_
+            # job_token=True (#1242) на перечитывании обязан увидеть маркер
+            # доверенным, той же прод-формой, что несёт честный REST-ответ.
             store.append({"created_at": "2026-09-06T04:41:00Z",
-                          "body": args[-1].removeprefix("body=")})
+                          "body": args[-1].removeprefix("body="),
+                          "performed_via_github_app": {"slug": "github-actions"}})
             return None
         if joined == f"repos/{REPO}/issues/120/comments?per_page=100&page=1":
             return list(store)
@@ -5315,7 +5859,8 @@ def test_after_merge_resume_dedupes_by_pr_marker(monkeypatch):
             {"created_at": "2026-09-06T04:17:30Z", "body": CLAIM_TRACE_BODY}],
         f"{REPO}/issues/120/comments?per_page": [
             {"created_at": "2026-09-06T04:41:00Z",
-             "body": pg.resume_alert_text(163, 217, None)}],
+             "body": pg.resume_alert_text(163, 217, None),
+             "performed_via_github_app": {"slug": "github-actions"}}],
         f"-X POST repos/{REPO}/issues/217/comments": None,
         f"repos/{REPO}/issues/217": {**issue(217, assignees=("mytab0r",)), "state": "open"},
         f"{REPO}/actions/workflows/worker.yml/runs": RESUME_RED_RUNS,
@@ -5329,6 +5874,74 @@ def test_after_merge_resume_dedupes_by_pr_marker(monkeypatch):
 
     assert hard_failure is False
     assert not any("сброшена мержем" in line for line in actions + observations)
+
+
+# Живой поддельный маркер (issue #1242, доводка #1101/#1074): issuecomment-
+# 5665003751, `gh api repos/mytab0r/edge-harness/issues/comments/5665003751`
+# (2026-09-14T13:47:30Z) — `performed_via_github_app` пусто, автор `mytab0r`.
+# Тело здесь ЗАМЕНЕНО на RESUME_MARKER этого PR (сам live-комментарий несёт
+# WIP-close текст, дедуп resume_series_by_merge на него не смотрит вовсе) —
+# envelope (user/performed_via_github_app), от которого зависит фильтр,
+# буквальный, скопирован без изменений.
+_FAKE_RESUME_ENVELOPE = {
+    "user": {"login": "mytab0r", "type": "User"},
+    "performed_via_github_app": None,
+}
+
+
+def test_after_merge_resume_ignores_fake_dedup_marker_without_job_token(monkeypatch):
+    """Без require_job_token=True поддельный RESUME_MARKER (та же форма, что
+    #1242 нашла в #120 живьём) навсегда блокирует ЛЕГИТИМНЫЙ авто-сброс —
+    дедуп «уже сигналился» решает по чужеродной подделке. escalate() зовётся
+    НАСТОЯЩИЙ (как в test_after_merge_resume_series_by_merge_posts_marker) —
+    поддельный маркер уже лежит в #120 ДО вызова, настоящий постинг
+    дописывает второй, честный. Мутация: убрать require_job_token=True у
+    обоих чтений resume_token в resume_series_by_merge — этот тест краснеет
+    (escalate не позовётся, дедуп решит «уже сигналился» на подделке)."""
+    merged = resume_pull()
+    store = [{
+        "created_at": "2026-09-06T04:41:00Z",
+        "body": pg.resume_alert_text(163, 217, None),
+        **_FAKE_RESUME_ENVELOPE,
+    }]
+
+    def fake_gh(*args):
+        joined = " ".join(args)
+        if joined.startswith(f"-X POST repos/{REPO}/issues/120/comments"):
+            store.append({"created_at": "2026-09-06T04:42:00Z",
+                          "body": args[-1].removeprefix("body="),
+                          "performed_via_github_app": {"slug": "github-actions"}})
+            return None
+        if joined == f"repos/{REPO}/issues/120/comments?per_page=100&page=1":
+            return list(store)
+        if joined.startswith(f"-X POST repos/{REPO}/issues/217/comments"):
+            return None
+        if joined in (f"repos/{REPO}/pulls/163/files?per_page=100&page=1",
+                      f"repos/{REPO}/pulls/163/files?per_page=100&page=2"):
+            return []
+        if joined == f"repos/{REPO}/pulls/163":
+            return {"number": 163, "merged_at": "2026-09-06T04:40:56Z"}
+        if joined == f"repos/{REPO}/issues/217/comments?per_page=100&page=1":
+            return [{"created_at": "2026-09-06T04:17:30Z", "body": CLAIM_TRACE_BODY}]
+        if joined == f"repos/{REPO}/issues/217":
+            return {**issue(217, assignees=("mytab0r",)), "state": "open"}
+        if joined == f"repos/{REPO}/actions/workflows/worker.yml/runs?per_page=10":
+            return RESUME_RED_RUNS
+        raise AssertionError(f"нет маршрута для: {joined}")
+
+    patch_gh(monkeypatch, fake_gh)
+    monkeypatch.setattr(pg, "send_telegram", lambda text: True)
+    monkeypatch.setattr(sch, "send_telegram", lambda text, as_html=False: True)
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
+
+    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+
+    assert hard_failure is False
+    # видимый результат: НАСТОЯЩИЙ маркер дописан в #120 — дедуп не спутал
+    # поддельный с реальным сигналом и не заблокировал сброс навсегда
+    assert len(store) == 2, "escalate() обязан был реально дописать честный маркер"
+    assert any("сброшена мержем #163" in line for line in actions + observations)
 
 
 def test_after_merge_resume_does_not_claim_reset_when_marker_not_posted(monkeypatch):
@@ -5407,6 +6020,54 @@ def test_last_worker_run_conclusion_none_when_unattributed(monkeypatch):
     })
     patch_gh(monkeypatch, fake)
     assert sch.last_worker_run_conclusion(REPO, 217) is None
+
+
+def test_last_worker_run_since_reads_task_comments_once_per_page(monkeypatch):
+    """Блокирующая находка ai-review PR #1276 (класс «цена читателя не должна
+    расти с историей задачи», #1100/#607): расширенное окно (`since=`,
+    issue #1274) сканирует до 5×100 прогонов; след аренды ВСЕЙ страницы лежит
+    в одном и том же списке комментариев задачи — читать его нужно ОДИН раз
+    на страницу, не на каждый прогон страницы (при отсутствии атрибуции
+    прежний код давал до 500 фетчей истории задачи на одно решение против
+    прежнего потолка 10). Поведенческая проверка цены: страница из ТРЁХ
+    прогонов, след у ПОСЛЕДНЕГО — ровно ОДИН фетч комментариев.
+    Мутация: верни в last_worker_run вызов run_claimed_task (фетч истории на
+    каждый прогон) — тест покраснеет (три фетча вместо одного)."""
+    fake = FakeGh({
+        "workflows/worker.yml/runs?per_page=100&page=1": {"workflow_runs": [
+            {"id": 34600000001, "status": "completed", "conclusion": "failure",
+             "created_at": "2026-09-12T12:00:00Z"},
+            {"id": 34600000002, "status": "completed", "conclusion": "success",
+             "created_at": "2026-09-12T11:30:00Z"},
+            {"id": 34600000003, "status": "completed", "conclusion": "success",
+             "created_at": "2026-09-12T11:00:00Z"},
+        ]},
+        f"{REPO}/issues/217/comments?per_page": [
+            {"created_at": "2026-09-12T11:00:30Z",
+             "body": CLAIM_TRACE_BODY.replace("34011108934", "34600000003")},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    run = sch.last_worker_run(REPO, 217, since=utc(2026, 9, 12, 10, 30))
+    assert run is not None and run["id"] == 34600000003  # атрибуция работает как раньше
+    comment_fetches = [c for c in fake.calls if "issues/217/comments?per_page" in c]
+    assert len(comment_fetches) == 1  # один фетч на страницу, не на прогон
+
+
+def test_last_worker_run_without_since_reads_task_comments_once(monkeypatch):
+    """Тот же класс для узкой ветки (без `since=`): страница из двух прогонов
+    — один фетч комментариев задачи, не два. Мутация та же, что выше."""
+    fake = FakeGh({
+        "workflows/worker.yml/runs?per_page=10": {"workflow_runs": [
+            {"id": 1, "conclusion": "cancelled"},
+            {"id": 2, "conclusion": "success"},
+        ]},
+        f"{REPO}/issues/217/comments?per_page": [],
+    })
+    patch_gh(monkeypatch, fake)
+    assert sch.last_worker_run(REPO, 217) is None
+    comment_fetches = [c for c in fake.calls if "issues/217/comments?per_page" in c]
+    assert len(comment_fetches) == 1
 
 
 def test_task_sh_composes_claim_via_worker_run_format():
