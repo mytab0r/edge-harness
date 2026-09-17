@@ -14,6 +14,13 @@
 этим решением) см. в git-истории task_ref.py и
 openspec/changes/contract-task-from-branch/proposal.md.
 
+Класс #1264 (ссылка на задачу ЧУЖОГО репозитория): `extract_task_refs`
+охраняла границу числа (#187/#195), но не то, что стоит ПЕРЕД `#` — форма
+`owner/repo#N` и HTML-ссылка на чужой issue/PR (`<a href=".../issues/N">
+#N</a>`, рендер Dependabot) засчитывались как ссылка на задачу ЭТОГО
+репозитория. Живой случай — PR #922, разославший ложные комментарии в
+задачи #744/#754.
+
 Кейсы кормятся прод-формой тела PR, которая реально встречается в
 репозитории.
 
@@ -27,6 +34,8 @@ SCRIPT = Path(__file__).with_name("task_ref.py")
 spec = importlib.util.spec_from_file_location("task_ref", SCRIPT)
 task_ref = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(task_ref)  # type: ignore[union-attr]
+
+_DIR = Path(__file__).resolve().parent
 
 
 def test_no_false_positive_on_longer_number_suffix():
@@ -80,6 +89,97 @@ def test_real_pr_body_no_relation_regression():
     body = "#182\n\nАрхив сессий раннера падает 403 (см. #174).\n"
     assert task_ref.references_task(body, 18) is False
     assert task_ref.references_task(body, 182) is True
+
+
+# ── Ссылка на задачу ЧУЖОГО репозитория — не наша (#1264) ────────────────────
+#
+# Прод-форма: дословное тело PR #922 (`gh api repos/mytab0r/edge-harness/
+# pulls/922 --jq .body`, живой прогон 2026-09-14), сохранено байт-в-байт в
+# fixtures_pr922_dependabot_body.md. Тело несёт форму `owner/repo#N` (текстом
+# внутри HTML-ссылки, например `actions/upload-artifact#754`) и форму
+# HTML-ссылки с голым `#N` текстом (`<a href="https://redirect.github.com/
+# actions/upload-artifact/issues/797">#797</a>`) — обе указывают на чужой
+# репозиторий actions/upload-artifact, не на этот. Живой инцидент: после
+# слияния этого PR `scheduler.py::after_merge` разослал в задачи #744 и #754
+# ложные комментарии «PR слит и упоминает эту задачу».
+_PR_922_BODY = (_DIR / "fixtures_pr922_dependabot_body.md").read_text(encoding="utf-8")
+
+
+def test_extract_task_refs_ignores_foreign_repo_dependabot_body():
+    refs = task_ref.extract_task_refs(_PR_922_BODY)
+    assert 744 not in refs, "actions/upload-artifact#744 — чужой репозиторий, не наша задача"
+    assert 754 not in refs, "actions/upload-artifact#754 (и HTML-ссылка #754) — чужой репозиторий"
+    # Тело целиком состоит из ссылок на чужой репозиторий (release notes +
+    # список коммитов) — после фильтра не остаётся ни одного числа.
+    assert refs == []
+
+
+def test_references_task_false_for_foreign_repo_numbers_in_real_body():
+    assert task_ref.references_task(_PR_922_BODY, 744) is False
+    assert task_ref.references_task(_PR_922_BODY, 754) is False
+
+
+def test_extract_task_refs_ignores_owner_repo_form_plain_text():
+    # Форма без HTML-обёртки (в т.ч. внутри markdown-ссылки) — как в
+    # собственных PR агентов, документирующих соседний репозиторий
+    # pawaca/dsh-edge (например PR #1209, #1066, #313, #79 — живой прогон
+    # 2026-09-14).
+    text = "Патч синхронизирован с [pawaca/dsh-edge#167](https://github.com/pawaca/dsh-edge/issues/167), задача #43 закрыта."
+    assert task_ref.extract_task_refs(text) == [43]
+
+
+def test_extract_task_refs_does_not_strip_numeric_ratio_before_hash():
+    # Живой контрпример (PR #1247, дословный фрагмент тела, 2026-09-14):
+    # «при дефолтных 300/180с#877 ретраи RATE_LIMIT физически не дожигают
+    # 9000с» — сегменты `300/180с` (байтово `300/180` + кириллическая «с»)
+    # без единой латинской буквы стоят ВПЛОТНУЮ к `#877`. Это НЕ форма
+    # owner/repo — #877 обязана остаться нашей задачей, иначе защита от
+    # чужого репозитория сама стала бы новым классом ложноотрицательных
+    # срабатываний. Adjacency обязателен: первая редакция этого теста
+    # отделяла `#877` пробелом и скобкой («(#877)») и МОЛЧА ЗЕЛЕНЕЛА на
+    # мутанте без буквенных lookahead'ов `_FOREIGN_REPO_REF_RE` (класс
+    # ложно-зелёной гвардии #891/#893, находка ai-review PR #1267).
+    text = (
+        "при дефолтных 300/180с#877 ретраи RATE_LIMIT физически "
+        "не дожигают 9000с — новый бюджет там не сработал бы"
+    )
+    assert task_ref.extract_task_refs(text) == [877]
+    # Две формы ниже — синтетические границы, живого примера каждой нет
+    # (названо прямо): они пинят КАЖДЫЙ lookahead `_FOREIGN_REPO_REF_RE` по
+    # отдельности, а не только совместное снятие. `300/abc#877` (вторая
+    # буква есть, первой нет) краснеет при снятии ПЕРВОГО lookahead,
+    # `abc/180с#877` (первая есть, во второй кириллица) — при снятии
+    # ВТОРОГО. Второй пин обязан нести НЕцифровой хвост второго сегмента:
+    # чистое `abc/180#877` как пин бесполезно — цифра перед `#` уже
+    # блокирует `_TASK_REF_RE` гвардией #187 `(?<!\d)`, и число невидимо при
+    # любом состоянии чужого регэкспа.
+    assert task_ref.extract_task_refs("бюджет 300/abc#877 исчерпан") == [877]
+    assert task_ref.extract_task_refs("бюджет abc/180с#877 исчерпан") == [877]
+    # Проза без adjacency (дробь и #N раздельно) остаётся рабочей.
+    assert task_ref.extract_task_refs("при 300/180 ретраи (#877).") == [877]
+
+
+def test_extract_task_refs_ignores_number_inside_fenced_code_block():
+    # Живой случай (PR #1206, 2026-09-14): код-блок с выводом упавшего теста
+    # несёт синтетический `#42` из юнит-теста claim_task — не ссылку на
+    # настоящую задачу #42.
+    body = (
+        "#100\n\n"
+        "```\n"
+        "AssertionError: assert False is True\n"
+        " +  where False = ClaimResult(claimed=False, task=42, holder='run:A',\n"
+        "     detail='задача #42 уже занята держателем run:A (замок refs/locks/task-42)').claimed\n"
+        "```\n"
+    )
+    assert task_ref.extract_task_refs(body) == [100]
+
+
+def test_extract_task_refs_still_finds_real_mentions_inside_blockquote():
+    # Блокцитаты НЕ вырезаются (GitHub их не исключает из разбора директив/
+    # ссылок, живые данные PR #475) — упоминание своей же задачи в цитате
+    # остаётся видимым.
+    text = "> Уже разобрано ai:* дважды за 120 мин: #387,#329,#327"
+    assert task_ref.extract_task_refs(text) == [387, 329, 327]
 
 
 # ── Резолвер «PR → задача» (#259, #394) — прод-форма реальных PR ────────────
