@@ -5,9 +5,9 @@
       "id": "hello",
       "package": "@edge-harness/dsh-plugin-hello",
       "source": {
-        "release": "plugins-hello-v0.1.1",
-        "asset": "hello-world-0.1.1.tgz",
-        "sha256": "f2790cacfcaafce67d808a28f13e07295bdba60266dc415a8c795390e4ff3921"
+        "release": "plugins-hello-v0.1.2",
+        "asset": "hello-0.1.2.tgz",
+        "sha256": "afb9c32c6b1c63de194d1005d81d8be6c12706f62f80632a64eba297b38c7442"
       },
       "server": true,
       "client": true
