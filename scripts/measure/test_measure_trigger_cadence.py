@@ -91,6 +91,39 @@ def test_no_upper_reference_when_threshold_never_reached():
     assert facts["nearest_above"] is None
 
 
+def test_no_lower_reference_when_threshold_below_working_mass():
+    """Блокер ai-review PR #1185 (круг 4): порог ниже ВСЕЙ рабочей массы —
+    `nearest_below` пуст, прежний предикат пропускал None-маржу и отдавал
+    «ok» (исполнено ревью: `cadence_verdict([60, 70, 90], 30.0, 15.0)` →
+    `("ok", fires_in_window=3)` — спокойный зелёный на пороге, стреляющем
+    на каждом тике). Обязан быть no-lower-reference с Named фактами."""
+    verdict, facts = mtc.cadence_verdict([60.0, 70.0, 90.0], 30.0, min_margin=15.0)
+    assert verdict == "no-lower-reference"
+    assert facts["nearest_below"] is None
+    assert facts["fires_in_window"] == 3
+
+
+def test_no_lower_reference_exit_one_through_cli(tmp_path):
+    """Тот же вход через CLI (--check + --from-file): код 1, вердикт в
+    машинном JSON — интеграция предиката с кодом возврата. Фикстура-минимум
+    той же прод-формы (у недельной фикстуры выше промежутки от 0.2 мин —
+    порог 30 там даёт thin-margin, не no-lower-reference)."""
+    runs = {"workflow_runs": [
+        {"id": 1, "conclusion": "success", "updated_at": "2026-09-17T10:00:00Z"},
+        {"id": 2, "conclusion": "success", "updated_at": "2026-09-17T11:00:00Z"},
+        {"id": 3, "conclusion": "success", "updated_at": "2026-09-17T12:10:00Z"},
+        {"id": 4, "conclusion": "success", "updated_at": "2026-09-17T13:40:00Z"},
+    ]}
+    fixture = tmp_path / "runs.json"
+    fixture.write_text(json.dumps(runs), encoding="utf-8")
+    result = subprocess.run(
+        [sys.executable, str(_HERE / "measure_trigger_cadence.py"),
+         "quota-watch.yml", "--from-file", str(fixture), "--check", "30", "--json"],
+        capture_output=True, encoding="utf-8")
+    assert result.returncode == 1, result.stderr
+    assert json.loads(result.stdout)["verdict"] == "no-lower-reference"
+
+
 def test_cli_check_exit_codes_and_json_on_fixture():
     """CLI до конца, без сети (--from-file): порог из quota_watch (90.0) —
     thin-margin → код 1 и машинный JSON несёт вердикт и факты; заведомо

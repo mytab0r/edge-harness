@@ -131,7 +131,11 @@ def cadence_verdict(gaps: list[float], threshold: float,
       поджимается распределением, пересчитать при следующем замере;
     - "no-upper-reference": в окне нет НИ ОДНОГО промежутка ≥ порога —
       верхнюю сторону разрыва подтвердить нечем (порог возможно сильно
-      завышен: канал простаивал бы молча весь сэмпл).
+      завышен: канал простаивал бы молча весь сэмпл);
+    - "no-lower-reference": в окне нет НИ ОДНОГО промежутка < порога —
+      нижнюю сторону разрыва подтвердить нечем (порог ниже всей рабочей
+      массы: канал стрелял бы на каждом тике — ложный «ok» здесь стоил бы
+      шторма ложных срабатываний, находка ai-review PR #1185, круг 4).
     Решение «какое число ставить» — не здесь: здесь только механика разрыва
     (AGENTS.md «Алерт не гадает»: факт — промежутки; выбор порога —
     калибровка)."""
@@ -150,10 +154,17 @@ def cadence_verdict(gaps: list[float], threshold: float,
         "fires_in_window": len(above),
         "min_margin": min_margin,
     }
+    if nearest_below is None:
+        # Симметрично «no-upper-reference» (находка ai-review PR #1185, круг 4):
+        # порог ниже ВСЕЙ рабочей массы промежутков — нижнюю сторону разрыва
+        # подтвердить нечем, канал стрелял бы на каждом тике (fires_in_window =
+        # всем промежуткам). Прежний предикат молча пропускал None-маржу и
+        # отдавал «ok» — спокойный зелёный на пороге, устраивающем шторм
+        # ложных срабатываний, ровно тот, с которым #1184 боролся.
+        return "no-lower-reference", facts
     if nearest_above is None:
         return "no-upper-reference", facts
-    if (facts["below_margin"] is not None and facts["below_margin"] < min_margin) \
-            or facts["above_margin"] < min_margin:
+    if facts["below_margin"] < min_margin or facts["above_margin"] < min_margin:
         return "thin-margin", facts
     return "ok", facts
 
@@ -241,6 +252,11 @@ def main(argv: list[str]) -> int:
         elif verdict == "no-upper-reference":
             print("в окне нет ни одного промежутка ≥ порога — верхнюю сторону "
                   "разрыва подтвердить нечем, порог возможно завышен")
+        elif verdict == "no-lower-reference":
+            print("в окне нет ни одного промежутка < порога — нижнюю сторону "
+                  "разрыва подтвердить нечем, порог ниже всей рабочей массы: "
+                  f"канал стрелял бы на каждом тике ({facts['fires_in_window']} "
+                  "срабатываний в окне)")
     return 0 if verdict == "ok" else 1
 
 
