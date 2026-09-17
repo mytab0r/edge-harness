@@ -17,7 +17,16 @@
       "source_pr": 1331,
       "status": "open",
       "title": "Возможная неточность contextWindow/maxTokens"
+    },
+    {
+      "detail": "`run_client` при провале печатает «вывод клиента» (`cat \"$outfile\"`), а соседний `run_client_expect_fail` в том же режиме каптурки при своём отказе (rc=0 вместо ожидаемого красного) показывает только журнал вызовов. Вывод клиента там — как раз главная улика, почему job позеленел; добавь тот же `cat \"$outfile\"` в ветку `rc -eq 0`.",
+      "file": "scripts/lib/test/dsh-clients.smoke.sh",
+      "id": 3,
+      "opened_at": "2026-09-17T02:01:51.337451+00:00",
+      "source_pr": 1328,
+      "status": "open",
+      "title": "expect-fail не показывает каптурку при неожиданно зелёном прогоне"
     }
   ],
-  "next_id": 3
+  "next_id": 4
 }
