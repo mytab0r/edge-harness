@@ -38,8 +38,18 @@ AI_REVIEW_YML = Path(__file__).resolve().parents[2] / ".github" / "workflows" / 
 @pytest.mark.parametrize("answer,expected", [
     ("Всё чисто, влита ровно задача.\nВЕРДИКТ: approve", "approve"),
     ("ВЕРДИКТ: rework", "rework"),
-    # маркер не последний — ответ считается битым
-    ("ВЕРДИКТ: approve\nИ ещё одна мысль...", "error"),
+    # #1332: ожидание ПЕРЕВЁРНУТО осознанно. Раньше маркер не на последней
+    # строке считался битым ответом; требование позиции снято, потому что при
+    # уже действующей единственности оно не снимало неоднозначности, а живые
+    # прогоны показали цену — три из одиннадцати упавших ai-review за сутки
+    # 2026-09-16 выбросили КОРРЕКТНЫЙ вердикт (PR #1328, прогон 35155260819:
+    # `ВЕРДИКТ: approve` первой строкой, следом разбор). Это прод-форма
+    # ответа моделей цепочки: решение, затем мета-комментарий.
+    ("ВЕРДИКТ: approve\nИ ещё одна мысль...", "approve"),
+    # Единственность — НЕ снята: два маркера это противоречие модели себе.
+    ("ВЕРДИКТ: approve\nразбор\nВЕРДИКТ: rework", "error"),
+    # Маркер в середине длинной прозы — тоже принимается (позиции нет вовсе).
+    ("Начало разбора.\nВЕРДИКТ: rework\nДальше подробности и КЛАСС: x", "rework"),
     # два маркера — двусмысленность
     ("ВЕРДИКТ: rework\nВЕРДИКТ: approve", "error"),
     # маркера нет вообще
@@ -689,9 +699,44 @@ def test_error_reason_empty_answer_without_transport_error():
 
 
 def test_error_reason_ambiguous_verdict_line_not_transport():
-    reason = ai.error_reason("ВЕРДИКТ: approve\nещё мысль", "0")
-    assert "не единственная" in reason or "не последняя" in reason
+    # #1332: прежняя прод-форма («вердикт, затем мысль») больше НЕ error —
+    # теперь неоднозначность это именно ДВА маркера, и текст обязан называть
+    # противоречие модели самой себе, а не позицию строки.
+    reason = ai.error_reason("ВЕРДИКТ: approve\nещё\nВЕРДИКТ: rework", "0")
+    assert "несколько" in reason
     assert "провайдера" not in reason
+
+
+def test_pre_model_failure_is_not_reported_as_contract_violation():
+    """#1332, дефект 2: исчерпание цепочки печаталось под шапкой «ответ не
+    соответствует контракту вердикта», хотя модель ничего не отвечала."""
+    reason = ai.error_reason("", "1")
+    assert ai.review_never_happened(reason), (
+        "отказ до модели обязан опознаваться как таковой, иначе шапка соврёт")
+    assert not ai.review_never_happened(
+        "модель ответила, но строки «ВЕРДИКТ: …» нет вообще")
+
+
+def test_error_headline_names_the_class_not_one_text_for_all():
+    """#1332, дефект 2: шапка обязана различать «модель не ответила» и
+    «ответ не по контракту» — лечатся они противоположным (ждать сброса
+    квоты против починить промпт/парсер)."""
+    chain = ai.error_reason("", "1")          # цепочка не дала ответа
+    contract = "модель ответила, но строки «ВЕРДИКТ: …» нет вообще"
+    assert ai.error_headline(chain) != ai.error_headline(contract), (
+        "одна шапка на оба класса — ровно то, что #1332 и заводился закрывать")
+    assert "контракту вердикта" not in ai.error_headline(chain), (
+        "отказ ДО модели не смеет называться нарушением контракта ОТВЕТА")
+    assert "контракту вердикта" in ai.error_headline(contract)
+
+
+def test_every_pre_model_reason_carries_prefix():
+    """Одно место правды: ветка «ревью не состоялось», написанная мимо
+    константы, молча вернула бы шапку про контракт ответа."""
+    import inspect
+    src = inspect.getsource(ai)
+    assert 'return ("ревью не состоялось' not in src and 'return f"ревью не состоялось' not in src, (
+        "ветка отказа-до-модели написана строкой мимо REVIEW_NEVER_HAPPENED_PREFIX")
 
 
 def test_error_reason_transport_failure_wins_over_line_check():
