@@ -70,6 +70,18 @@ repository secrets тем же именем (deploy-worker.yml/telegram-webhook.
 здесь единственный видимый сигнал расхождения, поэтому отказ громкий
 (RuntimeError → `::error::` → exit 1), не тихий no-op.
 
+Ручной запуск с ноута — ИЗМЕНЕНИЕ КОНТРАКТА ЭТИМ МЕРЖЕМ (#1251; находитка
+ревью PR #1254): #1037 называет «ручной apply_owner_decision с ноута»
+легитимным PAT-путём, и до этой правки вызов без аргумента подписи писал
+«РЕШЕНИЕ: N» безусловно. Теперь тот же вызов требует env
+TELEGRAM_WEBHOOK_SECRET (тот же секрет, что в GitHub Actions secrets и
+Cloudflare — есть ли он на ноуте, НЕ подтверждено) и --signature со
+значением compute_signature(secret, issue, option); без них скрипт откажет
+первыми двумя отказами verify_signature выше, НЕ записав ничего — это
+сознательно, безусловный обход подписи был бы той же дырой, что и прямой
+dispatch. Владелец без секрета на ноуте применяет решение нажатием кнопки
+в Telegram (аутентифицированный путь) либо комментарием «РЕШЕНИЕ: N».
+
 Запуск: python scripts/orchestra/apply_owner_decision.py --repo o/r --issue N --option M
 """
 
@@ -161,7 +173,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--signature", default="",
         help="HMAC-подпись client_payload (#1251) из github.event.client_payload.signature; "
-             "пусто — трактуется как «подписи нет» в verify_signature",
+             "для ручного запуска значение считает compute_signature(secret, issue, option), "
+             "secret — env SIGNATURE_SECRET_ENV_VAR (см. докстринг модуля, «Ручной запуск "
+             "с ноута»); пусто — трактуется как «подписи нет» в verify_signature",
     )
     args = parser.parse_args(argv)
 

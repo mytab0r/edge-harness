@@ -71,6 +71,15 @@ def test_compute_signature_matches_worker_hmac_format():
 
     expected = hmac_module.new(b"test-webhook-secret", b"471:2", hashlib.sha256).hexdigest()
     assert aod.compute_signature("test-webhook-secret", 471, 2) == expected
+    # Замороженный литеральный вектор (находка ревью PR #1254, #1251) —
+    # ЗНАЧЕНИЕ HMAC, НЕ пересчитанное тем же модулем: пересчёт выше ловит
+    # только «изменился ли вывод compute_signature», литерал ловит сговор
+    # обеих сторон — изменение формата одновременно в harness.ts и в этом
+    # тесте иначе обе сюиты пропустили бы зелёными. Значение независимо
+    # вычислено: HMAC-SHA256(b"test-webhook-secret", b"471:2").hexdigest().
+    assert aod.compute_signature("test-webhook-secret", 471, 2) == (
+        "63ed810b997707d5af406d1ad0596ec82b66a259c7cd9cc6b97a1c14b62d7d0e"
+    )
 
 
 def test_verify_signature_ok_does_not_raise():

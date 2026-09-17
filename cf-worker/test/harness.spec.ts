@@ -2343,6 +2343,19 @@ describe("Telegram: кнопки решения владельца (#254)", () =
       expect(sigA).not.toBe(sigC);
     });
 
+    it("формат подписи совпадает с замороженным литеральным вектором (находка ревью PR #1254)", async () => {
+      // Значение независимо вычислено: HMAC-SHA256("test-webhook-secret",
+      // "471:2") hex — тот же вектор заморожен в py-тесте
+      // (test_compute_signature_matches_worker_hmac_format). Литерал нужен,
+      // потому что happy-path выше сверяет воркер с ЛОКАЛЬНОЙ
+      // reimplementацией: синхронное изменение формата в harness.ts и в
+      // expectedOwnerDecisionSignature одним PR обе проверки пропустили бы
+      // зелёными — литерал такой сговор ловит.
+      expect(await expectedOwnerDecisionSignature("test-webhook-secret", 471, 2)).toBe(
+        "63ed810b997707d5af406d1ad0596ec82b66a259c7cd9cc6b97a1c14b62d7d0e",
+      );
+    });
+
     it("без TELEGRAM_WEBHOOK_SECRET в воркере — signature уходит пустой строкой, полем не пропадает (стабильный контракт client_payload)", async () => {
       const saved = env.TELEGRAM_WEBHOOK_SECRET;
       env.TELEGRAM_WEBHOOK_SECRET = "";
