@@ -80,16 +80,21 @@ def test_real_repo_has_zero_drift_after_the_fix():
     зафиксированного на момент разработки этой гвардии (issue #507/#806):
     после фикса разрыва не осталось ни для одного @deepseek-ai/* пакета,
     который апстрим объявляет на верхнем уровне. Список версий — снят живым
-    запросом к raw.githubusercontent.com при разработке гвардии (см. PR),
+    запросом к raw.githubusercontent.com (изначально при разработке гвардии,
+    обновлён бампом пина #1294: 0.1.2-rc.1 → 0.1.5-rc.2, сверено с
+    apps/dsh-edge/standalone/package.json на теге dsh-edge-v0.15.0),
     не сеть в pytest: живую сверку с ТЕКУЩИМ пином делает сам
-    scripts/lib/plugin_upstream_version_drift.py при запуске гвардии в CI."""
+    scripts/lib/plugin_upstream_version_drift.py при запуске гвардии в CI.
+    Снимок обязан идти следом за бампом пина, поднимающим версии
+    @deepseek-ai/*: расхождение с Pin в upstream.json красит этот тест,
+    хотя живая гвардия зелёная."""
     upstream_deps_snapshot = {
-        "@deepseek-ai/dsh-anonymous-user-id": "0.1.2-rc.1",
-        "@deepseek-ai/dsh-credentials": "0.1.2-rc.1",
-        "@deepseek-ai/dsh-llm": "0.1.2-rc.1",
-        "@deepseek-ai/dsh-llm-deepseek": "0.1.2-rc.1",
-        "@deepseek-ai/dsh-settings": "0.1.2-rc.1",
-        "@deepseek-ai/dsh-tools": "0.1.2-rc.1",
+        "@deepseek-ai/dsh-anonymous-user-id": "0.1.5-rc.2",
+        "@deepseek-ai/dsh-credentials": "0.1.5-rc.2",
+        "@deepseek-ai/dsh-llm": "0.1.5-rc.2",
+        "@deepseek-ai/dsh-llm-deepseek": "0.1.5-rc.2",
+        "@deepseek-ai/dsh-settings": "0.1.5-rc.2",
+        "@deepseek-ai/dsh-tools": "0.1.5-rc.2",
     }
     plugin_deps = drift.collect_plugin_deepseek_deps(drift.PLUGINS_SRC_DIR)
     assert plugin_deps, "plugins-src не даёт ни одной @deepseek-ai/* зависимости — карта устарела"
