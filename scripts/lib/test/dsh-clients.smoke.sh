@@ -674,14 +674,21 @@ run_client() { # LABEL SCRIPT [OUTFILE] — прогон в дочернем bas
 # по контракту, это не
 # поломка клиента, а честный красный прогон): неожиданный rc=0 здесь и есть
 # провал smoke, не наоборот.
-run_client_expect_fail() { # LABEL SCRIPT
+run_client_expect_fail() { # LABEL SCRIPT [OUTFILE]
+  # Третий аргумент — тот же необязательный режим «каптурни stdout+stderr в
+  # файл», что уже несёт run_client (PR #1058): режим, а не отдельный раннер.
+  # Нужен, потому что assert_not_log смотрит ЖУРНАЛ ВЫЗОВОВ, а часть текста
+  # отказа уходит обычным echo в stdout job'а и в журнал вызовов не попадает
+  # вовсе — находка AI-ревью PR #1328: четвёртый канал той же лжи прошёл мимо
+  # гвардии именно поэтому, а не из-за регистра.
   local label=$1 script=$2 rc=0
+  local outfile=${3:-}
   rm -f "$SMOKE_STATE/openssl-n"
-  echo "SMOKE: прогон $label (ожидаем красный job)"
-  if ( bash "$script" </dev/null ); then
-    rc=0
+  echo "SMOKE: прогон $label (ожидаем красный job)${outfile:+ (с каптуркой вывода)}"
+  if [ -n "$outfile" ]; then
+    if ( bash "$script" >"$outfile" 2>&1 </dev/null ); then rc=0; else rc=$?; fi
   else
-    rc=$?
+    if ( bash "$script" </dev/null ); then rc=0; else rc=$?; fi
   fi
   if [ "$rc" -eq 0 ]; then
     echo "::error::SMOKE: $label завершился ЗЕЛЁНЫМ (0), а обязан был провалиться (отказ цепочки провайдеров — #422)" >&2
@@ -941,10 +948,19 @@ TELEGRAM_BOT_TOKEN="smoke-tg-token" \
 TELEGRAM_CHAT_ID="42" \
 GH_ISSUE_JSON='{"number":123,"title":"Smoke: промпт длиннее предела execve","body":"## Цель\nпрогон\n\n## Критерий готовности\nсессия","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
 DSH_PROMPT_TOTAL_MAX_BYTES="10" \
-  run_client_expect_fail "worker-prompt-too-long-red" "$REPO/scripts/worker/task.sh"
+  run_client_expect_fail "worker-prompt-too-long-red" "$REPO/scripts/worker/task.sh" "$TMP/out-prompt-too-long"
 assert_log "остановлен НАШИМ ограничением" "worker-prompt-too-long-red: отказ НАШ (агент не вызывался) — шапка обязана называть это, а не винить провайдера (#1322)"
 assert_not_log "остановлен провайдером" "worker-prompt-too-long-red: шапка «остановлен провайдером» противоречит телу («ни один провайдер не тронут») — класс #1322"
 assert_not_log "цепочка провайдеров отказала" "worker-prompt-too-long-red: цепочка не отказывала, она не запускалась — Telegram и die-строка не смеют говорить иначе (#1322)"
+# Находка AI-ревью PR #1328: assert_not_log — grep -qF, РЕГИСТРОЗАВИСИМЫЙ, и
+# строка возврата в пул начинается с заглавной «Ц». Проверка выше её не
+# видела вовсе, четвёртый канал той же лжи прошёл мимо гвардии. Форма с
+# заглавной проверяется отдельной строкой, а не заменой на -i: регистр тут
+# часть прод-формы, и обе формы обязаны быть названы явно.
+grep -qiF "цепочка провайдеров отказала" "$TMP/out-prompt-too-long" \
+  && { echo "::error::SMOKE: в выводе job'а есть «цепочка провайдеров отказала» — строка возврата в пул это ЧЕТВЁРТЫЙ канал той же лжи, цепочка не запускалась (#1322, находка ревью PR #1328)" >&2; cat "$TMP/out-prompt-too-long" >&2; exit 1; }
+grep -qF "Отказ до работы агента" "$TMP/out-prompt-too-long" \
+  || { echo "::error::SMOKE: в выводе job'а нет честной строки возврата в пул «Отказ до работы агента (…)» — четвёртый канал не переведён на failure_kind (#1322)" >&2; cat "$TMP/out-prompt-too-long" >&2; exit 1; }
 assert_log "ни один провайдер не тронут" "worker-prompt-too-long-red: тело обязано сохранить факт #1315"
 echo "SMOKE: worker-prompt-too-long-red — ок (#1322)"
 

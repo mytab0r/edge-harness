@@ -941,7 +941,7 @@ if [ "$WORKER_TASK_FAILURE_REASON" = "quota_exhausted" ] || \
   esac
   release_out="$(lease_cli release-full "$number" 2>&1)" && release_rc=0 || release_rc=$?
   if [ "$release_rc" -eq 0 ]; then
-    echo "Цепочка провайдеров отказала — задача #$number возвращена в пул немедленно: $release_out"
+    echo "Отказ до работы агента ($failure_kind) — задача #$number возвращена в пул немедленно: $release_out"
     release_note="Задача возвращена в пул немедленно — снят и замок, и назначение ($release_out)."
   else
     echo "::warning::задача #$number не возвращена в пул (rc=$release_rc): $release_out — снимет TTL-сборщик через 24 ч"
