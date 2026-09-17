@@ -958,6 +958,32 @@ def test_measure_already_in_main_renamed_file_compares_new_path(repo):
     assert result.status == tri.check_result.STATUS_VIOLATION
 
 
+def test_measure_already_in_main_ok_when_pr_renames_away_file_main_still_holds(repo):
+    """Блокирующая находка ai-ревью этого PR: переименование — это удаление
+    СТАРОГО пути плюс появление НОВОГО. Base несёт old_name.py; PR
+    переименовывает его в new_name.py; main НЕЗАВИСИМО уже несёт new_name.py
+    с теми же байтами, но СТАРЫЙ путь не удалял. Сведение чистое и удаляет
+    old_name.py из main — настоящая правка, обязана быть ok(), не
+    violation(): сравнение одного лишь нового пути молча советовало закрыть
+    живой PR («PR не меняет main»), хотя main терял файл."""
+    write(repo / "old_name.py", "VALUE = 1\n")
+    git("add", "-A", cwd=repo)
+    git("commit", "-qm", "base with old_name.py", cwd=repo)
+
+    git("checkout", "-b", "pr", cwd=repo)
+    git("mv", "old_name.py", "new_name.py", cwd=repo)
+    git("commit", "-m", "pr renames old_name.py to new_name.py", cwd=repo)
+
+    git("checkout", "main", cwd=repo)
+    write(repo / "new_name.py", "VALUE = 1\n")
+    git("add", "-A", cwd=repo)
+    git("commit", "-m", "main adds new_name.py with same bytes, keeps old_name.py", cwd=repo)
+
+    files = [{"filename": "new_name.py", "status": "renamed", "previous_filename": "old_name.py"}]
+    result = tri.measure_already_in_main("main", "pr", files, cwd=str(repo))
+    assert result.status == tri.check_result.STATUS_OK
+
+
 # ── already_in_main_check: обёртка величины 8 (gh + git) ───────────────────
 
 def test_already_in_main_check_delegates_to_list_pr_files_and_measures(repo, monkeypatch):
@@ -993,6 +1019,21 @@ def test_already_in_main_check_transport_failure_is_unknown_not_raise(repo, monk
     result = tri.already_in_main_check("mytab0r/edge-harness", 501, "main", "main", cwd=str(repo))
     assert result.status == tri.check_result.STATUS_UNKNOWN
     assert "gh api pulls/501/files" in result.reason
+
+
+def test_already_in_main_check_unknown_when_ref_unreadable(repo, monkeypatch):
+    """`blob_sha` не отличает «файла нет» от «ref не читается» — обёртка
+    проверяет оба ref'а `rev-parse --verify` ДО сравнения (некритичная
+    находка ревью этого PR): несостоявшийся main_ref на ветке `removed`
+    иначе читался бы как «согласие сторон» и подталкивал к violation;
+    здесь — честный unknown() с именем отказавшего ref'а."""
+    monkeypatch.setattr(
+        tri.review_labels, "list_pr_files",
+        lambda repo_name, number, gh_func: [{"filename": "old.txt", "status": "removed"}])
+    result = tri.already_in_main_check(
+        "mytab0r/edge-harness", 1020, "no-such-ref", "main", cwd=str(repo))
+    assert result.status == tri.check_result.STATUS_UNKNOWN
+    assert "no-such-ref" in result.reason
 
 
 # ── cmd_queue: один кривой PR не валит обход очереди (настоящий git) ───────
