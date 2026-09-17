@@ -141,6 +141,8 @@ if str(_DIR) not in sys.path:
 import scheduler as sch  # noqa: E402 — после sys.path выше, тот же приём, что тесты scheduler.py
 
 review_labels = sch.review_labels  # уже загруженный scheduler'ом модуль — не грузим второй раз
+task_ref = sch.task_ref            # тем же приёмом (#1032): scheduler грузит его по пути файла,
+                                   # второй загрузки здесь не заводим
 
 # Загрузка по пути файла (issue #897) — тот же приём, что console_utf8 bootstrap
 # выше и сам guard_step_translator.py уже применяют (в scripts/lib нет
@@ -380,9 +382,15 @@ def process_pull(repo: str, pull: dict, repo_dir: Path) -> str:
         # запрос к API (task_ref.resolve_pr_task + атрибуция прогона) — цена
         # без выигрыша, раз пересечение и так исключено на уровне «воркер
         # один», тот же уровень точности, что уже применяет
-        # dispatch_conflict_rework (worker_runs_active(repo), не per-task,
-        # scheduler.py:778,855).
-        if sch.worker_runs_active(repo):
+        # #1032: гейт СУЖЕН до задачи (sch.worker_blocks_pr). Прежний
+        # repo-wide довод («воркер и так один, точная привязка потребует
+        # ещё запрос на PR — цена без выигрыша») не выдержал замера: за всю
+        # историю workflow 811 PR-слотов, 505 (62%) отложены этим гейтом,
+        # сведено НОЛЬ. Цена, которую довод назвал «без выигрыша», и была
+        # ценой всего механического пути целиком. Опасность из #764
+        # (force-with-lease над коммитами работающего агента) касается ОДНОЙ
+        # ветки, поэтому и проверка теперь про одну — по следу аренды.
+        if sch.worker_blocks_pr(repo, task_ref.resolve_pr_task(pull)):
             return "worker-running"
         running = review_labels.other_active_ai_review_runs(
             repo, number, exclude_run_id=None, gh_func=sch.gh)

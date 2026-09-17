@@ -3386,6 +3386,47 @@ def worker_runs_active(repo: str, now: datetime | None = None) -> bool:
     return False
 
 
+def worker_blocks_pr(repo: str, task_number: int | None,
+                     now: datetime | None = None) -> bool:
+    """Мешает ли АКТИВНЫЙ воркер трогать head именно ЭТОГО PR (#1032).
+
+    Зачем уже́ repo-wide `worker_runs_active`. Опасность, ради которой гейт
+    заведён (issue #764, требование 2), касается ОДНОЙ ветки: механический
+    `--force-with-lease` не должен уехать над коммитами агента, который прямо
+    сейчас работает над этой задачей. Repo-wide булево накрывает ВСЕ PR
+    очереди, а воркер занят почти всегда — замер за всю историю
+    `conflict-mechanical-rebase.yml`: 811 PR-слотов, 505 (62%) отложены этим
+    гейтом, СВЕДЕНО НОЛЬ. Тормоз без газа: условие снятия не наступает.
+
+    Различение — по следу аренды (`run_claimed_task`, тот же снаряд, что уже
+    использует `reap_stalled_worker_run`), а не по логину и не по догадке:
+    задача #N считается занятой, только если активный прогон ОТМЕТИЛСЯ в ней
+    маркером `worker run <id>`.
+
+    `queued`-прогон блокирует БЕЗУСЛОВНО: claim ещё физически не мог
+    случиться, следа нет ни у одной задачи, и различить нечего — молчаливое
+    «не мой» здесь было бы угадыванием, а не фактом.
+
+    `task_number is None` (ветка PR не называет задачу) — тоже блокируем:
+    сопоставить прогон не с чем, и это ровно тот случай, где осторожность
+    дешевле сожжённой агентской попытки."""
+    now = now or datetime.now(timezone.utc)
+    queued = (gh(f"repos/{repo}/actions/workflows/{WORKER_WORKFLOW}"
+                 f"/runs?status=queued&per_page=1") or {}).get("workflow_runs") or []
+    if queued:
+        return True
+    if task_number is None:
+        return worker_runs_active(repo, now)
+    running = (gh(f"repos/{repo}/actions/workflows/{WORKER_WORKFLOW}"
+                  f"/runs?status=in_progress&per_page=10") or {}).get("workflow_runs") or []
+    for run in running:
+        if _run_is_stalled(run, now):
+            continue  # завис — не блокирует, тот же довод, что у worker_runs_active
+        if run_claimed_task(repo, task_number, run["id"]):
+            return True
+    return False
+
+
 def reap_stalled_worker_run(
     repo: str, now: datetime, pool: list[dict], pulls: list[dict],
 ) -> tuple[list[str], list[str]]:

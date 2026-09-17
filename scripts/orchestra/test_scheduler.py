@@ -6300,6 +6300,62 @@ def test_run_is_stalled_true_past_threshold_false_within_threshold():
     assert sch._run_is_stalled(fresh, now) is False
 
 
+# ── #1032: гейт механического ребейза сужен до ЗАДАЧИ ────────────────────────
+# Замер, ради которого сужение и делается: за всю историю
+# conflict-mechanical-rebase.yml — 811 PR-слотов, 505 (62%) отложены repo-wide
+# гейтом «воркер жив где-либо», СВЕДЕНО НОЛЬ. Тормоз, условие снятия которого
+# не наступает.
+
+
+def _runs(in_progress=(), queued=()):
+    return FakeGh({
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": list(in_progress)},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": list(queued)},
+    })
+
+
+def test_worker_blocks_pr_false_when_active_run_claimed_another_task(monkeypatch):
+    """Воркер жив, но работает над ЧУЖОЙ задачей — этот PR трогать можно.
+    Ровно тот случай, который repo-wide гейт откладывал 505 раз."""
+    run = workflow_run(777, "in_progress")
+    run["run_started_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    patch_gh(monkeypatch, _runs(in_progress=[run]))
+    # След аренды прогона 777 есть у задачи 999, но НЕ у нашей 42.
+    monkeypatch.setattr(sch, "run_claimed_task",
+                        lambda repo, task, run_id: task == 999)
+    assert sch.worker_blocks_pr(REPO, 42) is False
+    assert sch.worker_blocks_pr(REPO, 999) is True
+
+
+def test_worker_blocks_pr_true_on_queued_run_regardless_of_task(monkeypatch):
+    """queued блокирует БЕЗУСЛОВНО: claim ещё физически не мог случиться,
+    следа нет ни у одной задачи — различать нечего, и «не мой» был бы
+    угадыванием."""
+    patch_gh(monkeypatch, _runs(queued=[workflow_run(5, "queued")]))
+    monkeypatch.setattr(sch, "run_claimed_task",
+                        lambda *a: pytest.fail("при queued след аренды спрашивать незачем"))
+    assert sch.worker_blocks_pr(REPO, 42) is True
+
+
+def test_worker_blocks_pr_falls_back_to_repo_wide_when_task_unknown(monkeypatch):
+    """Ветка PR не называет задачу — сопоставить прогон не с чем, и осторожность
+    дешевле сожжённой агентской попытки (#764)."""
+    run = workflow_run(1, "in_progress")
+    run["run_started_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    patch_gh(monkeypatch, _runs(in_progress=[run]))
+    assert sch.worker_blocks_pr(REPO, None) is True
+
+
+def test_worker_blocks_pr_ignores_stalled_run(monkeypatch):
+    """Зависший in_progress не блокирует — тот же довод, что у
+    worker_runs_active (#815): иначе один повисший прогон держит очередь часами."""
+    run = workflow_run(1, "in_progress")
+    run["run_started_at"] = "2020-01-01T00:00:00Z"
+    patch_gh(monkeypatch, _runs(in_progress=[run]))
+    monkeypatch.setattr(sch, "run_claimed_task", lambda *a: True)
+    assert sch.worker_blocks_pr(REPO, 42) is False
+
+
 def test_worker_runs_active_treats_ancient_in_progress_run_as_not_blocking(monkeypatch):
     # Прогон стартовал в 2020-м — хардкодим ЗАВЕДОМО древнюю дату, не
     # «свежую»: правдоподобная «недавняя» дата стареет сама по себе

@@ -542,7 +542,10 @@ def test_process_pull_defers_when_worker_is_active(tmp_path, monkeypatch):
     original_tip = branch_tip(origin, "agent/601-drifted-a")
     fake = FakeGh({"issues/601/timeline?per_page=100": []})
     patch_gh(monkeypatch, fake)
-    monkeypatch.setattr(sch, "worker_runs_active", lambda repo: True)
+    # #1032: гейт сужен до задачи — подменяется worker_blocks_pr, не
+    # worker_runs_active. Смысл проверки не изменился: когда воркер занят
+    # ИМЕННО этой задачей, head трогать нельзя (#764, требование 2).
+    monkeypatch.setattr(sch, "worker_blocks_pr", lambda repo, task: True)
 
     outcome = mr.process_pull(REPO, p, work)
 
@@ -550,9 +553,30 @@ def test_process_pull_defers_when_worker_is_active(tmp_path, monkeypatch):
     assert branch_tip(origin, "agent/601-drifted-a") == original_tip  # head не тронут
 
 
+def test_process_pull_proceeds_when_worker_busy_with_another_task(tmp_path, monkeypatch):
+    """#1032, ради чего сужение и делалось: воркер жив, но занят ЧУЖОЙ задачей —
+    этот PR обязан быть сведён, а не отложен. Прежний repo-wide гейт откладывал
+    здесь: замер за всю историю workflow — 505 таких отложек из 811 слотов при
+    НУЛЕ сведённых."""
+    origin = build_origin(tmp_path)
+    work = clone_workdir(origin, tmp_path)
+    p = pull(601, ref="agent/601-drifted-a")
+    original_tip = branch_tip(origin, "agent/601-drifted-a")
+    fake = FakeGh({"issues/601/timeline?per_page=100": []})
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(sch, "worker_blocks_pr", lambda repo, task: False)
+    monkeypatch.setattr(mr.review_labels, "other_active_ai_review_runs",
+                        lambda *a, **k: [])
+
+    outcome = mr.process_pull(REPO, p, work)
+
+    assert outcome == "resolved", "занятость воркера ЧУЖОЙ задачей больше не откладывает PR"
+    assert branch_tip(origin, "agent/601-drifted-a") != original_tip, "ветка не перебазирована"
+
+
 def test_run_reports_worker_running_and_skips_push(tmp_path, monkeypatch):
     """Мутационное доказательство (issue #764, находка ревью гейта, требование 2):
-    без этого гейта (monkeypatch.setattr(sch, "worker_runs_active", lambda repo: False))
+    без этого гейта (monkeypatch.setattr(sch, "worker_blocks_pr", lambda repo, task: False))
     PR #601 получил бы "resolved" и запушенную ветку — тест ниже покраснел бы на
     строке assert outcomes[601] == "resolved", доказывая, что гейт — не no-op."""
     origin = build_origin(tmp_path)
@@ -561,7 +585,7 @@ def test_run_reports_worker_running_and_skips_push(tmp_path, monkeypatch):
     original_tip = branch_tip(origin, "agent/601-drifted-a")
     fake = FakeGh({"pulls?state=open": [p], "issues/601/timeline?per_page=100": []})
     patch_gh(monkeypatch, fake)
-    monkeypatch.setattr(sch, "worker_runs_active", lambda repo: True)
+    monkeypatch.setattr(sch, "worker_blocks_pr", lambda repo, task: True)
 
     lines, outcomes = mr.run(REPO, work)
 
