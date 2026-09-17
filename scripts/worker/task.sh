@@ -976,7 +976,27 @@ COMMENT
   )
   gh issue comment "$number" --body "$comment" >/dev/null
   telegram_report "worker: задача #$number — $failure_kind ($reason). Задача возвращена в пул" || true
-  exit 0
+  # #1286: код возврата job'а разделяет классы так же, как шапка выше (#1322).
+  # НАШ отказ (prompt_too_long) умирает громко: серию его повторов останавливает
+  # предохранитель диспатча, а кормят его именно красные прогоны worker.yml
+  # (#1315) — зелёный код возврата сделал бы это названное место правды слепым.
+  # Отказ на стороне провайдера (quota_exhausted / rate_limit_retry_budget_
+  # exceeded / all_providers_exhausted) — не сбой воркера: задача выше уже
+  # возвращена в пул, сигнал ушёл в задачу и Telegram; красный job здесь
+  # кормил бы предохранитель (#226) чужой виной и задерживал восстановление
+  # после сброса квоты — открытый предохранитель снимает только зелёная проба
+  # (#205). Живой отказ этого класса: прогон 34893177035, задача #1286.
+  # ЧЕСТНАЯ ГРАНИЦА: серию зелёных прогонов во время долгого сбоя провайдеров
+  # предохранитель не видит — автостопа такой серии нет, сигнал владельцу —
+  # комментарий в задаче и Telegram (ждать сброса или сменить провайдера —
+  # docs/runbooks/switch-llm-provider.md). Контракт кода возврата гвардится
+  # исполнением настоящего блока: scripts/worker/test/
+  # provider-exhaustion-exit-code.smoke.sh (каталог: scripts/ci/guards/
+  # worker-exhaustion-exit-code-guard.sh).
+  case "$WORKER_TASK_FAILURE_REASON" in
+    prompt_too_long) die "$failure_kind: $reason" ;;
+    *) exit 0 ;;
+  esac
 fi
 
 # pr_status здесь бывает двух родов (#876): "empty"/"absent" (pr_outcome_rc=1)
