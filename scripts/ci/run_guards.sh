@@ -28,6 +28,30 @@
 # останавливает прогон немедленно (`set -e` + явный `exit 1` ниже), CI видит
 # ОДНУ причину за проход, не пачку вперемешку с гвардиями, которые могли бы
 # упасть по цепочке от первой же (#749, ревью PR #771, минорная находка 12).
+#
+# GUARD_CATALOG_SKIP (issue #1280) — необязательный список имён гвардий
+# (basename без .sh, через пробел), которые перебор регистрирует, но НЕ
+# исполняет в шаге ниже. По умолчанию пуст — вызов `bash scripts/ci/
+# run_guards.sh` без переменной (ровно то, что делает repo-ci.yml) ведёт
+# себя как прежде, полный каталог, без единого исключения. Переменная нужна
+# только локальному/dev-гейту `scripts/lib/pre_push_guard_gate.py`: два
+# файла каталога (`decision-doc-numbering-guard.sh`, `invariant-numbering-
+# guard.sh`) через общий примитив `decision_numbering.py::fetch_refs` делают
+# `git fetch --depth 1` (ловушка #1228) — измерено 2026-09-15: единичный
+# локальный прогон этого файла перевёл `git rev-parse --is-shallow-
+# repository` false -> true, т.е. замусорил ОБЩИЙ .git всех рабочих деревьев
+# задачи. В одноразовом чекауте CI (job `test`, воркер) той же мутации не за
+# что зацепиться — общего .git с другими деревьями там нет, поэтому CI
+# по-прежнему гоняет обе гвардии без исключений (переменную не выставляет).
+guard_catalog_skip="${GUARD_CATALOG_SKIP:-}"
+should_skip() {
+  local name="$1" entry
+  for entry in $guard_catalog_skip; do
+    [ "$entry" = "$name" ] && return 0
+  done
+  return 1
+}
+
 set -euo pipefail
 shopt -s nullglob
 
@@ -86,8 +110,14 @@ for script in "${scripts[@]}"; do
 done
 
 count=0
+skipped=0
 for script in "${scripts[@]}"; do
   name="$(basename "$script" .sh)"
+  if should_skip "$name"; then
+    echo "guard-catalog: '$name' пропущена (GUARD_CATALOG_SKIP) — не полный каталог, см. комментарий выше"
+    skipped=$((skipped + 1))
+    continue
+  fi
   echo "::group::guard: $name"
   count=$((count + 1))
   if ! (cd "$repo_root" && bash "$script"); then
@@ -97,4 +127,4 @@ for script in "${scripts[@]}"; do
   fi
   echo "::endgroup::"
 done
-echo "guard-catalog: выполнено $count гвардий из $dir"
+echo "guard-catalog: выполнено $count гвардий из $dir (пропущено $skipped)"
