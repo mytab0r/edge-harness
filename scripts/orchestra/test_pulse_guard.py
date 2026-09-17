@@ -144,9 +144,53 @@ def test_decide_heartbeat_within_threshold():
 
 
 def test_decide_heartbeat_stale_beyond_three_intervals():
-    # 46 минут > 45 = 3 интервала по 15 — пульсы пропадали
-    assert pg.decide_heartbeat("2026-08-31T11:00:00Z", utc(2026, 8, 31, 11, 46)) == "stale"
-    assert pg.decide_heartbeat(utc(2026, 8, 31, 10, 0), utc(2026, 8, 31, 11, 0)) == "stale"
+    # Ревизия #1184: порог от ИЗМЕРЕННОГО такта (медиана 20.2, максимум 25.0),
+    # не от cron: 60 = 3× медианного такта. 61 минута > 60 — пульсы пропадали;
+    # ровно 60 — ещё ok (порог строгий сверху), 46 минут — уже не достаточно
+    # для «пропадал» при такте 20-25 мин (один-два пропущенных такта — норма).
+    assert pg.decide_heartbeat("2026-08-31T11:00:00Z", utc(2026, 8, 31, 12, 1)) == "stale"
+    assert pg.decide_heartbeat(utc(2026, 8, 31, 10, 0), utc(2026, 8, 31, 11, 0)) == "ok"
+    assert pg.decide_heartbeat(utc(2026, 8, 31, 10, 0), utc(2026, 8, 31, 11, 1)) == "stale"
+
+
+def test_tick_cadence_observation_healthy_max_gap_below_tightest_window():
+    # Здоровая каденция (максимальный промежуток 20 мин < тугого окна 40) —
+    # None: здоровое состояние не печатается, чтобы не шуметь на каждый пульс.
+    times = ["2026-09-14T01:00:00Z", "2026-09-14T01:20:00Z", "2026-09-14T01:40:00Z",
+             "2026-09-14T02:00:00Z", "2026-09-14T02:20:00Z", "2026-09-14T02:40:00Z"]
+    assert pg.tick_cadence_observation([{"created_at": t} for t in times]) is None
+
+
+def test_tick_cadence_observation_drift_reaching_tightest_window_names_numbers():
+    # Дрейф: промежуток 40+ мин между тиками — замер #1184 протух, строка
+    # называет наблюдаемый максимум и тугое окно, а не общее «что-то не так».
+    times = ["2026-09-14T01:00:00Z", "2026-09-14T01:20:00Z", "2026-09-14T01:40:00Z",
+             "2026-09-14T02:00:00Z", "2026-09-14T02:20:00Z", "2026-09-14T03:05:00Z"]
+    line = pg.tick_cadence_observation([{"created_at": t} for t in times])
+    assert line is not None and line.startswith("⏱️")
+    assert "45.0" in line and "40" in line  # максимум 45.0; тугое окно 40
+    assert "протух" in line
+
+
+def test_tick_cadence_observation_insufficient_data_is_loud_not_silent():
+    # issue #1096: меньше TICK_CADENCE_MIN_GAPS свежих промежутков — ⏱️-строка
+    # «оценить нельзя», не молчаливый None (неспособность увидеть дрейф не
+    # есть его отсутствие).
+    two_runs = [{"created_at": "2026-09-14T01:00:00Z"},
+                {"created_at": "2026-09-14T01:20:00Z"}]
+    line = pg.tick_cadence_observation(two_runs)
+    assert line is not None and "не оценён" in line
+
+
+def test_tick_cadence_observation_excludes_daylong_gaps_with_named_reason():
+    # Суточный простой (выходные/пауза) — не «такт вырос»: исключается из
+    # замера, число исключённых названо в строке, если данных после этого
+    # хватает, решение принимается по свежим промежуткам.
+    times = ["2026-09-13T10:00:00Z", "2026-09-13T10:20:00Z", "2026-09-13T10:40:00Z",
+             "2026-09-13T11:00:00Z", "2026-09-13T11:20:00Z", "2026-09-13T11:40:00Z",
+             "2026-09-14T12:40:00Z"]  # 25 ч простоя, потом каденция вернулась
+    line = pg.tick_cadence_observation([{"created_at": t} for t in times])
+    assert line is None  # свежие промежутки по 20 мин — здорова; простой исключён
 
 
 # ── Тексты сигналов: маркеры, улики, путь возобновления ──────────────────────────
@@ -839,13 +883,41 @@ def test_heartbeat_ok_is_quiet_and_stale_cries(monkeypatch):
     lines = pg.heartbeat_check("mytab0r/edge-harness", utc(2026, 8, 31, 12, 0))
     assert sent == [] and any("в норме" in line for line in lines)
 
-    # последний успех 60 мин назад (порог 45) — опоздавший запуск кричит
+    # последний успех 61 мин назад (порог 60 = 3 медианных такта, #1184) —
+    # опоздавший запуск кричит
     fake.routes["workflows/orchestra.yml/runs"] = {
         "workflow_runs": [run("failure", "2026-08-31T11:59:00Z", 6),
                           run("success", "2026-08-31T11:00:00Z", 5)]}
     lines = pg.heartbeat_check("mytab0r/edge-harness", utc(2026, 8, 31, 12, 1))
     assert len(sent) == 1 and "пропадал" in sent[0]
     assert any("пропадал" in line for line in lines)
+
+
+def test_heartbeat_check_carries_live_cadence_observation(monkeypatch):
+    # Ревизия #1184: heartbeat_check уже владеет страницей тиков — из ТЕХ ЖЕ
+    # данных (ноль лишних запросов) сверяет окна с живым тактом. Здоровая
+    # плотность (пять промежутков по 20 мин < тугого окна 40) — ⏱️-строки в
+    # отчёте нет (здоровье не шумит); тиков меньше TICK_CADENCE_MIN_GAPS —
+    # строка «не оценён» обязана появиться: неспособность увидеть дрейф не
+    # есть его отсутствие (issue #1096, три исхода).
+    def check_with(runs, now):
+        fake = FakeGh({"workflows/orchestra.yml/runs": {"workflow_runs": runs},
+                       "issues/120/comments": []})
+        monkeypatch.setattr(pg, "gh", fake)
+        monkeypatch.setattr(pg, "send_telegram", lambda text: True)
+        monkeypatch.setattr(pg, "post_issue_comment", lambda *a: None)
+        return pg.heartbeat_check("mytab0r/edge-harness", now)
+
+    healthy = [run("success", f"2026-08-31T{10 + i // 3}:{(i * 20) % 60:02d}:00Z", 5 + i)
+               for i in range(6)]  # тики каждые 20 мин: 10:00..12:20
+    lines = check_with(healthy, utc(2026, 8, 31, 12, 30))
+    assert any("в норме" in line for line in lines)
+    assert not any("⏱️" in line for line in lines)
+
+    lines = check_with([run("success", "2026-08-31T12:00:00Z", 5),
+                        run("success", "2026-08-31T12:20:00Z", 6)],
+                       utc(2026, 8, 31, 12, 30))
+    assert any("не оценён" in line and "⏱️" in line for line in lines)
 
 
 # ── #133: contract (pull_request) не маскирует пропавший пульс orchestra ────────
@@ -2384,8 +2456,8 @@ def test_failure_watch_same_title_different_fingerprint_comments_not_duplicates(
 def test_failure_watch_repeat_pulse_of_same_run_does_not_double_comment(monkeypatch):
     # Мутационная проверка (находка ревью PR #612, живой прогон 34063041667 —
     # реальные id job'а/шага и реальный хвост лога сняты `gh api` с прод): окно
-    # свежести FAILURE_WATCH_WINDOW_MINUTES=30 при пульсе раз в 15 мин держит
-    # ОДИН И ТОТ ЖЕ красный прогон «свежим» до трёх пульсов подряд. Без дедупа
+    # свежести FAILURE_WATCH_WINDOW_MINUTES держит
+    # ОДИН И ТОТ ЖЕ красный прогон «свежим» несколько пульсов подряд. Без дедупа
     # по комментариям (issue_marker_times — приём stall_detector.py, #248)
     # каждый такой пульс писал бы БАЙТ-В-БАЙТ дубль на #578: тело issue не
     # меняется (ci_failure_fingerprints парсит только тела), значит только
@@ -2778,7 +2850,7 @@ def test_failure_watch_ignores_run_older_than_freshness_window(monkeypatch):
     # Находка ревью PR #488: провал старше окна не заводит задачу заново на
     # уже неактуальную причину — `now` обязан использоваться, не просто
     # приниматься в сигнатуру. Прогон на 4 дня старше NOW заведомо за окном
-    # FAILURE_WATCH_WINDOW_MINUTES (30 мин).
+    # FAILURE_WATCH_WINDOW_MINUTES (число — в pulse_guard).
     routes = dict(FAILURE_WATCH_QUIET_ROUTES)
     routes["workflows/worker.yml/runs?status=completed"] = {"workflow_runs": [
         run("failure", "2026-08-27T11:50:00Z", 34027035455,

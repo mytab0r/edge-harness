@@ -119,9 +119,22 @@ LAST_RUN_LOOKUP_PAGES = 5
 PROBE_BACKOFF_BASE_MINUTES = 15
 PROBE_BACKOFF_MAX_MINUTES = 240
 
-# Пульс orchestra идёт каждые 15 минут (cron orchestra.yml); три пропущенных
-# интервала — пульсы пропали. Пока опоздавший запуск жив, он обязан крикнуть.
-HEARTBEAT_MAX_AGE_MINUTES = 45
+# Порог простоя пульса — от ИЗМЕРЕННОГО такта, не от cron (ревизия #1184,
+# находка C): cron `*/15` у orchestra.yml реально доставляет единицы процентов
+# (docs/research/21-github-actions.md), такт несут легитимные события
+# schedule+workflow_dispatch, а занятая concurrency-группа теряет тик, не
+# копит его. Замер 60 прогонов orchestra.yml (2026-09-13T20:09Z…2026-09-14T01:
+# 40Z): медиана 20.2 мин, максимум 25.0. Три медианных интервала ≈ 60 минут:
+# одиночный пропущенный такт (до 25 мин) порога не достигает с запасом 2.4×,
+# крик появляется после трёх подряд «пропавших» интервалов. Прежние 45 были
+# 3×крона; при реальном такте два пропущенных такта по максимуму (2×25=50 мин
+# тишины) уже пробивали порог — ложный крик «пульс пропал» на нормальной
+# каденции. Номинальный интервал DO-пульса (10 мин после #812) — тоже не
+# носитель этого числа: калибруется ДОСТУПНЫЙ такт прогонов, а не обещание
+# конфига (белое пятно из tasks.md change'а orchestrator-pulse-interval-
+# tuning). Пока опоздавший запуск жив, он обязан крикнуть. Живая сверка числа
+# с тактом — tick_cadence_observation ниже (каждый пульс, ноль лишних запросов).
+HEARTBEAT_MAX_AGE_MINUTES = 60
 
 # Задача-статус: туда идут сигнальные комментарии (и маркеры серий).
 WATCHDOG_ISSUE = 120
@@ -492,8 +505,14 @@ STALE_BASE_SIGNATURES = (
 
 FAILURE_WATCH_INFRA_MARKER = "[failure-watch: инфраструктура"
 
-# Окно свежести провала (находка ревью PR #488): пульс ходит раз в 15 минут
-# (cron orchestra.yml), окно — двойной период с запасом на задержку раннера.
+# Окно свежести провала (находка ревью PR #488) — от ИЗМЕРЕННОГО такта
+# пульса, не от cron (ревизия #1184, находка C): медианный такт orchestra
+# 20.2 мин, максимум 25.0 (замер в комментарии у HEARTBEAT_MAX_AGE_MINUTES).
+# Окно — два медианных такта: свежий провал обязан быть увиден хотя бы одним
+# тиком в пределах окна, а максимальный наблюдаемый промежуток между тиками
+# 25 < 40 (запас 1.6×). Прежние «30 минут, двойной период cron `*/15`»
+# опирались на каденцию, которую cron не доставляет: один пропущенный такт
+# (максимум 25 мин при такте 20) выносил провал за 30-минутное окно молча.
 # Без него `runs[0]` навсегда остаётся тем же старым красным прогоном после
 # закрытия задачи (отпечаток исчезает из открытых → следующий пульс заводит
 # задачу заново на уже почившую причину, бесконечный цикл).
@@ -506,8 +525,8 @@ FAILURE_WATCH_INFRA_MARKER = "[failure-watch: инфраструктура"
 # лежит вне окна на КАЖДОМ пульсе — ни задачи, ни наблюдения, навсегда:
 # молчаливая потеря ровно тех провалов, ради которых #477. У ЗАВЕРШЁННОГО
 # прогона updated_at — момент завершения, то есть для красного прогона —
-# момент провала; «30 минут после провала» — ровно заявленная семантика.
-FAILURE_WATCH_WINDOW_MINUTES = 30
+# момент провала; «окно минут после провала» — ровно заявленная семантика.
+FAILURE_WATCH_WINDOW_MINUTES = 40
 
 # Выводы ЗАВЕРШЁННЫХ прогонов, которые failure_watch разбирает как провал.
 # Отдельный именованный набор, не общий FAILURE_CONCLUSIONS — судьба крайних
@@ -1038,6 +1057,61 @@ def orchestra_tick_runs(repo: str, per_page: int = 100) -> list[dict]:
     return real_orchestra_ticks(runs)
 
 
+# ── Живая сверка окон с измеренным тактом пульса (ревизия #1184, находка C) ───
+# HEARTBEAT_MAX_AGE_MINUTES и FAILURE_WATCH_WINDOW_MINUTES выше (и
+# repo_invariants.WIP_GATE_FALSE_ZERO_WINDOW_MINUTES — та же каденция orchestra,
+# тот же замер) откалиброваны срезом 2026-09-13/14: медиана 20.2, максимум
+# 25.0 мин. Срез статичен, такт дрейфует: занятая concurrency-группа ТЕРЯЕТ
+# тик (не копит), доставка schedule — единицы процентов, интенсивность
+# PR-шторма меняет диспатч-канал. heartbeat_check каждый пульс и так держит
+# свежую страницу настоящих тиков — из ТЕХ ЖЕ данных (ноль дополнительных
+# запросов) пересчитывается наблюдаемый максимум промежутка; когда он доходит
+# до самого тугого окна, замер протух и окна надо пересчитывать, пока провалы
+# не начали выпадать из окон молча. Префикс строки — нарочно ⏱️, НЕ ⚠️/🚨:
+# дрейф калибровки — наблюдение для пересчёта констант, не симптом простоя,
+# который stall_detector.extract_signals автозаводит по ⚠️/🚨-строкам отчёта.
+TICK_CADENCE_MIN_GAPS = 5
+# Промежутки больше суток — конвейер простаивал ЦЕЛИКОМ (выходные без
+# диспатчей, пауза маркером, отключённый workflow), а не «такт вырос»:
+# каденцию они не измеряют, из замера исключаются с названной причиной.
+TICK_CADENCE_EXCLUDE_GAP_MINUTES = 24 * 60
+
+
+def tick_cadence_observation(runs: list[dict]) -> str | None:
+    """Наблюдение о дрейфе такта пульса или None. `runs` — выход
+    orchestra_tick_runs (настоящие тики schedule/workflow_dispatch, отсортированы
+    по свежести) — данные, которые heartbeat_check и так скачала; сеть не
+    трогается, решение чистое.
+
+    Три исхода, не два (issue #1096):
+    - свежих промежутков меньше TICK_CADENCE_MIN_GAPS (все тики давние либо
+      промежутки за суточным потолком) — ⏱️-строка «оценить нельзя», не
+      молчаливый None: неспособность увидеть дрейф не есть его отсутствие
+      (AGENTS.md, «Алерт не гадает»);
+    - максимум свежих промежутков < самого тугого окна (FAILURE_WATCH_
+      WINDOW_MINUTES; HEARTBEAT_MAX_AGE_MINUTES вдвое свободнее) — None:
+      здоровое состояние не печатается, чтобы не шуметь на каждый пульс;
+    - максимум дошёл до окна — ⏱️-строка с числами и названным протухшим
+      замером."""
+    times = sorted(parse_time(run["created_at"]) for run in runs)
+    gaps = [(later - earlier).total_seconds() / 60.0
+            for earlier, later in zip(times, times[1:])]
+    fresh = [gap for gap in gaps if gap < TICK_CADENCE_EXCLUDE_GAP_MINUTES]
+    excluded = len(gaps) - len(fresh)
+    if len(fresh) < TICK_CADENCE_MIN_GAPS:
+        return (f"⏱️ такт пульса не оценён: {len(fresh)} свежих промежутков "
+                f"(нужно {TICK_CADENCE_MIN_GAPS}); исключено {excluded} длиннее суток "
+                "(конвейер простаивал целиком — каденцию это не измеряет)")
+    worst = max(fresh)
+    tightest = min(HEARTBEAT_MAX_AGE_MINUTES, FAILURE_WATCH_WINDOW_MINUTES)
+    if worst < tightest:
+        return None
+    return (f"⏱️ такт пульса дрейфовал: максимальный промежуток между тиками "
+            f"{worst:.1f} мин ≥ самого тугого окна {tightest} мин "
+            "(FAILURE_WATCH_WINDOW_MINUTES/HEARTBEAT_MAX_AGE_MINUTES) — замер "
+            "#1184 (медиана 20.2, максимум 25.0) протух, окна пересчитать")
+
+
 def heartbeat_age_minutes(last_success_at: str | datetime, now: datetime) -> float:
     if isinstance(last_success_at, str):
         last_success_at = parse_time(last_success_at)
@@ -1136,7 +1210,7 @@ def heartbeat_alert_text(age_minutes: float, run: dict | None) -> str:
         f"🚨 edge-harness: {HEARTBEAT_MARKER}\n"
         f"Пульсы orchestra пропадали: последний успешный прогон "
         f"{int(age_minutes)} мин назад (порог {HEARTBEAT_MAX_AGE_MINUTES} = "
-        "3 интервала по 15 мин). Этот прогон опоздал — кричу, пока жив.\n"
+        "3 медианных такта пульса, замер #1184). Этот прогон опоздал — кричу, пока жив.\n"
         "Частые причины: расписание отключено после 60 дней без активности "
         "(docs/research/21-github-actions.md), красные прогоны — см. Actions и почту. "
         "Полный охват мёртвого пульса даст только внешний монитор (не подтверждено, отложено)."
@@ -1801,6 +1875,10 @@ def heartbeat_check(repo: str, now: datetime) -> list[str]:
     тратится на `pull_request`-прогоны `contract`, так что труncация страницы
     настоящими тиками (найдено ревью PR #318) больше не молчит."""
     runs = orchestra_tick_runs(repo, per_page=100)
+    # Живая сверка окон с тактом (ревизия #1184) — из тех же данных, ноль
+    # дополнительных запросов; строка ⏱️ (дрейф/неоценённость) добавляется к
+    # любому исходу ниже, None (здорово) не печатается вовсе.
+    cadence_line = tick_cadence_observation(runs)
     last_ok = next((r for r in runs if r.get("conclusion") == "success"), None)
     if last_ok is None:
         # Пустой результат ПОСЛЕ серверного фильтра — не «выборка коротка»
@@ -1855,8 +1933,9 @@ def heartbeat_check(repo: str, now: datetime) -> list[str]:
         print(f"::warning::закрытие эпизода в #{WATCHDOG_ISSUE} не оставлено: {error}", file=sys.stderr)
     age = heartbeat_age_minutes(last_ok["created_at"], now)
     if decide_heartbeat(last_ok["created_at"], now) == "ok":
-        return [f"💗 пульс orchestra в норме: последний успех {int(age)} мин назад "
-                f"(порог {HEARTBEAT_MAX_AGE_MINUTES})"]
+        healthy = [f"💗 пульс orchestra в норме: последний успех {int(age)} мин назад "
+                   f"(порог {HEARTBEAT_MAX_AGE_MINUTES})"]
+        return healthy + ([cadence_line] if cadence_line else [])
     text = heartbeat_alert_text(age, last_ok)
     delivered = send_telegram(text)
     # posted/attempted — тот же класс, что и в ветке HEARTBEAT_NO_TICKS выше
@@ -1876,9 +1955,10 @@ def heartbeat_check(repo: str, now: datetime) -> list[str]:
     except RuntimeError as error:
         print(f"::warning::след в #{WATCHDOG_ISSUE} не оставлен: {error}", file=sys.stderr)
     trace = "оставлен" if posted else ("НЕ оставлен" if attempted else "не требовался — эпизод не новый")
-    return [f"🚨 пульс orchestra пропадал: последний успех {int(age)} мин назад "
-            f"> {HEARTBEAT_MAX_AGE_MINUTES} (Telegram: "
-            f"{'доставлен' if delivered else 'НЕ доставлен'}; след в #{WATCHDOG_ISSUE}: {trace})"]
+    stale_lines = [f"🚨 пульс orchestra пропадал: последний успех {int(age)} мин назад "
+                   f"> {HEARTBEAT_MAX_AGE_MINUTES} (Telegram: "
+                   f"{'доставлен' if delivered else 'НЕ доставлен'}; след в #{WATCHDOG_ISSUE}: {trace})"]
+    return stale_lines + ([cadence_line] if cadence_line else [])
 
 
 def decide_independent_pulse(
@@ -2537,7 +2617,7 @@ def failure_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
                 # Дедуп комментария по КЛАССУ (тот же приём, что
                 # stall_detector._evidence_marker/issue_marker_times, находка
                 # PR #248): свежий провал остаётся в окне FAILURE_WATCH_WINDOW_MINUTES
-                # несколько пульсов подряд (пульс — раз в 15 мин, окно — 30) — без
+                # несколько пульсов подряд (пульс — такт 20-25 мин, окно 40) — без
                 # этой проверки КАЖДЫЙ пульс писал бы БАЙТ-В-БАЙТ одинаковый
                 # комментарий на #578 (находка ревью PR #612: три пульса одного
                 # прогона на моках дали два дубля). ci_fingerprints выше не
