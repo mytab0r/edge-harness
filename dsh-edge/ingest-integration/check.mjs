@@ -262,7 +262,10 @@ try {
 
   // Список: сессия не пустая, заголовок наш.
   const listed = await rpc('session.list', {})
-  assert.equal(listed.result.ok, true, 'session.list')
+  // Сообщение несёт ПОЛНЫЙ envelope (не только факт отказа): «session.list»
+  // без ответа скрывал реальную ошибку RPC — красный деплой 0.15.0
+  // (run 35255769370) оставил только «false !== true» без причины.
+  assert.equal(listed.result.ok, true, `session.list → ${JSON.stringify(listed.result)}`)
   const summary = listed.result.value.items.find(item => item.sessionId === sid)
   assert.equal(summary.blank, false, 'сессия не blank после ingest')
   assert.equal(summary.projections.values.title, '#119: ingest-check', 'заголовок сохранён')
