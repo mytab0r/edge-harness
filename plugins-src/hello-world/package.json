@@ -1,7 +1,7 @@
 {
   "name": "@edge-harness/dsh-plugin-hello",
-  "version": "0.1.1",
-  "description": "PoC edge plugin: hello-world proving the manifest -> bundle -> deploy -> web roster channel for dsh-edge",
+  "version": "0.1.2",
+  "description": "PoC edge plugin: hello-world proving the manifest -> bundle -> deploy -> web roster channel for dsh-edge Версия поднята бампом пина #1294 (0.1.5-rc.2): депы @deepseek-ai/* согласованы с пином dsh-edge/upstream.json, релиз пересобран форжем (#80/#507).",
   "type": "module",
   "main": "server/index.js",
   "exports": {
@@ -15,7 +15,7 @@
     }
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-tools": "0.1.2-rc.1"
+    "@deepseek-ai/dsh-tools": "0.1.5-rc.2"
   },
   "files": [
     "server/index.js",
