@@ -949,6 +949,43 @@ if [ "$WORKER_TASK_FAILURE_REASON" = "quota_exhausted" ] || \
         reason="цепочка провайдеров исчерпана целиком (опробованы: ${WORKER_CHAIN_TRIED:-?})${WORKER_CHAIN_RESET_HINT:+, ближайший названный сброс: $WORKER_CHAIN_RESET_HINT} — все реально без квоты, повтор внутри этого прогона не поможет (docs/runbooks/switch-llm-provider.md, #727)"
       fi ;;
   esac
+  # #1286: исход job'а и машиночитаемый маркер в комментарии разделяют классы
+  # так же, как шапка выше (#1322), — ОДИН case на оба носителя, не две копии.
+  # НАШ отказ (prompt_too_long) умирает громко: серию его повторов останавливает
+  # предохранитель диспатча, а кормят его именно красные прогоны worker.yml
+  # (#1315) — зелёный код возврата сделал бы это названное место правды слепым.
+  # Отказ на стороне провайдера (quota_exhausted / rate_limit_retry_budget_
+  # exceeded / all_providers_exhausted) — не сбой воркера: задача ниже
+  # возвращается в пул, сигнал ушёл в задачу и Telegram; красный job здесь
+  # кормил бы предохранитель (#226) чужой виной и задерживал восстановление
+  # после сброса квоты — открытый предохранитель снимает только зелёная проба
+  # (#205). Живой отказ этого класса: прогон 34893177035, задача #1286.
+  # Маркер $refusal_marker читает оркестратор (scheduler.py,
+  # dispatch_ai_review_rework): зелёный прогон с этим маркером в комментарии
+  # задачи внутри окна прогона — инфра-путь доводки, не «честная попытка»
+  # находок (блокирующая находка ai-review PR #1313, класс
+  # «второй-потребитель-забыт»).
+  # Неизвестный класс — громкий die ДО возврата задачи в пул: молчаливый
+  # зелёный дефолт спрятал бы завтрашний пятый класс, добавленный в case
+  # выше и забытый здесь; задачу снимет TTL-сборщик (#121), красный job
+  # назовёт, что именно дописать. Контракт кода возврата гвардится
+  # исполнением настоящего блока: scripts/worker/test/
+  # provider-exhaustion-exit-code.smoke.sh (каталог: scripts/ci/guards/
+  # worker-exhaustion-exit-code-guard.sh).
+  # ЧЕСТНАЯ ГРАНИЦА: серию зелёных прогонов во время долгого сбоя провайдеров
+  # предохранитель не видит — автостопа такой серии нет, сигнал владельцу —
+  # комментарий в задаче и Telegram (ждать сброса или сменить провайдера —
+  # docs/runbooks/switch-llm-provider.md).
+  refusal_marker=""
+  job_exit="die"
+  case "$WORKER_TASK_FAILURE_REASON" in
+    quota_exhausted | rate_limit_retry_budget_exceeded | all_providers_exhausted)
+      job_exit="green"
+      refusal_marker="[воркер: провайдерный отказ (#1286)]" ;;
+    prompt_too_long) ;;  # НАШ отказ — job красный, маркера провайдерного отказа нет
+    *)
+      die "неизвестный класс отказа '$WORKER_TASK_FAILURE_REASON' в блоке провайдерного отказа — добавь его в оба case этого блока (выбор $failure_header и этот), не молча зелёный" ;;
+  esac
   release_out="$(lease_cli release-full "$number" 2>&1)" && release_rc=0 || release_rc=$?
   if [ "$release_rc" -eq 0 ]; then
     echo "Отказ до работы агента ($failure_kind) — задача #$number возвращена в пул немедленно: $release_out"
@@ -959,6 +996,7 @@ if [ "$WORKER_TASK_FAILURE_REASON" = "quota_exhausted" ] || \
   fi
   comment=$(cat <<COMMENT
 🤖 $failure_header: $reason.
+$refusal_marker
 $release_note Хвосты логов ниже (секреты замаскированы).
 
 Хвост stderr DSH:
@@ -976,27 +1014,10 @@ COMMENT
   )
   gh issue comment "$number" --body "$comment" >/dev/null
   telegram_report "worker: задача #$number — $failure_kind ($reason). Задача возвращена в пул" || true
-  # #1286: код возврата job'а разделяет классы так же, как шапка выше (#1322).
-  # НАШ отказ (prompt_too_long) умирает громко: серию его повторов останавливает
-  # предохранитель диспатча, а кормят его именно красные прогоны worker.yml
-  # (#1315) — зелёный код возврата сделал бы это названное место правды слепым.
-  # Отказ на стороне провайдера (quota_exhausted / rate_limit_retry_budget_
-  # exceeded / all_providers_exhausted) — не сбой воркера: задача выше уже
-  # возвращена в пул, сигнал ушёл в задачу и Telegram; красный job здесь
-  # кормил бы предохранитель (#226) чужой виной и задерживал восстановление
-  # после сброса квоты — открытый предохранитель снимает только зелёная проба
-  # (#205). Живой отказ этого класса: прогон 34893177035, задача #1286.
-  # ЧЕСТНАЯ ГРАНИЦА: серию зелёных прогонов во время долгого сбоя провайдеров
-  # предохранитель не видит — автостопа такой серии нет, сигнал владельцу —
-  # комментарий в задаче и Telegram (ждать сброса или сменить провайдера —
-  # docs/runbooks/switch-llm-provider.md). Контракт кода возврата гвардится
-  # исполнением настоящего блока: scripts/worker/test/
-  # provider-exhaustion-exit-code.smoke.sh (каталог: scripts/ci/guards/
-  # worker-exhaustion-exit-code-guard.sh).
-  case "$WORKER_TASK_FAILURE_REASON" in
-    prompt_too_long) die "$failure_kind: $reason" ;;
-    *) exit 0 ;;
-  esac
+  if [ "$job_exit" != "green" ]; then
+    die "$failure_kind: $reason"
+  fi
+  exit 0
 fi
 
 # pr_status здесь бывает двух родов (#876): "empty"/"absent" (pr_outcome_rc=1)

@@ -1345,56 +1345,97 @@ def dispatch_ai_review_rework(
                 # (conclusion=='success'), либо атрибуции нет вовсе (аренда
                 # сгорела до следа воркера) — ни один из двух не наш
                 # инфра-отказ, дальше без человека не разобраться.
+                provider_refusal_green = False
                 if run_conclusion == "success":
-                    # «Алерт не гадает» (#472, находка ai-review PR #1030,
-                    # второй круг): «ai-review снова нашёл нарушения на этом
-                    # коммите» недостижимо честно на этой ветке. Бюджет
-                    # считается ПО ОТПЕЧАТКУ (ai_rework_attempts), и смена
-                    # отпечатка его обнуляет — эскалация на текущем отпечатке
-                    # возможна только если success-прогон НЕ поменял отпечаток
-                    # диффа (иначе следующий пульс уже считал бы по новому
-                    # отпечатку с attempts=0). А при неизменном отпечатке
-                    # should_run_ai_review отдаёт go=False (keep-path) — сам
-                    # ai-review на этот коммит не запускался, «снова нашёл»
-                    # было бы утверждением о событии, которого не было.
-                    reason = (
-                        "worker.yml отработал успешно, но отпечаток диффа не изменился: "
-                        "повторный прогон ai-review на этом отпечатке не выполнялся "
-                        "(keep-path) — стоят находки прежнего ревью того же диффа"
-                    )
-                elif run_conclusion is None:
-                    reason = (
-                        "прогон worker.yml по этой задаче не атрибутирован (аренда сгорела "
-                        "до следа?) — см. лог worker.yml вручную"
+                    # #1286 (блокирующая находка ai-review PR #1313, класс
+                    # «второй-потребитель-забыт»): зелёный conclusion воркера
+                    # больше НЕ означает «агент честно пробовал находки» —
+                    # провайдерный отказ тоже зелёный (task.sh, блок
+                    # провайдерного отказа, exit 0). Различитель — маркер из
+                    # task.sh в комментарии ЗАДАЧИ внутри окна прогона: ставится
+                    # тем же прогоном, который дал этот зелёный conclusion, до
+                    # его завершения. Без этой светки провайдерный отказ при
+                    # доводке сгорал бы в бюджет попыток и эскалировал текстом
+                    # «отработал успешно, но отпечаток не изменился» — при том,
+                    # что агент не вызывался вовсе (смена семантики бюджета +
+                    # «алерт не гадает»).
+                    try:
+                        provider_refusal_green = worker_run_was_provider_refusal(
+                            repo, task_number, run)
+                    except RuntimeError as error:
+                        observations.append(
+                            f"⚠️ PR #{number}: не смог сверить маркер провайдерного "
+                            f"отказа в задаче #{task_number}: {error} — решение по "
+                            "доводке отложено до следующего прохода"
+                        )
+                        continue
+                if provider_refusal_green:
+                    # Исход 1-бис (#1286): инфра-путь, как у
+                    # `run_conclusion in FAILURE_CONCLUSIONS` выше, — попытка
+                    # не была честной пробой находок. Текст называет факт
+                    # (зелёный прогон при провайдерном отказе), не подменяет
+                    # его «успехом». Падаем сквозь к обычному диспатчу ниже,
+                    # мимо эскалации — так же, как Исход 1.
+                    infra_retry = True
+                    observations.append(
+                        f"🔁 PR #{number}: авто-доводка ({attempts}/"
+                        f"{AI_REWORK_MAX_ATTEMPTS} на этом отпечатке) не в счёт "
+                        "эскалации — последний прогон worker.yml завершился ЗЕЛЁНЫМ "
+                        "как провайдерный отказ (#1286: job зелёный, агент не "
+                        "вызывался, задача возвращена в пул) — автоматический "
+                        "повтор, без эскалации владельцу"
                     )
                 else:
-                    # Атрибутированный прогон с conclusion ВНЕ FAILURE_CONCLUSIONS
-                    # — timed_out (worker.yml несёт timeout-minutes: 340, #1067, висяк
-                    # даёт именно его) или startup_failure. «Алерт не гадает»
-                    # (#472, находка ai-review PR #1030): факт уже в руках —
-                    # называем conclusion как есть; прежний текст подменял его
-                    # неверным утверждением про атрибуцию («не атрибутирован»).
-                    # Решение не менялось (эскалация — это не наш класс
-                    # инфра-отказа), врал только текст.
-                    reason = (
-                        f"последний прогон worker.yml по этой задаче завершился с "
-                        f"conclusion={run_conclusion!r} — не success и не известный "
-                        "инфра-отказ, см. лог worker.yml вручную"
+                    if run_conclusion == "success":
+                        # «Алерт не гадает» (#472, находка ai-review PR #1030,
+                        # второй круг): «ai-review снова нашёл нарушения на этом
+                        # коммите» недостижимо честно на этой ветке. Бюджет
+                        # считается ПО ОТПЕЧАТКУ (ai_rework_attempts), и смена
+                        # отпечатка его обнуляет — эскалация на текущем отпечатке
+                        # возможна только если success-прогон НЕ поменял отпечаток
+                        # диффа (иначе следующий пульс уже считал бы по новому
+                        # отпечатку с attempts=0). А при неизменном отпечатке
+                        # should_run_ai_review отдаёт go=False (keep-path) — сам
+                        # ai-review на этот коммит не запускался, «снова нашёл»
+                        # было бы утверждением о событии, которого не было.
+                        reason = (
+                            "worker.yml отработал успешно, но отпечаток диффа не изменился: "
+                            "повторный прогон ai-review на этом отпечатке не выполнялся "
+                            "(keep-path) — стоят находки прежнего ревью того же диффа"
+                        )
+                    elif run_conclusion is None:
+                        reason = (
+                            "прогон worker.yml по этой задаче не атрибутирован (аренда сгорела "
+                            "до следа?) — см. лог worker.yml вручную"
+                        )
+                    else:
+                        # Атрибутированный прогон с conclusion ВНЕ FAILURE_CONCLUSIONS
+                        # — timed_out (worker.yml несёт timeout-minutes: 340, #1067, висяк
+                        # даёт именно его) или startup_failure. «Алерт не гадает»
+                        # (#472, находка ai-review PR #1030): факт уже в руках —
+                        # называем conclusion как есть; прежний текст подменял его
+                        # неверным утверждением про атрибуцию («не атрибутирован»).
+                        # Решение не менялось (эскалация — это не наш класс
+                        # инфра-отказа), врал только текст.
+                        reason = (
+                            f"последний прогон worker.yml по этой задаче завершился с "
+                            f"conclusion={run_conclusion!r} — не success и не известный "
+                            "инфра-отказ, см. лог worker.yml вручную"
+                        )
+                    text = (
+                        f"🚨 edge-harness: {marker}\n"
+                        f"PR #{number} (задача #{task_number}) остаётся с ai:changes-requested "
+                        f"на том же отпечатке диффа после {attempts} авто-попытки доводки "
+                        f"worker.yml — {reason}. Нужно решение владельца: посмотреть находки "
+                        "ai-review (gh pr view --comments) и разобраться руками."
                     )
-                text = (
-                    f"🚨 edge-harness: {marker}\n"
-                    f"PR #{number} (задача #{task_number}) остаётся с ai:changes-requested "
-                    f"на том же отпечатке диффа после {attempts} авто-попытки доводки "
-                    f"worker.yml — {reason}. Нужно решение владельца: посмотреть находки "
-                    "ai-review (gh pr view --comments) и разобраться руками."
-                )
-                escalation = escalate(repo, WATCHDOG_ISSUE, text)
-                actions.append(
-                    f"🚨 PR #{number}: авто-доводка по находкам ai-review исчерпана "
-                    f"({attempts}/{AI_REWORK_MAX_ATTEMPTS} на этом отпечатке) — эскалация "
-                    f"владельцу ({escalation})"
-                )
-                continue
+                    escalation = escalate(repo, WATCHDOG_ISSUE, text)
+                    actions.append(
+                        f"🚨 PR #{number}: авто-доводка по находкам ai-review исчерпана "
+                        f"({attempts}/{AI_REWORK_MAX_ATTEMPTS} на этом отпечатке) — эскалация "
+                        f"владельцу ({escalation})"
+                    )
+                    continue
         issue = pool_by_number.get(task_number)
         if issue is None:
             observations.append(
@@ -2203,6 +2244,34 @@ def last_worker_run_conclusion(repo: str, task_number: int) -> str | None:
     итог «PR всё ещё dirty», что и настоящий конфликт)."""
     run = last_worker_run(repo, task_number)
     return run.get("conclusion") if run else None
+
+
+# #1286 (блокирующая находка ai-review PR #1313, класс «второй-потребитель-
+# забыт»): машиночитаемый след провайдерного отказа воркера. Пишет task.sh в
+# комментарий задачи ТОЛЬКО в ветке зелёного исхода (provider-классы);
+# читается worker_run_was_provider_refusal ниже. Синхронизация литерала между
+# bash-писателем и этим питон-читателем гвардится исполнением:
+# scripts/worker/test/provider-exhaustion-exit-code.smoke.sh (сценарий 6)
+# сверяет литерал в обоих файлах — правишь здесь, правь и там.
+WORKER_PROVIDER_REFUSAL_MARKER = "[воркер: провайдерный отказ (#1286)]"
+
+
+def worker_run_was_provider_refusal(repo: str, task_number: int, run: dict) -> bool:
+    """True — прогон воркера `run` завершился ЗЕЛЁНЫМ как провайдерный отказ:
+    в комментариях задачи есть маркер WORKER_PROVIDER_REFUSAL_MARKER,
+    оставленный НЕ РАНЬШЕ старта этого прогона (task.sh ставит его тем же
+    прогоном, до завершения job'а, поэтому «маркер внутри окна прогона» = «этот
+    прогон был им»). Потребитель — dispatch_ai_review_rework: без этой светки
+    зелёный conclusion при провайдерном отказе сгорал в бюджет попыток
+    доводки и эскалировал текстом про «успех» (блокирующая находка ai-review
+    PR #1313). RuntimeError из чтения комментариев наружу не глотается —
+    вызывающий решает сам, как быть честным при недоступности факта."""
+    started_raw = run.get("run_started_at") or run.get("created_at")
+    if not started_raw:
+        return False  # у прогона нет времени старта — маркер не к чему привязать
+    started = parse_time(started_raw)
+    times = issue_marker_times(repo, task_number, WORKER_PROVIDER_REFUSAL_MARKER)
+    return any(marker_at >= started for marker_at in times)
 
 
 def resume_series_by_merge(repo: str, pull: dict, task_number: int) -> str | None:
