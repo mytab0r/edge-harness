@@ -1,5 +1,5 @@
 {
   "repo": "pawaca/dsh-edge",
   "sha": "ff6da77d658fa257914b90d70fc428735a74ce19",
-  "note": "Пин апстрима для source-build морды. Автоматический бамп (#1294, scripts/orchestra/upstream_drift.py::attempt_auto_bump): sha — тег dsh-edge-v0.15.0 (repos/pawaca/dsh-edge/tags). Патч-серия dsh-edge/patches НЕ перебазирована этим коммитом — применимость доказывает шаг «Патч-серия» deploy-dsh-edge.yml после мержа (dsh-edge/PATCHES.md); красный деплой — честный сигнал, не тихий пропуск версии, дальше заводит задачу пульс отказов деплоя (#477)."
+  "note": "Пин апстрима для source-build морды. Автоматический бамп (#1294, scripts/orchestra/upstream_drift.py::attempt_auto_bump): sha — тег dsh-edge-v0.15.0 (repos/pawaca/dsh-edge/tags). Патч-серия dsh-edge/patches перебазирована при доводке PR: 0.15.0 переписал метод workspaceRegistry() — в патче 0002 обновлена хвостовая контекстная строка хунка (док-комментарий waitForInitialization); серия 0002–0006 наложена git apply подряд на чистом клоне тега без единого хунка мимо (dsh-edge/PATCHES.md). Версии @deepseek-ai/* в plugins-src подняты до 0.1.5-rc.2 под этот же пин, плагины перевыпущены форжем, dsh-edge/plugins.json обновлён (класс #507)."
 }
