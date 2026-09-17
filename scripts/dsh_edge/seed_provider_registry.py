@@ -153,23 +153,45 @@ class MordaRpc:
         self.origin = origin.rstrip("/")
         self.access_key = access_key
         self.timeout = timeout
+        # Редирект НЕ следуем (#1337): 303 — это успех логина, а не промежуточный
+        # шаг; поход на цель редиректа возвращал 403 и маскировал успех отказом.
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *_args, **_kwargs):
+                return None
+
         self.opener = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(CookieJar()))
+            urllib.request.HTTPCookieProcessor(CookieJar()), _NoRedirect())
 
     def login(self) -> None:
+        """Обмен access-ключа на куку владельца. Успех — РОВНО 303, и по
+        редиректу идти НЕЛЬЗЯ (#1337).
+
+        Живой отказ прогона 35187895910: opener по умолчанию следует
+        редиректу, цель 303 отвечает 403 — и исключение всплывало из УЖЕ
+        УСПЕШНОГО логина, а текст винил ключ, который исправен. Эталон —
+        `scripts/lib/dsh-edge-session.sh::dsh_edge_login`: `curl` БЕЗ `-L`,
+        `case "$code" in *303*`. Здесь тот же контракт, не своя копия логики:
+        редирект гасится обработчиком, 303 принимается как успех, кука уже
+        поставлена ответом логина (HTTPCookieProcessor обрабатывает
+        Set-Cookie до редирект-обработчика)."""
         body = urllib.parse.urlencode({"accessKey": self.access_key}).encode()
         req = urllib.request.Request(
             f"{self.origin}/api/auth/login", data=body,
             headers={"Content-Type": "application/x-www-form-urlencoded"})
         try:
-            # 303 — штатный ответ логина; opener сам идёт по редиректу.
-            self.opener.open(req, timeout=self.timeout).read()
+            response = self.opener.open(req, timeout=self.timeout)
+            code = response.getcode()
+            response.read()
         except urllib.error.HTTPError as error:
-            raise SeedError(
-                f"логин в морду отказан (HTTP {error.code}) — проверь "
-                "DSH_EDGE_ACCESS_KEY; значение ключа здесь намеренно не печатается") from error
+            code = error.code
+            error.read()
         except OSError as error:
             raise SeedError(f"морда недоступна по {self.origin}: {error}") from error
+        if code != 303:
+            raise SeedError(
+                f"логин в морду не дал 303 (получен HTTP {code}) — ожидается "
+                "редирект с кукой владельца. Проверь DSH_EDGE_ACCESS_KEY и "
+                "DSH_EDGE_URL; значение ключа здесь намеренно не печатается")
 
     def call(self, method: str, payload: dict) -> dict:
         req = urllib.request.Request(

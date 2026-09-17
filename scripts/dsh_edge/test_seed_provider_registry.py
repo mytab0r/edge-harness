@@ -40,6 +40,7 @@ class FakeMorda:
         self.providers: dict = dict(preset or {})
         self.calls: list[tuple[str, dict]] = []
         self.credentials: dict[str, str] = {}
+        self.redirect_target_hits = 0
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -55,9 +56,14 @@ class FakeMorda:
                 self.wfile.write(body)
 
             def do_GET(self):  # noqa: N802 — цель 303-редиректа логина
-                # urllib идёт по редиректу GET'ом; без этого обработчика
-                # BaseHTTPRequestHandler отвечает 501 и логин "падает".
-                self.send_response(200)
+                # ПРОД-ФОРМА (#1337, живой прогон 35187895910): цель редиректа
+                # логина отвечает 403, а не 200. Раньше фикстура отдавала 200 —
+                # наш ПЕРЕСКАЗ поведения морды, и потому не поймала, что клиент
+                # по редиректу вообще ходит. Правило репозитория: тест кормит
+                # прод-форму, а не пересказ. Зелёный тест тут означает, что
+                # клиент по редиректу НЕ пошёл.
+                outer.redirect_target_hits += 1
+                self.send_response(403)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
 
@@ -131,6 +137,16 @@ def test_seeds_every_manifest_route_once(morda):
     assert sorted(routes) == sorted(set(routes)), f"маршрут записан дважды: {routes}"
     assert "glm" in routes and "nvidia-nim-1" in routes
     assert len(routes) == 8, f"ожидались все 8 маршрутов манифеста, ушло {routes}"
+
+
+def test_login_does_not_follow_the_303_redirect(morda):
+    """#1337: успех логина — это САМ 303; поход на цель редиректа отвечает 403
+    и маскировал успешный логин отказом, вина ложно падала на ключ."""
+    result = run_seed(morda.origin, extra_env={"DEEPSEEK_API_KEY": SECRET_VALUE})
+    assert result.returncode == 0, result.stderr
+    assert morda.redirect_target_hits == 0, (
+        "клиент пошёл по 303-редиректу — цель отвечает 403, и логин будет "
+        "объявлен отказом, хотя он удался")
 
 
 def test_second_run_is_noop(morda):
