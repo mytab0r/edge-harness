@@ -205,6 +205,7 @@ def _gh_preflight(env: dict):
     try:
         proc = subprocess.run(
             [gh, "auth", "status"], capture_output=True, text=True,
+            encoding="utf-8",  # класс #723: text=True без encoding на Windows декодирует локальной кодовой страницей
             timeout=GH_PREFLIGHT_TIMEOUT_SECONDS, env=env)
     except subprocess.TimeoutExpired:
         return (f"gh auth status не ответил за "
