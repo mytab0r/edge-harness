@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Тесты scripts/lib/pre_push_guard_gate.py (issue #1280).
 
-Юнит-уровень: логика трёх исходов (`run_gate`) и режима (`_mode`) на
-синтетическом каталоге гвардий (`tmp_path`), без сети и без боевых 81
+Юнит-уровень: логика трёх исходов (`run_gate`, включая префлайт окружения
+«gh аутентифицирован?» и потолок времени) и режима (`_mode`) на
+синтетическом каталоге гвардий (`tmp_path`), без сети и без боевых 82
 гвардий. Поведенческий сквозной прогон РЕАЛЬНОГО `.githooks/pre-push` на
 живом git push — `scripts/git/test/pre-push-guard-gate.test.sh` (отдельный
 носитель, AGENTS.md «Поведенческий тест находит то, чего структурный не
@@ -20,6 +21,7 @@ _console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_u
 # --- конец console_utf8 bootstrap ---
 
 import os
+import shutil
 import stat
 
 import pytest
@@ -44,6 +46,22 @@ def _make_catalog(tmp_path, exit_code: int) -> Path:
         "#!/usr/bin/env bash\nexit " + str(exit_code) + "\n", encoding="utf-8")
     run_guards.chmod(run_guards.stat().st_mode | stat.S_IEXEC)
     return tmp_path
+
+
+@pytest.fixture(autouse=True)
+def fake_gh_on_path(tmp_path, monkeypatch):
+    """Автофикстура: настоящий `gh` в тестовом окружении не гарантирован
+    (локальная машина без gh auth покрасила бы префлайт и сломала бы
+    unaffected-тесты прогонки каталога) — на PATH ставится fake `gh`,
+    завершающийся 0. Тесты самого префлайта переопределяют его явно
+    (выход 4 / отсутствие на PATH)."""
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_gh = fake_bin / "gh"
+    fake_gh.write_text("#!/usr/bin/env sh\nexit 0\n", encoding="utf-8")
+    fake_gh.chmod(fake_gh.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("PATH", str(fake_bin) + os.pathsep + os.environ["PATH"])
+    return fake_bin
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -88,7 +106,9 @@ def test_run_gate_local_mode_sets_skip_env_for_numbering_guards(tmp_path, monkey
     real_run = subprocess.run
 
     def spy(cmd, **kwargs):
-        proc = real_run(cmd, capture_output=True, text=True, **{k: v for k, v in kwargs.items() if k not in ("cwd", "env")}, cwd=kwargs.get("cwd"), env=kwargs.get("env"))
+        # capture_output/text фильтруются наравне с cwd/env: через spy теперь
+        # проходит и префлайт (`gh auth status`), который сам их передаёт.
+        proc = real_run(cmd, capture_output=True, text=True, **{k: v for k, v in kwargs.items() if k not in ("cwd", "env", "capture_output", "text")}, cwd=kwargs.get("cwd"), env=kwargs.get("env"))
         captured["stdout"] = proc.stdout
         return proc
 
@@ -96,6 +116,78 @@ def test_run_gate_local_mode_sets_skip_env_for_numbering_guards(tmp_path, monkey
     gate.run_gate(tmp_path, "local")
     assert "decision-doc-numbering-guard" in captured["stdout"]
     assert "invariant-numbering-guard" in captured["stdout"]
+
+
+def test_run_gate_full_mode_discards_ambient_skip_env(tmp_path, monkeypatch):
+    """Внешний GUARD_CATALOG_SKIP из окружения вызывающего НЕ должен молча
+    ужать «полный» каталог (находка ai-ревью PR #1285): full-режим изымает
+    переменную из окружения дочернего процесса — иначе
+    `GUARD_CATALOG_SKIP="..." git push` проходил бы мимо части гвардий."""
+    monkeypatch.setenv("GUARD_CATALOG_SKIP", "decision-doc-numbering-guard")
+    guards_dir = tmp_path / "scripts" / "ci" / "guards"
+    guards_dir.mkdir(parents=True)
+    run_guards = tmp_path / "scripts" / "ci" / "run_guards.sh"
+    run_guards.write_text(
+        "#!/usr/bin/env bash\necho \"SKIP=[$GUARD_CATALOG_SKIP]\"\nexit 0\n",
+        encoding="utf-8")
+    run_guards.chmod(run_guards.stat().st_mode | stat.S_IEXEC)
+
+    import subprocess
+    captured = {}
+    real_run = subprocess.run
+
+    def spy(cmd, **kwargs):
+        proc = real_run(cmd, capture_output=True, text=True, cwd=kwargs.get("cwd"), env=kwargs.get("env"))
+        captured["stdout"] = proc.stdout
+        return proc
+
+    monkeypatch.setattr(subprocess, "run", spy)
+    gate.run_gate(tmp_path, "full")
+    assert "SKIP=[]" in captured["stdout"]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# префлайт окружения — «упала гвардия» ≠ «окружение не даёт прогнать»
+# (находка ai-ревью PR #1285)
+# ══════════════════════════════════════════════════════════════════════════
+
+def test_run_gate_unknown_when_gh_missing(tmp_path, monkeypatch):
+    """gh CLI отсутствует → каталог заранее недостоверен (гвардии, требующие
+    gh, упали бы не из-за кода) → третье состояние, каталог НЕ запускается."""
+    repo_root = _make_catalog(tmp_path, 0)
+    bin_dir = tmp_path / "only-bash"
+    bin_dir.mkdir()
+    os.symlink(shutil.which("bash"), bin_dir / "bash")
+    monkeypatch.setenv("PATH", str(bin_dir))
+    result = gate.run_gate(repo_root, "local")
+    assert result.status == cr.STATUS_UNKNOWN
+    assert "gh" in result.reason
+
+
+def test_run_gate_unknown_when_gh_not_authenticated(tmp_path, fake_gh_on_path):
+    """`gh auth status` с ненулевым кодом (протухший PAT, офлайн, разлогин) —
+    тот же класс заранее недостоверного прогона, третье состояние."""
+    repo_root = _make_catalog(tmp_path, 0)
+    fake_gh = fake_gh_on_path / "gh"
+    fake_gh.write_text(
+        "#!/usr/bin/env sh\necho 'You are not logged into any GitHub hosts.' >&2\nexit 4\n",
+        encoding="utf-8")
+    result = gate.run_gate(repo_root, "local")
+    assert result.status == cr.STATUS_UNKNOWN
+    assert "аутентифицир" in result.reason
+    assert "код 4" in result.reason
+
+
+def test_run_gate_unknown_when_catalog_hangs_past_timeout(tmp_path, monkeypatch):
+    """Подвисшая гвардия не подвешивает пуш навсегда (находка ai-ревью
+    PR #1285): потолок времени → третье состояние, не красная гвардия."""
+    repo_root = _make_catalog(tmp_path, 0)
+    run_guards = repo_root / "scripts" / "ci" / "run_guards.sh"
+    run_guards.write_text("#!/usr/bin/env bash\nsleep 5\n", encoding="utf-8")
+    monkeypatch.setattr(gate, "GUARD_CATALOG_TIMEOUT_SECONDS", 1)
+    result = gate.run_gate(repo_root, "local")
+    assert result.status == cr.STATUS_UNKNOWN
+    assert "не уложился" in result.reason
 
 
 def test_run_gate_full_mode_does_not_skip_anything(tmp_path, monkeypatch):

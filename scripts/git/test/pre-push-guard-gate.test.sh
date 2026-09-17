@@ -4,7 +4,7 @@
 # на живом git-репозитории (не пересказ) — файлы копируются как есть, не
 # переписываются здесь заново. Каталог гвардий (scripts/ci/run_guards.sh +
 # один управляемый fake-guard) вынесен ВНЕ пушащего репозитория и подключён
-# через GUARD_GATE_REPO_ROOT — боевые 81 гвардия каталога сюда не тянутся
+# через GUARD_GATE_REPO_ROOT — боевые 82 гвардии каталога сюда не тянутся
 # (минуты, сеть, ловушка #1228), тестируется сам МЕХАНИЗМ гейта.
 #
 # Случаи:
@@ -14,7 +14,11 @@
 #   3) каталог гвардий красный + GUARD_GATE_SKIP_ACK   — push проходит с
 #      предупреждением (аварийный выход, issue #1280, п. 5);
 #   4) run_guards.sh отсутствует (третье состояние)    — push отклонён с
-#      текстом «НЕ СМОГ запуститься», отличным от текста нарушения.
+#      текстом «НЕ СМОГ запуститься», отличным от текста нарушения;
+#   5) gh CLI недоступен (находка ai-ревью PR #1285)   — push отклонён
+#      ТРЕТЬИМ состоянием («окружение не даёт достоверный прогон»), не
+#      красной гвардией: красные без gh (7 из 82 каталога) — слепота
+#      машины, не код.
 #
 # Мутация, которой доказана гвардия (issue #1280): закомментируй строку
 # `exec "$python_bin" ...` в .githooks/pre-push (замени на `exit 0`) —
@@ -118,7 +122,7 @@ fi
 
 # ── случай 3: красная гвардия + аварийный выход — push проходит с предупреждением ──
 echo red >"$STATE_FILE"
-(
+if (
   cd "$WORK/pusher"
   echo "change at $(date +%s%N)" >>note.txt
   git add note.txt
@@ -126,14 +130,16 @@ echo red >"$STATE_FILE"
   env -u GITHUB_ACTIONS GUARD_GATE_REPO_ROOT="$CATALOG" FAKE_GUARD_STATE_FILE="$STATE_FILE" \
     GUARD_GATE_SKIP_ACK="тест: аварийный выход" \
     git push -q origin HEAD:refs/heads/main 2>"$WORK/ack.stderr"
-)
-if [ $? -eq 0 ]; then
-  :
-fi
-if grep -q "GUARD_GATE_SKIP_ACK" "$WORK/ack.stderr"; then
-  note "случай 3 (аварийный выход): push прошёл с видимым предупреждением — ОК"
+); then
+  if grep -q "GUARD_GATE_SKIP_ACK" "$WORK/ack.stderr"; then
+    note "случай 3 (аварийный выход): push прошёл с видимым предупреждением — ОК"
+  else
+    note "случай 3 (аварийный выход): предупреждение не найдено в выводе — ОШИБКА"
+    cat "$WORK/ack.stderr" >&2
+    fail=1
+  fi
 else
-  note "случай 3 (аварийный выход): предупреждение не найдено в выводе — ОШИБКА"
+  note "случай 3 (аварийный выход): push ОТКЛОНЁН — ОШИБКА, аварийный выход обязан пропускать"
   cat "$WORK/ack.stderr" >&2
   fail=1
 fi
@@ -163,7 +169,46 @@ mkdir -p "$EMPTY_CATALOG"
   fi
 )
 
+# ── случай 5: gh CLI недоступен — окружение не даёт достоверный прогон ──
+# PATH заменяется на каталог-шейм со всеми исполняемыми текущего PATH,
+# КРОМЕ gh*: гейт обязан вернуть ТРЕТЬЕ состояние (факт про gh), не
+# красную гвардию, и заблокировать пуш.
+NOGH_BIN="$WORK/bin-without-gh"
+mkdir -p "$NOGH_BIN"
+no_gh_ifs="$IFS"
+IFS=":"
+for dir in $PATH; do
+  [ -d "$dir" ] || continue
+  for exe in "$dir"/*; do
+    [ -e "$exe" ] && [ -x "$exe" ] || continue
+    base="$(basename "$exe")"
+    case "$base" in gh|gh.*) continue ;; esac
+    [ -e "$NOGH_BIN/$base" ] || ln -s "$exe" "$NOGH_BIN/$base" 2>/dev/null || true
+  done
+done
+IFS="$no_gh_ifs"
+(
+  cd "$WORK/pusher"
+  echo "change at $(date +%s%N)" >>note.txt
+  git add note.txt
+  git commit -q -m "test commit (gh-missing)"
+  if out="$(env -u GITHUB_ACTIONS PATH="$NOGH_BIN" GUARD_GATE_REPO_ROOT="$CATALOG" \
+    git push -q origin HEAD:refs/heads/main 2>&1)"; then
+    note "случай 5 (gh недоступен): push прошёл — ОШИБКА, недостоверный прогон обязан блокировать"
+    fail=1
+  else
+    if printf '%s' "$out" | grep -q "НЕ СМОГ запуститься" \
+      && printf '%s' "$out" | grep -q "gh CLI не найден"; then
+      note "случай 5 (gh недоступен): push отклонён третьим состоянием с фактом про gh — ОК"
+    else
+      note "случай 5 (gh недоступен): отказ не называет ни третье состояние, ни gh — ОШИБКА"
+      echo "$out" >&2
+      fail=1
+    fi
+  fi
+)
+
 if [ "$fail" = 0 ]; then
-  echo "pre-push-guard-gate: все четыре случая прошли как ожидалось"
+  echo "pre-push-guard-gate: все пять случаев прошли как ожидалось"
 fi
 exit "$fail"
