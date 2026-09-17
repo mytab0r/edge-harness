@@ -428,7 +428,10 @@ git config core.hooksPath .githooks
 # агент вот-вот сам продолжит работать именно в этом дереве). Best-effort:
 # сбой уборки (сеть/gh недоступен) не блокирует создание НОВОЙ ветки задачи —
 # это maintenance, не гейт; свой вывод печатает сам скрипт.
-python3 "$(dirname "${BASH_SOURCE[0]}")/worktree-cleanup.py" || true
+# --publish-snapshot (#1250 п.4): этот путь — единственный, где деревья
+# физически есть, поэтому запись прогона для инварианта 24 публикует он;
+# публикация внутри уборщика best-effort и гейтом не является.
+python3 "$(dirname "${BASH_SOURCE[0]}")/worktree-cleanup.py" --publish-snapshot || true
 
 mkdir -p "$(dirname "$wt_dir")"
 git worktree add -b "$branch" "$wt_dir" refs/remotes/origin/main

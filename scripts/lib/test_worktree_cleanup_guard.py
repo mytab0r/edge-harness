@@ -80,6 +80,28 @@ main) и раунд 2 (плюс сравнение с живым апстрим�
       worktree list`) — не удаляется, не защищается, но ОБЯЗАН появиться в
       отчёте (`scan_orphan_directories`/`stats['orphan_dirs']`), не молчаливо
       игнорируется.
+  13. Fail loud «снято 0 при запертых деревьях» (#1250 п.3, находка ревью
+      PR #1257): прогон со снятым 0 и деревом старше retention с кодом из
+      STUCK_CODES обязан печатать грепаемый блок `!!! ВНИМАНИЕ` с веткой и
+      кодом — «0 из N» не должен читаться в логе как «убирать было нечего»;
+      прогон, снявший хоть одно дерево, тот же блок НЕ печатает.
+  14. `--publish-snapshot` (#1250 п.4, CLI end-to-end): прод-путь публикует
+      запись прогона на ветку данных origin (`data/worktree-cleanup`,
+      прод-форма JSONL), замеряя устаревшие копии гвардий
+      (`scripts/orchestra/pulse_guard.py` без `prod_writes_allowed`) по
+      реальным файлам; публикация каналом не гейтит (rc 0 и при отказе).
+  15. Песочница не публикует: origin чекаута не совпадает с
+      GITHUB_REPOSITORY — запись отпадает ДО сети с названной причиной,
+      data-ветка на origin не создаётся (синтетические числа не маскируют
+      живое состояние).
+  16. Чекаут без `.claude/worktrees` — запись не публикуется: объект
+      измерения отсутствует, и это называется явно (не «наблюдалось чисто»).
+  17. Отказ git-инструмента (таймаут: run_cmd отдаёт rc=1 и output "TIMEOUT")
+      НЕ читается как семантический ответ «содержимое разошлось» (находка
+      ревью PR #1257, чеклист): иначе таймаут сравнения уводил бы в ярус 3,
+      где доверие merged-статусу ПРИНИМАЕТ решение о снятии — сбой
+      инструмента авторизовал бы удаление. Должен быть `unknown()` — отказ,
+      не разрешение.
 
 get_pr_status монкипатчится на уровне класса для сценариев, где сетевой
 `gh`-вызов не имеет отношения к тому, что сценарий проверяет (dirty/young/
@@ -118,13 +140,24 @@ Retention/«текущее время» инъецируются парамет�
     `check_dirty`, потому что сам untracked-маркер и есть незакоммиченное
     изменение, — но проверка ловит ИМЕННО заявленную причину отказа, не
     любой отказ); вернуть тело — GREEN.
+  - вырезать громкий блок из `print_summary` (условие removed==0 при
+    непустом `stats['stuck_old']`) красит
+    `test_zero_removed_with_stuck_old_trees_prints_loud_block` в RED
+    («0 из N» снова неотличим в логе от «убирать было нечего», #1250 п.3);
+    вернуть блок — GREEN.
+  - убрать `--publish-snapshot` из вызова CLI (или тело
+    `publish_run_record`) красит `test_publish_snapshot_end_to_end` в RED —
+    ветка данных на origin не создаётся, инвариант 24 остаётся без записей
+    (#1250 п.4); вернуть публикацию — GREEN.
 
 Запуск: python -m pytest scripts/lib/test_worktree_cleanup_guard.py -q
 """
 
+import json
 import os
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -141,6 +174,14 @@ _SCRIPT_PATH = Path(__file__).resolve().parent.parent / "git" / "worktree-cleanu
 _wc_spec = importlib.util.spec_from_file_location("worktree_cleanup", _SCRIPT_PATH)
 worktree_cleanup = importlib.util.module_from_spec(_wc_spec)
 _wc_spec.loader.exec_module(worktree_cleanup)  # type: ignore[union-attr]
+
+# worktree_snapshot — тот же единственный модуль канала (состав записи,
+# парсер JSONL, транспорт), который пишет уборщик и читает инвариант 24;
+# тесты сверяются с ЕГО контрактом, не с копией словаря.
+_ws_spec = importlib.util.spec_from_file_location(
+    "worktree_snapshot", Path(__file__).resolve().parent / "worktree_snapshot.py")
+worktree_snapshot = importlib.util.module_from_spec(_ws_spec)
+_ws_spec.loader.exec_module(worktree_snapshot)  # type: ignore[union-attr]
 
 WorktreeAnalyzer = worktree_cleanup.WorktreeAnalyzer
 check_result = worktree_cleanup.check_result
@@ -744,6 +785,227 @@ def test_orphan_directory_is_reported_not_removed(tmp_path):
     assert stats["orphan_dirs"] == ["_scratch_pool"]
     assert orphan_dir.exists(), "каталог без .git не должен исчезать"
     assert (orphan_dir / "note.txt").exists(), "содержимое каталога без .git не должно трогаться"
+
+
+# ── Сценарий 13: fail loud «снято 0 из N при запертых деревьях» (#1250 п.3) ─
+
+def _old_stuck_worktree(work: Path, name: str, branch: str) -> Path:
+    """Чистое (без незакоммиченных правок) дерево с локальным коммитом,
+    которого нет нигде, — код отказа `unpushed` (ярусы 1-3 #1250)."""
+    wt_dir = _add_worktree(work, name, branch)
+    (wt_dir / "extra.txt").write_text("extra\n", encoding="utf-8")
+    _git(wt_dir, "add", "extra.txt")
+    _git(wt_dir, "commit", "-m", "local only, never pushed")
+    return wt_dir
+
+
+def test_zero_removed_with_stuck_old_trees_prints_loud_block(tmp_path, monkeypatch, capsys):
+    _patch_pr_status(monkeypatch, "open")  # PR не merged → ярус 3 честно отказывает
+    work = _setup_repo(tmp_path)
+    wt_dir = _old_stuck_worktree(work, "13-stuck", "agent/13-stuck")
+
+    now_ts = _mtime_now_ts(wt_dir, RETENTION_HOURS * 10)  # заведомо старше retention
+    analyzer = WorktreeAnalyzer(str(work), retention_hours=RETENTION_HOURS, now_ts=now_ts)
+
+    stats = analyzer.analyze_and_cleanup()
+    assert stats["removed"] == 0
+    assert [(b, c) for b, c, _age in stats["stuck_old"]] == [("agent/13-stuck", "unpushed")]
+
+    analyzer.print_summary(stats)
+    out = capsys.readouterr().out
+    assert "!!! ВНИМАНИЕ: снято 0 из 1" in out, out
+    assert "agent/13-stuck [unpushed]" in out, out
+    assert "retention" in out, out
+    assert "Газ:" in out, "громкий блок обязан называть газ, не только факт"
+
+
+def test_loud_block_not_printed_when_something_was_removed(tmp_path, monkeypatch, capsys):
+    """Снятое дерево при том же прогоне — не «ноль убранных»: блок `!!!`
+    обязан молчать, иначе сигнал размазывается по всем прогонам подряд и
+    перестаёт отличать инцидент от нормы."""
+    _install_fake_gh(monkeypatch, tmp_path, json.dumps([
+        {"headRefName": "agent/13b-done", "state": "MERGED"},
+        {"headRefName": "agent/13b-stuck", "state": "OPEN"},
+    ]))
+    work = _setup_repo(tmp_path)
+    done_dir = _add_worktree(work, "13b-done", "agent/13b-done")
+    _delete_remote_branch(work, "agent/13b-done")
+    stuck_dir = _old_stuck_worktree(work, "13b-stuck", "agent/13b-stuck")
+
+    now_ts = max(_mtime_now_ts(done_dir, RETENTION_HOURS * 10),
+                 _mtime_now_ts(stuck_dir, RETENTION_HOURS * 10))
+    analyzer = WorktreeAnalyzer(str(work), retention_hours=RETENTION_HOURS, now_ts=now_ts)
+
+    stats = analyzer.analyze_and_cleanup()
+    assert stats["removed"] == 1, stats
+    assert [b for b, _c, _age in stats["stuck_old"]] == ["agent/13b-stuck"], stats
+
+    analyzer.print_summary(stats)
+    out = capsys.readouterr().out
+    assert "!!! ВНИМАНИЕ" not in out, out
+
+
+# ── Сценарии 14-16: канал наблюдаемости (--publish-snapshot, #1250 п.4) ────
+
+_GITHUB_URL = "https://github.com/mytab0r/edge-harness.git"
+_GITHUB_REPO = "mytab0r/edge-harness"
+
+
+def _seed_guard_copy(wt_dir: Path, with_guard_fix: bool) -> None:
+    """Положить в дерево копию scripts/orchestra/pulse_guard.py — с гвардией
+    #1074 (`prod_writes_allowed`) или без неё. Файл — реальный носитель,
+    который замер #1250 и считает."""
+    guard = wt_dir / "scripts" / "orchestra" / "pulse_guard.py"
+    guard.parent.mkdir(parents=True, exist_ok=True)
+    body = "def decide():\n    prod_writes_allowed = True\n" if with_guard_fix \
+        else "def decide():\n    raise SystemExit(2)\n"
+    guard.write_text(body, encoding="utf-8")
+
+
+def test_publish_snapshot_end_to_end(tmp_path, monkeypatch):
+    """CLI `--dry-run --publish-snapshot` (cwd — чекаут, origin — GitHub-URL,
+    переписанный на локальный bare через `url.<base>.insteadOf` — прод-форма
+    транспорта, сеть не нужна) публикует JSONL-запись прогона на ветку данных
+    origin: total/removed/устаревшие копии гвардий/запертые деревья."""
+    monkeypatch.setenv("HOME", str(tmp_path))  # вместо of --global ниже и вместо of клона писателя
+    bare = tmp_path / "origin.git"
+    work = _setup_repo(tmp_path)
+    # Прод-форма origin чекаута; insteadOf уводит реальный сетевой трафик в bare.
+    _git(work, "remote", "set-url", "origin", _GITHUB_URL)
+    _git(work, "config", "--global", f"url.{bare}.insteadOf", _GITHUB_URL)
+
+    wt = _add_worktree(work, "14-old-guard", "agent/14-old-guard")
+    _seed_guard_copy(wt, with_guard_fix=False)
+    wt_fresh = _add_worktree(work, "14-fresh-guard", "agent/14-fresh-guard")
+    _seed_guard_copy(wt_fresh, with_guard_fix=True)
+    # Копия гвардии обязана быть ЗАКОММИЧЕННОЙ (не untracked): untracked-файл
+    # сделал бы дерево «dirty» и отодвинул его от кандидатов на снятие, а
+    # сценарий проверяет именно запись снимка по снятым кандидатам.
+    for d in (wt, wt_fresh):
+        _git(d, "add", "-A")
+        _git(d, "commit", "-qm", "guard copy snapshot")
+    _install_fake_gh(monkeypatch, tmp_path, json.dumps([
+        {"headRefName": "agent/14-old-guard", "state": "MERGED"},
+        {"headRefName": "agent/14-fresh-guard", "state": "MERGED"},
+    ]))
+    monkeypatch.setenv("GITHUB_REPOSITORY", _GITHUB_REPO)
+
+    # CLI-прогон идёт по реальным часам: состарим корни деревьев на 2 часа
+    # (utime, не sleep — класс «тесты-бомбы»), чтобы оба стали кандидатами
+    # на снятие (PR MERGED, апстрим синхронен) и запись несла removed>0.
+    past = time.time() - 2 * 3600
+    for d in (wt, wt_fresh):
+        os.utime(d, (past, past))
+
+    result = subprocess.run(
+        [sys.executable, str(_SCRIPT_PATH), "--dry-run", "--publish-snapshot"],
+        cwd=str(work),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=120,
+    )
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "worktree-snapshot: запись опубликована" in result.stdout, result.stdout
+
+    branch_ref = "refs/heads/data/worktree-cleanup"
+    assert _git(bare, "rev-parse", "--verify", "--quiet", branch_ref, check=False).returncode == 0
+    content = _git(bare, "show", f"{branch_ref}:{worktree_snapshot.SNAPSHOT_PATH}").stdout
+    (row,) = worktree_snapshot.read_rows(content)
+    assert row["total"] == 2
+    assert row["mode"] == "dry-run"
+    assert row["guard_copies"] == 2, "оба дерева несут копию pulse_guard.py"
+    assert row["stale_guard_copies"] == 1, "копия без prod_writes_allowed обязана быть посчитана"
+    assert row["removed"] == 2, "dry-run считает кандидатов через мок удаления"
+    worktree_snapshot.parse_ts(row["ts"])  # ts разбирается парсером канала
+
+
+def test_publish_skipped_when_origin_is_not_target(tmp_path, monkeypatch, capsys):
+    """Песочница: origin чекаута — локальный bare, GITHUB_REPOSITORY —
+    настоящий. Запись обязана отпасть ДО сети с названной причиной —
+    синтетические измерения не должны попадать в прод-канал и маскировать
+    живое состояние (до RECORD_STALE_AFTER_DAYS)."""
+    work = _setup_repo(tmp_path)  # origin — локальный путь, URL не трогаем
+    monkeypatch.setenv("GITHUB_REPOSITORY", _GITHUB_REPO)
+    _install_fake_gh(monkeypatch, tmp_path, "[]")
+
+    result = subprocess.run(
+        [sys.executable, str(_SCRIPT_PATH), "--dry-run", "--publish-snapshot"],
+        cwd=str(work),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=60,
+    )
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "не публикуется" in result.stdout
+    assert "не совпадает" in result.stdout
+    assert _git(
+        tmp_path / "origin.git", "rev-parse", "--verify", "--quiet",
+        "refs/heads/data/worktree-cleanup", check=False,
+    ).returncode != 0, "ветка данных не должна создаваться из песочницы"
+
+
+def test_publish_skipped_without_worktrees_dir(tmp_path, monkeypatch):
+    """`.claude/worktrees` отсутствует — объект измерения не существует, и
+    это печатается как факт («деревьев нет здесь»), не как «наблюдалось
+    чисто»: подмена чистоты отсутствием объекта — тот же silent-wrong."""
+    work = _setup_repo(tmp_path)
+    monkeypatch.setenv("GITHUB_REPOSITORY", _GITHUB_REPO)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _git(work, "remote", "set-url", "origin", _GITHUB_URL)
+    bare = tmp_path / "origin.git"
+    _git(work, "config", "--global", f"url.{bare}.insteadOf", _GITHUB_URL)
+
+    result = subprocess.run(
+        [sys.executable, str(_SCRIPT_PATH), "--dry-run", "--publish-snapshot"],
+        cwd=str(work),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=60,
+    )
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "не публикуется" in result.stdout
+    assert ".claude/worktrees" in result.stdout
+    assert _git(
+        bare, "rev-parse", "--verify", "--quiet",
+        "refs/heads/data/worktree-cleanup", check=False,
+    ).returncode != 0
+
+
+# ── Сценарий 17: отказ инструмента ≠ семантический ответ «разошлось» ───────
+
+def test_tool_failure_is_not_read_as_content_divergence(tmp_path, monkeypatch):
+    """run_cmd при таймауте отдаёт ("TIMEOUT", 1) — тот же rc, что у
+    `git diff --quiet` в семантике «различия есть». Если отказ читается как
+    расхождение, таймаут уводит в ярус 3, и доверие merged-статусу принимает
+    решение о снятии на СБОЙНОМ замере: _patch_pr_status(monkeypatch,
+    "merged") делает исход различимым — честный unknown() запрещает снятие,
+    прочитанный-как-расхождение таймаут авторизует ok() (RED при мутации)."""
+    _patch_pr_status(monkeypatch, "merged")
+    work = _setup_repo(tmp_path)
+    branch = "agent/17-timeout"
+    wt_dir = _add_worktree(work, "17-timeout", branch)
+    (wt_dir / "extra.txt").write_text("extra\n", encoding="utf-8")
+    _git(wt_dir, "add", "extra.txt")
+    _git(wt_dir, "commit", "-m", "local only, never pushed")
+
+    real_run_cmd = worktree_cleanup.run_cmd
+
+    def failing_run_cmd(cmd, cwd=None, check=False):
+        if cmd.startswith("git diff"):
+            return "TIMEOUT", 1  # прод-форма отказа run_cmd по таймауту
+        return real_run_cmd(cmd, cwd=cwd, check=check)
+
+    monkeypatch.setattr(worktree_cleanup, "run_cmd", failing_run_cmd)
+    analyzer = WorktreeAnalyzer(str(work), retention_hours=RETENTION_HOURS,
+                                now_ts=_mtime_now_ts(wt_dir, RETENTION_HOURS * 10))
+    result = analyzer.check_unpushed_commits(str(wt_dir), branch)
+    assert result.status == check_result.STATUS_UNKNOWN, (
+        "сбой инструмента обязан быть отказом, не «разошлось» → ярус 3: "
+        f"{result}")
+    assert "отказ инструмента" in (result.reason or "")
 
 
 # ── Здоровье скрипта: синтаксис и CLI --dry-run ────────────────────────────

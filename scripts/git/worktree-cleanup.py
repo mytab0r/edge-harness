@@ -102,14 +102,34 @@ scratch), удалять вслепую — риск потери чужой р�
 которого эта задача и избегает. `scan_orphan_directories()` только
 ОТЧИТЫВАЕТСЯ о них построчно в сводке (не молчаливое игнорирование) —
 решение, что с ними делать, за оператором.
+
+Fail loud на «снято 0» (issue #1250, пункт 3): прогон, не снявший НИЧЕГО,
+пока среди удержанных есть деревья СТАРШЕ retention с кодом из
+`worktree_snapshot.STUCK_CODES` (unpushed/unknown_work/unknown_pr — газ у
+них недостижим или внешненосителен), неотличим в логе от «убирать было
+нечего» — именно так «0 из 73» и прополз мимо всех. `print_summary`
+печатает отдельный блок с маркером `!!!` (грепается), называющий деревья
+и их коды; смерть этого сигнала в масштабе репозитория видит инвариант 24
+(`repo_invariants.check_worktree_cleanup_records`).
+
+Канал наблюдаемости (issue #1250, пункт 4): `--publish-snapshot` (передаёт
+прод-вызывающий `scripts/git/task-branch`) публикует запись прогона
+(total/removed/устаревшие копии гвардий/запертые деревья) на ветку данных
+`data/worktree-cleanup` (`scripts/lib/worktree_snapshot.py` — состав записи
+и транспорт, второй копии не заводим). Измерение живёт ЗДЕСЬ, где деревья
+физически есть, — инвариант на раннере repo-ci/orchestra видит пустой
+`.claude/worktrees` всегда и мерять не может. Публикация best-effort:
+отказ (сеть/права/песочница) печатается с причиной и НЕ ломает уборку —
+смерть канала ловит инвариант по свежести записей, а не красный task-branch.
 """
 
 import subprocess
 import os
 import sys
 import json
+import base64
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Tuple, List
 
 # --- console_utf8 bootstrap (класс: печать кириллицы валит encoding на Windows, issue #723) ---
@@ -126,6 +146,13 @@ _check_result_spec = importlib.util.spec_from_file_location(
 check_result = importlib.util.module_from_spec(_check_result_spec)
 _check_result_spec.loader.exec_module(check_result)
 # --- конец check_result bootstrap ---
+
+# --- worktree_snapshot bootstrap (канал наблюдаемости для инварианта 24, #1250) ---
+_worktree_snapshot_spec = importlib.util.spec_from_file_location(
+    "worktree_snapshot", Path(__file__).resolve().parent.parent / "lib" / "worktree_snapshot.py")
+worktree_snapshot = importlib.util.module_from_spec(_worktree_snapshot_spec)
+_worktree_snapshot_spec.loader.exec_module(worktree_snapshot)
+# --- конец worktree_snapshot bootstrap ---
 
 
 def run_cmd(cmd: str, cwd: Optional[str] = None, check: bool = False) -> Tuple[str, int]:
@@ -223,6 +250,27 @@ class WorktreeAnalyzer:
             return True  # Если не смогли проверить — считаем грязным
         return bool(output.strip())
 
+    @staticmethod
+    def _diff_state(spec: str, cwd: str) -> Tuple[str, str]:
+        """("same"|"diverged"|"failed", диагностика) для `git diff --quiet A B`.
+
+        Отказ инструмента обязан читаться НЕ тем же сигналом, что семантический
+        ответ (находка ревью PR #1257, чеклист): run_cmd при таймауте/исключении
+        возвращает rc=1 с output "TIMEOUT"/текстом исключения — тот же rc, что у
+        `git diff --quiet` в семантике «различия есть». Сам diff --quiet в обоих
+        семантических исходах печатает в stdout ПУСТО, поэтому rc==1 с непустым
+        stdout — отказ инструмента: "failed" (вызывающий код обязан дать
+        unknown(), не content_diverged)."""
+        output, rc = run_cmd(spec, cwd=cwd)
+        if rc == 0:
+            return "same", ""
+        if rc == 1 and not output.strip():
+            return "diverged", ""
+        return "failed", (
+            f"{spec} завершился кодом {rc}"
+            + (f", stdout={output[:120]}" if output.strip() else "")
+        )
+
     def check_unpushed_commits(self, worktree_path: str, branch: str) -> "check_result.CheckResult":
         """Доказана ли сохранность коммитов где-то ещё, кроме этого дерева.
 
@@ -314,29 +362,32 @@ class WorktreeAnalyzer:
             # ahead>0 (или не распарсилось) — апстрим есть, но локально
             # впереди него. Ярус 1: сверяем содержимое с ЖИВЫМ апстримом —
             # сильный, узкий сигнал (переписанная той же правкой ветка).
-            _, diff_rc = run_cmd('git diff --quiet HEAD @{u}', cwd=worktree_path)
-            if diff_rc == 0:
+            # (Огрех самой команды rev-list здесь не различается с «апстрим
+            # не резолвится» — не страшно: упавший git проявит себя на
+            # следующем же шаге в _diff_state как "failed" → unknown().)
+            state, diag = self._diff_state('git diff --quiet HEAD @{u}', worktree_path)
+            if state == "same":
                 return check_result.ok()
-            if diff_rc == 1:
+            if state == "diverged":
                 content_diverged = True
             else:
                 return check_result.unknown(
-                    f"git diff HEAD @{{u}} завершился кодом {diff_rc} в "
-                    f"{worktree_path} — не удалось сравнить дерево с апстримом"
+                    f"{diag} — не удалось сравнить дерево с апстримом в "
+                    f"{worktree_path} (отказ инструмента, не ответ «разошлось»)"
                 )
         else:
             # Апстрим не резолвится вовсе (ветка удалена на origin) — ярус 2:
             # сравнение с origin/main напрямую (слабее яруса 1, но лучше,
             # чем ничего, когда апстрима больше нет вовсе).
-            _, diff_rc = run_cmd('git diff --quiet HEAD origin/main', cwd=worktree_path)
-            if diff_rc == 0:
+            state, diag = self._diff_state('git diff --quiet HEAD origin/main', worktree_path)
+            if state == "same":
                 return check_result.ok()
-            if diff_rc == 1:
+            if state == "diverged":
                 content_diverged = True
             else:
                 return check_result.unknown(
-                    f"git diff HEAD origin/main завершился кодом {diff_rc} в "
-                    f"{worktree_path} — не удалось сравнить дерево с main"
+                    f"{diag} — не удалось сравнить дерево с main в "
+                    f"{worktree_path} (отказ инструмента, не ответ «разошлось»)"
                 )
 
         # Оба доступных яруса содержимого показали расхождение — ярус 3
@@ -599,6 +650,13 @@ class WorktreeAnalyzer:
             'young': [],
             'errors': [],
             'orphan_dirs': self.scan_orphan_directories(),
+            # (ветка, код, возраст_часов) удержанных деревьев СТАРШЕ retention,
+            # чей код — из worktree_snapshot.STUCK_CODES: носитель fail-loud
+            # сводки (пункт 3 #1250) и записи снимка (пункт 4). Возраст считается
+            # здесь, а не в can_remove_worktree, — к моменту отказа по кодам
+            # unpushed/unknown_work/unknown_pr проверка retention ещё не
+            # выполнялась (она ниже по коду).
+            'stuck_old': [],
         }
 
         for wt in worktrees:
@@ -619,6 +677,10 @@ class WorktreeAnalyzer:
                 if self.verbose:
                     print(f"Keeping: {branch} ({message})")
                 stats.setdefault(code, []).append((branch, message))
+                if code in worktree_snapshot.STUCK_CODES:
+                    age_hours = self.get_worktree_age_hours(path)
+                    if age_hours >= self.retention_hours:
+                        stats['stuck_old'].append((branch, code, age_hours))
 
         return stats
 
@@ -671,6 +733,30 @@ class WorktreeAnalyzer:
             for branch, error in stats['errors']:
                 print(f"  - {branch}: {error}")
 
+        # Fail loud на «снято 0 при запертых деревьях» (issue #1250, пункт 3,
+        # находка ревью PR #1257): «0 снято» в логе неотличимо от «убирать
+        # было нечего» — именно так 0 из 73 и прополз мимо всех. Маркер `!!!`
+        # в начале строк — грепаемый след прогона, который НИЧЕГО не снял,
+        # хотя работа по снятию объективно есть.
+        stuck_old = stats.get('stuck_old') or []
+        if stats.get('removed', 0) == 0 and stuck_old:
+            print(
+                f"\n!!! ВНИМАНИЕ: снято 0 из {stats['total']} — {len(stuck_old)} "
+                f"деревьев старше retention ({self.retention_hours}h) заперты "
+                "без достижимого газа (issue #1250):"
+            )
+            for branch, code, age_hours in stuck_old[:10]:
+                print(f"!!!   - {branch} [{code}] (возраст {age_hours:.0f}h)")
+            if len(stuck_old) > 10:
+                print(f"!!!   ... and {len(stuck_old) - 10} more")
+            print(
+                "!!! Газ: unpushed — запушить/слить PR ветки; unknown_work/unknown_pr — "
+                "свериться руками (git diff HEAD origin/main, gh pr list --head) и снять "
+                "(git worktree remove --force), если сохранность подтвердится. Смерть "
+                "этого сигнала в масштабе репозитория видит инвариант 24 "
+                "(repo_invariants.check_worktree_cleanup_records)."
+            )
+
         orphans = stats.get('orphan_dirs') or []
         if orphans:
             print(f"\nNon-worktree directories under .claude/worktrees (no .git, not managed by this script): {len(orphans)}")
@@ -679,6 +765,62 @@ class WorktreeAnalyzer:
                 print(f"  - {name}")
             if len(orphans) > 5:
                 print(f"  ... and {len(orphans) - 5} more")
+
+
+def publish_run_record(repo_root: str, stats: dict, analyzer: "WorktreeAnalyzer",
+                       mode: str) -> None:
+    """Опубликовать запись прогона на ветку данных `data/worktree-cleanup`
+    (issue #1250, пункт 4; `--publish-snapshot` — только прод-вызывающий
+    `scripts/git/task-branch`). Измерение устаревших копий гвардий и запертых
+    деревьев живёт здесь, где деревья физически есть; состав записи —
+    `worktree_snapshot.make_record`, транспорт — `data_branch_writer`.
+
+    Дешёвый антидубль-гейт ДО клона ветки (один `gh api` GET вместо полного
+    clone): те же числа в окне `RECORD_MIN_INTERVAL_MINUTES` — публиковать
+    нечего. Любой сбой гейта (gh недоступен, файл ещё не существует) — НЕ
+    повод пропустить запись: авторитетную проверку дубля `is_duplicate`
+    писателя делает по факту с сервера после громкого fetch/checkout (#882).
+    Порядок гейтов объявлен в publish_snapshot_record: безопасность канала
+    (origin == целевой репозиторий) проверяется ДО наличия объекта измерения —
+    песочница не публикует, даже когда измерять нечего."""
+    base = Path(repo_root) / ".claude" / "worktrees"
+    target_repo = os.environ.get("GITHUB_REPOSITORY", "")
+    guard_copies, stale_guard = (
+        worktree_snapshot.count_stale_guard_copies(base) if base.is_dir() else (0, 0))
+    stuck_by_code = {code: 0 for code in worktree_snapshot.STUCK_CODES}
+    for _branch, code, _age_hours in stats.get('stuck_old') or []:
+        stuck_by_code[code] = stuck_by_code.get(code, 0) + 1
+    record = worktree_snapshot.make_record(
+        ts=datetime.now(timezone.utc).isoformat(),
+        mode=mode,
+        total=stats['total'],
+        removed=stats['removed'],
+        kept=stats['kept'],
+        guard_copies=guard_copies,
+        stale_guard_copies=stale_guard,
+        stuck_old_by_code=stuck_by_code,
+        retention_hours=analyzer.retention_hours,
+    )
+    if target_repo:
+        out, rc = run_cmd(
+            f'gh api "repos/{target_repo}/contents/{worktree_snapshot.SNAPSHOT_PATH}'
+            f'?ref={worktree_snapshot.DATA_BRANCH}"',
+            cwd=repo_root,
+        )
+        if rc == 0 and out:
+            try:
+                blob = json.loads(out)
+                rows = worktree_snapshot.read_rows(
+                    base64.b64decode(blob["content"]).decode("utf-8"))
+                last = worktree_snapshot.last_record(rows)
+                if worktree_snapshot.is_duplicate_observation(
+                        last, record, now=datetime.now(timezone.utc)):
+                    print("worktree-snapshot: последняя запись уже несёт те же "
+                          "числа в окне антишума — не публикую")
+                    return
+            except (ValueError, KeyError, TypeError):
+                pass  # нечитаемая история — решает авторитетная проверка писателя
+    worktree_snapshot.publish_snapshot_record(repo_root, record, target_repo, measure_base=base)
 
 
 def main():
@@ -705,6 +847,13 @@ def main():
         action='store_true',
         help='Analyze only, do not remove'
     )
+    parser.add_argument(
+        '--publish-snapshot',
+        action='store_true',
+        help='Публиковать запись прогона на data-ветку %s (канал инварианта 24, '
+             'issue #1250 п.4) — прод-путь scripts/git/task-branch; best-effort, '
+             'не гейт уборки' % worktree_snapshot.DATA_BRANCH
+    )
 
     args = parser.parse_args()
 
@@ -730,6 +879,10 @@ def main():
 
         stats = analyzer.analyze_and_cleanup()
         analyzer.print_summary(stats)
+
+        if args.publish_snapshot:
+            publish_run_record(repo_root, stats, analyzer,
+                               mode="dry-run" if args.dry_run else "apply")
 
         # Exit with non-zero if there were errors
         if stats['errors']:
