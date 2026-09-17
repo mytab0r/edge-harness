@@ -197,7 +197,34 @@
       "source_pr": 1257,
       "status": "open",
       "title": "журнал канала растёт без потолка"
+    },
+    {
+      "detail": "`cadence_verdict([], 90.0)` (исполнено) отдаёт `no-lower-reference` с текстом «канал стрелял бы на каждом тике» при `fires_in_window=0` и `median=None` — диагноз самоопровергает собственные факты: измерять нечего, а не порог занижен. Соседний `tick_cadence_observation` в этом же PR разводит «оценить нельзя» отдельным исходом по #1096 («алерт не гадает») — сделай так же: третий вердикт для пустого набора промежутков.",
+      "file": "scripts/measure/measure_trigger_cadence.py",
+      "id": 23,
+      "opened_at": "2026-09-17T14:11:54.612638+00:00",
+      "source_pr": 1185,
+      "status": "open",
+      "title": "пустое окно замера неотличимо от «порог ниже рабочей массы»"
+    },
+    {
+      "detail": "`MEASUREMENT_STALE_MINUTES=90` на момент мержа thin-margin — нижний запас 0.77 мин по свежей неделе из твоей же фикстуры, а «живой замер» (скрипт с `--check`) не запускает никто и ничем по расписанию; ⏱️-строка пульса измеряет только такт orchestra, не quota-watch. Подвесь `measure_trigger_cadence.py quota-watch.yml --check` ненагружающим шагом (::warning:: / continue-on-error) в schedule quota-watch.yml — тогда «за живым распределением следит живой замер» станет фактом, а не обещанием из комментария.",
+      "file": ".github/workflows/quota-watch.yml",
+      "id": 24,
+      "opened_at": "2026-09-17T14:11:54.612638+00:00",
+      "source_pr": 1185,
+      "status": "open",
+      "title": "живой замер каденции quota-watch ничем не запускается, а калибровка уже на краю"
+    },
+    {
+      "detail": "`tick_cadence_observation` берёт `tightest = min(HEARTBEAT_MAX_AGE_MINUTES, FAILURE_WATCH_WINDOW_MINUTES)` — `WIP_GATE_FALSE_ZERO_WINDOW_MINUTES` из repo_invariants туда не попасть (обратный импорт — цикл, пульс грузится спекой из repo_invariants). Сегодня третья константа закрыта совпадением (40 = min(60,40)); после будущей перекалибровки двух pulse_guard-констант она молча выпадет из живой сверки — ровно «протухнет снова», против которого гвардия заводилась. Перенеси константу в pulse_guard рядом с сёстрами (repo_invariants уже перепривязывает оттуда `issue_marker_times` тем же паттерном) либо включи её в `tightest` иным путём.",
+      "file": "scripts/orchestra/pulse_guard.py",
+      "id": 25,
+      "opened_at": "2026-09-17T14:11:54.612638+00:00",
+      "source_pr": 1185,
+      "status": "open",
+      "title": "WIP-окно не входит в живую гвардию каденции, только упомянуто в комментарии"
     }
   ],
-  "next_id": 23
+  "next_id": 26
 }
