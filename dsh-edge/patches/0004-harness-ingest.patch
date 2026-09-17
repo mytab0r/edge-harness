@@ -172,7 +172,7 @@ index cfff36a..be11683 100644
      message: string,
    ) {
      super(message)
-@@ -1265,6 +1276,131 @@ export class EdgeSessionStore {
+@@ -1265,6 +1276,168 @@ export class EdgeSessionStore {
      }
    }
  
@@ -278,12 +278,44 @@ index cfff36a..be11683 100644
 +    // it, which also removes the O(full stored log) cold-resume cost #1049
 +    // was written against (upstream's own resident cache now pays that at
 +    // most once per session per DO activation, not once per ingest call).
++    // #1161: cache baseTurn on the session object to skip the O(history)
++    // snapshotEvents() pass on every ingest call — the session object is
++    // resident (0.14.0+), so the cache lives across ingest calls within the
++    // same DO activation; the first (cold) call scans once and populates it.
++    // Invalidation (ai-review PR #1173, round 3, finding 2): the cache
++    // carries the session `seq` it was computed at and is refreshed AFTER
++    // this batch's own appends. session.append bumps session.seq on EVERY
++    // append — ours and anyone else's — so any seq delta on the next entry
++    // means a FOREIGN writer touched the log between batches (a native turn
++    // in a resumed viewer session, a due schedule — the #572 "resumed for a
++    // native turn" case) and the scan reruns; a bare cached turn (this PR's
++    // first shape) numbered the next batch from the stale maximum and
++    // rewound the log under the foreign turn, breaking this method's own
++    // docstring ("turn numbers continue the stored log — a reused session
++    // never rewinds"). NOT byte-verified against upstream (dsh-edge is not
++    // vendored, PATCHES.md): this models "every writer appends through the
++    // same session log, so session.seq is the write cursor", the same
++    // assumption the guard stub (dsh-edge/verify-ingest-resident-safety.mjs)
++    // encodes — re-check by hand at every pin bump. The field name is
++    // harness-namespaced on purpose: no one can confirm upstream has no own
++    // semantics for a bare `lastTurn` field on its session object.
++    const sessionAny = session as unknown as { __harnessBaseTurnCache?: { seq: number; turn: number } }
++    const cachedBaseTurn = sessionAny.__harnessBaseTurnCache
 +    let baseTurn = 0
-+    for (const event of session.snapshotEvents()) {
-+      const turn = (event.data as { turn?: unknown }).turn
-+      if (typeof turn === 'number' && Number.isSafeInteger(turn) && turn > baseTurn) baseTurn = turn
++    if (cachedBaseTurn !== undefined && cachedBaseTurn.seq === session.seq) {
++      baseTurn = cachedBaseTurn.turn
++    } else {
++      for (const event of session.snapshotEvents()) {
++        const turn = (event.data as { turn?: unknown }).turn
++        if (typeof turn === 'number' && Number.isSafeInteger(turn) && turn > baseTurn) baseTurn = turn
++      }
 +    }
 +    let appended = 0
++    // Post-batch log-tail maximum for the cache below. baseTurn itself stays
++    // FIXED during the loop: normalizeHarnessIngestEvent applies ONE constant
++    // offset per batch (raw turn + baseTurn), so same-turn events (turn/start
++    // N ... turn/end N) stay paired no matter where the batch boundary falls.
++    let maxTurn = baseTurn
 +    for (const raw of events) {
 +      const normalized = normalizeHarnessIngestEvent(raw, baseTurn)
 +      // Runtime-dynamic event type: the generic append overload cannot express
@@ -296,7 +328,12 @@ index cfff36a..be11683 100644
 +      ) => SessionEvent
 +      append(normalized.type, normalized.data, normalized.surface ? { surfaceOp: 'append' } : undefined)
 +      appended += 1
++      const eventTurn = normalized.data.turn as number | undefined
++      if (typeof eventTurn === 'number' && eventTurn > maxTurn) maxTurn = eventTurn
 +    }
++    // Store the cache only after the batch's own appends: session.seq now
++    // reflects everything this batch wrote (see the invalidation note above).
++    sessionAny.__harnessBaseTurnCache = { seq: session.seq, turn: maxTurn }
 +    await sessions.flush(session)
 +    return { appended, lastSeq: session.seq - 1 }
 +  }
@@ -304,7 +341,7 @@ index cfff36a..be11683 100644
    /** Count live Agent owners for host.describe. */
    async attachedSessionCount(): Promise<number> {
      const { agents } = await this.services()
-@@ -1496,6 +1632,116 @@ export class EdgeSessionStore {
+@@ -1496,6 +1669,116 @@ export class EdgeSessionStore {
    }
  }
  
