@@ -131,6 +131,10 @@ source "$SCRIPT_DIR/../lib/dsh-edge-session.sh"
 # Аренда задачи (#121): claim/release/locks — единственный вход в работу.
 # shellcheck source=scripts/lib/lease.sh
 source "$SCRIPT_DIR/../lib/lease.sh"
+# PATH-шим gh (#594): агент DSH внутри этого воркера физически не может
+# открыть PR голым `gh pr create` в обход scripts/git/pr-create.
+# shellcheck source=scripts/lib/gh_shim.sh
+source "$SCRIPT_DIR/../lib/gh_shim.sh"
 
 WORKER_LOGIN="${WORKER_LOGIN:?WORKER_LOGIN не задан (логин, под которым воркер берёт задачи)}"
 DSH_TIMEOUT_SECS="${DSH_TIMEOUT_SECS:-7200}"   # 120 минут за попытку ОДНОГО провайдера (#877/#1067, см. обоснование в шапке файла)
@@ -612,6 +616,12 @@ else
 fi
 
 # ── 6. DSH: цепочка провайдеров (проверена в начале скрипта), установка (lib) ─────
+# PATH-шим gh (#594) — ставится ДО первого запуска dsh (шаг 7): dsh наследует
+# PATH этого процесса как обычный subprocess, поэтому агент внутри сессии
+# физически не находит настоящий `gh pr create` раньше шима. Ломается видимо
+# (die), не тихой деградацией до старого поведения — см. gh_shim_install.
+gh_shim_install "$WORK/gh-shim" || die "gh-шим не установился — см. ::error:: выше"
+
 dsh_install "$WORK/pkgs"
 dsh --version || true
 dsh_install_plugins_suite "$WORK/plugins" || die "suite ротации учёток не установился (см. ::error:: выше, #215)"
@@ -619,6 +629,9 @@ dsh_install_plugins_suite "$WORK/plugins" || die "suite ротации учёт�
 # ANTHROPIC_OAUTH_1/2, не vars.PLUGINS_SUITE_URL. Импорт — до первого dsh.
 dsh_install_anthropic_pool "$WORK/anthropic-pool" || die "быстрый провайдер Claude не установился (см. ::error:: выше, #838)"
 dsh_import_anthropic_accounts || die "импорт аккаунтов Claude не удался (см. ::error:: выше, #838)"
+# Факт «какой аккаунт пригоден и почему не пригодны остальные» — до первого
+# прогона, а не постфактум из агрегата pool_unavailable (#1311).
+dsh_pool_preflight
 # Нейтрализация self-регистрации плагина в settings — гонка с нашей
 # статической регистрацией (#1097/#1130), см. dsh-ci.sh для причины.
 dsh_patch_anthropic_pool_plugin || die "патч плагина anthropic-oauth-pool не применился (см. ::error:: выше, #1130)"
@@ -638,10 +651,14 @@ dsh_patch_anthropic_pool_plugin || die "патч плагина anthropic-oauth-
 _chain_head=$(jq -c '.[0]' <<<"$DSH_PROVIDER_CHAIN")
 _chain_head_secret=$(jq -r '.secret_env' <<<"$_chain_head")
 DEEPSEEK_BASE_URL=$(jq -r '.base_url' <<<"$_chain_head")
-DEEPSEEK_MODEL=$(jq -r '.model' <<<"$_chain_head")
+# #1309: у элемента цепочки может не быть поля `model` вовсе (форма
+# `models` — список кандидатов одного ключа). Затравка читает ПЕРВОГО
+# кандидата через то же одно место правды, что и сам цикл цепочки
+# (dsh_entry_model_candidates), а не третьей копией разбора JSON здесь.
+DEEPSEEK_MODEL=$(dsh_chain_head_model "$DSH_PROVIDER_CHAIN")
 DEEPSEEK_API_KEY="${!_chain_head_secret:-}"
 export DEEPSEEK_BASE_URL DEEPSEEK_MODEL DEEPSEEK_API_KEY
-DSH_MAX_TOKENS=$(jq -r '.max_output_tokens // 131072' <<<"$_chain_head") dsh_patch_profile headless
+DSH_MAX_TOKENS=$(dsh_chain_head_max_tokens "$DSH_PROVIDER_CHAIN") dsh_patch_profile headless
 dsh_mount_plugins_suite headless || die "suite ротации учёток не смонтировался (см. ::error:: выше, #215)"
 dsh_mount_anthropic_pool headless || die "быстрый провайдер Claude не смонтировался (см. ::error:: выше, #838)"
 
@@ -695,6 +712,10 @@ WORKER_TASK_FAILURE_REASON="$DSH_RUN_FAILURE_REASON"
 WORKER_CHAIN_PROVIDER="$DSH_CHAIN_PROVIDER"
 WORKER_CHAIN_TRIED="$DSH_CHAIN_TRIED"
 WORKER_CHAIN_RESET_HINT="$DSH_CHAIN_RESET_HINT"
+# #1307: разбор исхода цепочки по классам и признак «повтор имеет смысл» —
+# см. dsh_run_with_provider_chain/_dsh_chain_report_exhausted.
+WORKER_CHAIN_OUTCOME_SUMMARY="${DSH_CHAIN_OUTCOME_SUMMARY:-}"
+WORKER_CHAIN_RETRY_USEFUL="${DSH_CHAIN_RETRY_USEFUL:-0}"
 echo "dsh завершился с кодом $rc (провайдер: ${WORKER_CHAIN_PROVIDER:-нет успеха}, опробованы: ${WORKER_CHAIN_TRIED:-?})"
 # Отпечаток HEAD ветки ПОСЛЕ прогона — сравнивается с WORKER_BRANCH_START_SHA
 # на шаге 8 (dsh_worker_run_is_success, issue #876).
@@ -878,8 +899,35 @@ fi
 # держать её занятой зря.
 if [ "$WORKER_TASK_FAILURE_REASON" = "quota_exhausted" ] || \
    [ "$WORKER_TASK_FAILURE_REASON" = "rate_limit_retry_budget_exceeded" ] || \
+   [ "$WORKER_TASK_FAILURE_REASON" = "prompt_too_long" ] || \
    [ "$WORKER_TASK_FAILURE_REASON" = "all_providers_exhausted" ]; then
+  # #1322: шапка комментария выбирается ПО КЛАССУ, а не одна на все четыре.
+  # Три класса ниже — действительно отказ на стороне провайдера. Четвёртый,
+  # prompt_too_long, — НАШ отказ (агент не вызывался вовсе), и прежняя общая
+  # шапка «остановлен провайдером» противоречила собственному телу сообщения
+  # («ни один провайдер не тронут») в одном предложении. Владелец лечит эти
+  # два случая противоположными действиями: провайдера ждут/меняют, свой
+  # промпт укорачивают — AGENTS.md, «„возможности нет“ и „возможность есть,
+  # но сломана“ — разные сообщения» и «алерт не гадает».
+  failure_header="Автономный воркер остановлен провайдером, не своей ошибкой"
+  # Короткое имя исхода — ОДНО место правды на три канала (комментарий выше,
+  # Telegram и die-строка в логе job'а ниже). Раньше каждый канал нёс свою
+  # копию фразы «цепочка провайдеров отказала», и для prompt_too_long все три
+  # врали одинаково: цепочка не отказывала, она вообще не запускалась.
+  failure_kind="цепочка провайдеров отказала, не сбой агента"
   case "$WORKER_TASK_FAILURE_REASON" in
+    prompt_too_long)
+      failure_header="Автономный воркер остановлен НАШИМ ограничением, не провайдером и не своей ошибкой"
+      failure_kind="промпт не влез в аргумент execve — агент не вызывался, цепочка не запускалась"
+      # #1315: отказ НАШ (промпт не помещается в аргумент execve), но это
+      # ровно та же категория «не сбой агента»: агент не вызывался вовсе.
+      # Задача возвращается в пул тем же путём — держать её занятой не за что.
+      #
+      # ЧЕСТНАЯ ГРАНИЦА, названная вслух: отказ детерминированный для ЭТОЙ
+      # задачи — следующий воркер соберёт тот же промпт и упрётся так же.
+      # Автоматического укорачивания промпта здесь нет; серию повторов
+      # останавливает предохранитель конвейера (#120), а не этот код.
+      reason="промпт задачи не помещается в аргумент командной строки dsh (предел ядра 128 КиБ на один аргумент, MAX_ARG_STRLEN) — агент не вызывался ВООБЩЕ, ни один провайдер не тронут; повтор без укорачивания промпта даст тот же отказ (#1315, docs/runbooks/switch-llm-provider.md)" ;;
     quota_exhausted)
       reason="квота провайдера исчерпана надолго (RATE_LIMIT: Weekly/Monthly Limit Exhausted, код возврата $rc) — повтор внутри этого прогона не поможет, нужно ждать вне CI или сменить провайдера (docs/runbooks/switch-llm-provider.md)" ;;
     rate_limit_retry_budget_exceeded)
@@ -891,18 +939,64 @@ if [ "$WORKER_TASK_FAILURE_REASON" = "quota_exhausted" ] || \
       # провайдеру остаток» (которого сообщение здесь не знает).
       reason="временный RATE_LIMIT провайдера не снялся до исчерпания общего бюджета ожидания на весь прогон (${WORKER_RATE_LIMIT_MAX_WAIT_SECS}с суммарно, #877; код возврата $rc)" ;;
     all_providers_exhausted)
-      reason="цепочка провайдеров исчерпана целиком (опробованы: ${WORKER_CHAIN_TRIED:-?})${WORKER_CHAIN_RESET_HINT:+, ближайший названный сброс: $WORKER_CHAIN_RESET_HINT} — повтор внутри этого прогона не поможет (docs/runbooks/switch-llm-provider.md, #727)" ;;
+      # #1307: «исчерпана целиком» говорится ТОЛЬКО когда каждый провайдер
+      # реально без квоты. Иначе текст называет разбор по классам и тот факт,
+      # что повтор имеет смысл — иначе владелец читал «ждать сброса» там, где
+      # шесть провайдеров из восьми не были опробованы по-настоящему.
+      if [ "${WORKER_CHAIN_RETRY_USEFUL:-0}" = "1" ]; then
+        reason="ни один провайдер цепочки не ответил, но цепочка НЕ исчерпана квотой (опробованы: ${WORKER_CHAIN_TRIED:-?}) — ${WORKER_CHAIN_OUTCOME_SUMMARY:-разбор по классам недоступен}${WORKER_CHAIN_RESET_HINT:+; названный сброс: $WORKER_CHAIN_RESET_HINT}. Повтор ИМЕЕТ смысл: часть провайдеров не получила настоящей попытки (#1307, docs/runbooks/switch-llm-provider.md)"
+      else
+        reason="цепочка провайдеров исчерпана целиком (опробованы: ${WORKER_CHAIN_TRIED:-?})${WORKER_CHAIN_RESET_HINT:+, ближайший названный сброс: $WORKER_CHAIN_RESET_HINT} — все реально без квоты, повтор внутри этого прогона не поможет (docs/runbooks/switch-llm-provider.md, #727)"
+      fi ;;
+  esac
+  # #1286: исход job'а и машиночитаемый маркер в комментарии разделяют классы
+  # так же, как шапка выше (#1322), — ОДИН case на оба носителя, не две копии.
+  # НАШ отказ (prompt_too_long) умирает громко: серию его повторов останавливает
+  # предохранитель диспатча, а кормят его именно красные прогоны worker.yml
+  # (#1315) — зелёный код возврата сделал бы это названное место правды слепым.
+  # Отказ на стороне провайдера (quota_exhausted / rate_limit_retry_budget_
+  # exceeded / all_providers_exhausted) — не сбой воркера: задача ниже
+  # возвращается в пул, сигнал ушёл в задачу и Telegram; красный job здесь
+  # кормил бы предохранитель (#226) чужой виной и задерживал восстановление
+  # после сброса квоты — открытый предохранитель снимает только зелёная проба
+  # (#205). Живой отказ этого класса: прогон 34893177035, задача #1286.
+  # Маркер $refusal_marker читает оркестратор (scheduler.py,
+  # dispatch_ai_review_rework): зелёный прогон с этим маркером в комментарии
+  # задачи внутри окна прогона — инфра-путь доводки, не «честная попытка»
+  # находок (блокирующая находка ai-review PR #1313, класс
+  # «второй-потребитель-забыт»).
+  # Неизвестный класс — громкий die ДО возврата задачи в пул: молчаливый
+  # зелёный дефолт спрятал бы завтрашний пятый класс, добавленный в case
+  # выше и забытый здесь; задачу снимет TTL-сборщик (#121), красный job
+  # назовёт, что именно дописать. Контракт кода возврата гвардится
+  # исполнением настоящего блока: scripts/worker/test/
+  # provider-exhaustion-exit-code.smoke.sh (каталог: scripts/ci/guards/
+  # worker-exhaustion-exit-code-guard.sh).
+  # ЧЕСТНАЯ ГРАНИЦА: серию зелёных прогонов во время долгого сбоя провайдеров
+  # предохранитель не видит — автостопа такой серии нет, сигнал владельцу —
+  # комментарий в задаче и Telegram (ждать сброса или сменить провайдера —
+  # docs/runbooks/switch-llm-provider.md).
+  refusal_marker=""
+  job_exit="die"
+  case "$WORKER_TASK_FAILURE_REASON" in
+    quota_exhausted | rate_limit_retry_budget_exceeded | all_providers_exhausted)
+      job_exit="green"
+      refusal_marker="[воркер: провайдерный отказ (#1286)]" ;;
+    prompt_too_long) ;;  # НАШ отказ — job красный, маркера провайдерного отказа нет
+    *)
+      die "неизвестный класс отказа '$WORKER_TASK_FAILURE_REASON' в блоке провайдерного отказа — добавь его в оба case этого блока (выбор $failure_header и этот), не молча зелёный" ;;
   esac
   release_out="$(lease_cli release-full "$number" 2>&1)" && release_rc=0 || release_rc=$?
   if [ "$release_rc" -eq 0 ]; then
-    echo "Цепочка провайдеров отказала — задача #$number возвращена в пул немедленно: $release_out"
+    echo "Отказ до работы агента ($failure_kind) — задача #$number возвращена в пул немедленно: $release_out"
     release_note="Задача возвращена в пул немедленно — снят и замок, и назначение ($release_out)."
   else
     echo "::warning::задача #$number не возвращена в пул (rc=$release_rc): $release_out — снимет TTL-сборщик через 24 ч"
     release_note="Возврат в пул не подтверждён (см. лог job'а) — снимет TTL-сборщик через 24 ч."
   fi
   comment=$(cat <<COMMENT
-🤖 Автономный воркер остановлен провайдером, не своей ошибкой: $reason.
+🤖 $failure_header: $reason.
+$refusal_marker
 $release_note Хвосты логов ниже (секреты замаскированы).
 
 Хвост stderr DSH:
@@ -919,8 +1013,11 @@ $ANSWER_TAIL
 COMMENT
   )
   gh issue comment "$number" --body "$comment" >/dev/null
-  telegram_report "worker: задача #$number — цепочка провайдеров отказала, не сбой агента ($reason). Задача возвращена в пул" || true
-  die "Цепочка провайдеров отказала: $reason"
+  telegram_report "worker: задача #$number — $failure_kind ($reason). Задача возвращена в пул" || true
+  if [ "$job_exit" != "green" ]; then
+    die "$failure_kind: $reason"
+  fi
+  exit 0
 fi
 
 # pr_status здесь бывает двух родов (#876): "empty"/"absent" (pr_outcome_rc=1)

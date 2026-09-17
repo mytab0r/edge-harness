@@ -617,6 +617,9 @@ def test_gather_fails_on_missing_placeholder(monkeypatch, tmp_path):
         if path.startswith("repos/o/r/issues/comments"):
             # #1237/#1255: кандидаты классов дефектов — пустой список, тест не о словаре
             return []
+        if path.startswith(f"repos/o/r/contents/{ai.review_findings.REGISTRY_PATH}"):
+            # #1262: реестр находок — тест не о нём, честный 404 (ветки ещё нет)
+            raise RuntimeError(f"gh api {path}: HTTP 404: Not Found (https://api.github.com/...)")
         raise AssertionError(f"unexpected gh call: {path}")
 
     monkeypatch.setattr(ai, "gh", fake_gh)
@@ -828,6 +831,12 @@ def _fake_gh_pull(sha="76913bd001", ref="forge/runner-bridge-v0.1.2"):
         # честный «кандидатов нет».
         if url.startswith("repos/o/r/issues/comments"):
             return []
+        # cmd_gather (#1262) читает реестр находок ревью тем же нормальным
+        # путём — ветки данных ещё нет в тестовой прод-форме, честный 404,
+        # тот же приём, что review_findings.fetch_registry уже трактует как
+        # «реестр пуст», не как отказ.
+        if url.startswith(f"repos/o/r/contents/{ai.review_findings.REGISTRY_PATH}"):
+            raise RuntimeError(f"gh api {url}: HTTP 404: Not Found (https://api.github.com/...)")
         assert url == "repos/o/r/pulls/658"
         return {"title": "chore(plugins): обновить runner-bridge до v0.1.2",
                 "head": {"sha": sha, "ref": ref},
@@ -1742,6 +1751,206 @@ def test_cmd_verdict_merges_remark_blocks_into_pr_body(monkeypatch, tmp_path):
     assert "Мелкая неточность" in patches[0]
     assert ai.review_checklist.CHECKLIST_BEGIN in patches[0]
     assert "Описание PR." in patches[0]   # исходное тело PR не потеряно
+
+
+def test_cmd_verdict_remark_with_file_field_carries_file_tag_into_checklist(monkeypatch, tmp_path):
+    # #1262: ФАЙЛ — обязательное второе поле контракта ЗАМЕЧАНИЕ; при слиянии
+    # именно этот тег позволяет review_checklist.unresolved_findings отдать
+    # структурную форму (file), которую scheduler.py::after_merge переносит в
+    # реестр находок (review_findings.sync_after_merge).
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+
+    def fake_gh(url: str):
+        if url == "repos/o/r/pulls/294":
+            return {"head": {"sha": "deadbeef"}, "labels": [], "body": "Описание PR."}
+        if url.startswith("repos/o/r/pulls/294/files"):
+            page = url.split("page=")[-1]
+            return files if page == "1" else []
+        raise AssertionError(f"неожиданный вызов gh: {url}")
+
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    answer = (
+        "Всё в целом хорошо.\n\n"
+        "ЗАМЕЧАНИЕ: Мелкая неточность\nФАЙЛ: scripts/lib/foo.py\nПоправь X.\nКОНЕЦ ЗАМЕЧАНИЯ\n"
+        "ВЕРДИКТ: approve"
+    )
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, answer))
+    assert rc == 0
+    patches = _pr_patches(run_gh_calls)
+    assert len(patches) == 1
+    assert "- [ ] **Мелкая неточность** `scripts/lib/foo.py` — Поправь X." in patches[0]
+
+    # Перенос в реестр (review_checklist.unresolved_findings — то, что
+    # прочитает after_merge при слиянии) видит file.
+    unresolved = ai.review_checklist.unresolved_findings(patches[0])
+    assert unresolved == [{"title": "Мелкая неточность", "file": "scripts/lib/foo.py",
+                           "detail": "Поправь X."}]
+
+
+def test_cmd_verdict_resolved_findings_land_in_pr_body_marker(monkeypatch, tmp_path):
+    # #1262: НАХОДКА-ЗАКРЫТА в ответе модели становится маркером в ТЕЛЕ PR
+    # (review_findings.merge_resolved_marker) — тем же носителем, что чеклист
+    # ЗАМЕЧАНИЕ (#462): scheduler.py::after_merge читает тело PR при слиянии
+    # БЕЗ отдельного сетевого запроса, чтобы закрыть находки в реестре. Сам
+    # cmd_verdict реестр не трогает (contents: read у job'а verdict).
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+
+    def fake_gh(url: str):
+        if url == "repos/o/r/pulls/294":
+            return {"head": {"sha": "deadbeef"}, "labels": [], "body": "Описание PR."}
+        if url.startswith("repos/o/r/pulls/294/files"):
+            page = url.split("page=")[-1]
+            return files if page == "1" else []
+        raise AssertionError(f"неожиданный вызов gh: {url}")
+
+    run_gh_calls: list[tuple] = []
+    patched_bodies: list[str] = []
+    posted_comments: list[str] = []
+
+    def fake_run_gh(*args):
+        run_gh_calls.append(args)
+        if args[:3] == ("api", "-X", "PATCH") and args[3] == "repos/o/r/pulls/294":
+            patched_bodies.append(args[-1].split("body=", 1)[1])
+        if args[:3] == ("api", "-X", "POST") and args[3] == "repos/o/r/issues/294/comments":
+            posted_comments.append(args[-1].split("body=", 1)[1])
+
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", fake_run_gh)
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    answer = "Проверил открытую находку #7 — уже исправлена.\nНАХОДКА-ЗАКРЫТА: 7\nВЕРДИКТ: approve"
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, answer))
+    assert rc == 0
+    assert len(patched_bodies) == 1
+    assert ai.review_findings.parse_resolved_marker(patched_bodies[0]) == [7]
+    assert "Описание PR." in patched_bodies[0]  # исходное тело не потеряно
+
+    # Прозы комментария НЕ несёт саму служебную строку — findings_of вырезает
+    # её тем же приёмом, что КЛАСС: (#1237); человекочитаемое упоминание
+    # остаётся (build_comment).
+    assert len(posted_comments) == 1
+    assert "НАХОДКА-ЗАКРЫТА" not in posted_comments[0].split("\n\n", 1)[1]
+    assert "#7" in posted_comments[0]
+
+
+def test_findings_of_strips_resolved_finding_lines():
+    answer = "Проза находки.\nНАХОДКА-ЗАКРЫТА: 5\nВЕРДИКТ: approve"
+    findings = ai.findings_of(answer)
+    assert "НАХОДКА-ЗАКРЫТА" not in findings
+    assert "Проза находки." in findings
+
+
+def test_build_comment_mentions_resolved_findings_in_prose():
+    body = ai.build_comment(140, "abc", "approve", "Ок.", [], resolved_findings=[3, 7])
+    assert "#3" in body and "#7" in body
+    assert "исправленными" in body
+
+
+def test_build_comment_without_resolved_findings_backward_compat():
+    body = ai.build_comment(140, "abc", "approve", "Ок.", [])
+    assert "исправленными" not in body
+
+
+# ── findings_section: выписка реестра по файлам PR ($findings_section) ──────
+
+def test_findings_section_reports_open_findings_for_touched_files(monkeypatch):
+    stored = ai.review_findings.empty_registry()
+    ai.review_findings.add_finding(stored, "a.py", "Старая находка", "деталь", 10, "t")
+    ai.review_findings.add_finding(stored, "b.py", "Другой файл", "", 10, "t")
+
+    def fake_gh(url: str):
+        assert url == f"repos/o/r/contents/{ai.review_findings.REGISTRY_PATH}?ref={ai.review_findings.REGISTRY_BRANCH}"
+        import base64
+        text = ai.review_findings.dump_registry(stored)
+        return {"content": base64.b64encode(text.encode("utf-8")).decode("ascii"), "sha": "s"}
+
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    section = ai.findings_section("o/r", [{"filename": "a.py"}, {"filename": "c.py"}])
+    assert "a.py" in section and "Старая находка" in section
+    assert "Другой файл" not in section  # b.py этот PR не трогает
+
+
+def test_findings_section_degrades_loudly_on_non_404_error(monkeypatch):
+    def fake_gh(url: str):
+        raise RuntimeError(f"gh api {url}: HTTP 500: Internal Server Error")
+
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    section = ai.findings_section("o/r", [{"filename": "a.py"}])
+    assert "недоступен" in section
+    assert "HTTP 500" in section
+
+
+def test_findings_section_degrades_loudly_on_broken_json_registry(monkeypatch):
+    # Битый JSON реестра — RuntimeError из load_registry (не голый
+    # json.JSONDecodeError) — деградирует тем же путём, что HTTP 500, а не
+    # роняет cmd_gather целиком (дельта-спека #1262: «сбой чтения реестра
+    # (сеть, битый JSON) не роняет gather»; репро исполнен на ревью PR #1268).
+    import base64
+
+    def fake_gh(url: str):
+        return {"content": base64.b64encode(b"{not json").decode("ascii"), "sha": "x"}
+
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    section = ai.findings_section("o/r", [{"filename": "a.py"}])
+    assert "недоступен" in section
+    assert "битый JSON" in section
+
+
+# ── ФАЙЛ мимо диффа: ::warning:: при вердикте, не тихий ключ в реестре ──────
+
+def test_remark_files_outside_diff_returns_only_paths_not_in_pr():
+    remarks = [
+        {"title": "В диффе", "file": "a.py", "body": ""},
+        {"title": "Мимо диффа", "file": "nowhere/ghost.py", "body": ""},
+        {"title": "Без файла", "file": None, "body": ""},
+    ]
+    files = [{"filename": "a.py"}, {"filename": "b.py"}]
+    assert ai.remark_files_outside_diff(remarks, files) == [("nowhere/ghost.py", "Мимо диффа")]
+
+
+def test_cmd_verdict_warns_when_remark_file_is_outside_diff(monkeypatch, tmp_path, capsys):
+    # Путь, выданный моделью мимо диффа, при слиянии стал бы ключом находки,
+    # которую никто никогда не увидит. Предупреждение называет факт (путь не
+    # среди файлов PR) и последствие, НЕ молча выбрасывая путь (легальную
+    # находку про файл вне диффа от галлюцинации здесь не отличить).
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+
+    def fake_gh(url: str):
+        if url == "repos/o/r/pulls/294":
+            return {"head": {"sha": "deadbeef"}, "labels": [], "body": "Описание PR."}
+        if url.startswith("repos/o/r/pulls/294/files"):
+            page = url.split("page=")[-1]
+            return files if page == "1" else []
+        raise AssertionError(f"неожиданный вызов gh: {url}")
+
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    answer = (
+        "ЗАМЕЧАНИЕ: Путь-призрак\n"
+        "ФАЙЛ: nowhere/ghost.py\n"
+        "деталь находки\n"
+        "КОНЕЦ ЗАМЕЧАНИЯ\n"
+        "ВЕРДИКТ: approve\n"
+    )
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, answer))
+    assert rc == 0
+    captured = capsys.readouterr().out
+    assert "::warning::verdict:" in captured
+    assert "nowhere/ghost.py" in captured
+    assert "Путь-призрак" in captured
+    # Пункт не выброшен: чеклист в теле PR несёт его как раньше.
+    patches = _pr_patches(run_gh_calls)
+    assert any("Путь-призрак" in str(p) for p in patches)
 
 
 def test_cmd_verdict_without_remarks_does_not_patch_pr_body(monkeypatch, tmp_path):

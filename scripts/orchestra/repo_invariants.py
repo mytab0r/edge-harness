@@ -183,7 +183,12 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
       только комментарии СТРОГО ПОЗЖЕ даты приземления фикса. Наблюдательный,
       не в CI_GATING: Search API сам по себе может быть недоступен
       best-effort, гейтить обязательную проверку доступностью стороннего API
-      было бы новым тормозом без содержательного смысла.
+      было бы новым тормозом без содержательного смысла. Ревизия #1184:
+      маркер со знаком «?» устарел (фолбэк `${WORKER_CHAIN_PROVIDER:-?}`,
+      родивший этот символ, удалён самим же фиксом #876) — искомый литерал
+      обновлён на актуальную прод-форму «справился (провайдер: )» с пустым
+      провайдером (см. WORKER_FALSE_SUCCESS_MARKER); исторический текст
+      выше со знаком «?» — цитата инцидента ДО фикса, не сегодняшний маркер.
   15. check_merge_reaction_gaps (#955, следствие #929) — слияние PR через
       GITHUB_TOKEN НЕ создаёт push-событие (защита GitHub от рекурсии,
       доказано живым `timeline` PR #868/#872/#878: последний push-прогон
@@ -329,6 +334,32 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
       в ESCALATING_INVARIANTS: живой замер долга на момент внедрения — см.
       PR #1260 (задача #1253, число и датировка находок в описании PR),
       порог обоснован той же датой, не вкусом.
+  24. check_worktree_cleanup_records (issue #1250, живой инцидент 2026-09-14):
+      «уборщик снял 0 деревьев из 73» было видно только расследованием
+      инцидента — сводка печаталась в лог и умирала там. Сам инвариант
+      деревья измерить НЕ может: раннер repo-ci/orchestra видит свежий
+      чекаут с ПУСТЫМ `.claude/worktrees` всегда — инвариант, меряющий
+      деревья с раннера, был бы молча зелёным навсегда (класс #882: шаг
+      рапортует success, ничего не измерив). Поэтому измерение живёт в самом
+      уборщике (`worktree-cleanup.py --publish-snapshot`, единственный
+      прод-вызов — `scripts/git/task-branch`), пишет записи JSONL на
+      data-ветку `data/worktree-cleanup` (транспорт `worktree_snapshot.py`
+      + `data_branch_writer`, #882), а этот инвариант читает записи и
+      различает ТРИ состояния (находка ревью PR #1257 — инвариант, не
+      различающий их, читал бы смерть канала как чистоту): (a) «объект
+      ненаблюдаем отсюда» — записей нет НИ РАЗУ (kind=no-records) или канал
+      молчит дольше worktree_snapshot.RECORD_STALE_AFTER_DAYS (kind=stale-
+      channel); причина из самих записей не устанавливается — находка
+      честно говорит это и называет, где смотреть, не угадывает; (б)
+      «деревьев нет» — свежая запись с total=0: прогон состоялся и деревьев
+      не нашёл, это ЧИСТО, не слепота; (в) нарушения по числам записи:
+      stale_guard_copies > открытых PR (вторая половина критерия готовности
+      #1250 — устаревших копий прод-гвардии не больше, чем открытых PR) и
+      removed=0 при stuck_old_total>0 (основной симптом инцидента — «ноль
+      убранных при растущем числе запертых деревьев»). Наблюдательный, не в
+      CI_GATING: data-ветка пуста до первого прод-прогона уборщика после
+      слияния, замер долга на живом репозитории возможен только тогда (тот
+      же порядок, что у 9/12); газ — GATING_RELEASE_CONDITION[24].
 
 Расписание: главный канал — периодический шаг orchestra.yml (cron */15 мин),
 он же вызывает escalate() для всех эскалирующих инвариантов — реестр
@@ -482,6 +513,18 @@ _PH_SPEC = importlib.util.spec_from_file_location(
 pipeline_health = importlib.util.module_from_spec(_PH_SPEC)
 _PH_SPEC.loader.exec_module(pipeline_health)  # type: ignore[union-attr]
 
+# worktree_snapshot — состав записи, пути и пороги канала наблюдаемости
+# уборки рабочих деревьев (issue #1250, инвариант 24 ниже). Инвариант только
+# ЧИТАЕТ записи: измерение обязано жить в самом уборщике — единственном
+# пути, где `.claude/worktrees` физически не пуст (раннер этого файла видит
+# свежий чекаут с пустым каталогом всегда; инвариант, меряющий деревья
+# отсюда, был бы молча зелёным навсегда, класс #882). Константы ветки/пути/
+# порога свежести отсюда — вторая копия числа была бы двумя местами правды.
+_WS_SPEC = importlib.util.spec_from_file_location(
+    "worktree_snapshot", REPO_ROOT / "scripts" / "lib" / "worktree_snapshot.py")
+worktree_snapshot = importlib.util.module_from_spec(_WS_SPEC)
+_WS_SPEC.loader.exec_module(worktree_snapshot)  # type: ignore[union-attr]
+
 _DD_SPEC = importlib.util.spec_from_file_location(
     "declared_deps", REPO_ROOT / "scripts" / "lib" / "declared_deps.py")
 declared_deps = importlib.util.module_from_spec(_DD_SPEC)
@@ -596,6 +639,18 @@ GATING_RELEASE_CONDITION: dict[int, str] = {
         "(морда-push, openspec/changes/llm-provider-usage-manifest/tasks.md); "
         "0 нарушений на живом файле (python scripts/orchestra/repo_invariants.py, "
         "секция [11]) — машинно проверяемое условие возврата",
+    24: "ключ держим не в CI_GATING (см. комментарий у инварианта 24 в "
+        "докстринге модуля: data-ветка пуста до первого прод-прогона уборщика "
+        "после слияния) — это факт про газ, а не про то, гейтит ли сейчас 19. "
+        "Условие возврата в гейт — машинно проверяемое: 0 нарушений секции [24] "
+        "на живом репозитории при живых записях data/worktree-cleanup, тогда "
+        "правка CI_GATING этой же правкой константы. Разбор нарушений: "
+        "stale-guard-copies — снять деревья слитых задач прогоном уборщика "
+        "(новый task-branch или python scripts/git/worktree-cleanup.py); "
+        "zero-removed-stuck — разобрать запертые деревья руками (газ построчно "
+        "назван в сводке уборщика); no-records/stale-channel — проверить, что "
+        "прод-путь доходит до worktree-cleanup --publish-snapshot (scripts/git/"
+        "task-branch) и что push на data-ветку авторизован в этой среде",
 }
 
 
@@ -1796,8 +1851,9 @@ def fetch_open_task_issues_with_body(repo: str) -> list[dict]:
 # ══════════════════════════════════════════════════════════════════════════
 # Инвариант 10 (#794): N ПОДРЯД прогонов worker.yml провалились с ОДНОЙ и той
 # же классифицированной причиной — класс, который failure_watch (pulse_guard)
-# не ловит по построению: её окно свежести — FAILURE_WATCH_WINDOW_MINUTES (30
-# минут) и дедуп «одна задача на класс, пока не закрыта», а не «сколько раз
+# не ловит по построению: её окно свежести — FAILURE_WATCH_WINDOW_MINUTES
+# (число — в pulse_guard, здесь не дублируется) и дедуп «одна задача на
+# класс, пока не закрыта», а не «сколько раз
 # подряд повторилось за много часов». Дважды упавший предохранитель одного и
 # того же класса на живом инциденте (#794): worker.yml падал девять прогонов
 # подряд на сессии harness-257 с 2026-09-08 08:45Z по 2026-09-09 02:08Z
@@ -2151,9 +2207,20 @@ def check_conveyor_gate_phantom_pause(repo: str, now: datetime) -> check_result.
         runs = runs_of(pulse_guard.gh(
             f"repos/{repo}/actions/workflows/{pulse_guard.WORKER_WORKFLOW}/runs?per_page=10"),
             pulse_guard.WORKER_WORKFLOW)
+        # require_job_token=True (#1242, находка ai-review этого PR): этот
+        # пересчёт существует ради НЕЗАВИСИМОЙ сверки с решением conveyor_gate
+        # — значит, обязан читать маркеры с ТЕМ ЖЕ доверием, что и сам гейт
+        # (тот фильтр там с этого же PR). Без фильтра гейт и инвариант
+        # расходятся по построению на любом поддельном маркере: фейковый
+        # PAUSE при здоровой серии даёт «фантомную паузу», которой для гейта
+        # (allowed=True) не существует; фейковый RESUME становится якорем
+        # пересчёта и молча обнуляет проверку реальной красной серии. Сама
+        # детекция подделки не теряется — её держит инвариант 18 (всё
+        # семейство `[статус конвейера:`).
         all_markers = pulse_guard.issue_markers_any(
             repo, pulse_guard.WATCHDOG_ISSUE,
-            (pulse_guard.PAUSE_MARKER, pulse_guard.RESUME_MARKER))
+            (pulse_guard.PAUSE_MARKER, pulse_guard.RESUME_MARKER),
+            require_job_token=True)
     except RuntimeError as error:
         return check_result.unknown(
             f"история прогонов {pulse_guard.WORKER_WORKFLOW} или маркеры "
@@ -2196,14 +2263,28 @@ def check_conveyor_gate_phantom_pause(repo: str, now: datetime) -> check_result.
 # Инвариант 14: воркер не рапортует успех при пустом провайдере (#876)
 # ══════════════════════════════════════════════════════════════════════════
 
-# Дословный фрагмент шаблона scripts/worker/task.sh (до фикса #876): пустой
-# WORKER_CHAIN_PROVIDER рендерится в буквальный «?» — сообщение об успехе,
-# ссылающееся на неизвестного провайдера, само себе противоречит (dsh не
-# ответил успехом ни разу, если провайдер неизвестен). После фикса #876
-# (dsh_worker_run_is_success в scripts/lib/dsh-ci.sh) успех структурно
-# требует непустого провайдера — эта строка не может родиться заново, кроме
-# как регрессом самого фикса.
-WORKER_FALSE_SUCCESS_MARKER = "справился (провайдер: ?)"
+# Ревизия #1184 (находка A): маркер со знаком «?» устарел — «?» рождался
+# ТОЛЬКО из bash-фолбэка `${WORKER_CHAIN_PROVIDER:-?}`, который коммит
+# 77233d93 (сам фикс #876/PR #878) заменил на явный `die` (см.
+# scripts/worker/task.sh:809-811). Фолбэка с «?» в шаблоне не осталось нигде
+# — этот литерал физически не может родиться ни одним путём, существующим на
+# main, инвариант с ним был бы зелёным навсегда независимо от регресса, ради
+# которого написан (класс #1172).
+#
+# Актуальная прод-форма шаблона (scripts/worker/task.sh:814):
+#   🤖 Автономный воркер справился (провайдер: ${WORKER_CHAIN_PROVIDER}). PR ...
+# Сегодня путь к пустому WORKER_CHAIN_PROVIDER в этом тексте требует ДВУХ
+# независимых регрессов подряд: (1) dsh_worker_run_is_success
+# (scripts/lib/dsh-ci.sh) должен снова принять пустого провайдера как успех
+# — регресс самого фикса #876; (2) локальный `die`-гейт
+# scripts/worker/task.sh:809-811 (введён находкой ai-review PR #880 именно
+# как второй рубеж на случай регресса (1)) должен быть тоже снят/обойдён —
+# иначе job упадёт громко раньше, чем текст соберётся. Если оба рубежа
+# пробиты, `${WORKER_CHAIN_PROVIDER}` интерполируется в пустую строку, и
+# литерал становится «справился (провайдер: )» — без «?», с пустым местом
+# между двоеточием и закрывающей скобкой. Инвариант сторожит именно эту,
+# сегодня достижимую (хоть и составную), форму регресса.
+WORKER_FALSE_SUCCESS_MARKER = "справился (провайдер: )"
 
 # Находка ai-review PR #880 (второй раунд): ИСТОРИЧЕСКИЙ комментарий самого
 # инцидента (issue #140, 2026-09-10T18:53:32Z — живой случай, ради которого
@@ -2219,11 +2300,49 @@ WORKER_FALSE_SUCCESS_MARKER = "справился (провайдер: ?)"
 WORKER_FALSE_SUCCESS_FIX_LANDED_AT = datetime(2026, 9, 12, tzinfo=timezone.utc)
 
 
+def _strip_code_spans(text: str) -> str:
+    """Удаляет markdown code spans (`` `...` `` и ```` ```...``` ````)
+    из текста — локальная сверка инварианта 14 не должна срабатывать на
+    цитатах маркера в обсуждениях (PR #1189: ложное срабатывание на
+    цитировании нового литерала в бэктиках). Прод-комментарий воркера
+    фразу в бэктики не заворачивает."""
+    # Сначала убираем fenced code blocks (```...``` или ~~~...~~~)
+    text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+    text = re.sub(r"~~~.*?~~~", "", text, flags=re.DOTALL)
+    # Затем inline code spans (`...`) — нежадный, без вложенных бэктиков
+    text = re.sub(r"`[^`]*`", "", text)
+    return text
+
+
+def _marker_present_outside_code_spans(marker: str, body: str) -> bool:
+    """Аналог pulse_guard._marker_present, но игнорирует вхождения внутри
+    markdown code spans. Используется инвариантом 14 для локальной сверки
+    кандидата (PR #1189: избежать ложного срабатывания на цитатах в бэктиках)."""
+    stripped = _strip_code_spans(body)
+    return pulse_guard._marker_present(marker, stripped)
+
+
+def _marker_times_outside_code_spans(repo: str, issue_number: int, marker: str) -> list[datetime]:
+    """Локальная версия issue_marker_times, игнорирующая markdown code spans."""
+    try:
+        payload = pulse_guard.all_issue_comments(repo, issue_number)
+    except RuntimeError:
+        raise
+    return [
+        pulse_guard.parse_time(comment["created_at"])
+        for comment in payload
+        if _marker_present_outside_code_spans(marker, comment.get("body") or "")
+    ]
+
+
 def check_worker_false_success_comment(repo: str) -> check_result.CheckResult:
     """Инвариант 14 (issue #876, живой инцидент — прогон worker.yml
     34498185823, задача #140, 2026-09-10): комментарий «Автономный воркер
-    справился (провайдер: ?)» — противоречие само себе, после фикса #876
-    структурно невозможно (см. WORKER_FALSE_SUCCESS_MARKER выше).
+    справился (провайдер: )» с пустым провайдером — противоречие само себе
+    (dsh не ответил успехом ни разу, если провайдер неизвестен), сегодня
+    требует пробить оба рубежа фикса #876/#880 разом (см.
+    WORKER_FALSE_SUCCESS_MARKER выше — ревизия #1184 обновила литерал с
+    устаревшего «?» на актуальную прод-форму).
 
     Находка ai-review PR #880: GitHub Search отбрасывает знаки препинания
     (документированное поведение) — фразовый запрос на маркер, несущий `?`/
@@ -2292,7 +2411,7 @@ def check_worker_false_success_comment(repo: str) -> check_result.CheckResult:
         if number is None:
             continue
         try:
-            confirmed = issue_marker_times(repo, number, WORKER_FALSE_SUCCESS_MARKER)
+            confirmed = _marker_times_outside_code_spans(repo, number, WORKER_FALSE_SUCCESS_MARKER)
         except RuntimeError:
             unchecked += 1
             continue
@@ -2411,12 +2530,16 @@ def check_merge_reaction_gaps(
 # число, актуальное НА МОМЕНТ своей публикации, а открытые PR естественно
 # мержатся/появляются между пульсами (~1.6-1.8 PR/час, см. докстринг
 # scheduler.WIP_LIMIT) — сравнение старого маркера с текущим снимком было бы
-# гаданием (AGENTS.md «алерт не гадает»), не фактом. Окно — 2 такта cron
-# orchestra.yml (15 мин) с запасом: маркер этого или прошлого пульса всё ещё
-# описывает состояние, которое НЕ должно было успеть измениться настолько,
-# чтобы перевернуть решение допуска (13 PR не мержатся/не открываются за
-# 30 минут при наблюдаемом темпе).
-WIP_GATE_FALSE_ZERO_WINDOW_MINUTES = 30
+# гаданием (AGENTS.md «алерт не гадает»), не фактом. Окно — два ИЗМЕРЕННЫХ
+# такта пульса (ревизия #1184, находка C: медианный такт orchestra 20.2 мин,
+# максимум 25.0 — замер в комментарии у pulse_guard.HEARTBEAT_MAX_AGE_MINUTES;
+# cron `*/15`, от которого окно считали раньше, реальную каденцию не
+# доставляет): маркер этого или прошлого пульса всё ещё описывает состояние,
+# которое НЕ должно было успеть измениться настолько, чтобы перевернуть
+# решение допуска (13 PR не мержатся/не открываются за 40 минут при
+# наблюдаемом темпе). Промежуток между тиками никогда не превышает 25 мин,
+# окно 40 — запас 1.6×: маркер каждого пульса остаётся в окне к следующему.
+WIP_GATE_FALSE_ZERO_WINDOW_MINUTES = 40
 
 _WIP_GATE_COUNT_RE = re.compile(r"ждущих доработки:\s*(\d+)")
 
@@ -2830,7 +2953,10 @@ def check_frontend_deploy_stale(repo: str) -> dict:
 # REST-ответа `GET .../issues/{n}/comments` (не `user.login`: чужой логин
 # совпадает и у легитимного ручного обсуждения человеком в этом же issue,
 # не только у поддельного маркера — судить нужно о ТОКЕНЕ публикации, не о
-# личности автора, см. AGENTS.md «Атрибуция событий»). Живые прод-формы
+# личности автора, см. AGENTS.md «Атрибуция событий»). Сам предикат живёт
+# ОДИН раз — `pulse_guard.comment_is_job_authored` (#1242): его же зовут
+# фильтры чтения маркеров в conveyor_gate/resume_series_by_merge/инварианте
+# 13; здесь — та же функция, вторая инлайн-копия сведена. Живые прод-формы
 # (сняты 2026-09-13, `gh api repos/mytab0r/edge-harness/issues/120/comments`):
 #   честный маркер: {"performed_via_github_app": {"id": 15368, ...},
 #                     "user": {"login": "github-actions[bot]", "type": "Bot"}}
@@ -2920,7 +3046,10 @@ def check_pipeline_status_marker_impersonation(comments: list[dict]) -> list[dic
         first_line = body.splitlines()[0]
         if not PIPELINE_STATUS_MARKER_FAMILY_RE.search(first_line):
             continue
-        if comment.get("performed_via_github_app") is not None:
+        # Признак честности — одно место правды (замечание ai-review #1242):
+        # pulse_guard.comment_is_job_authored, тот же предикат, что фильтрует
+        # чтение маркеров в conveyor_gate/resume_series_by_merge/инварианте 13.
+        if pulse_guard.comment_is_job_authored(comment):
             continue  # опубликовано через GitHub App/job-токен — легитимно
         violations.append({
             "id": comment.get("id"),
@@ -2930,6 +3059,140 @@ def check_pipeline_status_marker_impersonation(comments: list[dict]) -> list[dic
             "url": comment.get("html_url"),
         })
     return sorted(violations, key=lambda item: item["created_at"] or "")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Инвариант 24: наблюдаемость уборки рабочих деревьев (issue #1250)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Инцидент #1250 (2026-09-14): уборщик `.claude/worktrees` запускался при
+# каждом создании ветки задачи, печатал сводку «Removed: 0 из 73» — и никто
+# этого не видел, пока инцидент не вскрыли руками. Этот инвариант читает
+# ЗАПИСИ прогонов уборщика (пишет их сам уборщик — единственный путь, где
+# деревья физически есть, см. блок-комментарий в докстринге модуля и в
+# импорте worktree_snapshot выше), не заводя второй измеритель.
+
+def check_worktree_cleanup_records(
+    records: list[dict], open_pr_count: int, now: datetime,
+) -> list[dict]:
+    """Чистая функция (без сети — `records` уже прочитаны
+    fetch_worktree_cleanup_records, `now` — инъекция, не `datetime.now()`).
+
+    Три различимых состояния (находка ревью PR #1257 — инвариант, который не
+    различает «деревьев нет» и «объект ненаблюдаем отсюда», молча читает
+    смерть канала как чистоту):
+      - kind="no-records"/"stale-channel" — канал молчит (никогда не писал /
+        тише порога RECORD_STALE_AFTER_DAYS). Причину (прогоны прекратились
+        против сломанной публикации) из самих записей установить НЕЛЬЗЯ —
+        находка называет этот пробел и где смотреть, не угадывает (AGENTS.md
+        «Алерт не гадает»);
+      - kind="bad-record" — канал пишет, но последняя запись нечитаема;
+      - свежая запись — числа против независимых данных этого прогона:
+        kind="stale-guard-copies" (устаревших копий прод-гвардии больше, чем
+        открытых PR — вторая половина критерия готовности #1250) и
+        kind="zero-removed-stuck" (removed=0 при запертых деревьях старше
+        retention — основной симптом инцидента).
+    Свежая запись с total=0 нарушением НЕ считается: прогон состоялся и
+    деревьев не нашёл — это «деревьев нет», не слепота (сообщается в отчёте
+    отдельной 💚-строкой с числом, не общим «здорово»)."""
+    if not records:
+        return [{"kind": "no-records",
+                 "where": f"{worktree_snapshot.DATA_BRANCH}:"
+                          f"{worktree_snapshot.SNAPSHOT_PATH}"}]
+    last = worktree_snapshot.last_record(records)
+    if last is None:
+        return [{"kind": "no-records",
+                 "where": f"{worktree_snapshot.DATA_BRANCH}:"
+                          f"{worktree_snapshot.SNAPSHOT_PATH}"}]
+    try:
+        last_dt = worktree_snapshot.parse_ts(str(last["ts"]))
+        record_total = int(last["total"])
+        record_removed = int(last["removed"])
+        stale_guard = int(last["stale_guard_copies"])
+        stuck_total = int(last["stuck_old_total"])
+    except (KeyError, TypeError, ValueError):
+        return [{"kind": "bad-record", "ts": str(last.get("ts", ""))[:40]}]
+
+    age_days = (now - last_dt).total_seconds() / 86400
+    if age_days > worktree_snapshot.RECORD_STALE_AFTER_DAYS:
+        return [{"kind": "stale-channel", "last_ts": str(last["ts"]),
+                 "age_days": round(age_days, 1),
+                 "threshold_days": worktree_snapshot.RECORD_STALE_AFTER_DAYS}]
+
+    violations = []
+    if stale_guard > open_pr_count:
+        violations.append({
+            "kind": "stale-guard-copies",
+            "stale_guard_copies": stale_guard,
+            "open_prs": open_pr_count,
+            "last_ts": str(last["ts"]),
+        })
+    if record_removed == 0 and stuck_total > 0:
+        violations.append({
+            "kind": "zero-removed-stuck",
+            "removed": record_removed,
+            "total": record_total,
+            "stuck_old_total": stuck_total,
+            "last_ts": str(last["ts"]),
+        })
+    return violations
+
+
+def worktree_cleanup_fact_line(item: dict) -> str:
+    """Человекочитаемая строка находки инварианта 24 по kind (семантика, не
+    парсинг подстроки — AGENTS.md «Семантика важнее подстроки»)."""
+    kind = item.get("kind")
+    if kind == "no-records":
+        return (f"записей уборщика рабочих деревьев нет НИ РАЗУ "
+                f"({item['where']}) — канал наблюдаемости #1250 молчит с "
+                "внедрения; причина из отсутствующих записей не устанавливается "
+                "(прогонов не было или публикация сломана — лог task-branch, "
+                "шаг worktree-cleanup --publish-snapshot)")
+    if kind == "bad-record":
+        return (f"последняя запись уборщика рабочих деревьев нечитаема "
+                f"(ts={item['ts']}) — канал жив, содержимое повреждено "
+                f"({worktree_snapshot.DATA_BRANCH}:"
+                f"{worktree_snapshot.SNAPSHOT_PATH})")
+    if kind == "stale-channel":
+        return (f"записей уборщика рабочих деревьев нет {item['age_days']} сут "
+                f"(последняя {item['last_ts']}, порог {item['threshold_days']}) — "
+                "причину из записей установить нельзя: записи не говорят, было ли "
+                "сами прогоны; различает их только лог прод-пути (task-branch → "
+                "worktree-cleanup --publish-snapshot)")
+    if kind == "stale-guard-copies":
+        return (f"устаревших копий прод-гвардии (pulse_guard.py без "
+                f"prod_writes_allowed): {item['stale_guard_copies']} > открытых "
+                f"PR {item['open_prs']} (запись от {item['last_ts']}) — критерий "
+                "готовности #1250 нарушен, газ: прогон уборщика снимает деревья "
+                "слитых задач")
+    if kind == "zero-removed-stuck":
+        return (f"уборщик снял 0 из {item['total']}, при этом "
+                f"{item['stuck_old_total']} деревьев старше retention заперты "
+                f"(запись от {item['last_ts']}) — основной симптом инцидента "
+                "#1250, газ построчно назван в сводке уборщика")
+    return str(item)
+
+
+def fetch_worktree_cleanup_records(repo: str) -> list[dict]:
+    """Записи прогонов уборщика через уже мокаемый транспорт `gh()` этого
+    файла — НЕ сетевые функции worktree_snapshot напрямую: тот же принцип,
+    что fetch_pipeline_health_history выше (единая точка патча в тестах).
+    404 (ветки/файла записи ещё нет) — штатное «записей не было», не ошибка;
+    RuntimeError любой другой природы (сеть/квота) не тонет молча —
+    build_report обязан отличать «записей нет» от «прочитать не удалось»."""
+    try:
+        blob = gh(f"repos/{repo}/contents/{worktree_snapshot.SNAPSHOT_PATH}"
+                  f"?ref={worktree_snapshot.DATA_BRANCH}")
+    except RuntimeError as error:
+        if "404" in str(error) or "Not Found" in str(error):
+            return []
+        raise
+    if not blob:
+        return []
+    import base64
+    return worktree_snapshot.read_rows(
+        base64.b64decode(blob["content"]).decode("utf-8"))
+
 
 def build_report(repo: str, now: datetime,
                   check_branch_protection: bool = False,
@@ -3196,17 +3459,17 @@ def build_report(repo: str, now: datetime,
     if v14.status == check_result.STATUS_UNKNOWN:
         lines.append(f"{check_result.status_emoji(v14.status)} [14] не удалось "
                       f"проверить комментарии воркера на противоречие "
-                      f"«справился (провайдер: ?)»: {v14.reason}")
+                      f"«{WORKER_FALSE_SUCCESS_MARKER}»: {v14.reason}")
     elif v14.violations:
         lines.append(f"{check_result.status_emoji(check_result.STATUS_VIOLATION)} "
                       f"[14] {len(v14.violations)} комментариев несут противоречие "
-                      f"«справился (провайдер: ?)» (#876):")
+                      f"«{WORKER_FALSE_SUCCESS_MARKER}» (#876):")
         for item in v14.violations:
             lines.append(f"   — #{item['issue']} «{item['title']}» — {item['url']}")
     else:
         lines.append(f"{check_result.status_emoji(check_result.STATUS_OK)} [14] ни "
                       "один комментарий воркера не несёт противоречия "
-                      "«справился (провайдер: ?)»")
+                      f"«{WORKER_FALSE_SUCCESS_MARKER}»")
 
     try:
         v15_all = check_merge_reaction_gaps(repo, now, merged_pulls)
@@ -3364,6 +3627,36 @@ def build_report(repo: str, now: datetime,
                 f"{AI_REWORK_NEVER_DISPATCHED_AFTER_MINUTES} мин без хотя бы одного "
                 "диспатча авто-доводки"
             )
+
+    try:
+        wt_records = fetch_worktree_cleanup_records(repo)
+    except RuntimeError as error:
+        findings[24] = []
+        lines.append(f"🚨 [24] журнал уборки рабочих деревьев недоступен: {error} — "
+                     "инвариант пропущен на этом прогоне (это НЕ «записей нет»)")
+    else:
+        v24 = check_worktree_cleanup_records(wt_records, len(open_pulls), now)
+        findings[24] = v24
+        if v24:
+            for item in v24:
+                lines.append(f"🚨 [24] {worktree_cleanup_fact_line(item)}")
+        else:
+            last24 = worktree_snapshot.last_record(wt_records)
+            last24_total = int(last24.get("total", -1)) if last24 else -1
+            if last24_total == 0:
+                lines.append(
+                    f"💚 [24] запись уборщика от {last24.get('ts', '?')}: рабочих "
+                    "деревьев нет (total=0) — прогон состоялся и измерять нечего "
+                    "(это «деревьев нет», не отсутствие наблюдения)"
+                )
+            else:
+                lines.append(
+                    f"💚 [24] запись уборщика от {last24.get('ts', '?')}: "
+                    f"removed={last24.get('removed')}, устаревших копий гвардий "
+                    f"{last24.get('stale_guard_copies')} ≤ открытых PR "
+                    f"{len(open_pulls)}, запертых старше retention "
+                    f"{last24.get('stuck_old_total')}"
+                )
     return lines, findings
 
 
@@ -3414,13 +3707,19 @@ def summary(lines: list[str]) -> None:
 # Эскалирующие инварианты: run_escalations обязана нести ветку для каждого
 # номера отсюда — находка доходит до канала владельца (#120 + Telegram через
 # pulse_guard.escalate), а не живёт только строкой отчёта прогона. 18 в
-# списке — поставленная задача (#1101, находка ревью PR #1102): поддельный
-# PAUSE/RESUME — единственный класс этих находок, который не только
-# сигнализирует, но и МЕНЯЕТ решение (conveyor_gate читает маркеры #120 без
-# trusted_login); соседний 16 эскалирует, а более широкий 18 молчал бы.
-# Газ общий и автоматический: escalate_if_new дедуплицирует по множеству id
-# нарушителей (вечный долг — одна эскалация, новая подделка — новая), ручного
-# снятия не требует.
+# списке — поставленная задача (#1101, находка ревью PR #1102). Уточнение
+# #1242 (доводка ai-review): до фильтра require_job_token поддельный
+# PAUSE/RESUME не только сигнализировал, но и МЕНЯЛ решение — conveyor_gate,
+# resume_series_by_merge и инвариант 13 читали маркеры #120 без фильтра по
+# токену. После закрытия того PR на чтении (те три места + PAUSE_REMINDER в
+# conveyor_gate) менять решение гейта подделка больше НЕ может нигде — 18
+# остаётся детектором самого ФАКТА подделки: маркер семейства
+# `[статус конвейера:` в канале, опубликованный не токеном job'а, — сигнал
+# о постороннем писателе, даже если на поведение конвейера он уже не влияет.
+# Эскалация отсюда не снимается: появление подделки — факт, который владелец
+# обязан видеть (писатель под PAT активен), а газ общий и автоматический:
+# escalate_if_new дедуплицирует по множеству id нарушителей (вечный долг —
+# одна эскалация, новая подделка — новая), ручного снятия не требует.
 ESCALATING_INVARIANTS = (1, 3, 12, 15, 16, 17, 18)
 
 def escalate_if_new(repo: str, invariant_id: int, marker_key: str, text: str) -> str | None:

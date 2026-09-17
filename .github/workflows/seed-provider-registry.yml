@@ -1,0 +1,58 @@
+# Засев реестра провайдеров морды из манифеста (#1330).
+#
+# Ручной запуск, не по расписанию: набор провайдеров меняется правкой
+# config/provider-usage.json через PR, и засев — следствие этой правки, а не
+# самостоятельный процесс. Автозапуск на push в main сознательно НЕ сделан:
+# морда — прод-состояние владельца, и переписывать его на каждый мерж без
+# явного решения значило бы делать тихий прод-деплой из merge-коммита.
+#
+# Направление одностороннее (манифест → морда). Обратное (морда → раннер,
+# замена vars.DSH_PROVIDER_CHAIN) — задача #735, заблокирована #1329:
+# приоритет МЕЖДУ провайдерами схема реестра выразить не может.
+name: seed-provider-registry
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Только показать план, не трогая морду"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: seed-provider-registry
+  cancel-in-progress: false
+
+jobs:
+  seed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Засев реестра морды
+        env:
+          DSH_EDGE_URL: ${{ vars.DSH_EDGE_URL }}
+          DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
+          # Ключи маршрутов: имена берутся из secret_env манифеста, значения —
+          # из секретов этой среды. В морду уходит ЗНАЧЕНИЕ (credentials.set),
+          # в лог — только ИМЯ (гвардия test_key_value_never_reaches_output).
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          NVIDIA_NIM_1_API_KEY: ${{ secrets.NVIDIA_NIM_1_API_KEY }}
+          NVIDIA_NIM_2_API_KEY: ${{ secrets.NVIDIA_NIM_2_API_KEY }}
+          OPENROUTER_1_API_KEY: ${{ secrets.OPENROUTER_1_API_KEY }}
+          OPENROUTER_2_API_KEY: ${{ secrets.OPENROUTER_2_API_KEY }}
+          OLLAMA_CLOUD_1_API_KEY: ${{ secrets.OLLAMA_CLOUD_1_API_KEY }}
+          OLLAMA_CLOUD_2_API_KEY: ${{ secrets.OLLAMA_CLOUD_2_API_KEY }}
+          OLLAMA_CLOUD_3_API_KEY: ${{ secrets.OLLAMA_CLOUD_3_API_KEY }}
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            python3 scripts/dsh_edge/seed_provider_registry.py --dry-run
+          else
+            python3 scripts/dsh_edge/seed_provider_registry.py
+          fi

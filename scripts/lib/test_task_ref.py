@@ -14,6 +14,13 @@
 этим решением) см. в git-истории task_ref.py и
 openspec/changes/contract-task-from-branch/proposal.md.
 
+Класс #1264 (ссылка на задачу ЧУЖОГО репозитория): `extract_task_refs`
+охраняла границу числа (#187/#195), но не то, что стоит ПЕРЕД `#` — форма
+`owner/repo#N` и HTML-ссылка на чужой issue/PR (`<a href=".../issues/N">
+#N</a>`, рендер Dependabot) засчитывались как ссылка на задачу ЭТОГО
+репозитория. Живой случай — PR #922, разославший ложные комментарии в
+задачи #744/#754.
+
 Кейсы кормятся прод-формой тела PR, которая реально встречается в
 репозитории.
 
@@ -27,6 +34,8 @@ SCRIPT = Path(__file__).with_name("task_ref.py")
 spec = importlib.util.spec_from_file_location("task_ref", SCRIPT)
 task_ref = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(task_ref)  # type: ignore[union-attr]
+
+_DIR = Path(__file__).resolve().parent
 
 
 def test_no_false_positive_on_longer_number_suffix():
@@ -80,6 +89,97 @@ def test_real_pr_body_no_relation_regression():
     body = "#182\n\nАрхив сессий раннера падает 403 (см. #174).\n"
     assert task_ref.references_task(body, 18) is False
     assert task_ref.references_task(body, 182) is True
+
+
+# ── Ссылка на задачу ЧУЖОГО репозитория — не наша (#1264) ────────────────────
+#
+# Прод-форма: дословное тело PR #922 (`gh api repos/mytab0r/edge-harness/
+# pulls/922 --jq .body`, живой прогон 2026-09-14), сохранено байт-в-байт в
+# fixtures_pr922_dependabot_body.md. Тело несёт форму `owner/repo#N` (текстом
+# внутри HTML-ссылки, например `actions/upload-artifact#754`) и форму
+# HTML-ссылки с голым `#N` текстом (`<a href="https://redirect.github.com/
+# actions/upload-artifact/issues/797">#797</a>`) — обе указывают на чужой
+# репозиторий actions/upload-artifact, не на этот. Живой инцидент: после
+# слияния этого PR `scheduler.py::after_merge` разослал в задачи #744 и #754
+# ложные комментарии «PR слит и упоминает эту задачу».
+_PR_922_BODY = (_DIR / "fixtures_pr922_dependabot_body.md").read_text(encoding="utf-8")
+
+
+def test_extract_task_refs_ignores_foreign_repo_dependabot_body():
+    refs = task_ref.extract_task_refs(_PR_922_BODY)
+    assert 744 not in refs, "actions/upload-artifact#744 — чужой репозиторий, не наша задача"
+    assert 754 not in refs, "actions/upload-artifact#754 (и HTML-ссылка #754) — чужой репозиторий"
+    # Тело целиком состоит из ссылок на чужой репозиторий (release notes +
+    # список коммитов) — после фильтра не остаётся ни одного числа.
+    assert refs == []
+
+
+def test_references_task_false_for_foreign_repo_numbers_in_real_body():
+    assert task_ref.references_task(_PR_922_BODY, 744) is False
+    assert task_ref.references_task(_PR_922_BODY, 754) is False
+
+
+def test_extract_task_refs_ignores_owner_repo_form_plain_text():
+    # Форма без HTML-обёртки (в т.ч. внутри markdown-ссылки) — как в
+    # собственных PR агентов, документирующих соседний репозиторий
+    # pawaca/dsh-edge (например PR #1209, #1066, #313, #79 — живой прогон
+    # 2026-09-14).
+    text = "Патч синхронизирован с [pawaca/dsh-edge#167](https://github.com/pawaca/dsh-edge/issues/167), задача #43 закрыта."
+    assert task_ref.extract_task_refs(text) == [43]
+
+
+def test_extract_task_refs_does_not_strip_numeric_ratio_before_hash():
+    # Живой контрпример (PR #1247, дословный фрагмент тела, 2026-09-14):
+    # «при дефолтных 300/180с#877 ретраи RATE_LIMIT физически не дожигают
+    # 9000с» — сегменты `300/180с` (байтово `300/180` + кириллическая «с»)
+    # без единой латинской буквы стоят ВПЛОТНУЮ к `#877`. Это НЕ форма
+    # owner/repo — #877 обязана остаться нашей задачей, иначе защита от
+    # чужого репозитория сама стала бы новым классом ложноотрицательных
+    # срабатываний. Adjacency обязателен: первая редакция этого теста
+    # отделяла `#877` пробелом и скобкой («(#877)») и МОЛЧА ЗЕЛЕНЕЛА на
+    # мутанте без буквенных lookahead'ов `_FOREIGN_REPO_REF_RE` (класс
+    # ложно-зелёной гвардии #891/#893, находка ai-review PR #1267).
+    text = (
+        "при дефолтных 300/180с#877 ретраи RATE_LIMIT физически "
+        "не дожигают 9000с — новый бюджет там не сработал бы"
+    )
+    assert task_ref.extract_task_refs(text) == [877]
+    # Две формы ниже — синтетические границы, живого примера каждой нет
+    # (названо прямо): они пинят КАЖДЫЙ lookahead `_FOREIGN_REPO_REF_RE` по
+    # отдельности, а не только совместное снятие. `300/abc#877` (вторая
+    # буква есть, первой нет) краснеет при снятии ПЕРВОГО lookahead,
+    # `abc/180с#877` (первая есть, во второй кириллица) — при снятии
+    # ВТОРОГО. Второй пин обязан нести НЕцифровой хвост второго сегмента:
+    # чистое `abc/180#877` как пин бесполезно — цифра перед `#` уже
+    # блокирует `_TASK_REF_RE` гвардией #187 `(?<!\d)`, и число невидимо при
+    # любом состоянии чужого регэкспа.
+    assert task_ref.extract_task_refs("бюджет 300/abc#877 исчерпан") == [877]
+    assert task_ref.extract_task_refs("бюджет abc/180с#877 исчерпан") == [877]
+    # Проза без adjacency (дробь и #N раздельно) остаётся рабочей.
+    assert task_ref.extract_task_refs("при 300/180 ретраи (#877).") == [877]
+
+
+def test_extract_task_refs_ignores_number_inside_fenced_code_block():
+    # Живой случай (PR #1206, 2026-09-14): код-блок с выводом упавшего теста
+    # несёт синтетический `#42` из юнит-теста claim_task — не ссылку на
+    # настоящую задачу #42.
+    body = (
+        "#100\n\n"
+        "```\n"
+        "AssertionError: assert False is True\n"
+        " +  where False = ClaimResult(claimed=False, task=42, holder='run:A',\n"
+        "     detail='задача #42 уже занята держателем run:A (замок refs/locks/task-42)').claimed\n"
+        "```\n"
+    )
+    assert task_ref.extract_task_refs(body) == [100]
+
+
+def test_extract_task_refs_still_finds_real_mentions_inside_blockquote():
+    # Блокцитаты НЕ вырезаются (GitHub их не исключает из разбора директив/
+    # ссылок, живые данные PR #475) — упоминание своей же задачи в цитате
+    # остаётся видимым.
+    text = "> Уже разобрано ai:* дважды за 120 мин: #387,#329,#327"
+    assert task_ref.extract_task_refs(text) == [387, 329, 327]
 
 
 # ── Резолвер «PR → задача» (#259, #394) — прод-форма реальных PR ────────────
@@ -331,6 +431,145 @@ def test_closing_keyword_mutation_startswith_regresses_on_pr_415_v1():
         "не директива: после ключевого слова нет #N вплотную — GitHub тут "
         "ничего не закроет, красить нечего"
     )
+
+
+# ── also_closes_targets (#1042) — прод-форма реальных тел трёх слитых PR ──────
+#
+# Все три взяты дословно из тел уже слитых PR этого репозитория (проверено
+# `gh pr view <N> --json body`, 2026-09-12), не пересказаны.
+
+_PR_986_FRAGMENT = (
+    "- Заявленные в issue #507 упоминания `dsh-tools@0.1.1-rc.2` в\n"
+    "  README/body.js сверены отдельно и не относятся к зависимостям,\n"
+    "  правкой; закрываю issue #507 этим PR как полностью покрытый.\n"
+)
+
+_PR_986_FALSE_POSITIVE_FRAGMENT = (
+    "в докстринге roster-гвардии — сейчас цепочка, от которой зависит "
+    "закрытие #806, живёт только в переносе"
+)
+
+_PR_986_NEGATION_FRAGMENT = (
+    "- #806 — причина 2 (ростер), не закрывается автоматически этим PR: "
+    "реальный перенос требует отдельного PR."
+)
+
+_PR_952_FRAGMENT = (
+    "форж отказывает\nгромко ДО сборки, если номер не определён "
+    "(закрывает #661, вариант 1).\n"
+)
+
+_PR_841_FRAGMENT = (
+    "- Закрыт класс #786 по всему `scripts/`: `gh` 2.85 не знает "
+    "`--body-file` у `gh secret set`.\n"
+)
+
+# Живые ложные срабатывания прошедшего времени (находка ai-review PR #1046,
+# круг 4, живой пул 323 слитых PR) — дословно из тел уже слитых PR #576 и
+# #358 (проверено `gh pr view <N> --json body`, 2026-09-14).
+_PR_576_PAST_TENSE_FRAGMENT = (
+    "дедуп следа доверяет телу чужого комментария** — `notify_head_moved` "
+    "ищет marker в любом комментарии PR, включая посторонние — это тот же "
+    "класс, что закрыла #294 («доверять телу комментария можно только "
+    "после проверки автора»)"
+)
+
+_PR_358_PAST_TENSE_FRAGMENT = (
+    "Три места класса «действие раньше проверки предусловия» (гвардия "
+    "срабатывает постфактум вместо проверки на входе), живой случай — "
+    "приёмка закрыла #320, пока по нему был открыт второй PR #325 (упал "
+    "на contract):"
+)
+
+
+def test_also_closes_targets_real_pr_986_declares_issue_507():
+    assert task_ref.also_closes_targets(_PR_986_FRAGMENT) == [507]
+
+
+def test_also_closes_targets_real_pr_952_declares_issue_661():
+    assert task_ref.also_closes_targets(_PR_952_FRAGMENT) == [661]
+
+
+def test_also_closes_targets_real_pr_841_declares_issue_786_with_class_word():
+    assert task_ref.also_closes_targets(_PR_841_FRAGMENT) == [786]
+
+
+def test_also_closes_targets_rejects_noun_form():
+    # Живой ложноположительный случай (тело PR #986, 2026-09-12): «закрытие»
+    # — существительное, не одна из глагольных форм списка. Тот же PR прямо
+    # пишет рядом, что #806 НЕ закрывается им (см. следующий тест) — открытый
+    # корень `закры[а-я]*` (первая попытка регэкспа) матчил бы оба фрагмента
+    # неразличимо; список конкретных форм отклоняет именно этот.
+    assert task_ref.also_closes_targets(_PR_986_FALSE_POSITIVE_FRAGMENT) == []
+
+
+def test_also_closes_targets_rejects_past_tense_narrative():
+    # Находка ai-review PR #1046 (круг 4, живой пул 323 слитых PR): форма
+    # ПРОШЕДШЕГО времени («закрыла»/«закрыли») ловит повествование о ЧУЖОМ
+    # прошлом действии («приёмка закрыла #320», «тот же класс, что закрыла
+    # #294»), не заявление ЭТОГО PR о себе — ни один из живых НАСТОЯЩИХ
+    # случаев (#986/#952/#841) прошедшего времени не использует (см.
+    # докстринг _ALSO_CLOSES_RE). Список форм урезан до настоящего времени и
+    # причастия текущего состояния — оба живых фрагмента больше не матчат.
+    assert task_ref.also_closes_targets(_PR_576_PAST_TENSE_FRAGMENT) == []
+    assert task_ref.also_closes_targets(_PR_358_PAST_TENSE_FRAGMENT) == []
+
+
+def test_also_closes_targets_mutation_past_tense_regresses_on_live_pr_576_358():
+    # Мутация: верни форму прошедшего времени в список (состояние ДО находки
+    # ai-review PR #1046, круг 4) — воспроизводим её здесь напрямую, не
+    # полагаясь на то, что кто-то повторит ту же правку в исходнике.
+    import re
+    past_tense_re = re.compile(
+        r"(?i)\b(?:закрывает|закрываю|закрыл[аио]?|закрыт[аоы]?)\b"
+        r"(?:\s+(?:issue|класс))?\s*#(\d+)"
+    )
+    assert [int(m.group(1)) for m in past_tense_re.finditer(_PR_576_PAST_TENSE_FRAGMENT)] == [294], \
+        "мутация (прошедшее время в списке) обязана воспроизводить ложное срабатывание на #294"
+    assert [int(m.group(1)) for m in past_tense_re.finditer(_PR_358_PAST_TENSE_FRAGMENT)] == [320], \
+        "мутация (прошедшее время в списке) обязана воспроизводить ложное срабатывание на #320"
+    # А актуальный код (без прошедшего времени) — нет:
+    assert task_ref.also_closes_targets(_PR_576_PAST_TENSE_FRAGMENT) == []
+    assert task_ref.also_closes_targets(_PR_358_PAST_TENSE_FRAGMENT) == []
+
+
+def test_also_closes_targets_ignores_number_before_verb():
+    # «#806 — … не закрывается автоматически этим PR» — номер стоит ДО
+    # глагола, регэксп ищет номер СРАЗУ ПОСЛЕ глагола (см. докстринг
+    # _ALSO_CLOSES_RE) и это отрицание структурно не матчит.
+    assert task_ref.also_closes_targets(_PR_986_NEGATION_FRAGMENT) == []
+
+
+def test_also_closes_targets_mutation_open_root_regresses_on_986():
+    # Мутация: замени явный список форм на открытый корень (первая версия,
+    # отвергнутая экспериментом) — воспроизводим её здесь напрямую, не
+    # полагаясь на то, что кто-то повторит ту же правку в исходнике.
+    import re
+    open_root_re = re.compile(
+        r"(?i)\bзакры[а-яё]*\b(?:\s+(?:issue|класс))?\s*#(\d+)"
+    )
+    matches = [int(m.group(1)) for m in open_root_re.finditer(_PR_986_FALSE_POSITIVE_FRAGMENT)]
+    assert matches == [806], "мутация (открытый корень) обязана воспроизводить ложное срабатывание на #806"
+    # А явный список форм (актуальный код) — нет:
+    assert task_ref.also_closes_targets(_PR_986_FALSE_POSITIVE_FRAGMENT) == []
+
+
+def test_also_closes_targets_empty_text():
+    assert task_ref.also_closes_targets("") == []
+    assert task_ref.also_closes_targets(None) == []
+
+
+def test_also_closes_targets_dedupes_preserving_order():
+    text = "закрывает #10, а также закрывает #20 и снова закрывает #10."
+    assert task_ref.also_closes_targets(text) == [10, 20]
+
+
+def test_also_closes_targets_does_not_match_english_closing_directive():
+    # Русские глагольные формы не входят в список ключевых слов GitHub —
+    # `also_closes_targets` не пересекается с closing_keyword_refs (разные
+    # языки, разный признак), но проверяем явно: английская директива сама
+    # по себе не матчит русский маркер.
+    assert task_ref.also_closes_targets("Closes #413") == []
 
 
 # Мутация, которой доказан resolve_pr_task (#259, #394): временно замени тело

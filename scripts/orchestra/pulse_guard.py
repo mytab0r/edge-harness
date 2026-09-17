@@ -102,6 +102,14 @@ FAILURE_CONCLUSIONS = ("failure", "cancelled")
 # Подряд красных прогонов worker.yml, после которых авто-диспетч останавливается.
 WORKER_FAILURE_PAUSE_AFTER = 3
 
+# Потолок страниц для окна поиска атрибуции С АНКЕРОМ (last_worker_run,
+# since=...; issue #1274, живой случай PR #804/задача #720, 2026-09-12→14):
+# по 100 прогонов на страницу — 500 прогонов при слоте worker.yml,
+# сериализованном одним concurrency-group (AGENTS.md: ~18-33 прогона/сутки),
+# это 15-27 суток истории — кратно больше измеренной задержки эскалации
+# (двое суток, 43 прогона по ДРУГИМ задачам между диспатчем и перепроверкой).
+LAST_RUN_LOOKUP_PAGES = 5
+
 # Полуоткрытое состояние (#205): разомкнутый предохранитель сам не снимается —
 # зелёного прогона неоткуда взяться без диспатча. Поэтому по истечении выдержки
 # разрешается РОВНО ОДИН пробный диспатч. Выдержка растёт экспоненциально с
@@ -111,9 +119,22 @@ WORKER_FAILURE_PAUSE_AFTER = 3
 PROBE_BACKOFF_BASE_MINUTES = 15
 PROBE_BACKOFF_MAX_MINUTES = 240
 
-# Пульс orchestra идёт каждые 15 минут (cron orchestra.yml); три пропущенных
-# интервала — пульсы пропали. Пока опоздавший запуск жив, он обязан крикнуть.
-HEARTBEAT_MAX_AGE_MINUTES = 45
+# Порог простоя пульса — от ИЗМЕРЕННОГО такта, не от cron (ревизия #1184,
+# находка C): cron `*/15` у orchestra.yml реально доставляет единицы процентов
+# (docs/research/21-github-actions.md), такт несут легитимные события
+# schedule+workflow_dispatch, а занятая concurrency-группа теряет тик, не
+# копит его. Замер 60 прогонов orchestra.yml (2026-09-13T20:09Z…2026-09-14T01:
+# 40Z): медиана 20.2 мин, максимум 25.0. Три медианных интервала ≈ 60 минут:
+# одиночный пропущенный такт (до 25 мин) порога не достигает с запасом 2.4×,
+# крик появляется после трёх подряд «пропавших» интервалов. Прежние 45 были
+# 3×крона; при реальном такте два пропущенных такта по максимуму (2×25=50 мин
+# тишины) уже пробивали порог — ложный крик «пульс пропал» на нормальной
+# каденции. Номинальный интервал DO-пульса (10 мин после #812) — тоже не
+# носитель этого числа: калибруется ДОСТУПНЫЙ такт прогонов, а не обещание
+# конфига (белое пятно из tasks.md change'а orchestrator-pulse-interval-
+# tuning). Пока опоздавший запуск жив, он обязан крикнуть. Живая сверка числа
+# с тактом — tick_cadence_observation ниже (каждый пульс, ноль лишних запросов).
+HEARTBEAT_MAX_AGE_MINUTES = 60
 
 # Задача-статус: туда идут сигнальные комментарии (и маркеры серий).
 WATCHDOG_ISSUE = 120
@@ -350,6 +371,26 @@ AI_REWORK_MARKER = "[ai-rework: авто-доводка]"
 # эскалация решается по каждому PR отдельно.
 AI_REWORK_ESCALATION_MARKER = "[ai-rework: эскалация]"
 
+# Четвёртый исход вместо «эскалация с первого раза» (issue #1274, AGENTS.md
+# «Воркеру нужны четыре исхода, не два»; живые случаи PR #1120 2026-09-13 и
+# PR #804 2026-09-14): #1027 научил dispatch_ai_review_rework РАЗЛИЧАТЬ
+# «отработал успешно, находки не закрыты» и «атрибуции нет» от честного
+# инфра-отказа, но ОТВЕЧАЛ на оба одинаково — эскалацией с первого же
+# обнаружения. Оба маркера ниже дают РОВНО один бесплатный (не по бюджету
+# AI_REWORK_MAX_ATTEMPTS) заход на отпечаток ПЕРЕД эскалацией; маркер уже
+# стоит на этом отпечатке — второе совпадение того же исхода эскалирует, с
+# текстом, называющим именно эту причину (не generic «находки ai-review»).
+AI_REWORK_SECOND_CHANCE_MARKER = "[ai-rework: находки явно]"
+AI_REWORK_UNATTRIBUTED_RETRY_MARKER = "[ai-rework: неатрибутированный повтор]"
+
+# Контракт второго захода (AI_REWORK_SECOND_CHANCE_MARKER): агент обязан
+# либо исправить находку, либо явно возразить комментарием с этим маркером
+# — молчаливое несогласие («поработал, ничего не поменял, причины не
+# сказал») не годится (AGENTS.md: «тогда это возражение и есть результат,
+# его надо донести до ревью, а не потерять»). Эскалация второго подряд
+# совпадения читает этот маркер и цитирует найденное возражение, если было.
+AI_REWORK_REBUTTAL_MARKER = "[ai-rework: возражение]"
+
 # ── Гвардия непрочитанных провалов ключевых workflow (#477) ──────────────────
 # worker.yml уже целиком под предохранителем conveyor_gate (пауза/проба) —
 # сюда включён тоже, потому что предохранитель отвечает на «дать ли диспатч»,
@@ -464,8 +505,14 @@ STALE_BASE_SIGNATURES = (
 
 FAILURE_WATCH_INFRA_MARKER = "[failure-watch: инфраструктура"
 
-# Окно свежести провала (находка ревью PR #488): пульс ходит раз в 15 минут
-# (cron orchestra.yml), окно — двойной период с запасом на задержку раннера.
+# Окно свежести провала (находка ревью PR #488) — от ИЗМЕРЕННОГО такта
+# пульса, не от cron (ревизия #1184, находка C): медианный такт orchestra
+# 20.2 мин, максимум 25.0 (замер в комментарии у HEARTBEAT_MAX_AGE_MINUTES).
+# Окно — два медианных такта: свежий провал обязан быть увиден хотя бы одним
+# тиком в пределах окна, а максимальный наблюдаемый промежуток между тиками
+# 25 < 40 (запас 1.6×). Прежние «30 минут, двойной период cron `*/15`»
+# опирались на каденцию, которую cron не доставляет: один пропущенный такт
+# (максимум 25 мин при такте 20) выносил провал за 30-минутное окно молча.
 # Без него `runs[0]` навсегда остаётся тем же старым красным прогоном после
 # закрытия задачи (отпечаток исчезает из открытых → следующий пульс заводит
 # задачу заново на уже почившую причину, бесконечный цикл).
@@ -478,19 +525,56 @@ FAILURE_WATCH_INFRA_MARKER = "[failure-watch: инфраструктура"
 # лежит вне окна на КАЖДОМ пульсе — ни задачи, ни наблюдения, навсегда:
 # молчаливая потеря ровно тех провалов, ради которых #477. У ЗАВЕРШЁННОГО
 # прогона updated_at — момент завершения, то есть для красного прогона —
-# момент провала; «30 минут после провала» — ровно заявленная семантика.
-FAILURE_WATCH_WINDOW_MINUTES = 30
+# момент провала; «окно минут после провала» — ровно заявленная семантика.
+FAILURE_WATCH_WINDOW_MINUTES = 40
 
 # Выводы ЗАВЕРШЁННЫХ прогонов, которые failure_watch разбирает как провал.
 # Отдельный именованный набор, не общий FAILURE_CONCLUSIONS — судьба крайних
 # случаев решена здесь явно (находка ревью PR #488, раунд 3; серверный фильтр
 # `status=failure` не отдаёт `timed_out` вовсе):
-# `timed_out` — ВКЛЮЧЁН: прогон, убитый собственным капом (timeout-minutes:
-# worker.yml = 340, #1067, было 280 — существует именно потому, что прогоны до него добираются),
-# — провал в смысле #477, его причина требует разбора как у всякого другого;
+#
+# `timed_out` — ВКЛЮЧЁН, но ревизия #1184 (находка B) поправляет ЧЬЁ
+# обоснование это на самом деле: держать его ради worker.yml было НЕВЕРНО —
+# scheduler.reap_stalled_worker_run (scheduler.py, WORKER_STALL_MINUTES=295)
+# отменяет ТОЛЬКО зависшие (тишина сессии ≥ WORKER_SILENCE_MINUTES ИЛИ
+# задача не коррелирована и возраст ≥ WORKER_STALL_MINUTES) in_progress-
+# прогоны — GitHub присваивает им conclusion=cancelled, не timed_out.
+# Живой по сессии harness-<N> прогон (сессия растёт, markers пишутся) рипер
+# по дизайну #1089 НЕ трогает: возрастной потолок для него НЕ применяется,
+# он идёт до жёсткой стены GitHub — timeout-minutes=340 job'а worker.yml —
+# и получает conclusion=timed_out. Путь структурно открыт, просто замер по
+# репозиторию (0 из последних 100 worker.yml и 0 по всему репо) показывает:
+# «сегодня не наблюдается», а не «физически не может».
+# `timed_out` живой не ради worker.yml, а ради ОСТАЛЬНЫХ шести
+# WATCHED_WORKFLOWS — ни у одного нет своего рипера: hands.yml
+# (timeout-minutes=70), orchestra.yml/deploy-worker.yml/
+# conflict-mechanical-rebase.yml (свой job-level timeout не задан — действует
+# дефолт GitHub 360), deploy-dsh-edge.yml (30), plugin-forge.yml (10/30) —
+# для них зависший job РЕАЛЬНО доходит до собственного капа и получает
+# conclusion=timed_out, разбор нужен как у всякого другого провала (#477).
+# Убирать значение из кортежа значило бы ослепить failure_watch именно на
+# этих шести воркфлоу ради одного, у которого класс и так закрыт иначе (см.
+# ниже) — тот же класс #1172 наоборот: снятие достижимого условия из-за
+# одного недостижимого частного случая.
+#
+# Зависание САМОГО worker.yml: рипер отменяет прогон и оставляет комментарий
+# на арендованной задаче («♻️ Прогон worker.yml (run …) завис … — оркестратор
+# счёл его зависшим, отменил …») и строку «🧟 worker run … завис» в отчёте
+# пульса (scheduler.py::reap_stalled_worker_run). У этой строки СЕГОДНЯ нет
+# автоматического читателя: stall_detector.extract_signals разбирает только
+# префиксы ⚠️/🚨 и пять специфичных шаблонов («красные проверки:», «без
+# вердикта AI», «♻️ #N просрочена», два архивных, «конвейер на паузе») —
+# 🧟-строка ни под один не подходит и молча отбрасывается (проверено на
+# дословной прод-форме обеих 🧟-строк выше), эскалации при повторении НЕТ.
+# Единственный сохранённый след — разовый комментарий на задаче; подключение
+# этой строки к stall_detector — отдельная задача #1224 (масштаб «отдельно»,
+# не этот PR).
+#
 # `cancelled` здесь НЕТ (в FAILURE_CONCLUSIONS есть): отмена — осознанное
 # действие человека или автоматики, а не сигнал о дефекте/инфраструктуре,
-# разбор отменённого прогона заводил бы задачи на нормальную работу конвейера.
+# разбор отменённого прогона заводил бы задачи на нормальную работу конвейера
+# (в т.ч. на штатную отмену рипером worker.yml выше — она уже видна другим
+# каналом, второй сигнал по ней не заводим).
 FAILURE_WATCH_RUN_CONCLUSIONS = ("failure", "timed_out")
 
 # Потолок разобранных упавших job'ов на один красный прогон (находка ревью PR
@@ -505,8 +589,11 @@ FAILURE_WATCH_MAX_JOBS_PER_RUN = 3
 # считается БЕЗОТНОСИТЕЛЬНО окна свежести: это просто N новейших завершённых.
 # 100, а не 20: worker.yml при WIP_LIMIT=12 и пульсе каждые 15 минут даёт
 # 20+ завершённых за несколько часов, а провал с самым старым created_at —
-# timed_out (прогон, убитый капом timeout-minutes: 340, #1067, поставлен в очередь
-# ЗА ЧАСЫ до провала) — вытеснялся бы за страницу 20 молча: ни задачи, ни
+# долгий прогон, поставленный в очередь ЗА ЧАСЫ до провала (у worker.yml
+# зависший прогон рипер отменяет до стены → cancelled; живой по сессии
+# доживает до timeout-minutes=340 → timed_out, но такого замером не
+# наблюдалось; у остальных WATCHED_WORKFLOWS без рипера это может быть и
+# timed_out) — вытеснялся бы за страницу 20 молча: ни задачи, ни
 # наблюдения, пока не выйдет из окна. Прецедент одной страницы 100 в этом же
 # файле — heartbeat_check/real_orchestra_ticks; цена та же, один запрос на
 # workflow.
@@ -970,6 +1057,61 @@ def orchestra_tick_runs(repo: str, per_page: int = 100) -> list[dict]:
     return real_orchestra_ticks(runs)
 
 
+# ── Живая сверка окон с измеренным тактом пульса (ревизия #1184, находка C) ───
+# HEARTBEAT_MAX_AGE_MINUTES и FAILURE_WATCH_WINDOW_MINUTES выше (и
+# repo_invariants.WIP_GATE_FALSE_ZERO_WINDOW_MINUTES — та же каденция orchestra,
+# тот же замер) откалиброваны срезом 2026-09-13/14: медиана 20.2, максимум
+# 25.0 мин. Срез статичен, такт дрейфует: занятая concurrency-группа ТЕРЯЕТ
+# тик (не копит), доставка schedule — единицы процентов, интенсивность
+# PR-шторма меняет диспатч-канал. heartbeat_check каждый пульс и так держит
+# свежую страницу настоящих тиков — из ТЕХ ЖЕ данных (ноль дополнительных
+# запросов) пересчитывается наблюдаемый максимум промежутка; когда он доходит
+# до самого тугого окна, замер протух и окна надо пересчитывать, пока провалы
+# не начали выпадать из окон молча. Префикс строки — нарочно ⏱️, НЕ ⚠️/🚨:
+# дрейф калибровки — наблюдение для пересчёта констант, не симптом простоя,
+# который stall_detector.extract_signals автозаводит по ⚠️/🚨-строкам отчёта.
+TICK_CADENCE_MIN_GAPS = 5
+# Промежутки больше суток — конвейер простаивал ЦЕЛИКОМ (выходные без
+# диспатчей, пауза маркером, отключённый workflow), а не «такт вырос»:
+# каденцию они не измеряют, из замера исключаются с названной причиной.
+TICK_CADENCE_EXCLUDE_GAP_MINUTES = 24 * 60
+
+
+def tick_cadence_observation(runs: list[dict]) -> str | None:
+    """Наблюдение о дрейфе такта пульса или None. `runs` — выход
+    orchestra_tick_runs (настоящие тики schedule/workflow_dispatch, отсортированы
+    по свежести) — данные, которые heartbeat_check и так скачала; сеть не
+    трогается, решение чистое.
+
+    Три исхода, не два (issue #1096):
+    - свежих промежутков меньше TICK_CADENCE_MIN_GAPS (все тики давние либо
+      промежутки за суточным потолком) — ⏱️-строка «оценить нельзя», не
+      молчаливый None: неспособность увидеть дрейф не есть его отсутствие
+      (AGENTS.md, «Алерт не гадает»);
+    - максимум свежих промежутков < самого тугого окна (FAILURE_WATCH_
+      WINDOW_MINUTES; HEARTBEAT_MAX_AGE_MINUTES вдвое свободнее) — None:
+      здоровое состояние не печатается, чтобы не шуметь на каждый пульс;
+    - максимум дошёл до окна — ⏱️-строка с числами и названным протухшим
+      замером."""
+    times = sorted(parse_time(run["created_at"]) for run in runs)
+    gaps = [(later - earlier).total_seconds() / 60.0
+            for earlier, later in zip(times, times[1:])]
+    fresh = [gap for gap in gaps if gap < TICK_CADENCE_EXCLUDE_GAP_MINUTES]
+    excluded = len(gaps) - len(fresh)
+    if len(fresh) < TICK_CADENCE_MIN_GAPS:
+        return (f"⏱️ такт пульса не оценён: {len(fresh)} свежих промежутков "
+                f"(нужно {TICK_CADENCE_MIN_GAPS}); исключено {excluded} длиннее суток "
+                "(конвейер простаивал целиком — каденцию это не измеряет)")
+    worst = max(fresh)
+    tightest = min(HEARTBEAT_MAX_AGE_MINUTES, FAILURE_WATCH_WINDOW_MINUTES)
+    if worst < tightest:
+        return None
+    return (f"⏱️ такт пульса дрейфовал: максимальный промежуток между тиками "
+            f"{worst:.1f} мин ≥ самого тугого окна {tightest} мин "
+            "(FAILURE_WATCH_WINDOW_MINUTES/HEARTBEAT_MAX_AGE_MINUTES) — замер "
+            "#1184 (медиана 20.2, максимум 25.0) протух, окна пересчитать")
+
+
 def heartbeat_age_minutes(last_success_at: str | datetime, now: datetime) -> float:
     if isinstance(last_success_at, str):
         last_success_at = parse_time(last_success_at)
@@ -1068,7 +1210,7 @@ def heartbeat_alert_text(age_minutes: float, run: dict | None) -> str:
         f"🚨 edge-harness: {HEARTBEAT_MARKER}\n"
         f"Пульсы orchestra пропадали: последний успешный прогон "
         f"{int(age_minutes)} мин назад (порог {HEARTBEAT_MAX_AGE_MINUTES} = "
-        "3 интервала по 15 мин). Этот прогон опоздал — кричу, пока жив.\n"
+        "3 медианных такта пульса, замер #1184). Этот прогон опоздал — кричу, пока жив.\n"
         "Частые причины: расписание отключено после 60 дней без активности "
         "(docs/research/21-github-actions.md), красные прогоны — см. Actions и почту. "
         "Полный охват мёртвого пульса даст только внешний монитор (не подтверждено, отложено)."
@@ -1120,10 +1262,19 @@ def merge_telegram_text(repo: str, pr_number: int, task_number: int, task_title:
 # ── IO-обвязка: чтение прогонов, сигналы, след в задаче ──────────────────────────
 
 
-def recent_runs(repo: str, workflow: str, per_page: int = 10, event: str | None = None) -> list[dict]:
+def recent_runs(
+    repo: str, workflow: str, per_page: int = 10, event: str | None = None,
+    page: int | None = None,
+) -> list[dict]:
+    """`page` — номер страницы GitHub-пагинации (1-based), None — как раньше
+    (первая страница, параметр вообще не передаётся). Нужен только вызывающим
+    с окном шире одной страницы (last_worker_run с `since=`, issue #1274) —
+    остальные вызовы этот параметр не передают, поведение не меняется."""
     query = f"per_page={per_page}"
     if event:
         query += f"&event={event}"
+    if page is not None:
+        query += f"&page={page}"
     payload = gh(
         f"repos/{repo}/actions/workflows/{workflow}/runs?{query}"
     ) or {}
@@ -1407,9 +1558,36 @@ def _marker_present(marker: str, body: str) -> bool:
     return re.search(pattern, body) is not None
 
 
+def comment_is_job_authored(comment: dict) -> bool:
+    """True — комментарий опубликован токеном job'а (`performed_via_github_app`
+    непустой), не личным PAT (issue #1242, доводка #1101/#1074, AGENTS.md
+    «Атрибуция событий»: различение по ТОКЕНУ, не по логину/личности автора —
+    тот же приём, что уже использует `repo_invariants.
+    check_pipeline_status_marker_impersonation`, инвариант 18).
+
+    Почему не логин: `trusted_login` (см. ниже) сравнивает `user.login` с
+    заданной строкой — работает, ПОКА единственный легитимный писатель
+    аутентифицируется штатным `GITHUB_TOKEN` (тогда `user.login ==
+    "github-actions[bot]"`). Но это НАДО знать заранее про каждого
+    конкретного писателя; сам REST-ответ несёт более прямой признак —
+    `performed_via_github_app` пусто ИМЕННО когда запрос ушёл под личным PAT,
+    независимо от того, где физически исполнялся код (внутри Actions или
+    локально: PAT остаётся PAT). Живые прод-формы (`gh api repos/mytab0r/
+    edge-harness/issues/120/comments`, 2026-09-14, issuecomment-5665006692 vs
+    issuecomment-5665003751):
+      честный маркер:  {"performed_via_github_app": {"slug": "github-actions", ...},
+                         "user": {"login": "github-actions[bot]", "type": "Bot"}}
+      поддельный:      {"performed_via_github_app": None,
+                         "user": {"login": "mytab0r", "type": "User"}}
+    Замер того же дня по всей истории #120 (1137 комментариев,
+    `--paginate`): 907 с `performed_via_github_app.slug == "github-actions"`,
+    230 с `None` — split ровно по семейству токена, без промежуточных форм."""
+    return comment.get("performed_via_github_app") is not None
+
+
 def issue_marker_times(
     repo: str, issue_number: int, marker: str, max_pages: int | None = None, *,
-    trusted_login: str | None = None,
+    trusted_login: str | None = None, require_job_token: bool = False,
 ) -> list[datetime]:
     """`trusted_login` (#1027, живой случай watchdog-issue #120 2026-09-12) —
     фильтр по логину АВТОРА комментария, не по факту «человек/агент»
@@ -1433,6 +1611,25 @@ def issue_marker_times(
     что и настоящий CI-тик — вызывающий, которому нужна гарантия «это
     записал именно job», обязан передать `trusted_login=EVENT_ACTOR_LOGIN`.
 
+    `require_job_token` (#1242) — второй, независимый фильтр: `True` требует
+    `comment_is_job_authored(comment)` вдобавок к (или вместо) `trusted_login`.
+    Нужен там, где `trusted_login` неудобен/недостаточен (писатель может
+    сменить способ аутентификации без изменения кода читателя) — эквивалент
+    по духу, но проверяет ТОКЕН публикации напрямую, а не имя, под которым
+    этот токен представляется. Оба фильтра можно комбинировать; по умолчанию
+    (`False`) поведение не меняется.
+
+    Живое доказательство пробела, который закрывает этот параметр: `#1074`
+    (2026-09-13) закрыл лазейку внутри `pulse_guard.gh()` — но это фикс в
+    коде ПИСАТЕЛЯ, а не в коде читателя. Любой прогон `scheduler.py` из
+    checkout'а СТАРШЕ этого коммита (чужая ветка/рабочее дерево, забытый
+    фоновой процесс) фикса не видит и продолжает писать тем же путём; прямой
+    `gh api`/веб-форма личным PAT фикс писателя не покрывает вовсе. Три
+    поддельных маркера легли в #120 2026-09-14, ПОСЛЕ #1074/#1101
+    (issuecomment-5663451458/5664955727/5665003751) — читатель, не зависящий
+    от версии кода писателя, единственная защита, устойчивая к обоим этим
+    случаям.
+
     `max_pages` — ограничить обход первыми N СВЕЖИМИ страницами (None — вся
     история), проброшен в `all_issue_comments` (#607): стоимость одного тика
     читателя не должна расти с историей задачи."""
@@ -1442,12 +1639,14 @@ def issue_marker_times(
         for comment in payload
         if _marker_present(marker, comment.get("body") or "")
         and (trusted_login is None or (comment.get("user") or {}).get("login") == trusted_login)
+        and (not require_job_token or comment_is_job_authored(comment))
     ]
 
 
 def issue_markers_any(
     repo: str, issue_number: int, markers: tuple[str, ...],
     max_pages: int | None = None, *, trusted_login: str | None = None,
+    require_job_token: bool = False,
 ) -> list[tuple[datetime, str]]:
     """Как issue_marker_times, но для нескольких маркеров сразу и с телом
     комментария — нужно там, где решение зависит не только от факта маркера,
@@ -1458,11 +1657,14 @@ def issue_markers_any(
 
     `trusted_login` — тот же фильтр по токену-автору, что у issue_marker_times
     (#1027), тем же способом (`None` не меняет поведение существующих
-    вызывающих)."""
+    вызывающих). `require_job_token` (#1242) — второй, независимый фильтр по
+    `performed_via_github_app`, см. docstring issue_marker_times."""
     payload = all_issue_comments(repo, issue_number, max_pages=max_pages)
     result = []
     for comment in payload:
         if trusted_login is not None and (comment.get("user") or {}).get("login") != trusted_login:
+            continue
+        if require_job_token and not comment_is_job_authored(comment):
             continue
         body = comment.get("body") or ""
         if any(_marker_present(marker, body) for marker in markers):
@@ -1673,6 +1875,10 @@ def heartbeat_check(repo: str, now: datetime) -> list[str]:
     тратится на `pull_request`-прогоны `contract`, так что труncация страницы
     настоящими тиками (найдено ревью PR #318) больше не молчит."""
     runs = orchestra_tick_runs(repo, per_page=100)
+    # Живая сверка окон с тактом (ревизия #1184) — из тех же данных, ноль
+    # дополнительных запросов; строка ⏱️ (дрейф/неоценённость) добавляется к
+    # любому исходу ниже, None (здорово) не печатается вовсе.
+    cadence_line = tick_cadence_observation(runs)
     last_ok = next((r for r in runs if r.get("conclusion") == "success"), None)
     if last_ok is None:
         # Пустой результат ПОСЛЕ серверного фильтра — не «выборка коротка»
@@ -1727,8 +1933,9 @@ def heartbeat_check(repo: str, now: datetime) -> list[str]:
         print(f"::warning::закрытие эпизода в #{WATCHDOG_ISSUE} не оставлено: {error}", file=sys.stderr)
     age = heartbeat_age_minutes(last_ok["created_at"], now)
     if decide_heartbeat(last_ok["created_at"], now) == "ok":
-        return [f"💗 пульс orchestra в норме: последний успех {int(age)} мин назад "
-                f"(порог {HEARTBEAT_MAX_AGE_MINUTES})"]
+        healthy = [f"💗 пульс orchestra в норме: последний успех {int(age)} мин назад "
+                   f"(порог {HEARTBEAT_MAX_AGE_MINUTES})"]
+        return healthy + ([cadence_line] if cadence_line else [])
     text = heartbeat_alert_text(age, last_ok)
     delivered = send_telegram(text)
     # posted/attempted — тот же класс, что и в ветке HEARTBEAT_NO_TICKS выше
@@ -1748,9 +1955,10 @@ def heartbeat_check(repo: str, now: datetime) -> list[str]:
     except RuntimeError as error:
         print(f"::warning::след в #{WATCHDOG_ISSUE} не оставлен: {error}", file=sys.stderr)
     trace = "оставлен" if posted else ("НЕ оставлен" if attempted else "не требовался — эпизод не новый")
-    return [f"🚨 пульс orchestra пропадал: последний успех {int(age)} мин назад "
-            f"> {HEARTBEAT_MAX_AGE_MINUTES} (Telegram: "
-            f"{'доставлен' if delivered else 'НЕ доставлен'}; след в #{WATCHDOG_ISSUE}: {trace})"]
+    stale_lines = [f"🚨 пульс orchestra пропадал: последний успех {int(age)} мин назад "
+                   f"> {HEARTBEAT_MAX_AGE_MINUTES} (Telegram: "
+                   f"{'доставлен' if delivered else 'НЕ доставлен'}; след в #{WATCHDOG_ISSUE}: {trace})"]
+    return stale_lines + ([cadence_line] if cadence_line else [])
 
 
 def decide_independent_pulse(
@@ -1901,6 +2109,16 @@ def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], list[str], bool]
     маркер паузы/пробы, не может этот маркер снять — предохранитель стоит,
     пока не истечёт backoff, хотя причина уже давно чинилась.
 
+    `require_job_token=True` в чтении маркеров (#1242, доводка #1101/#1074):
+    без него поддельный RESUME_MARKER, оставленный НЕ токеном job'а (личный
+    PAT — локальный прогон устаревшего checkout'а или прямой `gh api`, см.
+    docstring issue_marker_times), читался бы этой функцией как настоящий
+    сброс серии — «виртуальный success» снял бы паузу и разрешил диспатч,
+    хотя причина серии красных прогонов не чинилась вовсе. Тот же класс,
+    что #1027 уже закрыл для WIP-гейта (scheduler.wip_gate) — здесь
+    закрывается для предохранителя конвейера, который ЭТИМ маркером и
+    управляет напрямую.
+
     Ещё идущий прогон (conclusion=None) на голове списка при активной серии —
     отдельный класс (#899, п.2), не по этой же причине: судить, что делать
     ДАЛЬШЕ (новая проба, новый маркер), по прогону, чей исход ещё не известен,
@@ -1911,7 +2129,8 @@ def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], list[str], bool]
     last_ok = next((r for r in runs if r.get("conclusion") == "success"), None)
     last_ok_at = parse_time(last_ok["updated_at"]) if last_ok else None
     try:
-        all_markers = issue_markers_any(repo, WATCHDOG_ISSUE, (PAUSE_MARKER, RESUME_MARKER))
+        all_markers = issue_markers_any(
+            repo, WATCHDOG_ISSUE, (PAUSE_MARKER, RESUME_MARKER), require_job_token=True)
     except RuntimeError as error:
         if decide_dispatch(failures):
             return ([f"🟢 серия красных worker.yml: {failures} "
@@ -1995,7 +2214,16 @@ def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], list[str], bool]
                 f"диспатч остановлен, следующая проба не раньше чем через "
                 f"{int(remaining)} мин (маркер серии #{WATCHDOG_ISSUE} уже стоит)")
         try:
-            reminder_times = issue_marker_times(repo, WATCHDOG_ISSUE, PAUSE_REMINDER_MARKER)
+            # require_job_token=True (#1242, находка ai-review того же PR, что
+            # добавил фильтр на серийные маркеры выше): поддельное «пауза
+            # продолжается» (не токен job'а) сдвигало бы last_signal_at вперёд
+            # и молча давило напоминание о длящейся паузе (#899, п.4) на
+            # очередной интервал PAUSE_REMINDER_INTERVAL_MINUTES — чужеродный
+            # маркер подавлял бы алерт. Писатель этого маркера — сам
+            # conveyor_gate через pulse_guard.gh() (#1074), т.е. честное
+            # напоминание всегда несёт токен job'а и фильтр проходит.
+            reminder_times = issue_marker_times(
+                repo, WATCHDOG_ISSUE, PAUSE_REMINDER_MARKER, require_job_token=True)
         except RuntimeError as error:
             print(f"::warning::напоминания #{WATCHDOG_ISSUE} не прочитаны: {error}", file=sys.stderr)
             reminder_times = []
@@ -2389,7 +2617,7 @@ def failure_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
                 # Дедуп комментария по КЛАССУ (тот же приём, что
                 # stall_detector._evidence_marker/issue_marker_times, находка
                 # PR #248): свежий провал остаётся в окне FAILURE_WATCH_WINDOW_MINUTES
-                # несколько пульсов подряд (пульс — раз в 15 мин, окно — 30) — без
+                # несколько пульсов подряд (пульс — такт 20-25 мин, окно 40) — без
                 # этой проверки КАЖДЫЙ пульс писал бы БАЙТ-В-БАЙТ одинаковый
                 # комментарий на #578 (находка ревью PR #612: три пульса одного
                 # прогона на моках дали два дубля). ci_fingerprints выше не

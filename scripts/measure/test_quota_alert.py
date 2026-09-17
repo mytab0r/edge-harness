@@ -769,6 +769,82 @@ def test_reproduction_1100_trend_fires_before_exhaustion(monkeypatch):
     assert len(escalated) == 1
     assert "приближается к пределу" in escalated[0][0]
 
+
+def test_trend_horizon_catches_1100_incident_before_exhaustion(monkeypatch):
+    """Ai-review PR #1185, находка 1: комментарий у `TREND_HORIZON_MINUTES`
+    (quota_alert.py) ссылался на тест с этим именем, которого не существовало
+    — единственная гвардия числа (`test_trend_horizon_matches_check_interval`)
+    была снята ревизией #1184 вместе со связкой с `MEASUREMENT_STALE_MINUTES`.
+    Ближайший тест-сосед (`test_reproduction_1100_trend_fires_before_
+    exhaustion`) сэмплирует тиком `CHECK_INTERVAL_MINUTES=15` — детектор
+    бакетируется по 15-минутным точкам, и сдвиг `TREND_HORIZON_MINUTES` в
+    пределах одного тика (проверено мутацией: 45→40 и 45→50) остаётся
+    зелёным. Этот тест — та же реконструкция инцидента #1100 (та же скорость,
+    калиброванная по двум документированным точкам issue #1100: 6.1% в
+    07:03Z → 100% в 08:26Z), но тиком в 1 минуту — читает `qa.
+    TREND_HORIZON_MINUTES` напрямую (не литерал) и ловит дрейф константы с
+    точностью до минуты.
+
+    Доказательство мутацией: `TREND_HORIZON_MINUTES` 45→40 или 45→50 красит
+    этот тест (см. git-историю ревью PR #1185), 15-минутный тест-сосед
+    остаётся зелёным на тех же мутациях."""
+    T0 = datetime(2026, 9, 13, 7, 3, 0, tzinfo=timezone.utc)
+    EXHAUSTION = datetime(2026, 9, 13, 8, 26, 0, tzinfo=timezone.utc)
+    FIRST_FAILURE = datetime(2026, 9, 13, 8, 19, 0, tzinfo=timezone.utc)
+    LIMIT = 1000.0
+    START_PCT = 6.1
+    total_minutes = (EXHAUSTION - T0).total_seconds() / 60.0
+    rate_real = (100.0 - START_PCT) / total_minutes  # та же калибровка, что у соседнего теста
+
+    def pct_at(t):
+        minutes = (t - T0).total_seconds() / 60.0
+        return round(min(START_PCT + rate_real * minutes, 100.0), 2)
+
+    carrier = {"reading": None, "state": (None, None)}
+    escalated = []
+
+    monkeypatch.setattr(qa, "last_reading", lambda repo, key: carrier["reading"])
+    monkeypatch.setattr(qa, "last_state", lambda repo, key: carrier["state"])
+    monkeypatch.setattr(qa, "record_reading",
+                         lambda repo, key, pct, when, cid: carrier.__setitem__("reading", (pct, when, 1)))
+    monkeypatch.setattr(qa.pulse_guard, "post_issue_comment", lambda *a: None)
+    monkeypatch.setattr(qa.pulse_guard, "escalate",
+                         lambda repo, issue, text: escalated.append((text,)) or "Telegram: доставлен; след в #120: оставлен")
+    monkeypatch.setattr(qa, "create_or_note_task", lambda *a: (0, "не должно вызываться в approaching"))
+
+    fired_at = None
+    t = T0
+    tick = timedelta(minutes=1)  # разрешение теста, НЕ прод-каденция (см. докстринг)
+    while t <= EXHAUSTION:
+        pct = pct_at(t)
+        current = round(LIMIT * pct / 100.0)
+        result = qa.check_and_alert(REPO, "gh_rest_rate_limit_hour",
+                                     "GitHub REST rate limit (PAT/GITHUB_TOKEN)",
+                                     current, LIMIT, pct, threshold=80.0, now=t)
+        if "approaching —" in result:
+            fired_at = t
+            break
+        if "первое наблюдение" in result or "без изменений" in result:
+            carrier["state"] = (qa.STATE_OK, None)
+        t += tick
+
+    assert fired_at is not None, "тренд обязан был сработать до достижения EXHAUSTION"
+    minutes_before_exhaustion = (EXHAUSTION - fired_at).total_seconds() / 60.0
+    minutes_before_first_failure = (FIRST_FAILURE - fired_at).total_seconds() / 60.0
+    assert minutes_before_exhaustion > 0, "сигнал обязан прийти ДО исчерпания"
+    assert minutes_before_first_failure > 0, "сигнал обязан прийти ДО первого реального отказа оркестратора"
+    # Фиксированные ожидания (не выведенные из qa.TREND_HORIZON_MINUTES), тик
+    # теста 1 минута даёт другой момент срабатывания, чем у 15-минутного
+    # соседа (07:24, не 07:33). Проверено мутацией (45→40/46/50): этот тест
+    # краснеет, 15-минутный сосед на тех же значениях остаётся зелёным —
+    # не идеальная минутная точность в обе стороны (округление pct до двух
+    # знаков даёт асимметрию на -1), но на порядок точнее прежних 15 минут.
+    assert minutes_before_exhaustion == pytest.approx(62.0, abs=1.0)
+    assert minutes_before_first_failure == pytest.approx(55.0, abs=1.0)
+    assert len(escalated) == 1
+    assert "приближается к пределу" in escalated[0][0]
+
+
 def test_create_task_mixed_candidates_prefers_same_resource(monkeypatch):
     """Среди похожих кандидатов есть задача ТОГО ЖЕ ресурса — улика уходит
     в неё (вторая задача не заводится), задача другого ресурса игнорируется."""

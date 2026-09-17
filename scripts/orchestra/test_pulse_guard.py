@@ -11,6 +11,7 @@ conveyor_gate/heartbeat_check проверяется на моке gh — сет
 import importlib.util
 import json
 import re
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -50,6 +51,25 @@ def run(conclusion, created_at="2026-08-31T10:00:00Z", run_id=1, title="worker r
     if actor is not None:
         payload["triggering_actor"] = {"login": actor}
     return payload
+
+
+# Прод-форма поля `performed_via_github_app` честного маркера (#1242, снято
+# живьём `gh api repos/mytab0r/edge-harness/issues/120/comments`,
+# issuecomment-5665006692, 2026-09-14) — фикстуры conveyor_gate несут его на
+# комментариях, которые тест играет как НАСТОЯЩИЙ маркер job'а (require_
+# job_token=True теперь фильтрует чтение PAUSE/RESUME по этому полю, см.
+# pulse_guard.comment_is_job_authored). Поддельный маркер (тест на пробел,
+# который этот параметр закрывает) — этого поля НЕ несёт, см.
+# test_gate_ignores_fake_resume_marker_without_job_token ниже.
+JOB_APP = {"slug": "github-actions"}
+
+
+def job_comment(created_at: str, body: str) -> dict:
+    """Комментарий #120 в прод-форме ОТ ТОКЕНА JOB'А — обёртка вокруг
+    голого dict-литерала (используемого остальными, не security-критичными
+    тестами файла), чтобы conveyor_gate/require_job_token видели маркер как
+    легитимный, не как чужеродную подделку."""
+    return {"created_at": created_at, "body": body, "performed_via_github_app": JOB_APP}
 
 
 # ── Серия красных: подсчёт подряд ────────────────────────────────────────────────
@@ -124,9 +144,53 @@ def test_decide_heartbeat_within_threshold():
 
 
 def test_decide_heartbeat_stale_beyond_three_intervals():
-    # 46 минут > 45 = 3 интервала по 15 — пульсы пропадали
-    assert pg.decide_heartbeat("2026-08-31T11:00:00Z", utc(2026, 8, 31, 11, 46)) == "stale"
-    assert pg.decide_heartbeat(utc(2026, 8, 31, 10, 0), utc(2026, 8, 31, 11, 0)) == "stale"
+    # Ревизия #1184: порог от ИЗМЕРЕННОГО такта (медиана 20.2, максимум 25.0),
+    # не от cron: 60 = 3× медианного такта. 61 минута > 60 — пульсы пропадали;
+    # ровно 60 — ещё ok (порог строгий сверху), 46 минут — уже не достаточно
+    # для «пропадал» при такте 20-25 мин (один-два пропущенных такта — норма).
+    assert pg.decide_heartbeat("2026-08-31T11:00:00Z", utc(2026, 8, 31, 12, 1)) == "stale"
+    assert pg.decide_heartbeat(utc(2026, 8, 31, 10, 0), utc(2026, 8, 31, 11, 0)) == "ok"
+    assert pg.decide_heartbeat(utc(2026, 8, 31, 10, 0), utc(2026, 8, 31, 11, 1)) == "stale"
+
+
+def test_tick_cadence_observation_healthy_max_gap_below_tightest_window():
+    # Здоровая каденция (максимальный промежуток 20 мин < тугого окна 40) —
+    # None: здоровое состояние не печатается, чтобы не шуметь на каждый пульс.
+    times = ["2026-09-14T01:00:00Z", "2026-09-14T01:20:00Z", "2026-09-14T01:40:00Z",
+             "2026-09-14T02:00:00Z", "2026-09-14T02:20:00Z", "2026-09-14T02:40:00Z"]
+    assert pg.tick_cadence_observation([{"created_at": t} for t in times]) is None
+
+
+def test_tick_cadence_observation_drift_reaching_tightest_window_names_numbers():
+    # Дрейф: промежуток 40+ мин между тиками — замер #1184 протух, строка
+    # называет наблюдаемый максимум и тугое окно, а не общее «что-то не так».
+    times = ["2026-09-14T01:00:00Z", "2026-09-14T01:20:00Z", "2026-09-14T01:40:00Z",
+             "2026-09-14T02:00:00Z", "2026-09-14T02:20:00Z", "2026-09-14T03:05:00Z"]
+    line = pg.tick_cadence_observation([{"created_at": t} for t in times])
+    assert line is not None and line.startswith("⏱️")
+    assert "45.0" in line and "40" in line  # максимум 45.0; тугое окно 40
+    assert "протух" in line
+
+
+def test_tick_cadence_observation_insufficient_data_is_loud_not_silent():
+    # issue #1096: меньше TICK_CADENCE_MIN_GAPS свежих промежутков — ⏱️-строка
+    # «оценить нельзя», не молчаливый None (неспособность увидеть дрейф не
+    # есть его отсутствие).
+    two_runs = [{"created_at": "2026-09-14T01:00:00Z"},
+                {"created_at": "2026-09-14T01:20:00Z"}]
+    line = pg.tick_cadence_observation(two_runs)
+    assert line is not None and "не оценён" in line
+
+
+def test_tick_cadence_observation_excludes_daylong_gaps_with_named_reason():
+    # Суточный простой (выходные/пауза) — не «такт вырос»: исключается из
+    # замера, число исключённых названо в строке, если данных после этого
+    # хватает, решение принимается по свежим промежуткам.
+    times = ["2026-09-13T10:00:00Z", "2026-09-13T10:20:00Z", "2026-09-13T10:40:00Z",
+             "2026-09-13T11:00:00Z", "2026-09-13T11:20:00Z", "2026-09-13T11:40:00Z",
+             "2026-09-14T12:40:00Z"]  # 25 ч простоя, потом каденция вернулась
+    line = pg.tick_cadence_observation([{"created_at": t} for t in times])
+    assert line is None  # свежие промежутки по 20 мин — здорова; простой исключён
 
 
 # ── Тексты сигналов: маркеры, улики, путь возобновления ──────────────────────────
@@ -707,7 +771,7 @@ def test_gate_blocks_dispatch_after_streak_and_notifies_once(monkeypatch):
     # второй пульс той же серии: молчит (не спамит), диспатч всё ещё закрыт
     # (формат ответа issues/{N}/comments — голый массив, как у GitHub API)
     fake.routes["issues/120/comments"] = [
-        {"created_at": "2026-08-31T11:59:00Z", "body": f"x {pg.PAUSE_MARKER}"}]
+        job_comment("2026-08-31T11:59:00Z", f"x {pg.PAUSE_MARKER}")]
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: posted.append("spam"))
     monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append("spam") or True)
     _, _, allowed2 = pg.conveyor_gate("mytab0r/edge-harness", NOW)
@@ -719,7 +783,10 @@ def test_gate_allows_dispatch_when_series_reset_by_success(monkeypatch):
     fake = FakeGh({
         "workflows/worker.yml/runs": RECENT_OK,
         "issues/120/comments": [
-            {"created_at": "2026-08-31T10:00:00Z", "body": pg.PAUSE_MARKER}],
+            # Честный маркер (токен job'а, #1242): серия реально была, успех
+            # снимает её — тест проверяет ИМЕННО сброс успехом, а не то, что
+            # фильтр спрятал подделку (замечание ai-review #1242).
+            job_comment("2026-08-31T10:00:00Z", pg.PAUSE_MARKER)],
     })
     monkeypatch.setattr(pg, "gh", fake)
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
@@ -816,13 +883,41 @@ def test_heartbeat_ok_is_quiet_and_stale_cries(monkeypatch):
     lines = pg.heartbeat_check("mytab0r/edge-harness", utc(2026, 8, 31, 12, 0))
     assert sent == [] and any("в норме" in line for line in lines)
 
-    # последний успех 60 мин назад (порог 45) — опоздавший запуск кричит
+    # последний успех 61 мин назад (порог 60 = 3 медианных такта, #1184) —
+    # опоздавший запуск кричит
     fake.routes["workflows/orchestra.yml/runs"] = {
         "workflow_runs": [run("failure", "2026-08-31T11:59:00Z", 6),
                           run("success", "2026-08-31T11:00:00Z", 5)]}
     lines = pg.heartbeat_check("mytab0r/edge-harness", utc(2026, 8, 31, 12, 1))
     assert len(sent) == 1 and "пропадал" in sent[0]
     assert any("пропадал" in line for line in lines)
+
+
+def test_heartbeat_check_carries_live_cadence_observation(monkeypatch):
+    # Ревизия #1184: heartbeat_check уже владеет страницей тиков — из ТЕХ ЖЕ
+    # данных (ноль лишних запросов) сверяет окна с живым тактом. Здоровая
+    # плотность (пять промежутков по 20 мин < тугого окна 40) — ⏱️-строки в
+    # отчёте нет (здоровье не шумит); тиков меньше TICK_CADENCE_MIN_GAPS —
+    # строка «не оценён» обязана появиться: неспособность увидеть дрейф не
+    # есть его отсутствие (issue #1096, три исхода).
+    def check_with(runs, now):
+        fake = FakeGh({"workflows/orchestra.yml/runs": {"workflow_runs": runs},
+                       "issues/120/comments": []})
+        monkeypatch.setattr(pg, "gh", fake)
+        monkeypatch.setattr(pg, "send_telegram", lambda text: True)
+        monkeypatch.setattr(pg, "post_issue_comment", lambda *a: None)
+        return pg.heartbeat_check("mytab0r/edge-harness", now)
+
+    healthy = [run("success", f"2026-08-31T{10 + i // 3}:{(i * 20) % 60:02d}:00Z", 5 + i)
+               for i in range(6)]  # тики каждые 20 мин: 10:00..12:20
+    lines = check_with(healthy, utc(2026, 8, 31, 12, 30))
+    assert any("в норме" in line for line in lines)
+    assert not any("⏱️" in line for line in lines)
+
+    lines = check_with([run("success", "2026-08-31T12:00:00Z", 5),
+                        run("success", "2026-08-31T12:20:00Z", 6)],
+                       utc(2026, 8, 31, 12, 30))
+    assert any("не оценён" in line and "⏱️" in line for line in lines)
 
 
 # ── #133: contract (pull_request) не маскирует пропавший пульс orchestra ────────
@@ -1268,7 +1363,7 @@ def test_gate_stays_open_before_backoff_then_probes_after(monkeypatch):
         "workflows/worker.yml/runs": RECENT_FAILURES,
         "runs/3/jobs": JOBS_PAYLOAD,
         "issues/120/comments": [
-            {"created_at": "2026-08-31T11:50:00Z", "body": pg.PAUSE_MARKER}],
+            job_comment("2026-08-31T11:50:00Z", pg.PAUSE_MARKER)],
     })
     monkeypatch.setattr(pg, "gh", fake)
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
@@ -1281,7 +1376,7 @@ def test_gate_stays_open_before_backoff_then_probes_after(monkeypatch):
 
     # ровно 15 минут прошло — выдержка истекла: ровно одна проба, диспатч разрешён
     fake.routes["issues/120/comments"] = [
-        {"created_at": "2026-08-31T11:45:00Z", "body": pg.PAUSE_MARKER}]
+        job_comment("2026-08-31T11:45:00Z", pg.PAUSE_MARKER)]
     posted, sent = [], []
     monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
     monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
@@ -1323,8 +1418,8 @@ def test_gate_probe_failure_grows_backoff_and_blocks_next_probe(monkeypatch):
         "workflows/worker.yml/runs": RECENT_FAILURES,
         "runs/3/jobs": JOBS_PAYLOAD,
         "issues/120/comments": [
-            {"created_at": "2026-08-31T11:45:00Z", "body": pg.PAUSE_MARKER},
-            {"created_at": "2026-08-31T11:46:00Z", "body": probe_body(1)}],
+            job_comment("2026-08-31T11:45:00Z", pg.PAUSE_MARKER),
+            job_comment("2026-08-31T11:46:00Z", probe_body(1))],
     })
     monkeypatch.setattr(pg, "gh", fake)
     # 14 минут с последней пробы (11:46 -> 12:00) — меньше выдержки попытки 2 (30 мин)
@@ -1340,8 +1435,8 @@ def test_gate_probe_failure_grows_backoff_and_blocks_next_probe(monkeypatch):
     # 20 минут с последней пробы были бы >= 15 и пропустили бы вторую пробу —
     # exp-выдержка (30 мин после первой красной пробы) обязана держать закрытым
     fake.routes["issues/120/comments"] = [
-        {"created_at": "2026-08-31T11:45:00Z", "body": pg.PAUSE_MARKER},
-        {"created_at": "2026-08-31T11:40:00Z", "body": probe_body(1)}]
+        job_comment("2026-08-31T11:45:00Z", pg.PAUSE_MARKER),
+        job_comment("2026-08-31T11:40:00Z", probe_body(1))]
     _, _, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)  # 20 минут прошло
     assert allowed is False  # exp-выдержка (30 мин) ещё не истекла
     broken_backoff_would_allow = pg.minutes_between(
@@ -1364,8 +1459,8 @@ def test_gate_in_progress_probe_does_not_falsely_reopen_dispatch(monkeypatch):
             run("failure", "2026-08-31T11:20:00Z", 1),
         ]},
         "issues/120/comments": [
-            {"created_at": "2026-08-31T11:45:00Z", "body": pg.PAUSE_MARKER},
-            {"created_at": "2026-08-31T11:46:00Z", "body": probe_body(1)}],
+            job_comment("2026-08-31T11:45:00Z", pg.PAUSE_MARKER),
+            job_comment("2026-08-31T11:46:00Z", probe_body(1))],
     })
     monkeypatch.setattr(pg, "gh", fake)
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
@@ -1393,7 +1488,7 @@ def test_gate_probe_rate_is_bounded_by_backoff_within_an_hour(monkeypatch):
     comments = []
 
     def fake_issue_comments(repo, n, text):
-        comments.append({"created_at": current_now[0].isoformat().replace("+00:00", "Z"), "body": text})
+        comments.append(job_comment(current_now[0].isoformat().replace("+00:00", "Z"), text))
 
     fake = FakeGh({
         "workflows/worker.yml/runs": RECENT_FAILURES,
@@ -1510,8 +1605,8 @@ def test_gate_does_not_stack_new_probe_while_previous_probe_still_running(monkey
             run("failure", "2026-08-31T09:45:00Z", 1),
         ]},
         "issues/120/comments": [
-            {"created_at": "2026-08-31T10:15:00Z", "body": pg.PAUSE_MARKER},
-            {"created_at": "2026-08-31T11:10:00Z", "body": probe_body(1)},
+            job_comment("2026-08-31T10:15:00Z", pg.PAUSE_MARKER),
+            job_comment("2026-08-31T11:10:00Z", probe_body(1)),
         ],
     })
     monkeypatch.setattr(pg, "gh", fake)
@@ -1550,7 +1645,7 @@ def test_gate_open_text_names_effective_failures_not_raw_zero(monkeypatch):
             run("failure", "2026-08-31T11:20:00Z", 1),
         ]},
         "issues/120/comments": [
-            {"created_at": "2026-08-31T11:50:00Z", "body": pg.PAUSE_MARKER},
+            job_comment("2026-08-31T11:50:00Z", pg.PAUSE_MARKER),
         ],
     })
     monkeypatch.setattr(pg, "gh", fake)
@@ -1608,8 +1703,8 @@ def test_gate_open_state_posts_throttled_reminder_after_interval(monkeypatch):
         "workflows/worker.yml/runs": RECENT_FAILURES,
         "runs/3/jobs": JOBS_PAYLOAD,
         "issues/120/comments": [
-            {"created_at": "2026-08-31T10:00:00Z", "body": pg.PAUSE_MARKER},
-            {"created_at": "2026-08-31T10:01:00Z", "body": probe_body(4)},
+            job_comment("2026-08-31T10:00:00Z", pg.PAUSE_MARKER),
+            job_comment("2026-08-31T10:01:00Z", probe_body(4)),
         ],
     })
     monkeypatch.setattr(pg, "gh", fake)
@@ -1631,11 +1726,58 @@ def test_gate_open_state_posts_throttled_reminder_after_interval(monkeypatch):
 
     # тот же пульс ещё раз почти сразу (напоминание уже отправлено) — тихо
     fake.routes["issues/120/comments"] = fake.routes["issues/120/comments"] + [
-        {"created_at": "2026-08-31T11:31:00Z", "body": posted[0]}]
+        job_comment("2026-08-31T11:31:00Z", posted[0])]
     posted.clear()
     sent.clear()
     _, actions3, allowed3 = pg.conveyor_gate("mytab0r/edge-harness", utc(2026, 8, 31, 11, 35))
     assert allowed3 is False and posted == [] and sent == [] and actions3 == []
+
+
+def test_gate_fake_pause_reminder_marker_cannot_suppress_alert(monkeypatch):
+    """#1242, находка ai-review (второе место того же класса): чтение
+    PAUSE_REMINDER_MARKER в conveyor_gate обязано требовать токен job'а.
+    Без фильтра поддельное «пауза продолжается» (живой envelope инцидента
+    #1242, performed_via_github_app=None) сдвигало бы last_signal_at вперёд
+    и молча давило напоминание о длящейся паузе (#899, п.4) на очередной
+    интервал PAUSE_REMINDER_INTERVAL_MINUTES — чужеродный маркер подавлял
+    бы алерт. Мутация: снять require_job_token из чтения напоминаний —
+    фаза А краснеет (напоминание в 11:31 не уйдёт: подделка 11:00 «придумана»
+    только что). Фаза Б: честное напоминание throttle по-прежнему держит —
+    фильтр не ломает легитимное подавление. Писатель маркера один (сам
+    conveyor_gate через pulse_guard.gh(), #1074) — честные всегда проходят."""
+    fake = FakeGh({
+        "workflows/worker.yml/runs": RECENT_FAILURES,
+        "runs/3/jobs": JOBS_PAYLOAD,
+        "issues/120/comments": [
+            job_comment("2026-08-31T10:00:00Z", pg.PAUSE_MARKER),
+            job_comment("2026-08-31T10:01:00Z", probe_body(4)),
+            # поддельное «пауза продолжается» — envelope инцидента, тело той
+            # же прод-формы, что пишет сам гейт
+            {**_load_fixture(FIXTURE_FAKE_WIP_CLOSE),
+             "created_at": "2026-08-31T11:00:00Z",
+             "body": pg.pause_reminder_text(3, 150.0, None)},
+        ],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    posted, sent = [], []
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
+    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
+
+    # Фаза А: 90 минут с последнего ЧЕСТНОГО сигнала — throttle истёк,
+    # напоминание обязано уйти (подделка 11:00 фильтром не считается)
+    _, actions1, _ = pg.conveyor_gate("mytab0r/edge-harness", utc(2026, 8, 31, 11, 31))
+    assert len(posted) == 1 and len(sent) == 1, (
+        "поддельное «пауза продолжается» (не токен job'а) не должно "
+        "подавлять напоминание о длящейся паузе")
+    assert any("напоминание" in line for line in actions1)
+
+    # Фаза Б: честное напоминание (ушло гейтом в 11:31) держит throttle — тихо
+    fake.routes["issues/120/comments"] = fake.routes["issues/120/comments"] + [
+        job_comment("2026-08-31T11:31:00Z", posted[0])]
+    posted.clear()
+    sent.clear()
+    _, actions2, _ = pg.conveyor_gate("mytab0r/edge-harness", utc(2026, 8, 31, 11, 35))
+    assert posted == [] and sent == [] and actions2 == []
 
 
 # ── Авто-возобновление по мержу (#220): success-маркер — виртуальный success ──────
@@ -1675,8 +1817,8 @@ def test_gate_resume_marker_reopens_dispatch_without_probe(monkeypatch):
         "workflows/worker.yml/runs": RECENT_FAILURES,
         "runs/3/jobs": JOBS_PAYLOAD,
         "issues/120/comments": [
-            {"created_at": "2026-08-31T11:45:00Z", "body": pg.pause_alert_text(3, None, "err")},
-            {"created_at": "2026-08-31T11:55:00Z", "body": resume_body()},
+            job_comment("2026-08-31T11:45:00Z", pg.pause_alert_text(3, None, "err")),
+            job_comment("2026-08-31T11:55:00Z", resume_body()),
         ],
     })
     monkeypatch.setattr(pg, "gh", fake)
@@ -1699,9 +1841,9 @@ def test_gate_resume_resets_probe_attempt_numbering(monkeypatch):
         "workflows/worker.yml/runs": RECENT_FAILURES,
         "runs/3/jobs": JOBS_PAYLOAD,
         "issues/120/comments": [
-            {"created_at": "2026-08-31T11:45:00Z", "body": pg.PAUSE_MARKER},
-            {"created_at": "2026-08-31T11:46:00Z", "body": probe_body(1)},
-            {"created_at": "2026-08-31T11:55:00Z", "body": resume_body()},
+            job_comment("2026-08-31T11:45:00Z", pg.PAUSE_MARKER),
+            job_comment("2026-08-31T11:46:00Z", probe_body(1)),
+            job_comment("2026-08-31T11:55:00Z", resume_body()),
         ],
     })
     monkeypatch.setattr(pg, "gh", fake)
@@ -1727,7 +1869,7 @@ def test_gate_reds_after_resume_form_a_fresh_series(monkeypatch):
         ]},
         "runs/4/jobs": JOBS_PAYLOAD,
         "issues/120/comments": [
-            {"created_at": "2026-08-31T11:40:00Z", "body": resume_body()},
+            job_comment("2026-08-31T11:40:00Z", resume_body()),
         ],
     })
     monkeypatch.setattr(pg, "gh", fake)
@@ -1770,6 +1912,159 @@ def test_stale_resume_marker_does_not_shadow_real_success(monkeypatch):
     observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed is True
     assert not any("мержем" in line for line in observations)
+
+
+# ── require_job_token: живая прод-форма #120 (issue #1242) ───────────────────────
+#
+# Фикстуры — НЕ пересказ, а буквальный `gh api repos/mytab0r/edge-harness/
+# issues/comments/<id>` (AGENTS.md, «Тест кормит прод-форму данных»):
+#
+# fixtures_issue120_fake_wip_close_marker.json — issuecomment-5665003751,
+# 2026-09-14T13:47:30Z, тело «✅ [статус конвейера: WIP-лимит снят]…» —
+# ОДИН из трёх поддельных маркеров живого инцидента 2026-09-14 (issue #1242),
+# оставленных ПОСЛЕ #1074/#1101: `user.login == "mytab0r"`,
+# `performed_via_github_app is None`.
+#
+# fixtures_issue120_honest_resume_marker.json — issuecomment-5629074295,
+# 2026-09-11T03:37:34Z, честный маркер `scheduler.after_merge` → `escalate`
+# → `pulse_guard.post_issue_comment` (RESUME_MARKER семейства, ровно то, что
+# читает `conveyor_gate`): `user.login == "github-actions[bot]"`,
+# `performed_via_github_app.slug == "github-actions"`.
+_FIXTURE_DIR = Path(__file__).resolve().parent
+FIXTURE_FAKE_WIP_CLOSE = _FIXTURE_DIR / "fixtures_issue120_fake_wip_close_marker.json"
+FIXTURE_HONEST_RESUME = _FIXTURE_DIR / "fixtures_issue120_honest_resume_marker.json"
+
+
+def _load_fixture(path: Path) -> dict:
+    with path.open(encoding="utf-8") as file:
+        return json.load(file)
+
+
+def test_comment_is_job_authored_on_live_fixtures():
+    """`comment_is_job_authored` — прямая проверка на прод-форме обоих
+    классов, без прохода через issue_marker_times/gh: сама функция, сырой
+    REST-ответ."""
+    assert pg.comment_is_job_authored(_load_fixture(FIXTURE_HONEST_RESUME)) is True
+    assert pg.comment_is_job_authored(_load_fixture(FIXTURE_FAKE_WIP_CLOSE)) is False
+
+
+def test_issue_marker_times_require_job_token_filters_live_fake_marker(monkeypatch):
+    """Живой поддельный маркер (issuecomment-5665003751) — без
+    require_job_token читается как обычный (поведение до #1242, не меняется
+    по умолчанию); с require_job_token=True отфильтрован полностью."""
+    fake_comment = _load_fixture(FIXTURE_FAKE_WIP_CLOSE)
+    fake = FakeGh({"issues/120/comments": [fake_comment]})
+    monkeypatch.setattr(pg, "gh", fake)
+
+    marker = "[статус конвейера: WIP-лимит снят]"
+    assert pg.issue_marker_times("mytab0r/edge-harness", 120, marker) == \
+        [pg.parse_time(fake_comment["created_at"])]
+    assert pg.issue_marker_times(
+        "mytab0r/edge-harness", 120, marker, require_job_token=True) == []
+
+
+def test_issue_markers_any_require_job_token_keeps_honest_drops_fake(monkeypatch):
+    """Оба живых комментария в одном #120: честный RESUME_MARKER проходит
+    require_job_token=True, поддельный WIP-close — нет. Доказательство на
+    смешанном, не изолированном списке (класс #308: фильтр обязан работать
+    по каждому комментарию независимо, не по факту «первый/последний»)."""
+    honest = _load_fixture(FIXTURE_HONEST_RESUME)
+    fake_wip = _load_fixture(FIXTURE_FAKE_WIP_CLOSE)
+    fake = FakeGh({"issues/120/comments": [fake_wip, honest]})
+    monkeypatch.setattr(pg, "gh", fake)
+
+    without_filter = pg.issue_markers_any(
+        "mytab0r/edge-harness", 120,
+        (pg.RESUME_MARKER, "[статус конвейера: WIP-лимит снят]"))
+    assert len(without_filter) == 2  # оба видимы без фильтра
+
+    with_filter = pg.issue_markers_any(
+        "mytab0r/edge-harness", 120,
+        (pg.RESUME_MARKER, "[статус конвейера: WIP-лимит снят]"),
+        require_job_token=True)
+    assert len(with_filter) == 1
+    assert pg.RESUME_MARKER in with_filter[0][1]  # только честный остался
+
+
+def test_conveyor_gate_ignores_fake_resume_marker_with_live_impersonation_envelope(monkeypatch):
+    """Прямое доказательство закрытия живого пробела (issue #1242): фейковый
+    envelope (user/performed_via_github_app) — буквальный, скопированный из
+    живого инцидента (issuecomment-5665003751, тот же `user.login`/`None`);
+    тело переписано на RESUME_MARKER этой же серии — семейство, которое
+    реально читает conveyor_gate (WIP-close текст выше conveyor_gate не ищет
+    вовсе, поэтому для ЭТОГО дерева фактов нужен маркер нужного семейства).
+    Подмена тела — единственное отступление от «буквальной фикстуры»: live-
+    инцидент поддельного RESUME/PAUSE маркера в истории #120 ещё не
+    случился (проверено `gh api .../issues/120/comments` 2026-09-14 —
+    только WIP-семейство подделано на сегодня), это упреждающее закрытие
+    того же класса, не постфактум.
+
+    Без require_job_token=True (мутация — снять параметр из вызова в
+    conveyor_gate) этот поддельный маркер читался бы как настоящий сброс —
+    allowed стал бы True. С фильтром — серия красных остаётся активной,
+    диспатч заперт: см. test_conveyor_gate_removed_filter_would_be_fooled
+    ниже (красный прогон без фикса, зафиксированный явно)."""
+    fake_envelope = _load_fixture(FIXTURE_FAKE_WIP_CLOSE)
+    forged_resume = dict(fake_envelope)
+    forged_resume["body"] = resume_body(pr=999, task=888)
+    forged_resume["created_at"] = "2026-08-31T11:55:00Z"
+
+    fake = FakeGh({
+        "workflows/worker.yml/runs": RECENT_FAILURES,
+        "runs/3/jobs": JOBS_PAYLOAD,
+        "issues/120/comments": [forged_resume],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+    posted, sent = [], []
+    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
+    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
+
+    observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    assert allowed is False, (
+        "поддельный RESUME_MARKER (performed_via_github_app=None, живой "
+        "envelope инцидента #1242) не должен сбрасывать серию красных — "
+        "предохранитель обязан остаться закрыт")
+    assert any("паузе" in line for line in actions + observations)
+
+
+def test_conveyor_gate_removed_filter_would_be_fooled(monkeypatch):
+    """Поведенческое мутационное доказательство на САМОМ гейте (замечание
+    ai-review круга 2: прямой вызов читателя был тавтологией — читатель и
+    так читает). Имитация кода ДО #1242: issue_markers_any, молча
+    игнорирующая require_job_token (до появления параметра её сигнатура
+    принимала и отбрасывала бы такой аргумент точно так же). Реальный
+    conveyor_gate на том же поддельном RESUME разрешает диспатч —
+    allowed=True; соседний тест выше фиксирует запрещённое поведение с
+    фильтром (allowed=False). MUTATION-PROOF-блок — после мержа, когда
+    появится слитый ref."""
+    fake_envelope = _load_fixture(FIXTURE_FAKE_WIP_CLOSE)
+    forged_resume = dict(fake_envelope)
+    forged_resume["body"] = resume_body(pr=999, task=888)
+    forged_resume["created_at"] = "2026-08-31T11:55:00Z"
+
+    fake = FakeGh({
+        "workflows/worker.yml/runs": RECENT_FAILURES,
+        "runs/3/jobs": JOBS_PAYLOAD,
+        "issues/120/comments": [forged_resume],
+    })
+    monkeypatch.setattr(pg, "gh", fake)
+
+    real_issue_markers_any = pg.issue_markers_any
+
+    def pre_1242_issue_markers_any(repo, issue_number, markers, max_pages=None, *,
+                                   trusted_login=None, require_job_token=False):
+        # код ДО #1242: параметра require_job_token не существовало,
+        # вызывающий #1242-гейт передаёт его — имитация молчит и фильтрует
+        # НЕЧЕГО (читает всё, как до фикса)
+        return real_issue_markers_any(
+            repo, issue_number, markers, max_pages, trusted_login=trusted_login)
+
+    monkeypatch.setattr(pg, "issue_markers_any", pre_1242_issue_markers_any)
+
+    _, _, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    assert allowed is True, (
+        "без фильтра (код до #1242) поддельный RESUME обманывает сам гейт — "
+        "диспатч разрешён на серии красных; это и есть закрываемый дефект")
 
 
 def test_resume_alert_text_carries_marker_evidence():
@@ -2161,8 +2456,8 @@ def test_failure_watch_same_title_different_fingerprint_comments_not_duplicates(
 def test_failure_watch_repeat_pulse_of_same_run_does_not_double_comment(monkeypatch):
     # Мутационная проверка (находка ревью PR #612, живой прогон 34063041667 —
     # реальные id job'а/шага и реальный хвост лога сняты `gh api` с прод): окно
-    # свежести FAILURE_WATCH_WINDOW_MINUTES=30 при пульсе раз в 15 мин держит
-    # ОДИН И ТОТ ЖЕ красный прогон «свежим» до трёх пульсов подряд. Без дедупа
+    # свежести FAILURE_WATCH_WINDOW_MINUTES держит
+    # ОДИН И ТОТ ЖЕ красный прогон «свежим» несколько пульсов подряд. Без дедупа
     # по комментариям (issue_marker_times — приём stall_detector.py, #248)
     # каждый такой пульс писал бы БАЙТ-В-БАЙТ дубль на #578: тело issue не
     # меняется (ci_failure_fingerprints парсит только тела), значит только
@@ -2555,7 +2850,7 @@ def test_failure_watch_ignores_run_older_than_freshness_window(monkeypatch):
     # Находка ревью PR #488: провал старше окна не заводит задачу заново на
     # уже неактуальную причину — `now` обязан использоваться, не просто
     # приниматься в сигнатуру. Прогон на 4 дня старше NOW заведомо за окном
-    # FAILURE_WATCH_WINDOW_MINUTES (30 мин).
+    # FAILURE_WATCH_WINDOW_MINUTES (число — в pulse_guard).
     routes = dict(FAILURE_WATCH_QUIET_ROUTES)
     routes["workflows/worker.yml/runs?status=completed"] = {"workflow_runs": [
         run("failure", "2026-08-27T11:50:00Z", 34027035455,
@@ -2614,12 +2909,21 @@ def test_failure_watch_window_anchor_is_failure_moment_not_queue_time(monkeypatc
 def test_failure_watch_treats_timed_out_as_failure_and_ignores_cancelled(monkeypatch):
     # Находка ревью PR #488 (раунд 3, блокирующая): серверный фильтр
     # status=failure не возвращает timed_out, а прогон, убитый собственным
-    # капом (timeout-minutes: worker.yml = 280), — провал в смысле #477.
-    # Опрос идёт по status=completed с клиентским фильтром
-    # FAILURE_WATCH_RUN_CONCLUSIONS; cancelled там НЕТ — отмена это
-    # осознанное действие, не сигнал о дефекте/инфраструктуре.
+    # капом, — провал в смысле #477. Опрос идёт по status=completed с
+    # клиентским фильтром FAILURE_WATCH_RUN_CONCLUSIONS; cancelled там НЕТ —
+    # отмена это осознанное действие, не сигнал о дефекте/инфраструктуре.
+    #
+    # Workflow — hands.yml (timeout-minutes: 70), НЕ worker.yml (ревизия
+    # #1184, находка B): у worker.yml conclusion=timed_out недостижим на
+    # прод-величинах — scheduler.reap_stalled_worker_run отменяет его
+    # in_progress-прогон на WORKER_STALL_MINUTES=295, раньше, чем тот
+    # доживёт до собственного timeout-minutes=340, и GitHub отдаёт
+    # cancelled, не timed_out (см. комментарий у FAILURE_WATCH_RUN_
+    # CONCLUSIONS). Фикстура на worker.yml была бы тестом прод-НЕДОСТИЖИМОЙ
+    # формы для этого конкретного workflow — hands.yml своего рипера не
+    # имеет, для него timed_out — реальный, а не синтетический исход.
     routes = dict(FAILURE_WATCH_QUIET_ROUTES)
-    routes["workflows/worker.yml/runs?status=completed"] = {"workflow_runs": [
+    routes["workflows/hands.yml/runs?status=completed"] = {"workflow_runs": [
         # Прод-форма: список от нового к старому — отменённый прогон СТОИТ
         # ВПЕРЕДИ провального. Без клиентского фильтра вывода runs[0] — это
         # отменённый прогон, и разбор ушёл бы на него (мутация: снятие
@@ -2633,8 +2937,8 @@ def test_failure_watch_treats_timed_out_as_failure_and_ignores_cancelled(monkeyp
     # Маршрут jobs заведён ТОЛЬКО для timed_out-прогона 111: разбор
     # отменённого 222 уронил бы FakeGh AssertionError — громко, не молча.
     routes["runs/111/jobs"] = {"jobs": [
-        {"id": 111, "name": "task", "conclusion": "timed_out", "steps": [
-            {"name": "Задача через DSH headless", "conclusion": "failure"},
+        {"id": 111, "name": "dsh-task", "conclusion": "timed_out", "steps": [
+            {"name": "Прогон задачи через DSH headless", "conclusion": "failure"},
         ]},
     ]}
     routes["issues?state=open&labels=ci-failure"] = []
@@ -2643,7 +2947,7 @@ def test_failure_watch_treats_timed_out_as_failure_and_ignores_cancelled(monkeyp
     monkeypatch.setattr(
         pg, "subprocess",
         SimpleNamespace(run=lambda *a, **k: _stdout_with_error(
-            "scripts/worker/task.sh: line 375: .../infra_digest.sh: No such file or directory")))
+            "scripts/hands/dsh_task.sh: line 210: .../infra_digest.sh: No such file or directory")))
     created = []
 
     def fake_gh_dispatch(*args):
@@ -2657,6 +2961,65 @@ def test_failure_watch_treats_timed_out_as_failure_and_ignores_cancelled(monkeyp
     assert len(created) == 1  # задача — по timed_out-прогону; cancelled не разбирается
     assert "actions/runs/111" in " ".join(created[0])
     assert "actions/runs/222" not in " ".join(created[0])
+
+
+def test_worker_yml_stale_run_reaper_cuts_before_timeout():
+    # Ревизия #1184 (находка B) + уточнение PR #1189: рипер
+    # scheduler.reap_stalled_worker_run отменяет ТОЛЬКО зависшие (тишина сессии ≥
+    # WORKER_SILENCE_MINUTES ИЛИ задача не коррелирована и возраст ≥
+    # WORKER_STALL_MINUTES) in_progress-прогоны worker.yml — GitHub присваивает
+    # им conclusion=cancelled, не timed_out. Ассерт ниже проверяет, что
+    # фоллбэк-возрастной порог рипера (WORKER_STALL_MINUTES=295) строго меньше
+    # job-level timeout-minutes worker.yml (340) — это гарантирует, что
+    # зависший БЕЗ коррелированной живой сессии прогон не доживёт до timed_out.
+    # Живой по сессии прогон (сессия растёт, markers пишутся) рипер по дизайну
+    # #1089 НЕ трогает: возрастной потолок для него НЕ применяется, он идёт до
+    # стены GitHub и получает timed_out — путь структурно открыт, просто замер
+    # показывает 0/100 (не наблюдается, не «физически не может»).
+    # Мутация: подними WORKER_STALL_MINUTES выше timeout-minutes worker.yml —
+    # тест покраснеет, сигнализируя, что зависший фоллбэк-прогон мог бы дожить
+    # до timed_out, и комментарии у FAILURE_WATCH_RUN_CONCLUSIONS/
+    # FAILURE_WATCH_PER_PAGE устарели.
+    repo_root = Path(__file__).resolve().parents[2]
+    workflow_dir = repo_root / ".github" / "workflows"
+    worker_yml = (workflow_dir / "worker.yml").read_text(encoding="utf-8")
+    match = re.search(r"^\s*timeout-minutes:\s*(\d+)\s*$", worker_yml, re.MULTILINE)
+    assert match, "worker.yml обязан нести job-level timeout-minutes"
+    worker_timeout_minutes = int(match.group(1))
+
+    scheduler_path = repo_root / "scripts" / "orchestra" / "scheduler.py"
+    spec = importlib.util.spec_from_file_location("scheduler_reachability_probe", scheduler_path)
+    sch = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, str(scheduler_path.parent))
+    try:
+        spec.loader.exec_module(sch)  # type: ignore[union-attr]
+    finally:
+        sys.path.remove(str(scheduler_path.parent))
+
+    assert sch.WORKER_STALL_MINUTES < worker_timeout_minutes, (
+        f"фоллбэк-порог рипера (WORKER_STALL_MINUTES={sch.WORKER_STALL_MINUTES}) "
+        f"обязан резать строго раньше собственного капа worker.yml "
+        f"({worker_timeout_minutes}) — иначе зависший фоллбэк-прогон способен "
+        "дожить до timed_out, и комментарии у FAILURE_WATCH_RUN_CONCLUSIONS/"
+        "FAILURE_WATCH_PER_PAGE устарели"
+    )
+
+    # hands.yml — контрольный пример: у него нет рипера (единственный вызов
+    # runs/…/cancel во всём scheduler.py — внутри reap_stalled_worker_run,
+    # адресован строго WORKER_WORKFLOW="worker.yml"), поэтому для НЕГО
+    # timed_out остаётся достижимым прод-исходом, ради которого запись в
+    # FAILURE_WATCH_RUN_CONCLUSIONS и держится.
+    hands_yml = (workflow_dir / "hands.yml").read_text(encoding="utf-8")
+    assert re.search(r"^\s*timeout-minutes:\s*\d+\s*$", hands_yml, re.MULTILINE), (
+        "hands.yml обязан нести собственный timeout-minutes — иначе "
+        "\"timed_out для hands.yml достижим\" тоже нужно перепроверять"
+    )
+    sch_source = scheduler_path.read_text(encoding="utf-8")
+    cancel_call_sites = re.findall(r"actions/runs/\{[^}]+\}/cancel", sch_source)
+    assert len(cancel_call_sites) == 1, (
+        f"ожидался ровно один рипер (worker.yml), найдено вызовов cancel: {len(cancel_call_sites)} — "
+        "если появился второй, его workflow тоже надо вычесть из \"timed_out достижим\" в комментарии"
+    )
 
 
 def test_failure_watch_task_body_names_failed_steps(monkeypatch):
