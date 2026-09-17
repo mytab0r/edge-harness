@@ -183,7 +183,12 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
       только комментарии СТРОГО ПОЗЖЕ даты приземления фикса. Наблюдательный,
       не в CI_GATING: Search API сам по себе может быть недоступен
       best-effort, гейтить обязательную проверку доступностью стороннего API
-      было бы новым тормозом без содержательного смысла.
+      было бы новым тормозом без содержательного смысла. Ревизия #1184:
+      маркер со знаком «?» устарел (фолбэк `${WORKER_CHAIN_PROVIDER:-?}`,
+      родивший этот символ, удалён самим же фиксом #876) — искомый литерал
+      обновлён на актуальную прод-форму «справился (провайдер: )» с пустым
+      провайдером (см. WORKER_FALSE_SUCCESS_MARKER); исторический текст
+      выше со знаком «?» — цитата инцидента ДО фикса, не сегодняшний маркер.
   15. check_merge_reaction_gaps (#955, следствие #929) — слияние PR через
       GITHUB_TOKEN НЕ создаёт push-событие (защита GitHub от рекурсии,
       доказано живым `timeline` PR #868/#872/#878: последний push-прогон
@@ -2207,14 +2212,28 @@ def check_conveyor_gate_phantom_pause(repo: str, now: datetime) -> check_result.
 # Инвариант 14: воркер не рапортует успех при пустом провайдере (#876)
 # ══════════════════════════════════════════════════════════════════════════
 
-# Дословный фрагмент шаблона scripts/worker/task.sh (до фикса #876): пустой
-# WORKER_CHAIN_PROVIDER рендерится в буквальный «?» — сообщение об успехе,
-# ссылающееся на неизвестного провайдера, само себе противоречит (dsh не
-# ответил успехом ни разу, если провайдер неизвестен). После фикса #876
-# (dsh_worker_run_is_success в scripts/lib/dsh-ci.sh) успех структурно
-# требует непустого провайдера — эта строка не может родиться заново, кроме
-# как регрессом самого фикса.
-WORKER_FALSE_SUCCESS_MARKER = "справился (провайдер: ?)"
+# Ревизия #1184 (находка A): маркер со знаком «?» устарел — «?» рождался
+# ТОЛЬКО из bash-фолбэка `${WORKER_CHAIN_PROVIDER:-?}`, который коммит
+# 77233d93 (сам фикс #876/PR #878) заменил на явный `die` (см.
+# scripts/worker/task.sh:809-811). Фолбэка с «?» в шаблоне не осталось нигде
+# — этот литерал физически не может родиться ни одним путём, существующим на
+# main, инвариант с ним был бы зелёным навсегда независимо от регресса, ради
+# которого написан (класс #1172).
+#
+# Актуальная прод-форма шаблона (scripts/worker/task.sh:814):
+#   🤖 Автономный воркер справился (провайдер: ${WORKER_CHAIN_PROVIDER}). PR ...
+# Сегодня путь к пустому WORKER_CHAIN_PROVIDER в этом тексте требует ДВУХ
+# независимых регрессов подряд: (1) dsh_worker_run_is_success
+# (scripts/lib/dsh-ci.sh) должен снова принять пустого провайдера как успех
+# — регресс самого фикса #876; (2) локальный `die`-гейт
+# scripts/worker/task.sh:809-811 (введён находкой ai-review PR #880 именно
+# как второй рубеж на случай регресса (1)) должен быть тоже снят/обойдён —
+# иначе job упадёт громко раньше, чем текст соберётся. Если оба рубежа
+# пробиты, `${WORKER_CHAIN_PROVIDER}` интерполируется в пустую строку, и
+# литерал становится «справился (провайдер: )» — без «?», с пустым местом
+# между двоеточием и закрывающей скобкой. Инвариант сторожит именно эту,
+# сегодня достижимую (хоть и составную), форму регресса.
+WORKER_FALSE_SUCCESS_MARKER = "справился (провайдер: )"
 
 # Находка ai-review PR #880 (второй раунд): ИСТОРИЧЕСКИЙ комментарий самого
 # инцидента (issue #140, 2026-09-10T18:53:32Z — живой случай, ради которого
@@ -2230,11 +2249,49 @@ WORKER_FALSE_SUCCESS_MARKER = "справился (провайдер: ?)"
 WORKER_FALSE_SUCCESS_FIX_LANDED_AT = datetime(2026, 9, 12, tzinfo=timezone.utc)
 
 
+def _strip_code_spans(text: str) -> str:
+    """Удаляет markdown code spans (`` `...` `` и ```` ```...``` ````)
+    из текста — локальная сверка инварианта 14 не должна срабатывать на
+    цитатах маркера в обсуждениях (PR #1189: ложное срабатывание на
+    цитировании нового литерала в бэктиках). Прод-комментарий воркера
+    фразу в бэктики не заворачивает."""
+    # Сначала убираем fenced code blocks (```...``` или ~~~...~~~)
+    text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+    text = re.sub(r"~~~.*?~~~", "", text, flags=re.DOTALL)
+    # Затем inline code spans (`...`) — нежадный, без вложенных бэктиков
+    text = re.sub(r"`[^`]*`", "", text)
+    return text
+
+
+def _marker_present_outside_code_spans(marker: str, body: str) -> bool:
+    """Аналог pulse_guard._marker_present, но игнорирует вхождения внутри
+    markdown code spans. Используется инвариантом 14 для локальной сверки
+    кандидата (PR #1189: избежать ложного срабатывания на цитатах в бэктиках)."""
+    stripped = _strip_code_spans(body)
+    return pulse_guard._marker_present(marker, stripped)
+
+
+def _marker_times_outside_code_spans(repo: str, issue_number: int, marker: str) -> list[datetime]:
+    """Локальная версия issue_marker_times, игнорирующая markdown code spans."""
+    try:
+        payload = pulse_guard.all_issue_comments(repo, issue_number)
+    except RuntimeError:
+        raise
+    return [
+        pulse_guard.parse_time(comment["created_at"])
+        for comment in payload
+        if _marker_present_outside_code_spans(marker, comment.get("body") or "")
+    ]
+
+
 def check_worker_false_success_comment(repo: str) -> check_result.CheckResult:
     """Инвариант 14 (issue #876, живой инцидент — прогон worker.yml
     34498185823, задача #140, 2026-09-10): комментарий «Автономный воркер
-    справился (провайдер: ?)» — противоречие само себе, после фикса #876
-    структурно невозможно (см. WORKER_FALSE_SUCCESS_MARKER выше).
+    справился (провайдер: )» с пустым провайдером — противоречие само себе
+    (dsh не ответил успехом ни разу, если провайдер неизвестен), сегодня
+    требует пробить оба рубежа фикса #876/#880 разом (см.
+    WORKER_FALSE_SUCCESS_MARKER выше — ревизия #1184 обновила литерал с
+    устаревшего «?» на актуальную прод-форму).
 
     Находка ai-review PR #880: GitHub Search отбрасывает знаки препинания
     (документированное поведение) — фразовый запрос на маркер, несущий `?`/
@@ -2303,7 +2360,7 @@ def check_worker_false_success_comment(repo: str) -> check_result.CheckResult:
         if number is None:
             continue
         try:
-            confirmed = issue_marker_times(repo, number, WORKER_FALSE_SUCCESS_MARKER)
+            confirmed = _marker_times_outside_code_spans(repo, number, WORKER_FALSE_SUCCESS_MARKER)
         except RuntimeError:
             unchecked += 1
             continue
@@ -3213,17 +3270,17 @@ def build_report(repo: str, now: datetime,
     if v14.status == check_result.STATUS_UNKNOWN:
         lines.append(f"{check_result.status_emoji(v14.status)} [14] не удалось "
                       f"проверить комментарии воркера на противоречие "
-                      f"«справился (провайдер: ?)»: {v14.reason}")
+                      f"«{WORKER_FALSE_SUCCESS_MARKER}»: {v14.reason}")
     elif v14.violations:
         lines.append(f"{check_result.status_emoji(check_result.STATUS_VIOLATION)} "
                       f"[14] {len(v14.violations)} комментариев несут противоречие "
-                      f"«справился (провайдер: ?)» (#876):")
+                      f"«{WORKER_FALSE_SUCCESS_MARKER}» (#876):")
         for item in v14.violations:
             lines.append(f"   — #{item['issue']} «{item['title']}» — {item['url']}")
     else:
         lines.append(f"{check_result.status_emoji(check_result.STATUS_OK)} [14] ни "
                       "один комментарий воркера не несёт противоречия "
-                      "«справился (провайдер: ?)»")
+                      f"«{WORKER_FALSE_SUCCESS_MARKER}»")
 
     try:
         v15_all = check_merge_reaction_gaps(repo, now, merged_pulls)

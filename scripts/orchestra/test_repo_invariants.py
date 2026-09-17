@@ -2597,7 +2597,9 @@ def test_worker_false_success_comment_healthy_snapshot_no_hits(monkeypatch):
 def test_worker_false_success_comment_flags_genuine_regression_after_fix(monkeypatch):
     # Настоящий регресс: комментарий с точным маркером ПОЗЖЕ даты приземления
     # фикса #876 (WORKER_FALSE_SUCCESS_FIX_LANDED_AT) — единственный случай,
-    # когда фраза структурно не должна была родиться заново.
+    # когда фраза структурно не должна была родиться заново. Ревизия #1184:
+    # литерал — актуальная прод-форма («провайдер: )», пустой WORKER_CHAIN_
+    # PROVIDER после интерполяции task.sh:814), не устаревшее «?».
     fake = FakeGh({
         "search/issues": {"items": [
             {"number": 900, "html_url": "https://github.com/mytab0r/edge-harness/issues/900",
@@ -2605,7 +2607,7 @@ def test_worker_false_success_comment_flags_genuine_regression_after_fix(monkeyp
         ]},
         "issues/900/comments": [
             {"created_at": "2026-10-01T00:00:00Z",
-             "body": "🤖 Автономный воркер справился (провайдер: ?). PR открыт: .../pull/999"},
+             "body": "🤖 Автономный воркер справился (провайдер: ). PR открыт: .../pull/999"},
         ],
     })
     patch_gh(monkeypatch, fake)
@@ -2623,7 +2625,13 @@ def test_worker_false_success_comment_historical_incident_not_flagged(monkeypatc
     # комментарий самого инцидента (issue #140, 2026-09-10T18:53:32Z — живой
     # случай, ради которого #876 и написан) остаётся в теле issue навсегда.
     # Без отсечки по дате инвариант был бы красным с первого пульса после
-    # мержа — первое появление ДО фикса не регресс, а его причина.
+    # мержа — первое появление ДО фикса не регресс, а его причина. Ревизия
+    # #1184: с текущим маркером («провайдер: )», без «?» — см.
+    # WORKER_FALSE_SUCCESS_MARKER) этот исторический текст (тогда ещё с «?»,
+    # старый фолбэк `${WORKER_CHAIN_PROVIDER:-?}` был жив) не совпадает и по
+    # буквальной подстроке — дата-гейт здесь избыточная, но не лишняя защита:
+    # тест остаётся регрессом на случай, если маркер когда-нибудь снова
+    # сблизится с историческим текстом.
     fake = FakeGh({
         "search/issues": {"items": [
             {"number": 140, "html_url": "https://github.com/mytab0r/edge-harness/issues/140",
@@ -2640,7 +2648,8 @@ def test_worker_false_success_comment_historical_incident_not_flagged(monkeypatc
 
 def test_worker_false_success_comment_search_false_positive_not_reported(monkeypatch):
     # Находка ai-review PR #880: GitHub Search отбрасывает пунктуацию —
-    # фразовый запрос на «справился (провайдер: ?)» вырождается в поиск
+    # фразовый запрос на «справился (провайдер: )» (ревизия #1184: актуальный
+    # маркер, было устаревшее «?») вырождается в поиск
     # голых слов «справился»+«провайдер», которые соседствуют в КАЖДОМ
     # ЗДОРОВОМ успехе воркера («справился (провайдер: GLM)»). Search вернул
     # бы такую задачу кандидатом, но локальная сверка (буквальная подстрока
@@ -2662,17 +2671,81 @@ def test_worker_false_success_comment_search_false_positive_not_reported(monkeyp
 
 def test_worker_false_success_comment_query_uses_the_exact_contradiction_marker(monkeypatch):
     # Мутация: если запрос когда-нибудь начнёт искать другую фразу (например
-    # обобщённое «справился» без «провайдер: ?») — это либо ложные
+    # обобщённое «справился» без «провайдер: )») — это либо ложные
     # срабатывания на КАЖДЫЙ настоящий успех, либо тихая потеря сигнала.
     # Литерал ЗАШИТ здесь буквально (не через ri.WORKER_FALSE_SUCCESS_MARKER):
     # если бы тест сверял константу саму с собой, мутация значения константы
-    # прошла бы мимо теста — проверяем дословный прод-текст шаблона task.sh.
+    # прошла бы мимо теста — проверяем дословный прод-текст шаблона task.sh
+    # (ревизия #1184: актуальная форма с пустым провайдером, не устаревшее «?»).
     fake = FakeGh({"search/issues": {"items": []}})
     patch_gh(monkeypatch, fake)
     ri.check_worker_false_success_comment(REPO)
-    assert any("справился (провайдер: ?)" in call for call in fake.calls), (
+    assert any("справился (провайдер: )" in call for call in fake.calls), (
         f"запрос обязан нести точный маркер противоречия: {fake.calls}"
     )
+
+
+def test_worker_false_success_marker_matches_task_sh_template():
+    # Ai-review PR #1189: ничто механически не связывало WORKER_FALSE_SUCCESS_MARKER
+    # со строкой шаблона в scripts/worker/task.sh — следующий реворд текста
+    # успеха молча вернул бы инвариант 14 в класс #1172 (зелёный навсегда
+    # независимо от регресса). Читаем РЕАЛЬНЫЙ task.sh, извлекаем строку
+    # «🤖 Автономный воркер справился…», интерполируем пустой
+    # WORKER_CHAIN_PROVIDER и сверяем результат с ri.WORKER_FALSE_SUCCESS_MARKER.
+    task_sh = (_DIR.parent / "worker" / "task.sh").read_text(encoding="utf-8")
+    match = re.search(
+        r"^🤖 Автономный воркер справился \(провайдер: (\$\{WORKER_CHAIN_PROVIDER\})\)\.",
+        task_sh, re.MULTILINE,
+    )
+    assert match, "task.sh обязан нести дословный шаблон успеха с ${WORKER_CHAIN_PROVIDER}"
+    rendered_empty_provider = match.group(0)[:-1].replace(match.group(1), "")
+    assert ri.WORKER_FALSE_SUCCESS_MARKER in rendered_empty_provider, (
+        f"константа {ri.WORKER_FALSE_SUCCESS_MARKER!r} разошлась с прод-шаблоном "
+        f"task.sh при пустом WORKER_CHAIN_PROVIDER: {rendered_empty_provider!r}"
+    )
+
+
+def test_worker_false_success_comment_ignores_marker_in_code_spans(monkeypatch):
+    # PR #1189 (находка А): локальная сверка не должна считать вхождения
+    # маркера внутри markdown code spans (`` `...` `` / ```` ```...``` ````) —
+    # прод-комментарий воркера фразу в бэктики не заворачивает, а обсуждение
+    # PR/задачи вполне может её процитировать. Цитата в бэктиках — не нарушение.
+    fake = FakeGh({
+        "search/issues": {"items": [
+            {"number": 999, "html_url": "https://github.com/mytab0r/edge-harness/issues/999",
+             "title": "обсуждение с цитатой"},
+        ]},
+        "issues/999/comments": [
+            {"created_at": "2026-10-01T00:00:00Z",
+             "body": "Инвариант ищет `справился (провайдер: )` — это новая форма после #1184"},
+            {"created_at": "2026-10-01T00:00:00Z",
+             "body": "```\n🤖 Автономный воркер справился (провайдер: ). PR открыт: ...\n```"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    assert ri.check_worker_false_success_comment(REPO) == ri.check_result.ok()
+
+
+def test_worker_false_success_comment_still_flags_bare_marker(monkeypatch):
+    # Голое вхождение (не в бэктиках) ПОЗЖЕ даты отсечки — это нарушение.
+    fake = FakeGh({
+        "search/issues": {"items": [
+            {"number": 998, "html_url": "https://github.com/mytab0r/edge-harness/issues/998",
+             "title": "настоящий регресс"},
+        ]},
+        "issues/998/comments": [
+            {"created_at": "2026-10-01T00:00:00Z",
+             "body": "Обсуждение: новый маркер — справился (провайдер: ) — появился в логе"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    result = ri.check_worker_false_success_comment(REPO)
+    assert result.status == ri.check_result.STATUS_VIOLATION
+    assert result.violations == [{
+        "issue": 998,
+        "url": "https://github.com/mytab0r/edge-harness/issues/998",
+        "title": "настоящий регресс",
+    }]
 
 
 def test_worker_false_success_comment_unknown_on_network_failure(monkeypatch):
@@ -2731,7 +2804,7 @@ def test_worker_false_success_comment_confirmed_violation_beats_unchecked_siblin
         ]},
         "issues/900/comments": [
             {"created_at": "2026-10-01T00:00:00Z",
-             "body": "🤖 Автономный воркер справился (провайдер: ?). PR открыт: .../pull/999"},
+             "body": "🤖 Автономный воркер справился (провайдер: ). PR открыт: .../pull/999"},
         ],
         "issues/777/comments": RuntimeError("gh api: 502"),
     })
