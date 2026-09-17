@@ -25,11 +25,11 @@ import assert from 'node:assert/strict';
 // бы регресс ctx.settings.installSection — метода нет в 0.1.1-rc.2).
 const FIXTURES = [
   ['@deepseek-ai/cordis', '4.0.2', 'sha512-asOnXP1TzFSFQlHb1iegDZp0z/8WD1c7YNrwJR/Tx2bzNuMXfcekE/I67Iv6SQXeLB4csxqCngzQKANP7gdw0g=='],
-  ['@deepseek-ai/dsh-llm', '0.1.2-rc.1', 'sha512-7VYsha5AXsVLnsAwYJffWXz9bwUbElw8i5N8tlTSdai9Bupk3sMbsotzPf8ZbsuGAxQYErahMwQwgGEu4qZO6g=='],
-  ['@deepseek-ai/dsh-llm-deepseek', '0.1.2-rc.1', 'sha512-FWt7UZ6l0XN2IFIBYVPJUQkFI0knmA3kZiNIhsdQCjJT5zGe1ZzH1EqqpO5Rzc6THIox58VkvLIllU6Mns4dIQ=='],
-  ['@deepseek-ai/dsh-settings', '0.1.2-rc.1', 'sha512-wMmJ2w5S6I7hgmgPppuAVemltEcTmAa8gvii7fk4T2KGVCuBYgig8xPwQ8Lp2ukLZSzzE6ZVCQxhdYZyJX/USA=='],
-  ['@deepseek-ai/dsh-credentials', '0.1.2-rc.1', 'sha512-e7DGpuYQqiD4dOWGQeY/XAWPTjbax/MkrXBwsB8wBtNpoPiAKiLYgd+iFiQc66BGOlutSRFz31IKdbduqPbTxA=='],
-  ['@deepseek-ai/dsh-anonymous-user-id', '0.1.2-rc.1', 'sha512-8skUsMXiGnyKJi+AiRjGoXIl8inJHgeHgoruW8pjPpWN6g3qJSbO8U9JRZtvwymtjJsQuHmKPI28jc4H6jOCOQ=='],
+  ['@deepseek-ai/dsh-llm', '0.1.5-rc.2', 'sha512-Z7BVsBkK24SE4EItQeow8PHms/9GP0DSTi337vTAa/RY7tNg2Snz3INcXUj6CPZfvntQr1in9op9wLI+rfNsqA=='],
+  ['@deepseek-ai/dsh-llm-deepseek', '0.1.5-rc.2', 'sha512-qNRbLsE2ro+AfD7NgJwTukQLG82gIkbAISjDHgv0au7TocfPkNkUWSu20mTaBcuLGXzfSgBVn4oYx5N3ws6KVg=='],
+  ['@deepseek-ai/dsh-settings', '0.1.5-rc.2', 'sha512-LI2Y6GkEs9ALMW+7S9jHPeEZDXHtG5X6cix1HdJ1rRxTEO5427QlYhMiz45rk7hqZ8ca2O4XFMW8IWXFZQLxmw=='],
+  ['@deepseek-ai/dsh-credentials', '0.1.5-rc.2', 'sha512-TfX5MYLlyw0BFERj3dGxVfP9QGcKZUE5eXDSaY7ZfJbfQgK51VfxV5tP899OxIDRD3Bw94K5Rzx+dbUTSWJBtA=='],
+  ['@deepseek-ai/dsh-anonymous-user-id', '0.1.5-rc.2', 'sha512-YIpZoi8mY/d+BjnPOryDYR7lkwr2uWh5KJWjIqm2sGN+C6imc66lDiSi5wy91JMRzefFWJf26fCiYXAF7ErQAw=='],
   ['@deepseek-ai/schemastery', '3.18.2', 'sha512-njDtZsznjYxok7KLLlHOPyuv2efdWVbSflAHgztSfbMsg+CVraEoRe2DjOCgClYv3ZCSm7WXoaUkbB/+RY7tWQ=='],
 ];
 

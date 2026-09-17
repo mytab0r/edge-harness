@@ -10,7 +10,7 @@ index e1bb2e8..e5e0f88 100644
  import AgentRegistry, {
    installModelSelection,
    type Agent,
-@@ -326,6 +327,36 @@ export class EdgeSessionStore {
+@@ -659,6 +660,36 @@ export class EdgeSessionStore {
          projectionCallback(session.id, key, value, seq)
        })
      }
@@ -46,4 +46,4 @@ index e1bb2e8..e5e0f88 100644
 +    }
    }
  
-   /** Resolve the upstream workspace registry after initialization. */
+   /** Non-model APIs remain available when the optional model adapter failed. */

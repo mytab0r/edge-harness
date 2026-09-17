@@ -1,7 +1,7 @@
 {
   "name": "@edge-harness/dsh-plugin-integrations",
-  "version": "0.1.2",
-  "description": "Edge plugin: external-system integrations (#115) — agent tools (jira_issue, confluence_page, bitbucket_pr, slack_post) plus the morde settings section «Интеграции» driven by dsh-edge/integrations.json and journal statuses",
+  "version": "0.1.3",
+  "description": "Edge plugin: external-system integrations (#115) — agent tools (jira_issue, confluence_page, bitbucket_pr, slack_post) plus the morde settings section «Интеграции» driven by dsh-edge/integrations.json and journal statuses Версия поднята бампом пина #1294 (0.1.5-rc.2): депы @deepseek-ai/* согласованы с пином dsh-edge/upstream.json, релиз пересобран форжем (#80/#507).",
   "type": "module",
   "main": "server/index.js",
   "exports": {
@@ -18,7 +18,7 @@
     }
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-tools": "0.1.2-rc.1"
+    "@deepseek-ai/dsh-tools": "0.1.5-rc.2"
   },
   "files": [
     "server/index.js",
