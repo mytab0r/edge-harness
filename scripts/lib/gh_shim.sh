@@ -13,25 +13,36 @@
 GH_SHIM_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 gh_shim_install() { # $1 — рабочий каталог для шима (создаётся, обычно $WORK/gh-shim)
-  local shim_dir=$1 real_gh src resolved
+  local shim_dir=$1 real_gh src resolved in_path
+
+  src="$GH_SHIM_LIB_DIR/../gh-shim/gh"
+  [ -f "$src" ] || {
+    echo "::error::gh-shim: исходник $src не найден — установка сломана" >&2
+    return 1
+  }
 
   # ИДЕМПОТЕНТНОСТЬ / ЗАЩИТА ОТ ДВОЙНОЙ УСТАНОВКИ (находка ревью PR #596,
-  # оба раунда): если PATH УЖЕ указывает на шим в этом же shim_dir (повторный
-  # вызов без промежуточного снятия шима из PATH — например будущий
-  # рефакторинг task.sh, зовущий gh_shim_install дважды), `real_gh="$(type -P
-  # gh)"` НИЖЕ нашёл бы сам шим и записал бы его путь в GH_SHIM_REAL_GH — все
-  # дальнейшие вызовы `exec "$GH_SHIM_REAL_GH" "$@"` ушли бы в бесконечный
-  # self-exec loop, а дверь scripts/git/pr-create (тоже читающая эту
-  # переменную) отклоняла бы саму себя. Ловим это ДО того, как real_gh
-  # переопределён: если шим уже в PATH и старый GH_SHIM_REAL_GH валиден —
-  # повторный вызов не более чем no-op; если шим в PATH, а GH_SHIM_REAL_GH
-  # потерян/сломан — громкий отказ, не тихая порча переменной.
-  if [ "$(type -P gh 2>/dev/null || true)" = "$shim_dir/gh" ]; then
-    if [ -n "${GH_SHIM_REAL_GH:-}" ] && [ -x "${GH_SHIM_REAL_GH:-}" ] && [ "$GH_SHIM_REAL_GH" != "$shim_dir/gh" ]; then
-      echo "gh-shim: уже установлен ($shim_dir/gh) — повторный вызов gh_shim_install пропущен (идемпотентно)"
+  # все три раунда): если PATH УЖЕ указывает на копию ЭТОГО ЖЕ шима (повторный
+  # вызов без промежуточного снятия шима из PATH), `real_gh` НИЖЕ нашёл бы сам
+  # шим и записал бы его путь в GH_SHIM_REAL_GH — все дальнейшие вызовы
+  # `exec "$GH_SHIM_REAL_GH" "$@"` ушли бы в бесконечный self-exec loop, а
+  # дверь scripts/git/pr-create (тоже читающая эту переменную) отклоняла бы
+  # саму себя. Копия узнаётся независимо от каталога: `cmp -s` с шаблоном —
+  # установленная копия байт-в-байт равна scripts/gh-shim/gh. Проверка ТОЛЬКО
+  # на «тот же shim_dir» (предыдущий раунд) пропускала повторную установку в
+  # ДРУГОЙ каталог: `real_gh` становился первым шимом, и `gh api`/`gh pr view`
+  # висели насмерть (проверено живым прогоном ревью — `timeout 5` убивает с
+  # кодом 124). Ловим это ДО того, как real_gh переопределён: если шим уже в
+  # PATH и старый GH_SHIM_REAL_GH валиден — повторный вызов не более чем
+  # no-op; если шим в PATH, а GH_SHIM_REAL_GH потерян/сломан — громкий отказ,
+  # не тихая порча переменной.
+  in_path="$(type -P gh 2>/dev/null || true)"
+  if [ -n "$in_path" ] && { [ "$in_path" = "$shim_dir/gh" ] || cmp -s "$in_path" "$src"; }; then
+    if [ -n "${GH_SHIM_REAL_GH:-}" ] && [ -x "${GH_SHIM_REAL_GH:-}" ] && [ "$GH_SHIM_REAL_GH" != "$in_path" ]; then
+      echo "gh-shim: уже установлен ($in_path) — повторный вызов gh_shim_install пропущен (идемпотентно)"
       return 0
     fi
-    echo "::error::gh-shim: PATH уже указывает на $shim_dir/gh, но GH_SHIM_REAL_GH не задан валидно (\"${GH_SHIM_REAL_GH:-<пусто>}\") — повторная установка молча записала бы путь шима как «настоящий gh» (self-exec loop); чинить вызывающего (не звать gh_shim_install дважды без причины), не игнорировать" >&2
+    echo "::error::gh-shim: PATH уже указывает на копию шима ($in_path), но GH_SHIM_REAL_GH не задан валидно (\"${GH_SHIM_REAL_GH:-<пусто>}\") — повторная установка молча записала бы путь шима как «настоящий gh» (self-exec loop); чинить вызывающего (не звать gh_shim_install дважды без причины), не игнорировать" >&2
     return 1
   fi
 
@@ -42,16 +53,13 @@ gh_shim_install() { # $1 — рабочий каталог для шима (со
   # PATH — для python-подпроцессов claim_task.py, которых `export -f` не
   # достаёт); тем же файлом в PATH пользуется и этот шим. `command -v` в той
   # же смок-среде нашёл бы функцию, а не файл, и решил бы, что «настоящего
-  # gh нет» — ложный отказ на ровном месте.
-  real_gh="$(type -P gh)" || {
+  # gh нет» — ложный отказ на ровном месте. Выше (гвардия двойной установки)
+  # уже доказано, что найденное — НЕ копия этого шима, иначе здесь рекурсия.
+  if [ -z "$in_path" ]; then
     echo "::error::gh-shim: настоящий gh не найден в PATH (type -P) — установка невозможна (без него шим звал бы в никуда)" >&2
     return 1
-  }
-  src="$GH_SHIM_LIB_DIR/../gh-shim/gh"
-  [ -f "$src" ] || {
-    echo "::error::gh-shim: исходник $src не найден — установка сломана" >&2
-    return 1
-  }
+  fi
+  real_gh="$in_path"
   mkdir -p "$shim_dir"
   cp "$src" "$shim_dir/gh"
   chmod +x "$shim_dir/gh"

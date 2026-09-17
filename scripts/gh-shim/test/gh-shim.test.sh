@@ -25,6 +25,15 @@
 #   source gh_shim.sh, вызов gh_shim_install или `|| die` при нём — тест
 #   красный. Проводка шима в транспорт закреплена тестом, а не комментарием:
 #   без этого защита исчезает молча при рефакторинге task.sh.
+# — случаи 1d/1e (прилепленные формы глобальных флагов, круг 3 ревью PR #596):
+#   выкини из case в scripts/gh-shim/gh паттерны `-R=*|-H=*|-R?*|-H?*` —
+#   `gh -R=o/r pr create`/`gh -Ro/r pr create` уходят в настоящий gh, тест
+#   красный (`FAIL случай 1 (-R=…)`, маркер вызова настоящего gh).
+# — случаи 9b/9c (повторная установка в ДРУГОЙ каталог, круг 3): выкини
+#   cmp-гвардию «копия этого же шима в PATH» из scripts/lib/gh_shim.sh —
+#   тест красный (9b: GH_SHIM_REAL_GH меняется на путь первого шима и/или
+#   `gh --version` висит до таймаута; 9c: установка проходит тихо без
+#   валидной переменной).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -123,6 +132,32 @@ else
   note "OK случай 1c: gh -R o/r pr create тоже отклонён ДО сети (глобальный флаг не открывает обход)"
 fi
 
+# ── случаи 1d-1h (находка ревью PR #596, круг 3): значение, ПРИЛЕПЛЕННОЕ к
+# глобальному флагу, — тот же класс одним написанием дальше. `gh -R=o/r pr
+# create` и `gh -Ro/r pr create` gh 2.100.0 принимает так же, как `-R o/r`,
+# а шим узнавал только раздельную форму — обе уходили в настоящий gh
+# (инцидент #586 с другим написанием флага). У прилепленного значения нет
+# отдельной лексемы, поэтому в case шима такие формы пропускаются целиком.
+blocked_forms=(
+  "-R=o/r"      # 1d: короткий флаг, значение через =
+  "-Ro/r"       # 1e: короткий флаг, значение прилеплено без =
+  "--repo=o/r"  # 1f: длинный флаг, значение через =
+  "-H=h.test"   # 1g: hostname, значение через =
+  "-Hh.test"    # 1h: hostname, значение прилеплено без =
+)
+for flag_form in "${blocked_forms[@]}"; do
+  rm -f "$MARKER"
+  if out=$(gh "$flag_form" pr create --title t --body-file "$WORK/body.md" 2>"$WORK/err-form"); then
+    note "FAIL случай 1 ($flag_form): gh $flag_form pr create принят шимом (обход через прилепленное значение)"; fail=1
+  elif [ -f "$MARKER" ]; then
+    note "FAIL случай 1 ($flag_form): настоящий gh был вызван в обход через $flag_form — обязан быть отклонён шимом"; fail=1
+  elif ! grep -q "scripts/git/pr-create" "$WORK/err-form"; then
+    note "FAIL случай 1 ($flag_form): в stderr нет отсылки к scripts/git/pr-create"; cat "$WORK/err-form"; fail=1
+  else
+    note "OK случай 1: gh $flag_form pr create тоже отклонён ДО сети (прилепленное значение не открывает обход)"
+  fi
+done
+
 # ── случай 2: прозрачность — gh api (argv, exit code, ОБА потока, stdin) ────
 direct_out=$(REALGH_EXIT=7 "$WORK/real-bin/gh" api repos/o/r/pulls/1 --jq .number <<<"тело-запроса" 2>"$WORK/direct.err") && direct_rc=0 || direct_rc=$?
 shim_out=$(REALGH_EXIT=7 gh api repos/o/r/pulls/1 --jq .number <<<"тело-запроса" 2>"$WORK/shim.err") && shim_rc=0 || shim_rc=$?
@@ -159,6 +194,19 @@ elif [ "$d5" != "$s5" ] || [ "$rc_d5" != "$rc_s5" ]; then
   note "FAIL случай 3c: gh run list разошёлся (direct=[$d5]/$rc_d5 shim=[$s5]/$rc_s5)"; fail=1
 else
   note "OK случай 3: gh pr view / gh issue list / gh run list идентичны напрямую вызванному gh (включая ненулевой код возврата)"
+fi
+
+# ── случай 3d: ведущий глобальный флаг НЕ ломает прозрачность ────────────────
+# Обратная сторона случаев 1c/1d-1h: пропуск глобальных флагов в шиме обязан
+# быть прозрачным и для штатных вызовов — `gh -R o/r pr view` доходит до
+# настоящего gh с тем же argv (флаг в том же месте), иначе блокировка
+# `pr create` сломала бы легальные вызовы.
+d3d=$("$WORK/real-bin/gh" -R o/r pr view 42 --json number 2>&1) && rc_d3d=0 || rc_d3d=$?
+s3d=$(gh -R o/r pr view 42 --json number 2>&1) && rc_s3d=0 || rc_s3d=$?
+if [ "$d3d" != "$s3d" ] || [ "$rc_d3d" != "$rc_s3d" ]; then
+  note "FAIL случай 3d: gh -R o/r pr view разошёлся (direct=[$d3d]/$rc_d3d shim=[$s3d]/$rc_s3d) — пропуск глобальных флагов не прозрачен"; fail=1
+else
+  note "OK случай 3d: gh -R o/r pr view прозрачно доходит до настоящего gh (ведущий флаг не мешает)"
 fi
 
 # ── случай 4: без рекурсии — шим не вызывает сам себя ────────────────────────
@@ -306,5 +354,51 @@ fi
   esac
   echo "OK случай 9: повторный gh_shim_install идемпотентен, GH_SHIM_REAL_GH не превратился в путь шима"
 ) || { note "(случай 9 см. вывод выше)"; fail=1; }
+
+# ── случаи 9b/9c (находка ревью PR #596, круг 3): повторный gh_shim_install
+# с ДРУГИМ каталогом при уже стоящем в PATH шиме. Гвардия, сверявшая
+# `type -P gh` только с текущим shim_dir, этот сценарий пропускала обеими
+# ветками: real_gh становился ПЕРВЫМ шимом, и любой неперехваченный вызов
+# (`gh api`, `gh --version`, …) уходил в бесконечный self-exec loop — ревью
+# подтвердило живым прогоном (`timeout 5` убивает зависший `gh --version`
+# с кодом 124), худший вариант тихо вешал бы воркер на весь таймаут попытки.
+(
+  set -euo pipefail
+  export PATH="$BASE_PATH"
+  unset GH_SHIM_REAL_GH || true
+  W9A="$WORK/case9-shim-a"
+  W9B="$WORK/case9-shim-b"
+  if ! gh_shim_install "$W9A" >/dev/null; then
+    echo "FAIL случай 9b: первая установка сломалась"; exit 1
+  fi
+  first_real="$GH_SHIM_REAL_GH"
+  first_resolved="$(type -P gh)"
+  # 9b: валидный GH_SHIM_REAL_GH — вызов с другим каталогом обязан быть no-op:
+  # переменная не тронута, PATH не дополнился вторым каталогом.
+  if ! gh_shim_install "$W9B" >/dev/null; then
+    echo "FAIL случай 9b: повторная установка в другой каталог не идемпотентна (ожидался no-op)"; exit 1
+  fi
+  if [ "$GH_SHIM_REAL_GH" != "$first_real" ]; then
+    echo "FAIL случай 9b: второй gh_shim_install в другой каталог изменил GH_SHIM_REAL_GH ($first_real -> $GH_SHIM_REAL_GH) — настоящим gh записан шим (self-exec loop)"; exit 1
+  fi
+  if [ "$(type -P gh)" != "$first_resolved" ]; then
+    echo "FAIL случай 9b: после повторной установки type -P gh → $(type -P gh), ожидалось $first_resolved — PATH испорчен"; exit 1
+  fi
+  # Живой вызов обязан ЗАВЕРШИТЬСЯ (любой код, кроме 124-таймаута): до фикса
+  # `gh --version` висел насмерть на self-exec loop.
+  rc9b=0
+  timeout 10 gh --version >/dev/null 2>&1 || rc9b=$?
+  if [ "$rc9b" = "124" ]; then
+    echo "FAIL случай 9b: gh --version завис (timeout, код 124) — self-exec loop после повторной установки в другой каталог"; exit 1
+  fi
+  echo "OK случай 9b: повторный gh_shim_install в ДРУГОЙ каталог — no-op, GH_SHIM_REAL_GH и PATH не тронуты, gh --version не виснет"
+  # 9c: тот же сценарий с ПОТЕРЯННОЙ переменной — громкий отказ установки,
+  # не тихое продолжение с испорченным real_gh (висящий воркер).
+  unset GH_SHIM_REAL_GH
+  if gh_shim_install "$WORK/case9-shim-c" >/dev/null 2>&1; then
+    echo "FAIL случай 9c: gh_shim_install с шимом в PATH и без GH_SHIM_REAL_GH прошёл тихо — следующие неперехваченные вызовы зависли бы"; exit 1
+  fi
+  echo "OK случай 9c: тот же сценарий без валидной переменной — громкий отказ, а не тихая порча"
+) || { note "(случай 9b/9c см. вывод выше)"; fail=1; }
 
 exit "$fail"
