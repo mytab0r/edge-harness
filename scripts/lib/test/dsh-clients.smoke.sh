@@ -261,7 +261,7 @@ dsh() { # прогон пишет спул+ответ; dump-config доказы�
       # #1084 это единственная форма, в которой текст гейта
       # dsh_worker_run_is_success («не доказывает работу этого прогона»)
       # достижим: rc≠0 перехватывается исчерпанием цепочки раньше гейта
-      # (сценарий worker-chain-refusal-red ниже).
+      # (сценарий worker-chain-refusal-green ниже).
       if [ -n "${SMOKE_DSH_OK_NO_COMMIT:-}" ]; then
         smoke_write_spool
         echo "smoke: работа сделана (без коммита)"
@@ -877,15 +877,19 @@ assert_log "GH-COMMENT" "worker-auto: нет отчёта в задачу"
 echo "SMOKE: worker-auto — ок"
 
 # ── Живая форма инцидента #876: PR по ветке УЖЕ существует (дефолтный
-# GH_PR_LIST_URL_JSON, открыт с диффом) — job ОБЯЗАН быть красным, а не
-# «справился» по факту одного существования PR (находка ai-review PR #880:
+# GH_PR_LIST_URL_JSON, открыт с диффом) — исход «dsh отчитался успехом при
+# предсуществующем PR» ОБЯЗАН быть красным, а не «справился» по факту одного
+# существования PR (находка ai-review PR #880:
 # проводка гейта в task.sh не была покрыта мутацией — оба смока оставались
 # зелёными, если бы call-site в task.sh вернули старый критерий «только
-# pr_outcome_rc»). После #1084 путь разбивается на два: (а) dsh отказал —
-# исчерпание цепочки возвращает задачу в пул громким красным (гейт успеха не
-# достигается вовсе: rc≠0 перехватывается раньше него); (б) dsh отчитался
-# успехом, но ни одного нового коммита не оставил — единственная форма, в
-# которой текст гейта «не доказывает работу этого прогона» достижим.
+# pr_outcome_rc»). После #1084/#1286 путь разбивается на два: (а) dsh отказал
+# на провайдерном классе — задача возвращается в пул (release-full), сигнал
+# уходит в комментарий и Telegram, а job остаётся ЗЕЛЁНЫМ: красный прогон
+# воркера по чужой вине кормил бы предохранитель диспатча (#226) и
+# задерживал восстановление после сброса квоты (#205) — #1286, живой прогон
+# 34893177035; (б) dsh отчитался успехом, но ни одного нового коммита не
+# оставил — единственная форма, в которой текст гейта «не доказывает работу
+# этого прогона» достижим.
 scenario_start
 WORKER_LOGIN="mytab0r" \
 WORKER_TASK="123" \
@@ -895,7 +899,7 @@ TELEGRAM_BOT_TOKEN="smoke-tg-token" \
 TELEGRAM_CHAT_ID="42" \
 GH_ISSUE_JSON='{"number":123,"title":"Smoke живая форма инцидента #876","body":"## Цель\nпрогон\n\n## Критерий готовности\nсессия","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
 SMOKE_DSH_STOP_ERROR="INVALID_API_KEY: unauthorized" \
-  run_client_expect_fail "worker-chain-refusal-red" "$REPO/scripts/worker/task.sh"
+  run_client "worker-chain-refusal-green" "$REPO/scripts/worker/task.sh"
 # #1307: раньше здесь проверялась ЛИТЕРАЛЬНАЯ фраза «цепочка провайдеров
 # исчерпана». Она перестала быть верной для этого сценария: INVALID_API_KEY —
 # транзиентный класс, цепочка НЕ исчерпана квотой, и говорить «исчерпана» тут
@@ -903,12 +907,12 @@ SMOKE_DSH_STOP_ERROR="INVALID_API_KEY: unauthorized" \
 # ради которого сценарий существует: отказ провайдера отнесён не к агенту, и
 # причина названа разбором по классам, а не общей фразой. Это СТРОЖЕ прежней
 # проверки: прежняя прошла бы и на тексте без единого класса.
-assert_log "Автономный воркер остановлен провайдером, не своей ошибкой" "worker-chain-refusal-red: отказ dsh обязан быть отнесён к провайдеру, а не к агенту"
-assert_log "транзиентных отказов: 1" "worker-chain-refusal-red: причина обязана прийти разбором по классам (#1307), а не общей фразой"
-assert_log "Повтор ИМЕЕТ смысл" "worker-chain-refusal-red: транзиентный класс обязан называть, что повтор осмыслен (#1307)"
-assert_log "GH-API-LOCK-DELETE refs/locks/task-123" "worker-chain-refusal-red: задача не возвращена в пул при отказе dsh — осталась занятой"
-assert_not_log "Автономный воркер справился" "worker-chain-refusal-red: живой класс #876 — существование PR не маскирует отказ dsh"
-echo "SMOKE: worker-chain-refusal-red — ок (#876/#1084/#1307)"
+assert_log "Автономный воркер остановлен провайдером, не своей ошибкой" "worker-chain-refusal-green: отказ dsh обязан быть отнесён к провайдеру, а не к агенту"
+assert_log "транзиентных отказов: 1" "worker-chain-refusal-green: причина обязана прийти разбором по классам (#1307), а не общей фразой"
+assert_log "Повтор ИМЕЕТ смысл" "worker-chain-refusal-green: транзиентный класс обязан называть, что повтор осмыслен (#1307)"
+assert_log "GH-API-LOCK-DELETE refs/locks/task-123" "worker-chain-refusal-green: задача возвращена в пул СРАЗУ (release-full), не ждёт TTL-сборщика (#422)"
+assert_not_log "Автономный воркер справился" "worker-chain-refusal-green: зелёный job — это исход «не сбой воркера» (#1286), а не ложное «справился» (живой класс #876)"
+echo "SMOKE: worker-chain-refusal-green — ок (#876/#1084/#1307/#1286)"
 
 # ── #1307, парный сценарий: РЕАЛЬНОЕ исчерпание квоты. Прежняя формулировка
 # «исчерпана целиком» обязана остаться именно здесь — иначе «починить»
@@ -924,11 +928,11 @@ TELEGRAM_BOT_TOKEN="smoke-tg-token" \
 TELEGRAM_CHAT_ID="42" \
 GH_ISSUE_JSON='{"number":123,"title":"Smoke: цепочка реально без квоты","body":"## Цель\nпрогон\n\n## Критерий готовности\nсессия","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
 SMOKE_DSH_STOP_ERROR="RATE_LIMIT: Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-09-17 08:51:55" \
-  run_client_expect_fail "worker-chain-quota-red" "$REPO/scripts/worker/task.sh"
-assert_log "исчерпана целиком" "worker-chain-quota-red: когда ВСЕ провайдеры реально без квоты, прежняя формулировка обязана остаться (#1307)"
-assert_log "повтор внутри этого прогона не поможет" "worker-chain-quota-red: при реальной квоте действие обязано остаться «ждать», а не «повторить»"
-assert_not_log "Повтор ИМЕЕТ смысл" "worker-chain-quota-red: при реальной квоте повтор смысла не имеет — сообщение не должно звать повторять"
-echo "SMOKE: worker-chain-quota-red — ок (#1307)"
+  run_client "worker-chain-quota-green" "$REPO/scripts/worker/task.sh"
+assert_log "исчерпана целиком" "worker-chain-quota-green: когда ВСЕ провайдеры реально без квоты, прежняя формулировка обязана остаться (#1307)"
+assert_log "повтор внутри этого прогона не поможет" "worker-chain-quota-green: при реальной квоте действие обязано остаться «ждать», а не «повторить»"
+assert_not_log "Повтор ИМЕЕТ смысл" "worker-chain-quota-green: при реальной квоте повтор смысла не имеет — сообщение не должно звать повторять"
+echo "SMOKE: worker-chain-quota-green — ок (#1307/#1286: job зелёный, задача в пуле)"
 
 # ── #1322: НАШ отказ (prompt_too_long) не смеет называться провайдерским ─────
 # Парный к двум сценариям выше: там шапка «остановлен провайдером» ВЕРНА и
@@ -1120,9 +1124,10 @@ assert_log "GH-COMMENT" "worker-rate-limit-transient: нет отчёта в з�
 assert_not_log "цепочка провайдеров отказала" "worker-rate-limit-transient: успешный ретрай не должен звучать как провал провайдера"
 echo "SMOKE: worker-rate-limit-transient — ок"
 
-# 2) worker: RATE_LIMIT Weekly/Monthly (квота надолго) — падает СРАЗУ, задача
-# возвращается в пул (снят и замок, и назначение), сообщение различает
-# «цепочка провайдеров отказала» от «воркер не справился» (правило AGENTS.md).
+# 2) worker: RATE_LIMIT Weekly/Monthly (квота надолго) — задача возвращается
+# в пул СРАЗУ (снят и замок, и назначение), сообщение различает «цепочка
+# провайдеров отказала» от «воркер не справился» (правило AGENTS.md), а job
+# с #1286 остаётся ЗЕЛЁНЫМ: квота — вина провайдера, не сбой воркера.
 scenario_start
 WORKER_LOGIN="mytab0r" \
 WORKER_TASK="123" \
@@ -1133,15 +1138,15 @@ TELEGRAM_CHAT_ID="42" \
 GH_ISSUE_JSON='{"number":123,"title":"Smoke квота исчерпана","body":"## Цель\nпрогон\n\n## Критерий готовности\nсессия","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
 GH_PR_LIST_URL_JSON='[]' \
 SMOKE_RATE_LIMIT_MODE="quota-exhausted" \
-  run_client_expect_fail "worker-rate-limit-quota" "$REPO/scripts/worker/task.sh"
-assert_log "GH-API-LOCK-DELETE refs/locks/task-123" "worker-rate-limit-quota: замок не снят при квоте — задача осталась занятой"
-assert_log "GH-API-UNASSIGN issue-123" "worker-rate-limit-quota: назначение не снято при квоте — задача осталась занятой"
-assert_log "цепочка провайдеров отказала" "worker-rate-limit-quota: сообщение не различает провайдера от собственной ошибки"
+  run_client "worker-rate-limit-quota" "$REPO/scripts/worker/task.sh"
+assert_log "GH-API-LOCK-DELETE refs/locks/task-123" "worker-rate-limit-quota: замок снят при квоте — задача возвращена в пул, не ждёт TTL-сборщика (#422)"
+assert_log "GH-API-UNASSIGN issue-123" "worker-rate-limit-quota: назначение снято при квоте — задача свободна другим каналам (#422)"
+assert_log "цепочка провайдеров отказала" "worker-rate-limit-quota: сообщение различает провайдера от собственной ошибки"
 assert_not_log "Автономный воркер не справился" "worker-rate-limit-quota: сообщение спутало лимит провайдера с ошибкой агента"
 tg_line=$(grep -F "TG-SEND" "$CALLLOG" | tail -1)
 grep -qF -- "цепочка провайдеров отказала" <<<"$tg_line" \
   || { echo "::error::SMOKE: worker-rate-limit-quota: Telegram не различает провайдера от ошибки агента: $tg_line" >&2; exit 1; }
-echo "SMOKE: worker-rate-limit-quota — ок"
+echo "SMOKE: worker-rate-limit-quota — ок (#422/#1286: job зелёный, задача в пуле)"
 
 # 3) hands: бюджет короткого RATE_LIMIT кончился раньше успеха — задача
 # (issue-N) возвращается в пул ПОСЛЕ того, как GH_RUN_TOKEN уже снят из

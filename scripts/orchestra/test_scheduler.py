@@ -3762,6 +3762,80 @@ def test_dispatch_ai_review_rework_escalates_when_worker_succeeded_but_findings_
     assert task["assignees"] != []  # эскалация не трогает задачу
 
 
+def test_dispatch_ai_review_rework_provider_refusal_green_run_is_infra_retry(monkeypatch):
+    """#1286 (блокирующая находка ai-review PR #1313, класс
+    «второй-потребитель-забыт»): после #1286 провайдерный отказ воркера даёт
+    ЗЕЛЁНЫЙ conclusion (task.sh, блок провайдерного отказа, exit 0) — наивная
+    светка по conclusion принимала бы его за Исход 2 («отработал успешно»):
+    попытка сгорала в бюджет доводки, а владельцу уходило «отработал
+    успешно, но отпечаток не изменился» при том, что агент не вызывался
+    вовсе. Различитель — маркер task.sh (WORKER_PROVIDER_REFUSAL_MARKER) в
+    комментарии ЗАДАЧИ внутри окна прогона. Здесь маркер есть и свежее
+    старта прогона → инфра-путь: автоматический повтор, попытка не в счёт,
+    без эскалации.
+    Мутация: удали ветку provider_refusal_green в dispatch_ai_review_rework —
+    тест покраснеет (escalated непуст, dispatched False)."""
+    task = issue(782, assignees=("mytab0r",))
+    p = pull(1020, labels=[sch.review_labels.AI_CHANGES], ref="agent/782-fix-waiting-owner-relabel-loop")
+    fingerprint, fixture = _ai_rework_base_fixture(
+        1020, 782, 34600000010, "success", dispatched_since="2026-09-12T10:00:00Z")
+    fixture[f"{REPO}/issues/782/comments?per_page"].append(
+        {"created_at": "2026-09-12T11:02:00Z",
+         "body": "🤖 Автономный воркер остановлен провайдером, не своей ошибкой: "
+                 "цепочка провайдеров исчерпана целиком. "
+                 f"{sch.WORKER_PROVIDER_REFUSAL_MARKER}"},
+    )
+    fake = FakeGh(fixture)
+    patch_gh(monkeypatch, fake)
+    escalated = []
+    posted = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+
+    observations, actions, dispatched = sch.dispatch_ai_review_rework(REPO, [p], pool=[task])
+
+    assert dispatched is True
+    assert escalated == []  # зелёный провайдерный отказ — не законная эскалация
+    dispatch_calls = [c for c in fake.calls if "worker.yml/dispatches" in c]
+    assert len(dispatch_calls) == 1
+    assert "inputs[task]=782" in dispatch_calls[0]
+    assert any("не в счёт" in line and "провайдерный отказ" in line for line in observations)
+    assert posted and "повтор после инфра-отказа" in posted[0][1]
+    assert "2/1" not in posted[0][1]  # попытка бюджет не расходует (PR #1030, чеклист)
+
+
+def test_dispatch_ai_review_rework_refusal_marker_outside_run_window_still_escalates(monkeypatch):
+    """Тот же маркер, но СТАРЕЕ старта прогона — оставлен ПРЕДЫДУЩИМ прогоном,
+    не этим. Светка по окну обязана НЕ срабатывать: зелёный прогон без маркера
+    СВОЕГО окна остаётся Исходом 2 (законная эскалация). Иначе один старый
+    маркер навсегда маскировал бы настоящие исходы доводки на этом PR.
+    Мутация: убери в worker_run_was_provider_refusal сравнение с началом
+    прогона (`any(marker_at >= started ...)` → `bool(times)`) — тест
+    покраснеет (эскалация не случится, пойдёт инфра-повтор)."""
+    task = issue(782, assignees=("mytab0r",))
+    p = pull(1020, labels=[sch.review_labels.AI_CHANGES], ref="agent/782-fix-waiting-owner-relabel-loop")
+    fingerprint, fixture = _ai_rework_base_fixture(
+        1020, 782, 34600000011, "success", dispatched_since="2026-09-12T10:00:00Z")
+    fixture[f"{REPO}/issues/782/comments?per_page"].append(
+        {"created_at": "2026-09-12T09:00:00Z",  # прогон стартовал в 11:00
+         "body": f"🤖 ... {sch.WORKER_PROVIDER_REFUSAL_MARKER}"},
+    )
+    fake = FakeGh(fixture)
+    patch_gh(monkeypatch, fake)
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("эскалация — не обычный комментарий в PR"))
+    monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("бюджет исчерпан — задачу не трогаем"))
+
+    observations, actions, dispatched = sch.dispatch_ai_review_rework(REPO, [p], pool=[task])
+
+    assert dispatched is False
+    assert escalated and escalated[0][1] == sch.WATCHDOG_ISSUE
+    assert "отработал успешно" in escalated[0][2]
+    assert any("исчерпана" in line and "#1020" in line for line in actions)
+
+
 def test_dispatch_ai_review_rework_escalation_names_attributed_non_success_conclusion(monkeypatch):
     """Исход 2, атрибутированный прогон с conclusion ВНЕ FAILURE_CONCLUSIONS
     (некритичная находка ai-review PR #1030 → блокирующая, «алерт не гадает»
