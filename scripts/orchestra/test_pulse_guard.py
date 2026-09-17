@@ -1955,12 +1955,15 @@ def test_conveyor_gate_ignores_fake_resume_marker_with_live_impersonation_envelo
 
 
 def test_conveyor_gate_removed_filter_would_be_fooled(monkeypatch):
-    """Ручное мутационное доказательство (без MUTATION-PROOF-блока: `ref`
-    этого PR ещё не существует в истории main на момент написания) — тот же
-    сценарий, что выше, но с ВРУЧНУЮ отключённым фильтром (имитация кода ДО
-    #1242: issue_markers_any без require_job_token) — показывает, что БЕЗ
-    фикса допустимо ровно то, чего фикс не допускает: allowed становится
-    True на том же поддельном маркере."""
+    """Поведенческое мутационное доказательство на САМОМ гейте (замечание
+    ai-review круга 2: прямой вызов читателя был тавтологией — читатель и
+    так читает). Имитация кода ДО #1242: issue_markers_any, молча
+    игнорирующая require_job_token (до появления параметра её сигнатура
+    принимала и отбрасывала бы такой аргумент точно так же). Реальный
+    conveyor_gate на том же поддельном RESUME разрешает диспатч —
+    allowed=True; соседний тест выше фиксирует запрещённое поведение с
+    фильтром (allowed=False). MUTATION-PROOF-блок — после мержа, когда
+    появится слитый ref."""
     fake_envelope = _load_fixture(FIXTURE_FAKE_WIP_CLOSE)
     forged_resume = dict(fake_envelope)
     forged_resume["body"] = resume_body(pr=999, task=888)
@@ -1973,13 +1976,22 @@ def test_conveyor_gate_removed_filter_would_be_fooled(monkeypatch):
     })
     monkeypatch.setattr(pg, "gh", fake)
 
-    # Тот же вызов, что делает conveyor_gate ДО фикса #1242 (без require_job_token):
-    unfiltered_markers = pg.issue_markers_any(
-        "mytab0r/edge-harness", 120, (pg.PAUSE_MARKER, pg.RESUME_MARKER))
-    resume_at = max((t for t, body in unfiltered_markers if pg.RESUME_MARKER in body), default=None)
-    assert resume_at is not None, (
-        "без require_job_token поддельный маркер читается как настоящий "
-        "RESUME_MARKER — ровно дефект, который закрывает #1242")
+    real_issue_markers_any = pg.issue_markers_any
+
+    def pre_1242_issue_markers_any(repo, issue_number, markers, max_pages=None, *,
+                                   trusted_login=None, require_job_token=False):
+        # код ДО #1242: параметра require_job_token не существовало,
+        # вызывающий #1242-гейт передаёт его — имитация молчит и фильтрует
+        # НЕЧЕГО (читает всё, как до фикса)
+        return real_issue_markers_any(
+            repo, issue_number, markers, max_pages, trusted_login=trusted_login)
+
+    monkeypatch.setattr(pg, "issue_markers_any", pre_1242_issue_markers_any)
+
+    _, _, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
+    assert allowed is True, (
+        "без фильтра (код до #1242) поддельный RESUME обманывает сам гейт — "
+        "диспатч разрешён на серии красных; это и есть закрываемый дефект")
 
 
 def test_resume_alert_text_carries_marker_evidence():
