@@ -55,6 +55,32 @@ ADR прав: это чтение и суждение, не число (см. е
 опциональный вход (`replacement_found: bool | None`), не пытается
 вычислить сама.
 
+## Величина 8: PR-дубль уже слитой работы (issue #1236, живой случай PR #1020)
+
+Величина 5 читается человеком («есть ли уже эквивалент в main») — величина 8
+не требует чтения вовсе: все файлы, ТРОНУТЫЕ PR (прод-форма `gh api
+pulls/{n}/files`, статус `added`/`removed`/`modified`/`renamed` — обход
+страниц `review_labels.list_pr_files`, класс пагинации #308/#309), побайтно
+(blob-SHA, не diff-текст) равны соответствующим файлам main → PR не меняет
+main вовсе, дубль уже слитой работы. Живая улика: PR #1020 закрыт как
+мёртвый груз, но величина 3 (AST-пересечение) на нём дала «8 пересечений» —
+это было пересечение PR С ЕГО ЖЕ КОПИЕЙ в main (работа уже слита коммитом
+`1def95d6`, задача #1021 закрыта), не с независимой правкой main; метод
+величины 3 структурно не различает эти два случая. Величина 8 вычисляется
+ПЕРВОЙ в `cmd_queue` (см. `already_in_main_check`), ДО вызова `measure_pr`
+(который считает дорогую величину 3) — обнаруженный дубль делает величину 3
+не только ненужной, но и ВВОДЯЩЕЙ В ЗАБЛУЖДЕНИЕ для такого PR, поэтому она
+не считается вовсе (обесценена, не просто пропущена ради экономии). Статус
+`removed` — особый случай (requirement 3 issue #1236): PR, удаляющий файл,
+который main ЕЩЁ несёт, — настоящая правка, не дубль; файл, уже отсутствующий
+и там и там, — согласие сторон, само по себе не решает. Тот же критерий для
+`renamed`: переименование — это удаление старого пути ПЛЮС появление нового,
+main, всё ещё несущий `previous_filename`, делает PR настоящей правкой.
+Третье состояние
+(`scripts/lib/check_result.py`, #1096) — `unknown()`, если хотя бы один blob
+не удалось прочитать (сеть/git отказали), а расхождений при этом не нашлось:
+«дубль» и «не дубль» здесь одинаково неверны для непроверенного PR.
+
 Импорт соседних модулей — importlib по файлу (паттерн claim_task/
 review_labels/upstream_drift: скрипты этого репозитория запускаются как
 файлы, не как пакет).
@@ -62,7 +88,7 @@ review_labels/upstream_drift: скрипты этого репозитория �
 CLI:
   python stalled_pr_triage.py measure <PR>       — величины 1–3,7 для
                                                     одного PR (git, без gh).
-  python stalled_pr_triage.py queue               — величины 1,2,3,4,6,7 +
+  python stalled_pr_triage.py queue               — величины 1,2,3,4,6,7,8 +
                                                     решение для ВСЕХ открытых
                                                     PR репозитория (gh + git).
 """
@@ -292,6 +318,7 @@ def decide(
     replacement_found: bool | None = None,
     invariant_collision: bool = False,
     decision_doc_collision: bool = False,
+    already_in_main: bool = False,
 ) -> dict:
     """Единая точка решения — читает ВСЕ входы вместе (ADR 0021, «шесть
     величин вместе», не порог на одной). `task_state` — "open"/"closed"/
@@ -299,11 +326,19 @@ def decide(
     «не знаю» не превращается в «открыта», находка ревью PR #1219; решение
     при этом не строится на величине 4 вовсе, а в reasons попадает честное
     «не подтверждено»). `ai_verdict` — одна из `review_labels.AI_VERDICTS`
-    либо `None` (вердикта ещё нет).
+    либо `None` (вердикта ещё нет). `already_in_main` — величина 8 (issue
+    #1236, см. шапку модуля): МАШИННО доказанный факт («все тронутые файлы
+    побайтно равны main»), в отличие от `replacement_found` (чтение
+    человеком/суждением, величина 5) — поэтому проверяется РАНЬШЕ него, а не
+    вместо: он не требует ничьего суждения, чтобы быть верным.
 
-    Порядок проверок — от самого дешёвого решения (замена/закрытая задача)
-    к самому дорогому суждению (велики ли 1–3):
+    Порядок проверок — от самого дешёвого и самого достоверного решения к
+    самому дорогому суждению (велики ли 1–3):
 
+      0. `already_in_main=True` — PR не меняет main вовсе (величина 8,
+         машинное доказательство byte-for-byte) — закрыть немедленно, раньше
+         даже предупреждений о коллизии номеров (величина 7): нечему
+         коллидировать, если сводить нечего.
       1. `replacement_found=True` — работа уже сделана в main, закрыть
          независимо от остального (ADR: величина 5 перекрывает всё).
       2. Задача закрыта И замены нет — автор потерял интерес, закрыть.
@@ -328,6 +363,11 @@ def decide(
     ревью PR #1219: одна строка про «# Инвариант N» описывала только
     инвариантную половину и врала в doc-случаях)."""
     reasons: list[str] = []
+    if already_in_main:
+        reasons.append(
+            "величина 8: все файлы, тронутые PR, побайтно (git blob-SHA) совпадают с main — "
+            "PR не меняет main, дубль уже слитой работы (живой случай #1020)")
+        return {"action": ACTION_CLOSE, "reasons": reasons}
     if invariant_collision:
         reasons.append(
             "величина 7 (инварианты): PR добавляет запись в реестре repo_invariants.py, "
@@ -431,6 +471,27 @@ def show_file(ref: str, path: str, cwd: str | None = None) -> str | None:
     if result.returncode != 0:
         return None
     return result.stdout
+
+
+def blob_sha(ref: str, path: str, cwd: str | None = None) -> str | None:
+    """SHA блоба `path` на `ref` (`git rev-parse ref:path`) — носитель
+    сравнения величины 8 (issue #1236): байт-в-байт сравнение через
+    blob-SHA, не через diff-текст (совпадающий SHA — то же самое дерево
+    байт, диффа при этом может не быть вовсе, что и требуется). `None` —
+    файла на этом `ref` нет ИЛИ сам `ref` не читается: `git rev-parse`
+    отвечает ненулевым кодом на то и другое, и различить их изнутри
+    нельзя (некритичная находка ревью этого PR: цена различения — отдельный
+    вызов, здесь она не платится). Различение делает вызывающий:
+    `already_in_main_check` проверяет оба ref'а `rev-parse --verify` ДО
+    сравнения и уходит в `unknown()` при отказе — несостоявшийся `main_ref`
+    не имеет права читаться веткой `removed` как «согласие сторон»."""
+    result = subprocess.run(
+        ["git", "rev-parse", f"{ref}:{path}"], cwd=cwd,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
 
 
 def changed_files(base_sha: str, ref: str, cwd: str | None = None) -> set[str]:
@@ -593,6 +654,105 @@ def measure_pr(main_ref: str, head_ref: str, cwd: str | None = None) -> dict:
     }
 
 
+# ── Величина 8: PR-дубль уже слитой работы (issue #1236) ────────────────────
+
+def measure_already_in_main(main_ref: str, head_ref: str, files: list[dict],
+                            cwd: str | None = None) -> check_result.CheckResult:
+    """Величина 8 (см. шапку модуля, живой случай PR #1020): все файлы,
+    тронутые PR, побайтно (`blob_sha`) равны main → PR ничего не меняет.
+    `files` — прод-форма `gh api pulls/{n}/files` (список словарей с ключами
+    `filename`/`status`; статус — `added`/`removed`/`modified`/`renamed`,
+    requirement 3 issue #1236 учитывается по нему):
+
+      `removed` — main ЕЩЁ несёт этот путь → PR удаляет то, чего main не
+        удалял, это НАСТОЯЩАЯ правка → немедленный `ok()` (доказательство
+        «PR не дубль» найдено, дальше можно не читать). Main тоже НЕ несёт
+        путь → согласие сторон («уже отсутствует и там, и там») — само по
+        себе НЕ довод ни за, ни против, файл пропускается, решают остальные.
+      `renamed` — переименование = удаление СТАРОГО пути плюс появление
+        НОВОГО (блокирующая находка ai-ревью этого PR): main всё ещё несёт
+        `previous_filename` → сведение удалит его из main, это НАСТОЯЩАЯ
+        правка → немедленный `ok()`, сравнение нового пути не проводится
+        (тот же критерий, что `removed` выше); main старый путь уже снял
+        (переименовал так же) или прод-форма не назвала его — решает
+        сравнение НОВОГО пути, как для `modified`.
+      `added`/`modified` (сравнение по пути `filename`) —
+        blob на `head_ref` сравнивается с blob на `main_ref`. Main НЕ несёт
+        такой путь вовсе (файл существует только у PR) — тоже настоящая
+        правка → немедленный `ok()`. Blob'ы расходятся — тоже `ok()`.
+
+    Ранний выход на ПЕРВОМ же файле с доказанной настоящей правкой — цена
+    величины 8 намеренно минимальна (requirement 1: вычисляется ДО дорогой
+    величины 3, обесценивает её), не собирает полный список различий.
+
+    Три исхода (`check_result`, #1096): `ok()` — найдена хотя бы одна
+    настоящая правка, PR не дубль; `violation([имена файлов])` — ВСЕ
+    тронутые файлы совпали с main, PR — мёртвый груз (live-case #1020);
+    `unknown(reason)` — ни одного расхождения не нашлось, но хотя бы один
+    blob не читается (`head_ref` недоступен на момент сравнения, аномалия
+    прод-формы) — «дубль» и «не дубль» здесь одинаково неверны."""
+    if not files:
+        return check_result.unknown(
+            "величина 8: PR не несёт ни одного файла в pulls/{n}/files — "
+            "список пуст, сравнение не имеет смысла")
+    unresolved: list[str] = []
+    for entry in files:
+        path = entry.get("filename")
+        status = entry.get("status")
+        if status == "removed":
+            if blob_sha(main_ref, path, cwd=cwd) is not None:
+                return check_result.ok()
+            continue
+        if status == "renamed":
+            previous = entry.get("previous_filename")
+            if previous and blob_sha(main_ref, previous, cwd=cwd) is not None:
+                # Main всё ещё несёт СТАРЫЙ путь: сведение удалит его из main —
+                # настоящая правка, не дубль (блокирующая находка ai-ревью
+                # этого PR: сравнение одного лишь нового пути молча читало
+                # такой PR как «дубль», хотя слияние убрало бы из main файл,
+                # который main не удалял).
+                return check_result.ok()
+            # Старый путь main уже снял (переименовал так же) — решает
+            # сравнение НОВОГО пути, см. ниже.
+        head_blob = blob_sha(head_ref, path, cwd=cwd)
+        if head_blob is None:
+            unresolved.append(
+                f"{path}: git rev-parse {head_ref}:{path} не читается (status={status})")
+            continue
+        if blob_sha(main_ref, path, cwd=cwd) != head_blob:
+            return check_result.ok()
+    if unresolved:
+        return check_result.unknown("; ".join(unresolved))
+    return check_result.violation(sorted(entry.get("filename") for entry in files))
+
+
+def already_in_main_check(repo: str, number: int, main_ref: str, head_ref: str,
+                          cwd: str | None = None) -> check_result.CheckResult:
+    """Обёртка величины 8 для одного PR очереди: список тронутых файлов —
+    `review_labels.list_pr_files` (прод-форма `gh api pulls/{n}/files`, обход
+    страниц уже встроен туда — класс #308/#309, второй копии обхода здесь
+    не заводим), сравнение — `measure_already_in_main` (git-only). Сетевой
+    отказ gh — `unknown()`, не падение всего обхода очереди: один кривой PR
+    из-за отказа сети на ЭТОМ конкретном запросе не обязан валить `cmd_queue`
+    целиком через общий except (requirement 2 issue #1236 — причина обязана
+    дойти до строки очереди, не потеряться)."""
+    try:
+        files = review_labels.list_pr_files(repo, number, gh)
+    except RuntimeError as error:
+        return check_result.unknown(f"величина 8: gh api pulls/{number}/files отказал: {error}")
+    # `blob_sha` не отличает «файла нет» от «ref не читается» (см. его
+    # докстринг) — ref'ы проверяются ЗДЕСЬ, до сравнения (находка ревью
+    # этого PR): иначе несостоявшийся main_ref читался бы веткой `removed`
+    # как «согласие сторон» и подталкивал строку очереди к violation.
+    for ref in (main_ref, head_ref):
+        try:
+            run_git("rev-parse", "--verify", f"{ref}^{{commit}}", cwd=cwd)
+        except GitError as error:
+            return check_result.unknown(
+                f"величина 8: ref {ref} не читается, сравнение blob-SHA невозможно: {error}")
+    return measure_already_in_main(main_ref, head_ref, files, cwd=cwd)
+
+
 # ── IO: gh (метаданные) ──────────────────────────────────────────────────────
 
 def gh(*args: str):
@@ -668,13 +828,19 @@ def decision_doc_collision_pr_numbers(
 
 
 def cmd_queue(repo: str, cwd: str | None = None) -> list[dict]:
-    """Величины 1,2,3,4,6,7 + решение для всех открытых PR репозитория.
+    """Величины 1,2,3,4,6,7,8 + решение для всех открытых PR репозитория.
+    Величина 8 (issue #1236) считается ПЕРВОЙ на каждый PR — обнаруженный
+    дубль (`already_in_main_check`) обесценивает дорогую величину 3
+    (AST-пересечение) настолько, что она вовсе не вызывается для этого PR
+    (см. цикл ниже и шапку модуля).
     Сеть: одна страница `pulls` + один GraphQL-батч задач (gh) + один прогон
-    decision_numbering (свой отдельный обход, см. его докстринг) + фетч
-    head'а КАЖДОГО PR (`refs/pull/N/head`, находка ревью PR #1219: это
-    сетевые запросы, «без сетевой цены на PR» — неправда; правда — «на PR
-    нет дорогих gh-вызовов: контрактов/комментариев/состояний, дальше
-    только git-объекты»). Refspec с `+`: назначение `origin/pr-N`
+    decision_numbering (свой отдельный обход, см. его докстринг) + на КАЖДЫЙ
+    PR фетч его head'а (`refs/pull/N/head`) и список тронутых файлов
+    (`gh api pulls/N/files`, величина 8, обход страниц
+    `review_labels.list_pr_files`; находка ревью PR #1219: это сетевые
+    запросы, «без сетевой цены на PR» — неправда; правда — «на PR нет
+    дорогих gh-вызовов: контрактов/комментариев/состояний»). Refspec с `+`:
+    назначение `origin/pr-N`
     приватное для этого прогона, а force-push в чужой открытый PR отклонил
     бы refspec как non-fast-forward и уронил весь обход очереди. Дальше —
     только локальный git (merge-tree/diff/merge-base) на каждый PR. Строка
@@ -715,7 +881,20 @@ def cmd_queue(repo: str, cwd: str | None = None) -> list[dict]:
             head_ref = f"origin/pr-{number}"
             run_git("fetch", "--quiet", "origin",
                     f"+refs/pull/{number}/head:refs/remotes/origin/pr-{number}", cwd=cwd)
-            measured = measure_pr("origin/main", head_ref, cwd=cwd)
+            already = already_in_main_check(repo, number, "origin/main", head_ref, cwd=cwd)
+            row["velichina8_already_in_main"] = already.status == check_result.STATUS_VIOLATION
+            row["velichina8_already_in_main_files"] = (
+                already.violations if already.status == check_result.STATUS_VIOLATION else [])
+            row["velichina8_already_in_main_unknown"] = (
+                already.reason if already.status == check_result.STATUS_UNKNOWN else None)
+            if row["velichina8_already_in_main"]:
+                # Дорогая величина 3 (AST-пересечение) не только не нужна,
+                # но и ОБМАНЫВАЕТ на чистом дубле (живая улика PR #1020: она
+                # сравнивала PR с его же копией в main и врала «8
+                # пересечений») — не считаем вовсе, см. шапку модуля.
+                measured = {}
+            else:
+                measured = measure_pr("origin/main", head_ref, cwd=cwd)
         except RuntimeError as error:  # GitError — подкласс RuntimeError
             # Один кривой PR (несуществующий head, несводимые с main истории,
             # отказ merge-tree, дрейф формата реестра) не валит весь обход
@@ -736,13 +915,28 @@ def cmd_queue(repo: str, cwd: str | None = None) -> list[dict]:
         if "error" in row:
             rows.append(row)
             continue
+        # Дубль (величина 8) не несёт величин 1,3,7 вовсе (не считали, см.
+        # цикл выше) — decide() решает по already_in_main раньше, чем
+        # прочитал бы их, нейтральные дефолты безопасны ПОСТРОЕНИЕМ.
+        # Недублевая строка читает ключи ПРЯМОЙ индексацией (находка ревью
+        # этого PR): переименование ключа measure_pr обязано падать громко,
+        # а не молча превращать PR в «довести» через .get-дефолт.
+        if row["velichina8_already_in_main"]:
+            conflicting = False
+            functional_overlap_count = 0
+            invariant_collisions: list[str] = []
+        else:
+            conflicting = row["velichina1_conflicting"]
+            functional_overlap_count = row["velichina3_functional_overlap"]
+            invariant_collisions = row["velichina7_invariant_collisions"]
         decision = decide(
-            conflicting=row["velichina1_conflicting"],
-            functional_overlap_count=row["velichina3_functional_overlap"],
+            conflicting=conflicting,
+            functional_overlap_count=functional_overlap_count,
             task_state=row["task_state"],
             ai_verdict=row["ai_verdict"],
-            invariant_collision=bool(row["velichina7_invariant_collisions"]),
+            invariant_collision=bool(invariant_collisions),
             decision_doc_collision=row["number"] in doc_collisions,
+            already_in_main=row["velichina8_already_in_main"],
         )
         rows.append({
             **row,

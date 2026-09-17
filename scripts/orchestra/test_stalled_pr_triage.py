@@ -145,6 +145,50 @@ def test_declaration_collision_is_a_warning_overlaid_on_any_action():
     assert not any("инварианты" in r for r in recreate["reasons"])
 
 
+# ── decide(): величина 8 — PR-дубль уже слитой работы (issue #1236) ─────────
+#
+# MUTATION-PROOF
+# ref: 1caf1f7053a2323bf0a05c9e4054c413b4a872b6
+# paths: scripts/orchestra/stalled_pr_triage.py
+# run: python -m pytest scripts/orchestra/test_stalled_pr_triage.py -k test_already_in_main_closes_regardless_of_everything_else -q --tb=no
+# expect: 1 failed
+#
+# `ref` — main ДО этого PR (issue #1236): на нём `decide()` не принимает
+# `already_in_main`, `measure_already_in_main`/`already_in_main_check` не
+# существуют вовсе. Гвардия (scripts/lib/mutation_recipe_guard.py, #1194)
+# подменяет ТОЛЬКО stalled_pr_triage.py историческим содержимым, тест ниже
+# остаётся текущим (зовёт already_in_main=...) — TypeError на неизвестном
+# kwarg даёт "1 failed", которого нет в baseline-прогоне текущего дерева
+# (там тест зелёный, "failed" не встречается вовсе). `--tb=no` — не
+# декорация: без него pytest печатает кириллический докстринг/исходник
+# вокруг падения, а Windows-раннер этого рецепта (в отличие от Linux-CI)
+# декодирует stdout ДОЧЕРНЕГО pytest в кодировке локали, а не UTF-8 —
+# `--tb=no` убирает печать исходника, рецепт остаётся кроссплатформенным
+# без `set PYTHONIOENCODING=...` (синтаксис cmd.exe, ломается на Linux-CI).
+
+def test_already_in_main_closes_regardless_of_everything_else():
+    """Величина 8 — машинно доказанный факт (git blob-SHA), а не чтение
+    человеком (в отличие от replacement_found, величина 5) — проверяется
+    РАНЬШЕ него и раньше предупреждений о коллизии номеров: нечему
+    коллидировать, если сводить нечего."""
+    result = tri.decide(conflicting=True, functional_overlap_count=99,
+                         task_state="open", ai_verdict=tri.review_labels.AI_CHANGES,
+                         invariant_collision=True, decision_doc_collision=True,
+                         already_in_main=True)
+    assert result["action"] == tri.ACTION_CLOSE
+    assert any("величина 8" in r and "1020" in r for r in result["reasons"])
+    # Предупреждения о коллизии номеров (величина 7) не появляются — нечему
+    # коллидировать, если PR не меняет main вовсе.
+    assert not any("величина 7" in r for r in result["reasons"])
+
+
+def test_already_in_main_false_does_not_short_circuit():
+    result = tri.decide(conflicting=False, functional_overlap_count=0,
+                         task_state="open", ai_verdict=None, already_in_main=False)
+    assert result["action"] == tri.ACTION_PROCEED
+    assert not any("величина 8" in r for r in result["reasons"])
+
+
 # ── declaration_collisions (чистые) ─────────────────────────────────────────
 
 def test_declaration_collisions_only_flags_numbers_added_by_both_sides():
@@ -794,6 +838,204 @@ def test_measure_invariant_collision_raises_when_registry_format_drifts(repo):
         tri.measure_invariant_collision("main", "pr", cwd=str(repo))
 
 
+# ── measure_already_in_main: величина 8, PR-дубль уже слитой работы ────────
+# (issue #1236, живой случай PR #1020 — оба файла PR побайтно совпадали
+# с main, а величина 3 (AST) этого не видела и врала «8 пересечений»,
+# сравнивая PR с его же копией в main.)
+
+def test_measure_already_in_main_violation_when_all_touched_files_byte_identical(repo):
+    """Регрессия живого случая #1020: PR и main независимо пришли к
+    одинаковым байтам одного файла — blob-SHA совпадает, величина 8 обязана
+    дать violation() (already_in_main), не читая AST вовсе."""
+    write(repo / "guard.py", "def check():\n    return 1\n")
+    git("add", "-A", cwd=repo)
+    git("commit", "-qm", "base with guard.py", cwd=repo)
+
+    git("checkout", "-b", "pr", cwd=repo)
+    write(repo / "guard.py", "def check():\n    return 42\n")
+    git("commit", "-am", "pr rewrites guard.py", cwd=repo)
+
+    git("checkout", "main", cwd=repo)
+    write(repo / "guard.py", "def check():\n    return 42\n")
+    git("commit", "-am", "main independently arrives at the same bytes", cwd=repo)
+
+    files = [{"filename": "guard.py", "status": "modified"}]
+    result = tri.measure_already_in_main("main", "pr", files, cwd=str(repo))
+    assert result.status == tri.check_result.STATUS_VIOLATION
+    assert result.violations == ["guard.py"]
+
+
+def test_measure_already_in_main_ok_when_main_edited_same_function_differently(repo):
+    """Обратный случай (requirement 6, issue #1236): main и PR правили ОДНУ
+    функцию, но РАЗНО — файлы расходятся байт в байт, величина 8 обязана
+    дать ok() (не дубль), не violation()."""
+    write(repo / "guard.py", "def check():\n    return 1\n")
+    git("add", "-A", cwd=repo)
+    git("commit", "-qm", "base with guard.py", cwd=repo)
+
+    git("checkout", "-b", "pr", cwd=repo)
+    write(repo / "guard.py", "def check():\n    return 42\n")
+    git("commit", "-am", "pr rewrites guard.py to 42", cwd=repo)
+
+    git("checkout", "main", cwd=repo)
+    write(repo / "guard.py", "def check():\n    return 7\n")
+    git("commit", "-am", "main rewrites guard.py to 7, differently", cwd=repo)
+
+    files = [{"filename": "guard.py", "status": "modified"}]
+    result = tri.measure_already_in_main("main", "pr", files, cwd=str(repo))
+    assert result.status == tri.check_result.STATUS_OK
+
+
+def test_measure_already_in_main_ok_when_pr_removes_file_main_still_holds(repo):
+    """requirement 3 (issue #1236): PR удаляет файл, который main ЕЩЁ несёт —
+    настоящая правка, НЕ дубль."""
+    write(repo / "old.txt", "content\n")
+    git("add", "-A", cwd=repo)
+    git("commit", "-qm", "base with old.txt", cwd=repo)
+
+    git("checkout", "-b", "pr", cwd=repo)
+    git("rm", "--quiet", "old.txt", cwd=repo)
+    git("commit", "-m", "pr removes old.txt", cwd=repo)
+
+    files = [{"filename": "old.txt", "status": "removed"}]
+    result = tri.measure_already_in_main("main", "pr", files, cwd=str(repo))
+    assert result.status == tri.check_result.STATUS_OK
+
+
+def test_measure_already_in_main_removed_file_already_gone_in_main_counts_as_duplicate(repo):
+    """requirement 3, обратная сторона: PR удаляет файл, которого main УЖЕ
+    не несёт (main удалил его независимо) — стороны согласны, само по себе
+    это не блокирует already_in_main для остальных файлов PR."""
+    write(repo / "old.txt", "content\n")
+    git("add", "-A", cwd=repo)
+    git("commit", "-qm", "base with old.txt", cwd=repo)
+
+    git("checkout", "-b", "pr", cwd=repo)
+    git("rm", "--quiet", "old.txt", cwd=repo)
+    git("commit", "-m", "pr removes old.txt", cwd=repo)
+
+    git("checkout", "main", cwd=repo)
+    git("rm", "--quiet", "old.txt", cwd=repo)
+    git("commit", "-m", "main independently removes old.txt too", cwd=repo)
+
+    files = [{"filename": "old.txt", "status": "removed"}]
+    result = tri.measure_already_in_main("main", "pr", files, cwd=str(repo))
+    assert result.status == tri.check_result.STATUS_VIOLATION
+    assert result.violations == ["old.txt"]
+
+
+def test_measure_already_in_main_unknown_when_blob_unreadable(repo):
+    """Аномалия прод-формы (PR заявляет путь, которого нет на его же голове) —
+    честное unknown(), не тихое «не дубль» и не «дубль»."""
+    files = [{"filename": "no/such/path.py", "status": "modified"}]
+    result = tri.measure_already_in_main("main", "main", files, cwd=str(repo))
+    assert result.status == tri.check_result.STATUS_UNKNOWN
+    assert "no/such/path.py" in result.reason
+
+
+def test_measure_already_in_main_empty_files_list_is_unknown(repo):
+    result = tri.measure_already_in_main("main", "main", [], cwd=str(repo))
+    assert result.status == tri.check_result.STATUS_UNKNOWN
+
+
+def test_measure_already_in_main_renamed_file_compares_new_path(repo):
+    """`renamed` сравнивается по НОВОМУ пути (`filename`) — тот же критерий,
+    что added/modified."""
+    write(repo / "old_name.py", "VALUE = 1\n")
+    git("add", "-A", cwd=repo)
+    git("commit", "-qm", "base with old_name.py", cwd=repo)
+
+    git("checkout", "-b", "pr", cwd=repo)
+    git("mv", "old_name.py", "new_name.py", cwd=repo)
+    git("commit", "-m", "pr renames file", cwd=repo)
+
+    git("checkout", "main", cwd=repo)
+    git("mv", "old_name.py", "new_name.py", cwd=repo)
+    git("commit", "-m", "main independently renames the same way", cwd=repo)
+
+    files = [{"filename": "new_name.py", "status": "renamed", "previous_filename": "old_name.py"}]
+    result = tri.measure_already_in_main("main", "pr", files, cwd=str(repo))
+    assert result.status == tri.check_result.STATUS_VIOLATION
+
+
+def test_measure_already_in_main_ok_when_pr_renames_away_file_main_still_holds(repo):
+    """Блокирующая находка ai-ревью этого PR: переименование — это удаление
+    СТАРОГО пути плюс появление НОВОГО. Base несёт old_name.py; PR
+    переименовывает его в new_name.py; main НЕЗАВИСИМО уже несёт new_name.py
+    с теми же байтами, но СТАРЫЙ путь не удалял. Сведение чистое и удаляет
+    old_name.py из main — настоящая правка, обязана быть ok(), не
+    violation(): сравнение одного лишь нового пути молча советовало закрыть
+    живой PR («PR не меняет main»), хотя main терял файл."""
+    write(repo / "old_name.py", "VALUE = 1\n")
+    git("add", "-A", cwd=repo)
+    git("commit", "-qm", "base with old_name.py", cwd=repo)
+
+    git("checkout", "-b", "pr", cwd=repo)
+    git("mv", "old_name.py", "new_name.py", cwd=repo)
+    git("commit", "-m", "pr renames old_name.py to new_name.py", cwd=repo)
+
+    git("checkout", "main", cwd=repo)
+    write(repo / "new_name.py", "VALUE = 1\n")
+    git("add", "-A", cwd=repo)
+    git("commit", "-m", "main adds new_name.py with same bytes, keeps old_name.py", cwd=repo)
+
+    files = [{"filename": "new_name.py", "status": "renamed", "previous_filename": "old_name.py"}]
+    result = tri.measure_already_in_main("main", "pr", files, cwd=str(repo))
+    assert result.status == tri.check_result.STATUS_OK
+
+
+# ── already_in_main_check: обёртка величины 8 (gh + git) ───────────────────
+
+def test_already_in_main_check_delegates_to_list_pr_files_and_measures(repo, monkeypatch):
+    write(repo / "guard.py", "def check():\n    return 1\n")
+    git("add", "-A", cwd=repo)
+    git("commit", "-qm", "base", cwd=repo)
+    git("checkout", "-b", "pr", cwd=repo)
+    write(repo / "guard.py", "def check():\n    return 42\n")
+    git("commit", "-am", "pr", cwd=repo)
+    git("checkout", "main", cwd=repo)
+    write(repo / "guard.py", "def check():\n    return 42\n")
+    git("commit", "-am", "main matches independently", cwd=repo)
+
+    calls = []
+
+    def fake_list_pr_files(repo_name, number, gh_func):
+        calls.append((repo_name, number))
+        return [{"filename": "guard.py", "status": "modified"}]
+
+    monkeypatch.setattr(tri.review_labels, "list_pr_files", fake_list_pr_files)
+    result = tri.already_in_main_check("mytab0r/edge-harness", 1020, "main", "pr", cwd=str(repo))
+    assert result.status == tri.check_result.STATUS_VIOLATION
+    assert calls == [("mytab0r/edge-harness", 1020)]
+
+
+def test_already_in_main_check_transport_failure_is_unknown_not_raise(repo, monkeypatch):
+    """Сетевой отказ gh (requirement 2, issue #1236) — unknown(), обход
+    очереди на одном PR не падает целым RuntimeError наружу."""
+    def fail(repo_name, number, gh_func):
+        raise RuntimeError("gh api упал: HTTP 502")
+
+    monkeypatch.setattr(tri.review_labels, "list_pr_files", fail)
+    result = tri.already_in_main_check("mytab0r/edge-harness", 501, "main", "main", cwd=str(repo))
+    assert result.status == tri.check_result.STATUS_UNKNOWN
+    assert "gh api pulls/501/files" in result.reason
+
+
+def test_already_in_main_check_unknown_when_ref_unreadable(repo, monkeypatch):
+    """`blob_sha` не отличает «файла нет» от «ref не читается» — обёртка
+    проверяет оба ref'а `rev-parse --verify` ДО сравнения (некритичная
+    находка ревью этого PR): несостоявшийся main_ref на ветке `removed`
+    иначе читался бы как «согласие сторон» и подталкивал к violation;
+    здесь — честный unknown() с именем отказавшего ref'а."""
+    monkeypatch.setattr(
+        tri.review_labels, "list_pr_files",
+        lambda repo_name, number, gh_func: [{"filename": "old.txt", "status": "removed"}])
+    result = tri.already_in_main_check(
+        "mytab0r/edge-harness", 1020, "no-such-ref", "main", cwd=str(repo))
+    assert result.status == tri.check_result.STATUS_UNKNOWN
+    assert "no-such-ref" in result.reason
+
+
 # ── cmd_queue: один кривой PR не валит обход очереди (настоящий git) ───────
 
 def test_cmd_queue_continues_past_one_broken_pr(tmp_path, monkeypatch):
@@ -835,6 +1077,19 @@ def test_cmd_queue_continues_past_one_broken_pr(tmp_path, monkeypatch):
     monkeypatch.setattr(tri, "open_pulls", lambda repo: pulls)
     monkeypatch.setattr(tri, "decision_doc_collision_pr_numbers",
                         lambda repo, cwd=None: (set(), None))
+    # Величина 8 (issue #1236) теперь звонит gh ДО измерения каждого PR —
+    # без мока это был бы настоящий сетевой gh api на реальном репозитории
+    # (класс изоляции теста, не относится к дефекту #1219 самой строки):
+    # pr501 несёт реальное расхождение с main (f.txt "2\n" против "1\n") —
+    # величина 8 честно даёт ok(), сценарий не меняется; pr502 (orphan,
+    # несводимая история) получает пустой список — величина 8 уходит в
+    # unknown() ДО git-вызовов, сам «кривой PR» сценарий (несводимая история)
+    # по-прежнему проверяется дальше, в measure_pr.
+    def fake_list_pr_files(repo, number, gh_func):
+        if number == 501:
+            return [{"filename": "f.txt", "status": "modified"}]
+        return []
+    monkeypatch.setattr(tri.review_labels, "list_pr_files", fake_list_pr_files)
     rows = tri.cmd_queue("mytab0r/edge-harness", cwd=str(clone))
 
     by_number = {row["number"]: row for row in rows}
@@ -845,3 +1100,79 @@ def test_cmd_queue_continues_past_one_broken_pr(tmp_path, monkeypatch):
     assert good["velichina1_conflicting"] is False
     assert good["action"] == tri.ACTION_PROCEED
     assert good["velichina7_decision_doc_unknown"] is None
+    assert good["velichina8_already_in_main"] is False
+
+
+# ── cmd_queue: величина 8 short-circuit — дубль не считает величину 3 ──────
+
+def test_cmd_queue_closes_duplicate_pr_without_computing_functional_overlap(tmp_path, monkeypatch):
+    """Живой случай #1020: PR, чьи тронутые файлы побайтно совпадают с main,
+    обязан получить ACTION_CLOSE через величину 8, а величина 3 (AST-
+    пересечение) не должна вычисляться вовсе (requirement 1 issue #1236 —
+    «вычисляется ДО дорогих величин, обесценивает их»). Второй PR очереди —
+    подлинная правка, доказывает, что short-circuit не сломал обычный путь."""
+    origin = tmp_path / "origin.git"
+    origin.mkdir()
+    git("init", "--quiet", "--bare", cwd=origin)
+
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    init_repo(seed)
+    git("remote", "add", "origin", str(origin), cwd=seed)
+    write(seed / "f.txt", "1\n")
+    git("add", "-A", cwd=seed)
+    git("commit", "-qm", "c0", cwd=seed)
+    git("push", "-q", "origin", "main", cwd=seed)
+
+    # pr601 — дубль: правит f.txt на "2\n", ровно то же, что main получит
+    # независимо (ветка от c0, main продвигается позже отдельным коммитом).
+    git("checkout", "-qb", "pr601", cwd=seed)
+    write(seed / "f.txt", "2\n")
+    git("commit", "-am", "pr601 rewrites f.txt", cwd=seed)
+    git("push", "-q", "origin", "pr601:refs/pull/601/head", cwd=seed)
+
+    git("checkout", "-q", "main", cwd=seed)
+    write(seed / "f.txt", "2\n")
+    git("commit", "-am", "main independently arrives at the same bytes", cwd=seed)
+    git("push", "-q", "origin", "main", cwd=seed)
+
+    # pr602 — подлинная правка: новый файл, которого main не несёт.
+    git("checkout", "-qb", "pr602", "main", cwd=seed)
+    write(seed / "g.txt", "genuine new content\n")
+    git("add", "-A", cwd=seed)
+    git("commit", "-qm", "pr602 adds g.txt", cwd=seed)
+    git("push", "-q", "origin", "pr602:refs/pull/602/head", cwd=seed)
+
+    clone = tmp_path / "clone"
+    git("clone", "--quiet", "--no-local", str(origin), str(clone), cwd=tmp_path)
+
+    pulls = [
+        {"number": 601, "title": "duplicate", "head": {"ref": "pr601"}, "labels": []},
+        {"number": 602, "title": "genuine", "head": {"ref": "pr602"}, "labels": []},
+    ]
+    monkeypatch.setattr(tri, "open_pulls", lambda repo: pulls)
+    monkeypatch.setattr(tri, "decision_doc_collision_pr_numbers",
+                        lambda repo, cwd=None: (set(), None))
+
+    def fake_list_pr_files(repo, number, gh_func):
+        if number == 601:
+            return [{"filename": "f.txt", "status": "modified"}]
+        return [{"filename": "g.txt", "status": "added"}]
+    monkeypatch.setattr(tri.review_labels, "list_pr_files", fake_list_pr_files)
+
+    rows = tri.cmd_queue("mytab0r/edge-harness", cwd=str(clone))
+    by_number = {row["number"]: row for row in rows}
+
+    dup = by_number[601]
+    assert dup["velichina8_already_in_main"] is True
+    assert dup["velichina8_already_in_main_files"] == ["f.txt"]
+    assert dup["action"] == tri.ACTION_CLOSE
+    assert any("величина 8" in r for r in dup["reasons"])
+    # Дорогая величина 3 не вычислялась вовсе для дубля (мутация: сними
+    # short-circuit в cmd_queue — этот ключ появится, тест покраснеет).
+    assert "velichina3_functional_overlap" not in dup
+
+    genuine = by_number[602]
+    assert genuine["velichina8_already_in_main"] is False
+    assert genuine["action"] == tri.ACTION_PROCEED
+    assert "velichina3_functional_overlap" in genuine
