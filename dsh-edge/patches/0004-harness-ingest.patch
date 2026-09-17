@@ -304,7 +304,7 @@ index cfff36a..be11683 100644
    /** Count live Agent owners for host.describe. */
    async attachedSessionCount(): Promise<number> {
      const { agents } = await this.services()
-@@ -1496,6 +1632,107 @@ export class EdgeSessionStore {
+@@ -1496,6 +1632,116 @@ export class EdgeSessionStore {
    }
  }
  
@@ -403,6 +403,15 @@ index cfff36a..be11683 100644
 +        || typeof sourceRecord.provider !== 'string' || sourceRecord.provider === ''
 +        || typeof sourceRecord.model !== 'string' || sourceRecord.model === '') {
 +        throw fail('"assistant/message" requires role "assistant" and a model source with provider/model')
++      }
++      // 0.15.0 (0.1.5-rc.2, Format V3): token-meter's usageOf() reads
++      // event.data.stream for every assistant/message without data.usage —
++      // an ingested settlement carrying neither field crashed session.list
++      // with "Cannot read properties of undefined (reading 'length')"
++      // (deploy run 35255769370). A mirrored settlement carries no stream
++      // chunks and no usage sample; an empty stream is the honest form.
++      if (data.usage === undefined && data.stream === undefined) {
++        data.stream = []
 +      }
 +    }
 +  }
