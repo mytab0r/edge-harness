@@ -11,6 +11,7 @@
 """
 
 import importlib.util
+import json
 import re
 import sys
 from datetime import datetime, timezone
@@ -62,6 +63,14 @@ def health_snapshot_contents_response(rows: list[dict]) -> dict:
     import json
     text = "\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n"
     return {"content": base64.b64encode(text.encode()).decode(), "encoding": "base64"}
+
+
+def worktree_snapshot_contents_response(rows: list[dict]) -> dict:
+    """Та же прод-форма Contents API для журнала уборки рабочих деревьев
+    (инвариант 24, #1250) — читает `fetch_worktree_cleanup_records`; форма
+    ответа одинаковая, отдельная фикстура только чтобы докстринг теста называл
+    свой канал, а не соседний."""
+    return health_snapshot_contents_response(rows)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -207,17 +216,15 @@ class FakeGh:
     собственный маршрут contents/pipeline-health.jsonl, хотя история снимков
     не их предмет.
 
-    Запасной маршрут для комментариев #120 (инвариант 13, #899, и инвариант
-    16, дефект A watchdog-issue #120 — оба читают комментарии #120, один
-    общий дефолт на оба): здоровый дефолт — пустой список (маркеров серии
-    конвейера/WIP-гейта нет). Без него КАЖДЫЙ существующий тест build_report
-    был бы обязан завести собственный маршрут issues/120/comments, хотя ни
-    фантомная пауза конвейера, ни WIP-гейт — не их предмет; тест, которому
-    нужны конкретные маркеры, переопределяет этот маршрут явно (уже так
-    делают тесты #196/#220 выше)."""
+    Запасной маршрут для журнала уборки рабочих деревьев (инвариант 24,
+    #1250) — тот же приём и та же причина: 404 (data/worktree-cleanup пуста
+    до первого прод-прогона уборщика после слияния). Тест, которому нужны
+    записи, переопределяет маршрут явно (test_worktree_cleanup_records_*)."""
     _DEFAULT_ROUTES = {
         "actions/workflows/ai-review.yml/runs": {"workflow_runs": []},
         "contents/docs/research/data/pipeline-health.jsonl": RuntimeError(
+            "gh api repos/o/r/contents/...: HTTP 404: Not Found"),
+        "contents/docs/research/data/worktree-cleanup.jsonl": RuntimeError(
             "gh api repos/o/r/contents/...: HTTP 404: Not Found"),
         "issues/120/comments": [],
         # Запасной маршрут для инварианта 17 (морда dsh-edge, #1041): здоровый
@@ -253,15 +260,20 @@ class FakeGh:
 
 
 def patch_gh(monkeypatch, fake):
-    """Единая точка патча — оба модуля читают gh() по имени (repo_invariants
+    """Единая точка патча — ТРИ модуля читают gh() по имени (repo_invariants
     реэкспортирует pulse_guard.gh как свой атрибут `ri.gh`, но
     post_issue_comment/escalate внутри pulse_guard.py вызывают СВОЙ
-    module-level `gh`, а не `ri.gh`). Патчить только `ri.gh` недостаточно —
-    так один прогон реально ушёл в живой issue #120 (инцидент этой задачи,
-    #244: очищено вручную, gh api -X DELETE .../comments/5527288512).
-    Патчим оба имени — тот же приём, что test_scheduler.py::patch_gh."""
+    module-level `gh`, а не `ri.gh`; ai_changes_labeled_at внутри
+    scheduler.py — третий, самостоятельный биндинг `scheduler.gh`).
+    Патчить только `ri.gh`/`ri.pulse_guard.gh` недостаточно — так один
+    прогон реально ушёл в живой issue #120 (инцидент этой задачи, #244:
+    очищено вручную, gh api -X DELETE .../comments/5527288512), а находка
+    ревью PR #1260 поймала тот же класс на `scheduler.gh`: тесты
+    check_ai_rework_never_dispatched читали живой GitHub вместо фикстур.
+    Патчим все три имени — тот же приём, что test_scheduler.py::patch_gh."""
     monkeypatch.setattr(ri, "gh", fake)
     monkeypatch.setattr(ri.pulse_guard, "gh", fake)
+    monkeypatch.setattr(ri.scheduler, "gh", fake)
 
 
 def gate1_status(when: str):
@@ -2054,6 +2066,19 @@ def test_idle_guard_healthy_snapshot_no_violations_no_mutating_calls(tmp_path, m
         # остался про ДРУГИЕ инварианты, а не про историю снимков.
         "contents/docs/research/data/pipeline-health.jsonl":
             health_snapshot_contents_response([{"date": "2026-09-03", "merge_throughput": 1}]),
+        # Инвариант 24 (#1250): свежая запись уборщика с числами, которые не
+        # нарушают ни половину критерия готовности (устаревших копий гвардий
+        # 0 ≤ открытых PR 1), ни симптом инцидента (removed>0) — тем же приёмом,
+        # что снимок здоровья выше, чтобы тест остался про другие инварианты.
+        "contents/docs/research/data/worktree-cleanup.jsonl":
+            worktree_snapshot_contents_response([{
+                "ts": "2026-09-03T11:30:00+00:00", "mode": "apply",
+                "total": 5, "removed": 2, "kept": 3,
+                "guard_copies": 5, "stale_guard_copies": 0,
+                "stuck_old_total": 0, "stuck_old_unpushed": 0,
+                "stuck_old_unknown_work": 0, "stuck_old_unknown_pr": 0,
+                "retention_hours": 1.0,
+            }]),
         # Инвариант 12 (#876): полнотекстовый поиск не находит ни одного
         # комментария с противоречивой фразой — здоровое состояние.
         "search/issues": {"items": []},
@@ -2303,13 +2328,30 @@ def test_run_escalations_pipeline_health_dedupes_by_last_date(monkeypatch):
 
 
 def pause_marker_comment(when: str) -> dict:
-    return {"created_at": when, "body": ri.pulse_guard.PAUSE_MARKER}
+    """Честный маркер серии: `performed_via_github_app` НЕ пуст (#1242) —
+    писатель семейства один (`pulse_guard.gh()` под `github.token`, #1074),
+    поэтому инвариант 13 с require_job_token=True обязан его видеть."""
+    return {"created_at": when, "body": ri.pulse_guard.PAUSE_MARKER,
+            "performed_via_github_app": {"id": 15368, "slug": "github-actions"}}
 
 
 def probe_marker_comment(when: str, attempt: int) -> dict:
     return {"created_at": when,
             "body": ri.pulse_guard.probe_alert_text(
-                attempt, ri.pulse_guard.probe_backoff_minutes(attempt), None, "err")}
+                attempt, ri.pulse_guard.probe_backoff_minutes(attempt), None, "err"),
+            "performed_via_github_app": {"id": 15368, "slug": "github-actions"}}
+
+
+def fake_marker_comment(when: str, body: str) -> dict:
+    """Прод-форма ПОДДЕЛЬНОГО маркера: буквальный envelope живого инцидента
+    #1242 (issuecomment-5665003751 — та же фикстура, что у test_pulse_guard,
+    один источник), тело подставляется под сценарий. `user.login == "mytab0r"`,
+    `performed_via_github_app is None` — не токен job'а."""
+    comment = json.loads((_DIR / "fixtures_issue120_fake_wip_close_marker.json")
+                         .read_text(encoding="utf-8"))
+    comment["created_at"] = when
+    comment["body"] = body
+    return comment
 
 
 def test_phantom_pause_flags_active_marker_with_zero_real_failures(monkeypatch):
@@ -2467,6 +2509,64 @@ def test_phantom_pause_unknown_on_malformed_run_history_shape(monkeypatch):
     assert "неожиданной" in result.reason
 
 
+def test_phantom_pause_ignores_fake_pause_marker_without_job_token(monkeypatch):
+    """#1242, находка ai-review этого PR: инвариант 13 — независимый пересчёт
+    решения conveyor_gate, обязан читать маркеры с тем же доверием, что и
+    сам гейт (тот с этого же PR требует require_job_token=True). Без фильтра
+    поддельный PAUSE (живой envelope инцидента #1242, performed_via_github_app
+    =None) при здоровой серии давал violation «фантомная пауза»
+    ({'failures': 0, ...}) — отчёт о паузе, которой для гейта (allowed=True)
+    не существует: гейт и инвариант расходились по построению. С фильтром —
+    здоровое состояние, согласованное с гейтом. Сама подделка при этом не
+    остаётся невидимой: её детектирует инвариант 18 (всё семейство
+    `[статус конвейера:`). Мутация: снять require_job_token из вызова в
+    check_conveyor_gate_phantom_pause — тест краснеет (нарушение вернётся)."""
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": [
+            worker_run(5, "2026-09-10T11:55:00Z", conclusion="skipped"),
+            worker_run(2, "2026-09-10T11:35:00Z"),
+            worker_run(1, "2026-09-10T11:20:00Z"),
+        ]},
+        "issues/120/comments": [
+            fake_marker_comment("2026-09-10T11:45:00Z", ri.pulse_guard.PAUSE_MARKER)],
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 10, 12, 0)
+    assert ri.check_conveyor_gate_phantom_pause(REPO, now) == ri.check_result.ok(), (
+        "поддельный PAUSE (не токен job'а) не должен порождать фантомную "
+        "паузу в независимом пересчёте — гейт с теми же данными разрешает "
+        "диспатч")
+
+
+def test_phantom_pause_fake_resume_cannot_cancel_honest_pause(monkeypatch):
+    """#1242, симметричный случай: поддельный RESUME (не токен job'а) НЕ
+    должен становиться якорем пересчёта и молча обнулять проверку честной
+    паузы. Без фильтра resume_at брался с подделки (11:50 новее честного
+    PAUSE 11:45), маркеры после якоря пусты — «серии нет», инвариант молчал,
+    хотя пауза стоит и реальных провалов нет (ровно фантом). С фильтром —
+    нарушение видно. Мутация: снять require_job_token — тест краснеет
+    (молчаливое ok() вернётся)."""
+    fake = FakeGh({
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": [
+            worker_run(5, "2026-09-10T11:55:00Z", conclusion="skipped"),
+            worker_run(2, "2026-09-10T11:35:00Z"),
+            worker_run(1, "2026-09-10T11:20:00Z"),
+        ]},
+        "issues/120/comments": [
+            pause_marker_comment("2026-09-10T11:45:00Z"),
+            fake_marker_comment("2026-09-10T11:50:00Z",
+                                f"✅ edge-harness: {ri.pulse_guard.RESUME_MARKER} #999]"),
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 10, 12, 0)
+    result = ri.check_conveyor_gate_phantom_pause(REPO, now)
+    assert result.status == ri.check_result.STATUS_VIOLATION, (
+        "поддельный RESUME не должен отменять честную паузу в пересчёте — "
+        "фантом (пауза активна, реальных провалов 0) обязан остаться виден")
+    assert result.violations[0]["failures"] == 0
+
+
 def test_phantom_pause_not_in_ci_gating():
     """Долг на живом репозитории ещё не измерен (тот же порядок, что у
     1/5/9/10/12) — наблюдательный, не гейтящий."""
@@ -2516,7 +2616,9 @@ def test_worker_false_success_comment_healthy_snapshot_no_hits(monkeypatch):
 def test_worker_false_success_comment_flags_genuine_regression_after_fix(monkeypatch):
     # Настоящий регресс: комментарий с точным маркером ПОЗЖЕ даты приземления
     # фикса #876 (WORKER_FALSE_SUCCESS_FIX_LANDED_AT) — единственный случай,
-    # когда фраза структурно не должна была родиться заново.
+    # когда фраза структурно не должна была родиться заново. Ревизия #1184:
+    # литерал — актуальная прод-форма («провайдер: )», пустой WORKER_CHAIN_
+    # PROVIDER после интерполяции task.sh:814), не устаревшее «?».
     fake = FakeGh({
         "search/issues": {"items": [
             {"number": 900, "html_url": "https://github.com/mytab0r/edge-harness/issues/900",
@@ -2524,7 +2626,7 @@ def test_worker_false_success_comment_flags_genuine_regression_after_fix(monkeyp
         ]},
         "issues/900/comments": [
             {"created_at": "2026-10-01T00:00:00Z",
-             "body": "🤖 Автономный воркер справился (провайдер: ?). PR открыт: .../pull/999"},
+             "body": "🤖 Автономный воркер справился (провайдер: ). PR открыт: .../pull/999"},
         ],
     })
     patch_gh(monkeypatch, fake)
@@ -2542,7 +2644,13 @@ def test_worker_false_success_comment_historical_incident_not_flagged(monkeypatc
     # комментарий самого инцидента (issue #140, 2026-09-10T18:53:32Z — живой
     # случай, ради которого #876 и написан) остаётся в теле issue навсегда.
     # Без отсечки по дате инвариант был бы красным с первого пульса после
-    # мержа — первое появление ДО фикса не регресс, а его причина.
+    # мержа — первое появление ДО фикса не регресс, а его причина. Ревизия
+    # #1184: с текущим маркером («провайдер: )», без «?» — см.
+    # WORKER_FALSE_SUCCESS_MARKER) этот исторический текст (тогда ещё с «?»,
+    # старый фолбэк `${WORKER_CHAIN_PROVIDER:-?}` был жив) не совпадает и по
+    # буквальной подстроке — дата-гейт здесь избыточная, но не лишняя защита:
+    # тест остаётся регрессом на случай, если маркер когда-нибудь снова
+    # сблизится с историческим текстом.
     fake = FakeGh({
         "search/issues": {"items": [
             {"number": 140, "html_url": "https://github.com/mytab0r/edge-harness/issues/140",
@@ -2559,7 +2667,8 @@ def test_worker_false_success_comment_historical_incident_not_flagged(monkeypatc
 
 def test_worker_false_success_comment_search_false_positive_not_reported(monkeypatch):
     # Находка ai-review PR #880: GitHub Search отбрасывает пунктуацию —
-    # фразовый запрос на «справился (провайдер: ?)» вырождается в поиск
+    # фразовый запрос на «справился (провайдер: )» (ревизия #1184: актуальный
+    # маркер, было устаревшее «?») вырождается в поиск
     # голых слов «справился»+«провайдер», которые соседствуют в КАЖДОМ
     # ЗДОРОВОМ успехе воркера («справился (провайдер: GLM)»). Search вернул
     # бы такую задачу кандидатом, но локальная сверка (буквальная подстрока
@@ -2581,17 +2690,81 @@ def test_worker_false_success_comment_search_false_positive_not_reported(monkeyp
 
 def test_worker_false_success_comment_query_uses_the_exact_contradiction_marker(monkeypatch):
     # Мутация: если запрос когда-нибудь начнёт искать другую фразу (например
-    # обобщённое «справился» без «провайдер: ?») — это либо ложные
+    # обобщённое «справился» без «провайдер: )») — это либо ложные
     # срабатывания на КАЖДЫЙ настоящий успех, либо тихая потеря сигнала.
     # Литерал ЗАШИТ здесь буквально (не через ri.WORKER_FALSE_SUCCESS_MARKER):
     # если бы тест сверял константу саму с собой, мутация значения константы
-    # прошла бы мимо теста — проверяем дословный прод-текст шаблона task.sh.
+    # прошла бы мимо теста — проверяем дословный прод-текст шаблона task.sh
+    # (ревизия #1184: актуальная форма с пустым провайдером, не устаревшее «?»).
     fake = FakeGh({"search/issues": {"items": []}})
     patch_gh(monkeypatch, fake)
     ri.check_worker_false_success_comment(REPO)
-    assert any("справился (провайдер: ?)" in call for call in fake.calls), (
+    assert any("справился (провайдер: )" in call for call in fake.calls), (
         f"запрос обязан нести точный маркер противоречия: {fake.calls}"
     )
+
+
+def test_worker_false_success_marker_matches_task_sh_template():
+    # Ai-review PR #1189: ничто механически не связывало WORKER_FALSE_SUCCESS_MARKER
+    # со строкой шаблона в scripts/worker/task.sh — следующий реворд текста
+    # успеха молча вернул бы инвариант 14 в класс #1172 (зелёный навсегда
+    # независимо от регресса). Читаем РЕАЛЬНЫЙ task.sh, извлекаем строку
+    # «🤖 Автономный воркер справился…», интерполируем пустой
+    # WORKER_CHAIN_PROVIDER и сверяем результат с ri.WORKER_FALSE_SUCCESS_MARKER.
+    task_sh = (_DIR.parent / "worker" / "task.sh").read_text(encoding="utf-8")
+    match = re.search(
+        r"^🤖 Автономный воркер справился \(провайдер: (\$\{WORKER_CHAIN_PROVIDER\})\)\.",
+        task_sh, re.MULTILINE,
+    )
+    assert match, "task.sh обязан нести дословный шаблон успеха с ${WORKER_CHAIN_PROVIDER}"
+    rendered_empty_provider = match.group(0)[:-1].replace(match.group(1), "")
+    assert ri.WORKER_FALSE_SUCCESS_MARKER in rendered_empty_provider, (
+        f"константа {ri.WORKER_FALSE_SUCCESS_MARKER!r} разошлась с прод-шаблоном "
+        f"task.sh при пустом WORKER_CHAIN_PROVIDER: {rendered_empty_provider!r}"
+    )
+
+
+def test_worker_false_success_comment_ignores_marker_in_code_spans(monkeypatch):
+    # PR #1189 (находка А): локальная сверка не должна считать вхождения
+    # маркера внутри markdown code spans (`` `...` `` / ```` ```...``` ````) —
+    # прод-комментарий воркера фразу в бэктики не заворачивает, а обсуждение
+    # PR/задачи вполне может её процитировать. Цитата в бэктиках — не нарушение.
+    fake = FakeGh({
+        "search/issues": {"items": [
+            {"number": 999, "html_url": "https://github.com/mytab0r/edge-harness/issues/999",
+             "title": "обсуждение с цитатой"},
+        ]},
+        "issues/999/comments": [
+            {"created_at": "2026-10-01T00:00:00Z",
+             "body": "Инвариант ищет `справился (провайдер: )` — это новая форма после #1184"},
+            {"created_at": "2026-10-01T00:00:00Z",
+             "body": "```\n🤖 Автономный воркер справился (провайдер: ). PR открыт: ...\n```"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    assert ri.check_worker_false_success_comment(REPO) == ri.check_result.ok()
+
+
+def test_worker_false_success_comment_still_flags_bare_marker(monkeypatch):
+    # Голое вхождение (не в бэктиках) ПОЗЖЕ даты отсечки — это нарушение.
+    fake = FakeGh({
+        "search/issues": {"items": [
+            {"number": 998, "html_url": "https://github.com/mytab0r/edge-harness/issues/998",
+             "title": "настоящий регресс"},
+        ]},
+        "issues/998/comments": [
+            {"created_at": "2026-10-01T00:00:00Z",
+             "body": "Обсуждение: новый маркер — справился (провайдер: ) — появился в логе"},
+        ],
+    })
+    patch_gh(monkeypatch, fake)
+    result = ri.check_worker_false_success_comment(REPO)
+    assert result.status == ri.check_result.STATUS_VIOLATION
+    assert result.violations == [{
+        "issue": 998,
+        "url": "https://github.com/mytab0r/edge-harness/issues/998",
+        "title": "настоящий регресс",
+    }]
 
 
 def test_worker_false_success_comment_unknown_on_network_failure(monkeypatch):
@@ -2650,7 +2823,7 @@ def test_worker_false_success_comment_confirmed_violation_beats_unchecked_siblin
         ]},
         "issues/900/comments": [
             {"created_at": "2026-10-01T00:00:00Z",
-             "body": "🤖 Автономный воркер справился (провайдер: ?). PR открыт: .../pull/999"},
+             "body": "🤖 Автономный воркер справился (провайдер: ). PR открыт: .../pull/999"},
         ],
         "issues/777/comments": RuntimeError("gh api: 502"),
     })
@@ -3934,3 +4107,300 @@ def test_run_escalations_invariant_18_key_stays_compact(monkeypatch):
     ri.run_escalations("mytab0r/edge-harness", {18: many_plus_one})
     assert len(seen_markers) == 2
     assert seen_markers[0] != seen_markers[1]  # новый состав — новая эскалация
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Инвариант 22 (issue #1253): «доводку не звали ни разу» отдельно от
+# «доводка звалась и не помогла» — check_stuck_review_gate (инвариант 3)
+# структурно не видит PR с уже вынесенным ai:changes-requested.
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def timeline_with_ai_changes(when: str):
+    return [{"event": "labeled", "label": {"name": ri.review_labels.AI_CHANGES}, "created_at": when}]
+
+
+def ai_rework_marker_comment(when: str):
+    return {"created_at": when, "body": f"🤖 {ri.scheduler.AI_REWORK_MARKER} fp:abc123 текст"}
+
+
+def test_ai_rework_never_dispatched_flags_after_threshold_without_marker(monkeypatch):
+    # Живой случай (issue #1253, замер 2026-09-14): PR #261 несёт
+    # ai:changes-requested с 2026-09-06T09:13:49Z (~8.3 сут на момент замера)
+    # и ни разу не получал маркер авто-доводки — голодание очереди по
+    # возрасту (dispatch_ai_review_rework перебирал сырой порядок open_pulls,
+    # новые PR первыми, до фикса этим же PR).
+    pull = open_pr(261, labels=[ri.review_labels.AI_CHANGES])
+    fake = FakeGh({
+        "issues/261/timeline": timeline_with_ai_changes("2026-09-06T09:13:49Z"),
+        "issues/261/comments": [],
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 14, 15, 33)
+    violations = ri.check_ai_rework_never_dispatched("mytab0r/edge-harness", now, [pull])
+    assert len(violations) == 1
+    assert violations[0]["pr"] == 261
+    assert violations[0]["age_minutes"] > ri.AI_REWORK_NEVER_DISPATCHED_AFTER_MINUTES
+
+
+def test_ai_rework_never_dispatched_silent_within_threshold(monkeypatch):
+    # Свежепомеченный PR — формирующийся бэклог сразу после дисптача,
+    # НЕ находка (тот же класс «тормоз без газа», от которого уже
+    # отказались для 1/4/5/9): очередь из N PR разгребается сама за часы.
+    pull = open_pr(1254, labels=[ri.review_labels.AI_CHANGES])
+    fake = FakeGh({
+        "issues/1254/timeline": timeline_with_ai_changes("2026-09-14T15:33:15Z"),
+        "issues/1254/comments": [],
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 14, 15, 34)
+    assert ri.check_ai_rework_never_dispatched("mytab0r/edge-harness", now, [pull]) == []
+
+
+def test_ai_rework_never_dispatched_silent_when_marker_present(monkeypatch):
+    # «Доводка звалась и не помогла» — ДРУГОЕ состояние: бюджет
+    # dispatch_ai_review_rework (AI_REWORK_MAX_ATTEMPTS + эскалация) уже
+    # отвечает за него, второй тормоз здесь не заводится.
+    #
+    # Мутация: убери ветку `if ever_dispatched: continue` в
+    # check_ai_rework_never_dispatched — этот тест покраснеет (PR #804,
+    # 7.5 суток с меткой, стал бы ложной находкой несмотря на маркер доводки).
+    pull = open_pr(804, labels=[ri.review_labels.AI_CHANGES])
+    fake = FakeGh({
+        "issues/804/timeline": timeline_with_ai_changes("2026-09-09T09:35:51Z"),
+        "issues/804/comments": [ai_rework_marker_comment("2026-09-12T13:00:00Z")],
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 14, 15, 33)  # ~7.5 суток с простановки метки
+    assert ri.check_ai_rework_never_dispatched("mytab0r/edge-harness", now, [pull]) == []
+
+
+def test_ai_rework_never_dispatched_flags_recidivism_across_episodes(monkeypatch):
+    """Находка написания дельта-спеки этого PR (класс #1172 в новом коде):
+    `ever_dispatched` сканировал ВСЮ историю комментариев PR на маркер
+    доводки, не сверяясь с `labeled_at` ТЕКУЩЕГО эпизода — PR, которому
+    доводку делали в ПРОШЛОМ эпизоде ai:changes-requested, потом метку
+    сняли, потом навесили снова и он опять застоялся сверх порога, не
+    отмечался НИКОГДА: старый маркер глушил находку ровно на рецидиве, ради
+    которого инвариант написан.
+
+    Два эпизода на одном PR: доводка (маркер) в ПЕРВОМ эпизоде
+    (2026-08-25 → снята 2026-08-28), тишина во ВТОРОМ эпизоде (навешена
+    заново 2026-09-06) сверх порога — инвариант обязан найти, несмотря на
+    маркер первого эпизода.
+
+    Мутация: убери условие `pulse_guard.parse_time(comment["created_at"]) >=
+    labeled_at` (верни голое `MARKER in body for comment in comments`,
+    без сверки с episode) — этот тест покраснеет: старый маркер первого
+    эпизода снова заглушит находку второго."""
+    pull = open_pr(900, labels=[ri.review_labels.AI_CHANGES])
+    timeline = [
+        {"event": "labeled", "label": {"name": ri.review_labels.AI_CHANGES},
+         "created_at": "2026-08-25T00:00:00Z"},
+        {"event": "unlabeled", "label": {"name": ri.review_labels.AI_CHANGES},
+         "created_at": "2026-08-28T00:00:00Z"},
+        {"event": "labeled", "label": {"name": ri.review_labels.AI_CHANGES},
+         "created_at": "2026-09-06T00:00:00Z"},
+    ]
+    fake = FakeGh({
+        "issues/900/timeline": timeline,
+        # Маркер лежит МЕЖДУ первым labeled (08-25) и unlabeled (08-28) —
+        # принадлежит ПЕРВОМУ эпизоду, строго раньше второго labeled (09-06).
+        "issues/900/comments": [ai_rework_marker_comment("2026-08-26T12:00:00Z")],
+    })
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 14, 15, 33)  # ~8.6 суток со ВТОРОГО эпизода (09-06)
+    violations = ri.check_ai_rework_never_dispatched("mytab0r/edge-harness", now, [pull])
+    assert len(violations) == 1
+    assert violations[0]["pr"] == 900
+    assert violations[0]["labeled_at"].startswith("2026-09-06")  # возраст СЧИТАН от нового эпизода
+
+
+def test_ai_rework_never_dispatched_silent_for_conflict_pr(monkeypatch):
+    # Conflict-PR — своя очередь (dispatch_conflict_rework), этот инвариант
+    # их не трогает вовсе, даже если ai:changes-requested тоже висит.
+    pull = open_pr(560, labels=[ri.review_labels.AI_CHANGES, ri.scheduler.CONFLICT_LABEL])
+    fake = FakeGh({})  # маршрут даже не должен запрашиваться
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 14, 15, 33)
+    assert ri.check_ai_rework_never_dispatched("mytab0r/edge-harness", now, [pull]) == []
+    assert fake.calls == []
+
+
+def test_ai_rework_never_dispatched_silent_when_no_ai_changes_label():
+    pull = open_pr(1, labels=["review:ok"])
+    now = utc(2026, 9, 14, 15, 33)
+    assert ri.check_ai_rework_never_dispatched("mytab0r/edge-harness", now, [pull]) == []
+
+
+def test_ai_rework_never_dispatched_silent_when_label_event_not_found(monkeypatch):
+    # ai_changes_labeled_at вернул None (таймлайн не отдал событие — метка
+    # снята и переставлена мимо API, редкий факт) — не гадаем, не находка.
+    pull = open_pr(1, labels=[ri.review_labels.AI_CHANGES])
+    fake = FakeGh({"issues/1/timeline": []})
+    patch_gh(monkeypatch, fake)
+    now = utc(2026, 9, 14, 15, 33)
+    assert ri.check_ai_rework_never_dispatched("mytab0r/edge-harness", now, [pull]) == []
+
+
+def test_ai_rework_never_dispatched_not_in_ci_gating_or_escalating():
+    # Наблюдательный (docstring build_report/CI_GATING): свежедобавленный
+    # инвариант, ноль истории эскалаций — тот же порядок, что у 8/9/10/12/14.
+    assert 22 not in ri.CI_GATING
+    assert 22 not in ri.ESCALATING_INVARIANTS
+
+
+def test_build_report_wires_invariant_22(monkeypatch):
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": [{**open_pr(261, labels=[ri.review_labels.AI_CHANGES]),
+                               "created_at": "2026-09-06T00:00:00Z"}],
+        "graphql": graphql_pool_page(),
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+        "search/issues": {"items": []},
+        "issues/261/timeline": timeline_with_ai_changes("2026-09-06T09:13:49Z"),
+        "issues/261/comments": [],
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    now = utc(2026, 9, 14, 15, 33)
+    lines, findings = ri.build_report("mytab0r/edge-harness", now)
+    assert len(findings[22]) == 1
+    assert findings[22][0]["pr"] == 261
+    assert any("🚨" in line and "[22]" in line for line in lines)
+    assert any("#261" in line for line in lines)
+# Инвариант 24 (#1250): наблюдаемость уборки рабочих деревьев
+# ══════════════════════════════════════════════════════════════════════════
+
+# Прод-форма записи уборщика — сам состав полей читается из ЕДИНОГО модуля
+# канала (worktree_snapshot.make_record), не из копии словаря в тесте.
+def wt_record(ts="2026-09-14T11:00:00+00:00", **over):
+    base = ri.worktree_snapshot.make_record(
+        ts=ts, mode="apply", total=76, removed=28, kept=48,
+        guard_copies=73, stale_guard_copies=13, stuck_old_by_code={
+            "unpushed": 7, "unknown_work": 1, "unknown_pr": 1},
+        retention_hours=1.0)
+    base.update(over)
+    return base
+
+
+def test_worktree_cleanup_records_no_records_is_not_healthy():
+    """«Записей нет НИ РАЗУ» — нарушение («объект ненаблюдаем»), не 💚:
+    инвариант, читающий пустоту как чистоту, повторял бы класс #882."""
+    violations = ri.check_worktree_cleanup_records([], 26, utc(2026, 9, 14, 12, 0))
+    assert len(violations) == 1 and violations[0]["kind"] == "no-records"
+
+
+def test_worktree_cleanup_records_stale_channel_names_unobservability():
+    old = wt_record(ts="2026-09-01T11:00:00+00:00")
+    violations = ri.check_worktree_cleanup_records([old], 26, utc(2026, 9, 14, 12, 0))
+    assert len(violations) == 1
+    assert violations[0]["kind"] == "stale-channel"
+    assert violations[0]["age_days"] == 13.0
+    assert violations[0]["threshold_days"] == ri.worktree_snapshot.RECORD_STALE_AFTER_DAYS
+
+
+def test_worktree_cleanup_records_fresh_total_zero_is_healthy():
+    """Свежая запись с total=0 — «деревьев нет»: прогон СОСТОЯЛСЯ и деревьев
+    не нашёл. Это отличимое от «ненаблюдаем» здоровое состояние."""
+    fresh_zero = wt_record(total=0, removed=0, kept=0, guard_copies=0,
+                           stale_guard_copies=0, stuck_old_total=0)
+    assert ri.check_worktree_cleanup_records([fresh_zero], 26, utc(2026, 9, 14, 12, 0)) == []
+
+
+def test_worktree_cleanup_records_stale_guard_copies_over_open_prs():
+    """Вторая половина критерия готовности #1250: устаревших копий гвардий
+    не больше числа открытых PR. Числа — из замера задачи (41 против 26)."""
+    record = wt_record(stale_guard_copies=41)
+    violations = ri.check_worktree_cleanup_records([record], 26, utc(2026, 9, 14, 12, 0))
+    assert violations == [{
+        "kind": "stale-guard-copies", "stale_guard_copies": 41, "open_prs": 26,
+        "last_ts": "2026-09-14T11:00:00+00:00",
+    }]
+    at_boundary = wt_record(stale_guard_copies=26)
+    assert ri.check_worktree_cleanup_records([at_boundary], 26, utc(2026, 9, 14, 12, 0)) == []
+
+
+def test_worktree_cleanup_records_zero_removed_while_stuck():
+    """Основной симптом инцидента #1250: removed=0 при запертых деревьях
+    старше retention — нарушение; removed>0 или без запертых — нет."""
+    incident = wt_record(removed=0, stuck_old_total=45)
+    violations = ri.check_worktree_cleanup_records([incident], 26, utc(2026, 9, 14, 12, 0))
+    assert violations == [{
+        "kind": "zero-removed-stuck", "removed": 0, "total": 76,
+        "stuck_old_total": 45, "last_ts": "2026-09-14T11:00:00+00:00",
+    }]
+    healthy = wt_record(removed=28)
+    assert ri.check_worktree_cleanup_records([healthy], 26, utc(2026, 9, 14, 12, 0)) == []
+    nothing_stuck = wt_record(removed=0, stuck_old_total=0)
+    assert ri.check_worktree_cleanup_records([nothing_stuck], 26, utc(2026, 9, 14, 12, 0)) == []
+
+
+def test_worktree_cleanup_records_bad_record_is_violation_not_crash():
+    broken = {"ts": "не-время", "total": 1}
+    violations = ri.check_worktree_cleanup_records([broken], 26, utc(2026, 9, 14, 12, 0))
+    assert len(violations) == 1 and violations[0]["kind"] == "bad-record"
+
+
+def test_fetch_worktree_cleanup_records_404_is_empty(monkeypatch):
+    patch_gh(monkeypatch, FakeGh({}))  # дефолтный маршрут — 404, штатное «записей не было»
+    assert ri.fetch_worktree_cleanup_records("mytab0r/edge-harness") == []
+
+
+def test_build_report_wires_invariant_24(monkeypatch):
+    """Прод-форма Contents API → находка [24] в отчёте; 404 — отдельная
+    🚨 «записей нет НИ РАЗУ», не 💚."""
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        # 26 открытых PR, 41 устаревшая копия — числа из замера задачи #1250.
+        "pulls?state=open": [open_pr(n) for n in range(26)],
+        "graphql": graphql_pool_page(),
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+        "search/issues": {"items": []},
+        "contents/docs/research/data/worktree-cleanup.jsonl":
+            worktree_snapshot_contents_response([wt_record(stale_guard_copies=41)]),
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    lines, findings = ri.build_report("mytab0r/edge-harness", utc(2026, 9, 14, 12, 0))
+    assert [v["kind"] for v in findings[24]] == ["stale-guard-copies"]
+    assert any("🚨" in line and "[24]" in line and "41" in line for line in lines)
+
+    fake404 = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": [],
+        "graphql": graphql_pool_page(),
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+        "search/issues": {"items": []},
+    })
+    patch_gh(monkeypatch, fake404)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    lines404, findings404 = ri.build_report("mytab0r/edge-harness", utc(2026, 9, 14, 12, 0))
+    assert [v["kind"] for v in findings404[24]] == ["no-records"]
+    assert any("🚨" in line and "[24]" in line and "НИ РАЗУ" in line for line in lines404)
+
+
+def test_build_report_invariant_24_healthy_line_carries_numbers(monkeypatch):
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": [],
+        "graphql": graphql_pool_page(),
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+        "search/issues": {"items": []},
+        "contents/docs/research/data/worktree-cleanup.jsonl":
+            worktree_snapshot_contents_response([wt_record(total=0, removed=0, kept=0,
+                                                           guard_copies=0,
+                                                           stale_guard_copies=0,
+                                                           stuck_old_total=0)]),
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    lines, findings = ri.build_report("mytab0r/edge-harness", utc(2026, 9, 14, 12, 0))
+    assert findings[24] == []
+    healthy = [line for line in lines if "[24]" in line and "💚" in line]
+    assert healthy and "total=0" in healthy[0], \
+        "здоровая строка обязана различать «деревьев нет» от общего «здорово»"

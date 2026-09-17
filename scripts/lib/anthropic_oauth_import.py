@@ -37,8 +37,14 @@ import sys
 
 REPO_DEFAULT = "mytab0r/edge-harness"
 SECRET_PREFIX = "ANTHROPIC_OAUTH_"
-# Плагин требует минимум эти два поля (dsh-anthropic-oauth-pool accounts.js).
-REQUIRED_OAUTH_FIELDS = ("accessToken", "refreshToken")
+# #1311: обязателен ТОЛЬКО accessToken. refreshToken раньше считался
+# обязательным «потому что плагин требует» (dsh-anthropic-oauth-pool
+# accounts.js) — но это требование само было дефектом и снято патчами 5/6
+# (scripts/lib/patch_anthropic_pool_plugin.py): долгоживущий токен без
+# рефреша — рабочий случай, а не битый секрет (docs/research/
+# 32-claude-oauth-provider.md; #1130). Отвергать его на импорте значило
+# физически не пускать в пул единственный рабочий токен владельца.
+REQUIRED_OAUTH_FIELDS = ("accessToken",)
 
 
 class LoudError(RuntimeError):
@@ -127,7 +133,8 @@ def krouter_claude_accounts(backup: Path) -> list[dict]:
         if not conn.get("isActive") or conn.get("isPermanentlyBanned"):
             continue
         oauth = krouter_conn_to_oauth(conn)
-        if not oauth["accessToken"] or not oauth["refreshToken"]:
+        # #1311: refreshToken больше не обязателен — см. REQUIRED_OAUTH_FIELDS.
+        if not oauth["accessToken"]:
             continue
         out.append({"name": conn.get("name") or "?", "oauth": oauth,
                     "priority": conn.get("priority", 999)})
