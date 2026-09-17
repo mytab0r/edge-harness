@@ -65,6 +65,14 @@ def health_snapshot_contents_response(rows: list[dict]) -> dict:
     return {"content": base64.b64encode(text.encode()).decode(), "encoding": "base64"}
 
 
+def worktree_snapshot_contents_response(rows: list[dict]) -> dict:
+    """Та же прод-форма Contents API для журнала уборки рабочих деревьев
+    (инвариант 24, #1250) — читает `fetch_worktree_cleanup_records`; форма
+    ответа одинаковая, отдельная фикстура только чтобы докстринг теста называл
+    свой канал, а не соседний."""
+    return health_snapshot_contents_response(rows)
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # Инвариант 1: задача открыта без исполнителя, PR уже слит
 # ══════════════════════════════════════════════════════════════════════════
@@ -208,17 +216,15 @@ class FakeGh:
     собственный маршрут contents/pipeline-health.jsonl, хотя история снимков
     не их предмет.
 
-    Запасной маршрут для комментариев #120 (инвариант 13, #899, и инвариант
-    16, дефект A watchdog-issue #120 — оба читают комментарии #120, один
-    общий дефолт на оба): здоровый дефолт — пустой список (маркеров серии
-    конвейера/WIP-гейта нет). Без него КАЖДЫЙ существующий тест build_report
-    был бы обязан завести собственный маршрут issues/120/comments, хотя ни
-    фантомная пауза конвейера, ни WIP-гейт — не их предмет; тест, которому
-    нужны конкретные маркеры, переопределяет этот маршрут явно (уже так
-    делают тесты #196/#220 выше)."""
+    Запасной маршрут для журнала уборки рабочих деревьев (инвариант 24,
+    #1250) — тот же приём и та же причина: 404 (data/worktree-cleanup пуста
+    до первого прод-прогона уборщика после слияния). Тест, которому нужны
+    записи, переопределяет маршрут явно (test_worktree_cleanup_records_*)."""
     _DEFAULT_ROUTES = {
         "actions/workflows/ai-review.yml/runs": {"workflow_runs": []},
         "contents/docs/research/data/pipeline-health.jsonl": RuntimeError(
+            "gh api repos/o/r/contents/...: HTTP 404: Not Found"),
+        "contents/docs/research/data/worktree-cleanup.jsonl": RuntimeError(
             "gh api repos/o/r/contents/...: HTTP 404: Not Found"),
         "issues/120/comments": [],
         # Запасной маршрут для инварианта 17 (морда dsh-edge, #1041): здоровый
@@ -2060,6 +2066,19 @@ def test_idle_guard_healthy_snapshot_no_violations_no_mutating_calls(tmp_path, m
         # остался про ДРУГИЕ инварианты, а не про историю снимков.
         "contents/docs/research/data/pipeline-health.jsonl":
             health_snapshot_contents_response([{"date": "2026-09-03", "merge_throughput": 1}]),
+        # Инвариант 24 (#1250): свежая запись уборщика с числами, которые не
+        # нарушают ни половину критерия готовности (устаревших копий гвардий
+        # 0 ≤ открытых PR 1), ни симптом инцидента (removed>0) — тем же приёмом,
+        # что снимок здоровья выше, чтобы тест остался про другие инварианты.
+        "contents/docs/research/data/worktree-cleanup.jsonl":
+            worktree_snapshot_contents_response([{
+                "ts": "2026-09-03T11:30:00+00:00", "mode": "apply",
+                "total": 5, "removed": 2, "kept": 3,
+                "guard_copies": 5, "stale_guard_copies": 0,
+                "stuck_old_total": 0, "stuck_old_unpushed": 0,
+                "stuck_old_unknown_work": 0, "stuck_old_unknown_pr": 0,
+                "retention_hours": 1.0,
+            }]),
         # Инвариант 12 (#876): полнотекстовый поиск не находит ни одного
         # комментария с противоречивой фразой — здоровое состояние.
         "search/issues": {"items": []},
@@ -4251,3 +4270,137 @@ def test_build_report_wires_invariant_22(monkeypatch):
     assert findings[22][0]["pr"] == 261
     assert any("🚨" in line and "[22]" in line for line in lines)
     assert any("#261" in line for line in lines)
+# Инвариант 24 (#1250): наблюдаемость уборки рабочих деревьев
+# ══════════════════════════════════════════════════════════════════════════
+
+# Прод-форма записи уборщика — сам состав полей читается из ЕДИНОГО модуля
+# канала (worktree_snapshot.make_record), не из копии словаря в тесте.
+def wt_record(ts="2026-09-14T11:00:00+00:00", **over):
+    base = ri.worktree_snapshot.make_record(
+        ts=ts, mode="apply", total=76, removed=28, kept=48,
+        guard_copies=73, stale_guard_copies=13, stuck_old_by_code={
+            "unpushed": 7, "unknown_work": 1, "unknown_pr": 1},
+        retention_hours=1.0)
+    base.update(over)
+    return base
+
+
+def test_worktree_cleanup_records_no_records_is_not_healthy():
+    """«Записей нет НИ РАЗУ» — нарушение («объект ненаблюдаем»), не 💚:
+    инвариант, читающий пустоту как чистоту, повторял бы класс #882."""
+    violations = ri.check_worktree_cleanup_records([], 26, utc(2026, 9, 14, 12, 0))
+    assert len(violations) == 1 and violations[0]["kind"] == "no-records"
+
+
+def test_worktree_cleanup_records_stale_channel_names_unobservability():
+    old = wt_record(ts="2026-09-01T11:00:00+00:00")
+    violations = ri.check_worktree_cleanup_records([old], 26, utc(2026, 9, 14, 12, 0))
+    assert len(violations) == 1
+    assert violations[0]["kind"] == "stale-channel"
+    assert violations[0]["age_days"] == 13.0
+    assert violations[0]["threshold_days"] == ri.worktree_snapshot.RECORD_STALE_AFTER_DAYS
+
+
+def test_worktree_cleanup_records_fresh_total_zero_is_healthy():
+    """Свежая запись с total=0 — «деревьев нет»: прогон СОСТОЯЛСЯ и деревьев
+    не нашёл. Это отличимое от «ненаблюдаем» здоровое состояние."""
+    fresh_zero = wt_record(total=0, removed=0, kept=0, guard_copies=0,
+                           stale_guard_copies=0, stuck_old_total=0)
+    assert ri.check_worktree_cleanup_records([fresh_zero], 26, utc(2026, 9, 14, 12, 0)) == []
+
+
+def test_worktree_cleanup_records_stale_guard_copies_over_open_prs():
+    """Вторая половина критерия готовности #1250: устаревших копий гвардий
+    не больше числа открытых PR. Числа — из замера задачи (41 против 26)."""
+    record = wt_record(stale_guard_copies=41)
+    violations = ri.check_worktree_cleanup_records([record], 26, utc(2026, 9, 14, 12, 0))
+    assert violations == [{
+        "kind": "stale-guard-copies", "stale_guard_copies": 41, "open_prs": 26,
+        "last_ts": "2026-09-14T11:00:00+00:00",
+    }]
+    at_boundary = wt_record(stale_guard_copies=26)
+    assert ri.check_worktree_cleanup_records([at_boundary], 26, utc(2026, 9, 14, 12, 0)) == []
+
+
+def test_worktree_cleanup_records_zero_removed_while_stuck():
+    """Основной симптом инцидента #1250: removed=0 при запертых деревьях
+    старше retention — нарушение; removed>0 или без запертых — нет."""
+    incident = wt_record(removed=0, stuck_old_total=45)
+    violations = ri.check_worktree_cleanup_records([incident], 26, utc(2026, 9, 14, 12, 0))
+    assert violations == [{
+        "kind": "zero-removed-stuck", "removed": 0, "total": 76,
+        "stuck_old_total": 45, "last_ts": "2026-09-14T11:00:00+00:00",
+    }]
+    healthy = wt_record(removed=28)
+    assert ri.check_worktree_cleanup_records([healthy], 26, utc(2026, 9, 14, 12, 0)) == []
+    nothing_stuck = wt_record(removed=0, stuck_old_total=0)
+    assert ri.check_worktree_cleanup_records([nothing_stuck], 26, utc(2026, 9, 14, 12, 0)) == []
+
+
+def test_worktree_cleanup_records_bad_record_is_violation_not_crash():
+    broken = {"ts": "не-время", "total": 1}
+    violations = ri.check_worktree_cleanup_records([broken], 26, utc(2026, 9, 14, 12, 0))
+    assert len(violations) == 1 and violations[0]["kind"] == "bad-record"
+
+
+def test_fetch_worktree_cleanup_records_404_is_empty(monkeypatch):
+    patch_gh(monkeypatch, FakeGh({}))  # дефолтный маршрут — 404, штатное «записей не было»
+    assert ri.fetch_worktree_cleanup_records("mytab0r/edge-harness") == []
+
+
+def test_build_report_wires_invariant_24(monkeypatch):
+    """Прод-форма Contents API → находка [24] в отчёте; 404 — отдельная
+    🚨 «записей нет НИ РАЗУ», не 💚."""
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        # 26 открытых PR, 41 устаревшая копия — числа из замера задачи #1250.
+        "pulls?state=open": [open_pr(n) for n in range(26)],
+        "graphql": graphql_pool_page(),
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+        "search/issues": {"items": []},
+        "contents/docs/research/data/worktree-cleanup.jsonl":
+            worktree_snapshot_contents_response([wt_record(stale_guard_copies=41)]),
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    lines, findings = ri.build_report("mytab0r/edge-harness", utc(2026, 9, 14, 12, 0))
+    assert [v["kind"] for v in findings[24]] == ["stale-guard-copies"]
+    assert any("🚨" in line and "[24]" in line and "41" in line for line in lines)
+
+    fake404 = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": [],
+        "graphql": graphql_pool_page(),
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+        "search/issues": {"items": []},
+    })
+    patch_gh(monkeypatch, fake404)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    lines404, findings404 = ri.build_report("mytab0r/edge-harness", utc(2026, 9, 14, 12, 0))
+    assert [v["kind"] for v in findings404[24]] == ["no-records"]
+    assert any("🚨" in line and "[24]" in line and "НИ РАЗУ" in line for line in lines404)
+
+
+def test_build_report_invariant_24_healthy_line_carries_numbers(monkeypatch):
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": [],
+        "graphql": graphql_pool_page(),
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+        "search/issues": {"items": []},
+        "contents/docs/research/data/worktree-cleanup.jsonl":
+            worktree_snapshot_contents_response([wt_record(total=0, removed=0, kept=0,
+                                                           guard_copies=0,
+                                                           stale_guard_copies=0,
+                                                           stuck_old_total=0)]),
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    lines, findings = ri.build_report("mytab0r/edge-harness", utc(2026, 9, 14, 12, 0))
+    assert findings[24] == []
+    healthy = [line for line in lines if "[24]" in line and "💚" in line]
+    assert healthy and "total=0" in healthy[0], \
+        "здоровая строка обязана различать «деревьев нет» от общего «здорово»"

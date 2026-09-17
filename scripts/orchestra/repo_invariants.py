@@ -334,6 +334,32 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
       в ESCALATING_INVARIANTS: живой замер долга на момент внедрения — см.
       PR #1260 (задача #1253, число и датировка находок в описании PR),
       порог обоснован той же датой, не вкусом.
+  24. check_worktree_cleanup_records (issue #1250, живой инцидент 2026-09-14):
+      «уборщик снял 0 деревьев из 73» было видно только расследованием
+      инцидента — сводка печаталась в лог и умирала там. Сам инвариант
+      деревья измерить НЕ может: раннер repo-ci/orchestra видит свежий
+      чекаут с ПУСТЫМ `.claude/worktrees` всегда — инвариант, меряющий
+      деревья с раннера, был бы молча зелёным навсегда (класс #882: шаг
+      рапортует success, ничего не измерив). Поэтому измерение живёт в самом
+      уборщике (`worktree-cleanup.py --publish-snapshot`, единственный
+      прод-вызов — `scripts/git/task-branch`), пишет записи JSONL на
+      data-ветку `data/worktree-cleanup` (транспорт `worktree_snapshot.py`
+      + `data_branch_writer`, #882), а этот инвариант читает записи и
+      различает ТРИ состояния (находка ревью PR #1257 — инвариант, не
+      различающий их, читал бы смерть канала как чистоту): (a) «объект
+      ненаблюдаем отсюда» — записей нет НИ РАЗУ (kind=no-records) или канал
+      молчит дольше worktree_snapshot.RECORD_STALE_AFTER_DAYS (kind=stale-
+      channel); причина из самих записей не устанавливается — находка
+      честно говорит это и называет, где смотреть, не угадывает; (б)
+      «деревьев нет» — свежая запись с total=0: прогон состоялся и деревьев
+      не нашёл, это ЧИСТО, не слепота; (в) нарушения по числам записи:
+      stale_guard_copies > открытых PR (вторая половина критерия готовности
+      #1250 — устаревших копий прод-гвардии не больше, чем открытых PR) и
+      removed=0 при stuck_old_total>0 (основной симптом инцидента — «ноль
+      убранных при растущем числе запертых деревьев»). Наблюдательный, не в
+      CI_GATING: data-ветка пуста до первого прод-прогона уборщика после
+      слияния, замер долга на живом репозитории возможен только тогда (тот
+      же порядок, что у 9/12); газ — GATING_RELEASE_CONDITION[24].
 
 Расписание: главный канал — периодический шаг orchestra.yml (cron */15 мин),
 он же вызывает escalate() для всех эскалирующих инвариантов — реестр
@@ -487,6 +513,18 @@ _PH_SPEC = importlib.util.spec_from_file_location(
 pipeline_health = importlib.util.module_from_spec(_PH_SPEC)
 _PH_SPEC.loader.exec_module(pipeline_health)  # type: ignore[union-attr]
 
+# worktree_snapshot — состав записи, пути и пороги канала наблюдаемости
+# уборки рабочих деревьев (issue #1250, инвариант 24 ниже). Инвариант только
+# ЧИТАЕТ записи: измерение обязано жить в самом уборщике — единственном
+# пути, где `.claude/worktrees` физически не пуст (раннер этого файла видит
+# свежий чекаут с пустым каталогом всегда; инвариант, меряющий деревья
+# отсюда, был бы молча зелёным навсегда, класс #882). Константы ветки/пути/
+# порога свежести отсюда — вторая копия числа была бы двумя местами правды.
+_WS_SPEC = importlib.util.spec_from_file_location(
+    "worktree_snapshot", REPO_ROOT / "scripts" / "lib" / "worktree_snapshot.py")
+worktree_snapshot = importlib.util.module_from_spec(_WS_SPEC)
+_WS_SPEC.loader.exec_module(worktree_snapshot)  # type: ignore[union-attr]
+
 _DD_SPEC = importlib.util.spec_from_file_location(
     "declared_deps", REPO_ROOT / "scripts" / "lib" / "declared_deps.py")
 declared_deps = importlib.util.module_from_spec(_DD_SPEC)
@@ -601,6 +639,18 @@ GATING_RELEASE_CONDITION: dict[int, str] = {
         "(морда-push, openspec/changes/llm-provider-usage-manifest/tasks.md); "
         "0 нарушений на живом файле (python scripts/orchestra/repo_invariants.py, "
         "секция [11]) — машинно проверяемое условие возврата",
+    24: "ключ держим не в CI_GATING (см. комментарий у инварианта 24 в "
+        "докстринге модуля: data-ветка пуста до первого прод-прогона уборщика "
+        "после слияния) — это факт про газ, а не про то, гейтит ли сейчас 19. "
+        "Условие возврата в гейт — машинно проверяемое: 0 нарушений секции [24] "
+        "на живом репозитории при живых записях data/worktree-cleanup, тогда "
+        "правка CI_GATING этой же правкой константы. Разбор нарушений: "
+        "stale-guard-copies — снять деревья слитых задач прогоном уборщика "
+        "(новый task-branch или python scripts/git/worktree-cleanup.py); "
+        "zero-removed-stuck — разобрать запертые деревья руками (газ построчно "
+        "назван в сводке уборщика); no-records/stale-channel — проверить, что "
+        "прод-путь доходит до worktree-cleanup --publish-snapshot (scripts/git/"
+        "task-branch) и что push на data-ветку авторизован в этой среде",
 }
 
 
@@ -3005,6 +3055,140 @@ def check_pipeline_status_marker_impersonation(comments: list[dict]) -> list[dic
         })
     return sorted(violations, key=lambda item: item["created_at"] or "")
 
+
+# ══════════════════════════════════════════════════════════════════════════
+# Инвариант 24: наблюдаемость уборки рабочих деревьев (issue #1250)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Инцидент #1250 (2026-09-14): уборщик `.claude/worktrees` запускался при
+# каждом создании ветки задачи, печатал сводку «Removed: 0 из 73» — и никто
+# этого не видел, пока инцидент не вскрыли руками. Этот инвариант читает
+# ЗАПИСИ прогонов уборщика (пишет их сам уборщик — единственный путь, где
+# деревья физически есть, см. блок-комментарий в докстринге модуля и в
+# импорте worktree_snapshot выше), не заводя второй измеритель.
+
+def check_worktree_cleanup_records(
+    records: list[dict], open_pr_count: int, now: datetime,
+) -> list[dict]:
+    """Чистая функция (без сети — `records` уже прочитаны
+    fetch_worktree_cleanup_records, `now` — инъекция, не `datetime.now()`).
+
+    Три различимых состояния (находка ревью PR #1257 — инвариант, который не
+    различает «деревьев нет» и «объект ненаблюдаем отсюда», молча читает
+    смерть канала как чистоту):
+      - kind="no-records"/"stale-channel" — канал молчит (никогда не писал /
+        тише порога RECORD_STALE_AFTER_DAYS). Причину (прогоны прекратились
+        против сломанной публикации) из самих записей установить НЕЛЬЗЯ —
+        находка называет этот пробел и где смотреть, не угадывает (AGENTS.md
+        «Алерт не гадает»);
+      - kind="bad-record" — канал пишет, но последняя запись нечитаема;
+      - свежая запись — числа против независимых данных этого прогона:
+        kind="stale-guard-copies" (устаревших копий прод-гвардии больше, чем
+        открытых PR — вторая половина критерия готовности #1250) и
+        kind="zero-removed-stuck" (removed=0 при запертых деревьях старше
+        retention — основной симптом инцидента).
+    Свежая запись с total=0 нарушением НЕ считается: прогон состоялся и
+    деревьев не нашёл — это «деревьев нет», не слепота (сообщается в отчёте
+    отдельной 💚-строкой с числом, не общим «здорово»)."""
+    if not records:
+        return [{"kind": "no-records",
+                 "where": f"{worktree_snapshot.DATA_BRANCH}:"
+                          f"{worktree_snapshot.SNAPSHOT_PATH}"}]
+    last = worktree_snapshot.last_record(records)
+    if last is None:
+        return [{"kind": "no-records",
+                 "where": f"{worktree_snapshot.DATA_BRANCH}:"
+                          f"{worktree_snapshot.SNAPSHOT_PATH}"}]
+    try:
+        last_dt = worktree_snapshot.parse_ts(str(last["ts"]))
+        record_total = int(last["total"])
+        record_removed = int(last["removed"])
+        stale_guard = int(last["stale_guard_copies"])
+        stuck_total = int(last["stuck_old_total"])
+    except (KeyError, TypeError, ValueError):
+        return [{"kind": "bad-record", "ts": str(last.get("ts", ""))[:40]}]
+
+    age_days = (now - last_dt).total_seconds() / 86400
+    if age_days > worktree_snapshot.RECORD_STALE_AFTER_DAYS:
+        return [{"kind": "stale-channel", "last_ts": str(last["ts"]),
+                 "age_days": round(age_days, 1),
+                 "threshold_days": worktree_snapshot.RECORD_STALE_AFTER_DAYS}]
+
+    violations = []
+    if stale_guard > open_pr_count:
+        violations.append({
+            "kind": "stale-guard-copies",
+            "stale_guard_copies": stale_guard,
+            "open_prs": open_pr_count,
+            "last_ts": str(last["ts"]),
+        })
+    if record_removed == 0 and stuck_total > 0:
+        violations.append({
+            "kind": "zero-removed-stuck",
+            "removed": record_removed,
+            "total": record_total,
+            "stuck_old_total": stuck_total,
+            "last_ts": str(last["ts"]),
+        })
+    return violations
+
+
+def worktree_cleanup_fact_line(item: dict) -> str:
+    """Человекочитаемая строка находки инварианта 24 по kind (семантика, не
+    парсинг подстроки — AGENTS.md «Семантика важнее подстроки»)."""
+    kind = item.get("kind")
+    if kind == "no-records":
+        return (f"записей уборщика рабочих деревьев нет НИ РАЗУ "
+                f"({item['where']}) — канал наблюдаемости #1250 молчит с "
+                "внедрения; причина из отсутствующих записей не устанавливается "
+                "(прогонов не было или публикация сломана — лог task-branch, "
+                "шаг worktree-cleanup --publish-snapshot)")
+    if kind == "bad-record":
+        return (f"последняя запись уборщика рабочих деревьев нечитаема "
+                f"(ts={item['ts']}) — канал жив, содержимое повреждено "
+                f"({worktree_snapshot.DATA_BRANCH}:"
+                f"{worktree_snapshot.SNAPSHOT_PATH})")
+    if kind == "stale-channel":
+        return (f"записей уборщика рабочих деревьев нет {item['age_days']} сут "
+                f"(последняя {item['last_ts']}, порог {item['threshold_days']}) — "
+                "причину из записей установить нельзя: записи не говорят, было ли "
+                "сами прогоны; различает их только лог прод-пути (task-branch → "
+                "worktree-cleanup --publish-snapshot)")
+    if kind == "stale-guard-copies":
+        return (f"устаревших копий прод-гвардии (pulse_guard.py без "
+                f"prod_writes_allowed): {item['stale_guard_copies']} > открытых "
+                f"PR {item['open_prs']} (запись от {item['last_ts']}) — критерий "
+                "готовности #1250 нарушен, газ: прогон уборщика снимает деревья "
+                "слитых задач")
+    if kind == "zero-removed-stuck":
+        return (f"уборщик снял 0 из {item['total']}, при этом "
+                f"{item['stuck_old_total']} деревьев старше retention заперты "
+                f"(запись от {item['last_ts']}) — основной симптом инцидента "
+                "#1250, газ построчно назван в сводке уборщика")
+    return str(item)
+
+
+def fetch_worktree_cleanup_records(repo: str) -> list[dict]:
+    """Записи прогонов уборщика через уже мокаемый транспорт `gh()` этого
+    файла — НЕ сетевые функции worktree_snapshot напрямую: тот же принцип,
+    что fetch_pipeline_health_history выше (единая точка патча в тестах).
+    404 (ветки/файла записи ещё нет) — штатное «записей не было», не ошибка;
+    RuntimeError любой другой природы (сеть/квота) не тонет молча —
+    build_report обязан отличать «записей нет» от «прочитать не удалось»."""
+    try:
+        blob = gh(f"repos/{repo}/contents/{worktree_snapshot.SNAPSHOT_PATH}"
+                  f"?ref={worktree_snapshot.DATA_BRANCH}")
+    except RuntimeError as error:
+        if "404" in str(error) or "Not Found" in str(error):
+            return []
+        raise
+    if not blob:
+        return []
+    import base64
+    return worktree_snapshot.read_rows(
+        base64.b64decode(blob["content"]).decode("utf-8"))
+
+
 def build_report(repo: str, now: datetime,
                   check_branch_protection: bool = False,
                   check_declared_deps: bool = True) -> tuple[list[str], dict[int, list]]:
@@ -3438,6 +3622,36 @@ def build_report(repo: str, now: datetime,
                 f"{AI_REWORK_NEVER_DISPATCHED_AFTER_MINUTES} мин без хотя бы одного "
                 "диспатча авто-доводки"
             )
+
+    try:
+        wt_records = fetch_worktree_cleanup_records(repo)
+    except RuntimeError as error:
+        findings[24] = []
+        lines.append(f"🚨 [24] журнал уборки рабочих деревьев недоступен: {error} — "
+                     "инвариант пропущен на этом прогоне (это НЕ «записей нет»)")
+    else:
+        v24 = check_worktree_cleanup_records(wt_records, len(open_pulls), now)
+        findings[24] = v24
+        if v24:
+            for item in v24:
+                lines.append(f"🚨 [24] {worktree_cleanup_fact_line(item)}")
+        else:
+            last24 = worktree_snapshot.last_record(wt_records)
+            last24_total = int(last24.get("total", -1)) if last24 else -1
+            if last24_total == 0:
+                lines.append(
+                    f"💚 [24] запись уборщика от {last24.get('ts', '?')}: рабочих "
+                    "деревьев нет (total=0) — прогон состоялся и измерять нечего "
+                    "(это «деревьев нет», не отсутствие наблюдения)"
+                )
+            else:
+                lines.append(
+                    f"💚 [24] запись уборщика от {last24.get('ts', '?')}: "
+                    f"removed={last24.get('removed')}, устаревших копий гвардий "
+                    f"{last24.get('stale_guard_copies')} ≤ открытых PR "
+                    f"{len(open_pulls)}, запертых старше retention "
+                    f"{last24.get('stuck_old_total')}"
+                )
     return lines, findings
 
 
