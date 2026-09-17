@@ -239,5 +239,50 @@ def test_restored_tree_does_not_stop_claim_loop(tmp_path: Path, capsys: pytest.C
     assert "по чужой причине" not in out
 
 
+# ── битый ERE: громкий отказ с газом, не трейсбек ────────────────────────────
+
+def test_broken_ere_is_error_with_gas_not_traceback(tmp_path: Path, capsys: pytest.CaptureFixture):
+    """`git grep` с синтаксически битым ERE (rc>=2) — ошибка ФОРМЫ заявления:
+    glue печатает `::error::` с GAS_NOTE и НЕ падает трейсбеком (прежнее
+    поведение: необработанный RuntimeError убивал прогон ДО мутационной фазы,
+    единственный путь отказа без газа — находка ai-review PR #1028,
+    чеклист)."""
+    (tmp_path / "seed.py").write_text("seed\n", encoding="utf-8")
+    _init_repo(tmp_path)  # живой репозиторий: ошибка именно в паттерне, не в «не git»
+    body = (
+        "## Класс закрыт\n"
+        "Grep: `([unclosed`\n"
+        "Ожидается совпадений: 0\n"
+    )
+    failed = pr_check._run_class_closed(body, tmp_path)
+    out = capsys.readouterr().out
+    assert failed is True
+    assert "::error::" in out
+    assert "не исполняется" in out
+    assert pr_check.GAS_NOTE in out
+    assert "Traceback" not in out
+
+
+def test_broken_ere_does_not_stop_later_claims(tmp_path: Path, capsys: pytest.CaptureFixture):
+    """Битый ERE в одном заявлении не топит остальные: второе (валидное)
+    заявление всё равно проверяется и его исход печатается."""
+    (tmp_path / "seed.py").write_text("old form here\n", encoding="utf-8")
+    _init_repo(tmp_path)
+    body = (
+        "## Класс закрыт\n"
+        "Grep: `([unclosed`\n"
+        "Ожидается совпадений: 0\n"
+        "\n"
+        "## Класс закрыт\n"
+        "Grep: `old form here`\n"
+        "Ожидается совпадений: 1\n"
+    )
+    failed = pr_check._run_class_closed(body, tmp_path)
+    out = capsys.readouterr().out
+    assert failed is True
+    assert "не исполняется" in out
+    assert "подтверждено — паттерн «old form here»" in out
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"] + sys.argv[1:]))

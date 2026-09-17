@@ -124,6 +124,51 @@ def test_parse_mutation_claims_missing_diff_fence_raises():
         mutation_claim.parse_mutation_claims(body)
 
 
+def test_parse_mutation_claims_accepts_parameterized_test_id():
+    """Параметризованный pytest-id (`test_x[param-1,2]`) проходит — находка
+    ai-review PR #1028 в чеклисте: прежний класс символов отвергал `[]` и
+    `,`, автор был бы вынужден целиться в весь файл вместо точечного кейса."""
+    body = (
+        "## Доказательство мутацией\n"
+        "Тест: `python -m pytest scripts/lib/test_x.py::test_y[param-1,2] -q`\n"
+        "```diff\n-a\n+b\n```\n"
+    )
+    claims = mutation_claim.parse_mutation_claims(body)
+    assert claims[0].test_target == "scripts/lib/test_x.py::test_y[param-1,2]"
+
+
+def test_parse_mutation_claims_mutation_proof_block_gets_targeted_error():
+    """Секция заявления с узнаваемой формой MUTATION-PROOF (ADR 0023) даёт
+    адресную ошибку про разведение поверхностей, а не вводящее в заблуждение
+    «не найдена строка Тест:» (блокирующая находка ai-review PR #1028:
+    автор, идущий по документации про ADR 0023, получал бы красный CI на
+    формально правильном артефакте)."""
+    body = (
+        "## Доказательство мутацией\n"
+        "# MUTATION-PROOF\n"
+        "# ref: d239e324~1\n"
+        "# paths: scripts/lib/x.py\n"
+        "# run: python -m pytest scripts/lib/test_x.py -q\n"
+        "# expect: 1 failed\n"
+    )
+    with pytest.raises(mutation_claim.MutationClaimFormatError, match="MUTATION-PROOF"):
+        mutation_claim.parse_mutation_claims(body)
+
+
+def test_parse_mutation_claims_prose_mention_of_mutation_proof_not_flagged():
+    """Прозовое УПОМИНАНИЕ формата (без формы блока: маркер не на своей
+    строке-комментарии, полей ref/paths/run/expect нет) не превращается в
+    адресную ошибку — секция разбирается обычным путём."""
+    body = (
+        "## Доказательство мутацией\n"
+        "Тут не нужен MUTATION-PROOF, потому что мутация гипотетическая.\n"
+        "Тест: `python -m pytest scripts/lib/test_x.py -q`\n"
+        "```diff\n-a\n+b\n```\n"
+    )
+    claims = mutation_claim.parse_mutation_claims(body)
+    assert len(claims) == 1
+
+
 # ── parse_class_closed_claims ────────────────────────────────────────────────
 
 def test_parse_class_closed_claims_valid():

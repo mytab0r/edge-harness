@@ -94,8 +94,11 @@ UNVERIFIED_HEADING = "## Непроверено машиной"
 # scripts/ci/guards/*.sh уже может содержать произвольный bash — см.
 # scripts/ci/run_guards.sh) — это тот же периметр (файлы этого же PR
 # проходят ревью тем же путём), просто без shell-инъекции через `Тест:`.
+# `[]` и `,` в классе символов — параметризованные pytest-id
+# (`test_x[param-1,2]`, находка ai-review PR #1028 в чеклисте: без них автор
+# был бы вынужден целиться в весь файл вместо точечного кейса).
 TEST_CMD_RE = re.compile(
-    r"^python -m pytest ([\w./:\-]+) -q$"
+    r"^python -m pytest ([\w./:\-\[\],]+) -q$"
 )
 
 # Известные формулировки заявлений, которые машина проверить не может без
@@ -118,6 +121,21 @@ UNVERIFIABLE_PHRASES = [
 _HEADING_LINE_RE = re.compile(r"^##\s+\S")
 _FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
 _DIFF_GIT_HEADER_RE = re.compile(r"^diff --git a/(.+) b/(.+)$", re.MULTILINE)
+
+# Формат MUTATION-PROOF (ADR 0023, движок `mutation_recipe_guard.py`) в теле
+# PR-заявления — чужой поверхности (разведение форматов: ADR 0026, #968).
+# Маркер — строка, чьё содержимое после strip и снятия комментарного префикса
+# (`#`, `//`, `*`, `<!--` — те же, что допускает ADR 0023) равно
+# `MUTATION-PROOF`; поле — строка, начинающаяся (с теми же префиксами) на
+# `ref:`/`paths:`/`run:`/`expect:`. Оба признака вместе — чтобы прозовое
+# УПОМИНАНИЕ формата («здесь не нужен MUTATION-PROOF, потому что…») не
+# превращалось в ложную адресную ошибку.
+_MUTATION_PROOF_MARKER_RE = re.compile(
+    r"^\s*(?:[#//!*]|<!--)*\s*MUTATION-PROOF\s*$", re.MULTILINE
+)
+_MUTATION_PROOF_FIELD_RE = re.compile(
+    r"^\s*(?:[#//!*]|<!--)*\s*(?:ref|paths|run|expect):", re.MULTILINE
+)
 
 
 class MutationClaimFormatError(ValueError):
@@ -182,10 +200,40 @@ def parse_mutation_claims(body: str) -> list[MutationClaim]:
     """Секции `MUTATION_HEADING` тела PR → список заявлений. Пустой список —
     заголовка в теле нет вовсе (author claim отсутствует — это НЕ ошибка
     формата, вызывающий код сам решает, обязателен ли блок для этого PR).
-    `MutationClaimFormatError` — заголовок есть, но полей не хватает или
-    команда не разрешённой формы (контракт нарушен, а не «не заявлено»)."""
+    `MutationClaimFormatError` — заголовок есть, но полей не хватает, команда
+    не разрешённой формы или секция несёт ЧУЖОЙ формат `MUTATION-PROOF`
+    (контракт нарушен, а не «не заявлено»).
+
+    Про `MUTATION-PROOF` в секции: формат ADR 0023 — ДРУГАЯ поверхность
+    (закоммиченные файлы, исполняет `mutation_recipe_guard.py`, доказывает
+    заявления об ИСТОРИЧЕСКОМ ref). Заявление в теле PR про гипотетическое
+    состояние («снял фикс — тест покраснел») через `ref:` не выразимо, а
+    произвольная команда `run:` из НЕПРОРЕВЬЮЕННОГО тела PR расширила бы
+    радиус исполнения (ср. сужение `TEST_CMD_RE` ниже) — поэтому секция с
+    узнаваемой формой MUTATION-PROOF получает адресный отказ с объяснением
+    обеих поверхностей, а не вводящее в заблуждение «не найдена строка
+    Тест:» (блокирующая находка ai-review PR #1028: автор, идущий по
+    документации репозитория про ADR 0023, получал бы красный CI на
+    формально правильном по AGENTS.md артефакте)."""
     claims: list[MutationClaim] = []
     for idx, section in enumerate(_sections(body, MUTATION_HEADING), start=1):
+        if (_MUTATION_PROOF_MARKER_RE.search(section)
+                and _MUTATION_PROOF_FIELD_RE.search(section)):
+            raise MutationClaimFormatError(
+                f"{MUTATION_HEADING} (блок {idx}): найден блок формата "
+                "MUTATION-PROOF (ADR 0023) — это формат ДРУГОЙ поверхности: "
+                "он живёт в закоммиченных файлах, где его исполняет "
+                "mutation_recipe_guard.py (гвардия "
+                "mutation-recipe-execution-guard.sh), и доказывает заявления "
+                "об ИСТОРИЧЕСКОМ состоянии под ref. Заявление в теле PR — "
+                "«снял фикс ЭТОГО PR, тест покраснел» — про гипотетическое "
+                "состояние, которого нет ни под одним ref; здесь оно "
+                "выражается строкой «Тест: `python -m pytest "
+                "<путь>[::<test_id>] -q`» и блоком ```diff``` с патчем, "
+                "снимающим фикс (накладываемым на ТЕКУЩЕЕ дерево). "
+                "Разведение форматов — ADR 0026, docs/decisions/"
+                "0026-verify-agent-claims-machine-check.md"
+            )
         test_match = re.search(r"^\s*Тест:\s*`([^`]+)`\s*$", section, re.MULTILINE)
         if not test_match:
             raise MutationClaimFormatError(
@@ -199,7 +247,9 @@ def parse_mutation_claims(body: str) -> list[MutationClaim]:
             raise MutationClaimFormatError(
                 f"{MUTATION_HEADING} (блок {idx}): команда «{test_cmd}» не "
                 "разрешённой формы — единственная форма: "
-                "«python -m pytest <путь>[::<test_id>] -q» (без shell-операторов)"
+                "«python -m pytest <путь>[::<test_id>] -q» "
+                "(параметризованные id со скобками и запятыми разрешены; "
+                "без shell-операторов)"
             )
         fence_match = _FENCE_RE.search(section)
         if not fence_match or not fence_match.group(1).strip():

@@ -164,7 +164,21 @@ def _run_class_closed(body: str, repo_root: Path) -> bool:
         return True
     failed = False
     for claim in claims:
-        ok, matches = mutation_claim.run_class_closed_check(repo_root, claim)
+        try:
+            ok, matches = mutation_claim.run_class_closed_check(repo_root, claim)
+        except RuntimeError as error:
+            # rc >= 2 у git grep (битый ERE, не-репозиторий) — ошибка ФОРМЫ
+            # заявления, а не «не совпало». Раньше это роняло glue
+            # необработанным трейсбеком ДО мутационной фазы: GAS_NOTE не
+            # печатался вовсе — единственный путь отказа без газа (находка
+            # ai-review PR #1028, чеклист). Громко, с газом, и мутационная
+            # фаза после этого продолжает работу.
+            failed = True
+            print(
+                f"::error::mutation-claim[класс закрыт]: паттерн «{claim.pattern}» "
+                f"не исполняется: {error} {GAS_NOTE}"
+            )
+            continue
         if ok:
             print(
                 f"mutation-claim[класс закрыт]: подтверждено — паттерн "
