@@ -400,7 +400,7 @@ jobs:
           src = open("worker.js", encoding="utf-8").read()
           # скобочно-сбалансированный матч: массив может содержать вложенные
           # скобки (inputModalities:["text","image"]) — наивный [^\]]* рвёт бандл
-          pattern = re.compile(r'\[\{id:"deepseek-v4-flash"(?:[^\[\]]|\[[^\[\]]*\])*\]')
+          pattern = re.compile(r'\[(?:[^\[\]]|\[[^\[\]]*\])*\{id:"deepseek-v4-flash"(?:[^\[\]]|\[[^\[\]]*\])*\}(?:[^\[\]]|\[[^\[\]]*\])*\]')
           patched, n = pattern.subn(lambda _: new_array, src, count=1)
           if n != 1:
               sys.exit("::error::Каталог моделей в бандле не найден — upstream сменил форму; патч применять некуда")
