@@ -132,6 +132,27 @@ def test_render_body_carries_required_sections():
     assert "Честный потолок" in body
 
 
+def test_render_body_passes_declared_dependency_gate():
+    """render_body — единственное тело, которое run_self_audit передает
+    create_pool_issue: обязано проходить НАСТОЯЩИЙ гейт (мок только
+    транспорта; соседние тесты монкипатчат сам create_pool_issue — гейт
+    обойдён). Мутация: сними строку «БЛОКИРУЕТСЯ: ничем» из render_body —
+    create_pool_issue бросит RuntimeError ДО сети, тест краснеет."""
+    pi_spec = importlib.util.spec_from_file_location(
+        "pool_issue_health_audit_gate", Path(__file__).with_name("..").resolve() / "lib" / "pool_issue.py")
+    pool_issue = importlib.util.module_from_spec(pi_spec)
+    pi_spec.loader.exec_module(pool_issue)
+
+    body = ha.render_body(ha.fingerprint_of("merge_throughput"), regression(),
+                          "docs/research/data/pipeline-health.jsonl@abc")
+    calls = []
+    pool_issue.create_pool_issue(lambda *a: calls.append(a) or {"number": 1},
+                                 REPO, "заголовок", body,
+                                 [ha.TASK_LABEL, ha.SELF_AUDIT_LABEL])
+    assert len(calls) == 1, "реальный гейт пропустил тело — объявление связи на месте"
+    assert body.rstrip().endswith("БЛОКИРУЕТСЯ: ничем")  # инлайн-форма — последней непустой строкой
+
+
 # ── Пожар: заведение + немедленная эскалация ─────────────────────────────
 
 

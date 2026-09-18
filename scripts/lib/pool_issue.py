@@ -5,13 +5,20 @@
 метки вовсе. Обе обошли шаблон (шаблон применяется только к веб-форме, не к
 API/CLI-созданию) и остались без `task` — пул воркера физически их не видит
 (`scripts/orchestra/scheduler.py::open_task_issues` читает только
-`labels=task`, класс #179). До этого файла четыре программных создателя
-(`scripts/review/file_tasks.py`, `scripts/orchestra/scheduler.py::after_merge`
-— хвост чеклиста, `scripts/orchestra/stall_detector.py::create_task`,
+`labels=task`, класс #179). До этого файла первые четыре программных
+создателя (`scripts/review/file_tasks.py`, `scripts/orchestra/scheduler.py`
+— тогда ещё живой хвост чеклиста `after_merge`, #462,
+`scripts/orchestra/stall_detector.py::create_task`,
 `scripts/orchestra/upstream_drift.py::create_bump_issue`) сами собирали
 `-f labels[]=task` каждый в своём месте — рабочий код по факту, но
 без единой точки, которая сделала бы пропуск метки невозможным для СЛЕДУЮЩЕГО
-создателя. `create_pool_issue` — эта точка: labels без `task` — RuntimeError
+создателя. Живые создатели на сейчас (замер PR #804, раунд 4): восемь через
+этот гейт — `file_tasks.py`, `stall_detector.py::create_task`,
+`upstream_drift.py::create_bump_issue`,
+`scheduler.py::_create_task_replacement`, `pulse_guard.py::failure_watch`,
+`dependabot_alert_watch.py`, `health_audit.py`, `merge_health_watch.py` —
+и один через bash-обёртку ниже (`scripts/measure/quota_alert.py`).
+`create_pool_issue` — эта точка: labels без `task` — RuntimeError
 ДО сетевого вызова, не постфактум-гвардия по уже созданной issue.
 
 Канал агентских/ручных запросов (`gh issue create` в терминале, вне

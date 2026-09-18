@@ -467,3 +467,28 @@ def test_run_watch_fire_daily_cap_exhausted_escalates_without_new_task(monkeypat
     assert not created
     assert any("потолок исчерпан" in line for line in report)
     assert len(escalated) == 1
+
+
+# ── #720: тело fire-задачи несёт машиночитаемое объявление связи ────────────
+
+
+def test_render_body_passes_declared_dependency_gate():
+    """render_body — единственное тело, которое run_watch передает
+    create_pool_issue: обязано проходить НАСТОЯЩИЙ гейт (мок только
+    транспорта; соседние тесты монкипатчат сам create_pool_issue — гейт
+    обойдён, находка ревью PR #804 раунд 4). Мутация: сними строку
+    «БЛОКИРУЕТСЯ: ничем» из render_body — create_pool_issue бросит
+    RuntimeError ДО сети, тест краснеет."""
+    pi_spec = importlib.util.spec_from_file_location(
+        "pool_issue_merge_health_gate", Path(__file__).with_name("..").resolve() / "lib" / "pool_issue.py")
+    pool_issue = importlib.util.module_from_spec(pi_spec)
+    pi_spec.loader.exec_module(pool_issue)
+
+    fire = mhw.Verdict("fire", 33.3, 6, 100.0, 12, False, "2026-09-11T04:54:00+00:00")
+    body = mhw.render_body(fire, [], False)
+    calls = []
+    pool_issue.create_pool_issue(lambda *a: calls.append(a) or {"number": 1},
+                                 "mytab0r/edge-harness", "заголовок", body,
+                                 [mhw.TASK_LABEL, mhw.PROCESS_LABEL])
+    assert len(calls) == 1, "реальный гейт пропустил тело — объявление связи на месте"
+    assert body.rstrip().endswith("БЛОКИРУЕТСЯ: ничем")  # инлайн-форма — последней непустой строкой
