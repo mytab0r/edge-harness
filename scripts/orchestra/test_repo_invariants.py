@@ -3377,15 +3377,26 @@ def test_wip_gate_false_zero_is_escalating_not_gating():
 # ══════════════════════════════════════════════════════════════════════════
 
 def _wip_gate_finding(marker_at: datetime, claimed: int, actual: int, limit: int) -> dict:
-    return {
-        "marker_at": marker_at.isoformat(),
-        "claimed_count": claimed,
-        "actual_count": actual,
-        "limit": limit,
-        "claimed_closes_gate": claimed >= limit,
-        "actual_closes_gate": actual >= limit,
-        "literal_false_zero": claimed == 0 and actual > 0,
+    """Находка инварианта 16 в ПРОД-ФОРМЕ (AGENTS.md, «Тест кормит прод-форму
+    данных, а не пересказ»): не рукописный словарь с булевой математикой,
+    пересчитанной на тестовой стороне, а результат самого
+    check_wip_gate_false_zero — тело маркера той же формы, какую публикует
+    scheduler.wip_gate («Открытых PR, ждущих доработки: …»), и синтетические
+    открытые PR, из которых scheduler.pr_needs_rework насчитывает ровно
+    `actual`. Смена булевой математики в проде здесь краснеть НЕ молчит:
+    помощник отдаёт то, что реально вернул прод-код, а пустой список
+    (согласованное состояние) валит тест громким assert, не тихой находкой."""
+    body = (f"{ri.scheduler.WIP_GATE_CLOSE_MARKER}\n"
+            f"Открытых PR, ждущих доработки: {claimed} < {limit} — WIP-лимит снят")
+    rework_pull = {
+        "draft": False,
+        "user": {"login": "mytab0r"},
+        "labels": [{"name": label} for label in sorted(ri.scheduler.REWORK_LABELS)],
     }
+    finding = ri.check_wip_gate_false_zero(
+        marker_at, [(marker_at, body)], [dict(rework_pull) for _ in range(actual)])
+    assert len(finding) == 1, f"ожидаемая находка не построилась: {claimed=}, {actual=}, {limit=}"
+    return finding[0]
 
 
 def _wire_escalation_recorder(monkeypatch):
@@ -3495,8 +3506,12 @@ def test_escalation_state_key_windowing_matches_reminder_constant():
     finding_c = _wip_gate_finding(bucket_start + timedelta(minutes=window + 1), 0, 31, limit)
 
     def key_of(item):
-        sig = f"{item['claimed_closes_gate']}:{item['actual_closes_gate']}:{item['literal_false_zero']}"
-        return ri.escalation_state_key(datetime.fromisoformat(item["marker_at"]), sig)
+        # Сигнатура — из прод-помощника (wip_gate_state_signature), не
+        # вторая ручная сборка той же f-строки: смена формы сигнатуры в
+        # проде обязана пройти и через этот замер (issue #1261, ревью PR #1263).
+        return ri.escalation_state_key(
+            datetime.fromisoformat(item["marker_at"]),
+            ri.wip_gate_state_signature(item))
 
     assert key_of(finding_a) == key_of(finding_b), "внутри окна — тот же ключ, несмотря на дрейф actual"
     assert key_of(finding_a) != key_of(finding_c), "за окном — новый ключ (напоминание)"
@@ -3549,15 +3564,20 @@ def test_issue120_fixture_reproduces_36_escalations_with_old_key():
 
 def test_issue120_fixture_new_key_collapses_36_into_units():
     """Число «после» (issue #1261): та же история, дедуп-ключ
-    `escalation_state_key` (тот же код, что использует run_escalations) —
-    36 наблюдений схлопываются в единицы, не в одно (см. соседний тест —
-    инцидент длился ~30 часов, окно 6 часов даёт периодическое напоминание,
-    а не одну немую запись на весь инцидент)."""
+    `escalation_state_key` — 36 наблюдений схлопываются в единицы, не в одно
+    (см. соседний тест — инцидент длился ~30 часов, окно 6 часов даёт
+    периодическое напоминание, а не одну немую запись на весь инцидент).
+
+    Каждая строка фикстуры прогоняется через сам check_wip_gate_false_zero
+    (та же прод-форма входа, что и у поведенческих тестов выше), сигнатура —
+    из wip_gate_state_signature: прод-код здесь не пересказан формулой, а
+    исполнен, и смена булевой математики в проде перенесёт этот замер за
+    собой, а не оставит мерить устаревший ключ (ревью PR #1263)."""
     rows = _load_issue120_invariant16_history()
     seen_in_order = []
     for marker_at, claimed, actual, limit in rows:
-        signature = f"{claimed >= limit}:{actual >= limit}:{claimed == 0 and actual > 0}"
-        key = ri.escalation_state_key(marker_at, signature)
+        key = ri.escalation_state_key(
+            marker_at, ri.wip_gate_state_signature(_wip_gate_finding(marker_at, claimed, actual, limit)))
         if key not in seen_in_order:
             seen_in_order.append(key)
     # Единицы, не десятки (было 36) и не единственная запись на весь

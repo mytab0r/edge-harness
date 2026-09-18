@@ -339,7 +339,16 @@ def test_scan_of_last_20_merged_pr_test_files_finds_zero_blocks_and_zero_violati
         "scripts/lib/test_check_result_migrations.py",
         "scripts/orchestra/test_stale_blocked_guard.py",
         "scripts/lib/test_provider_quota_state_guard.py",
-        "scripts/orchestra/test_repo_invariants.py",
+        # scripts/orchestra/test_repo_invariants.py ВЫПАЛ из корпуса прозы
+        # 2026-09-18 (#1261, PR #1263): его поведенческий тест дедупа
+        # эскалации 16 (test_run_escalations_wip_gate_dedupes_repeated_ticks_
+        # of_same_state) несёт НАСТОЯЩИЙ блок MUTATION-PROOF — исполняется
+        # второй половиной этой же гвардии (git grep-сканом по дереву ниже,
+        # шаг mutation-recipe-execution-guard.sh): возврат волатильного
+        # ключа `marker_at:claimed:actual` в run_escalations красит тест
+        # ровно с «1 failed». Держать файл в этой фикстуре значило бы
+        # требовать «0 блоков» там, где блок легален. Вернуть файл сюда
+        # можно только вместе с удалением того блока.
         "dsh-edge/test/ingest-resident-safety.test.mjs",
     ]
     existing = [REPO_ROOT / f for f in candidate_files if (REPO_ROOT / f).is_file()]
