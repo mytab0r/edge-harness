@@ -361,7 +361,7 @@ jobs:
       - name: Тесты аренды задачи claim_task
         run: |
           pip install --quiet pytest pyyaml
-          python -m pytest scripts/lib/test_claim_task.py -q
+          python -m pytest scripts/lib/test_claim_task.py scripts/lib/test_claim_task_real_refs.py -q
 
       # Номер задачи из текста PR/issue — одно место правды (#187): границы
       # числа с обеих сторон, не подстрока (#18 не должен матчить #180/#5180;
