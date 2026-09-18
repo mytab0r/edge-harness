@@ -219,13 +219,13 @@ describe("Замер CPU: батч условных upsert'ов внутри О�
     console.log(
       `[CPU-замер, design.md §3.6] батч=${size} upsert(new): ${elapsedMs.toFixed(3)} мс замерено ` +
         `(квант таймера этого рантайма — целые мс), экстраполяция из throughput-замера: ` +
-        `${(size * MEASURED_MS_PER_OP).toFixed(4)} мс — предохранитель ${CPU_LIMIT_MS} мс.`,
+        `${(size * MEASURED_MS_PER_OP).toFixed(4)} мс (справочно, для человека).`,
     );
-    // Прямая проверка кванта: батч кладывается в измеримо меньше лимита ИЛИ
-    // сам замер (если рантайм всё же дал ненулевое число) меньше лимита —
-    // обе ветки честны, ни одна не завышает результат подгонкой.
+    // Предохранитель — только ЗАМЕР этого прогона против лимита. Константная
+    // проверка `size * MEASURED_MS_PER_OP < CPU_LIMIT_MS` убрана (находка
+    // ревью PR #1299): арифметика над зашитым числом не может покраснеть —
+    // тавтология, а не предохранитель.
     expect(elapsedMs).toBeLessThan(CPU_LIMIT_MS);
-    expect(size * MEASURED_MS_PER_OP).toBeLessThan(CPU_LIMIT_MS);
   });
 
   it.each(BATCH_SIZES)("батч из %i условных upsert'ов БЕЗ изменений (edge-triggered no-op — реальный установившийся режим)", async (size) => {
@@ -254,10 +254,9 @@ describe("Замер CPU: батч условных upsert'ов внутри О�
     // eslint-disable-next-line no-console
     console.log(
       `[CPU-замер, design.md §3.6] батч=${size} upsert(no-op): ${elapsedMs.toFixed(3)} мс замерено, ` +
-        `экстраполяция: ${(size * MEASURED_MS_PER_OP).toFixed(4)} мс — предохранитель ${CPU_LIMIT_MS} мс.`,
+        `экстраполяция: ${(size * MEASURED_MS_PER_OP).toFixed(4)} мс (справочно, для человека).`,
     );
     expect(elapsedMs).toBeLessThan(CPU_LIMIT_MS);
-    expect(size * MEASURED_MS_PER_OP).toBeLessThan(CPU_LIMIT_MS);
   });
 });
 

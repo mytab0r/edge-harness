@@ -402,8 +402,16 @@ TASK_STAGE_TERMINAL = {TASK_STAGE_DONE, TASK_STAGE_ABANDONED}
 
 
 class ObservedPR(SimpleNamespace):
-    """Иммутабельная запись — design.md §1.2 (build_observed — ОДНА функция,
-    вычисляющая ВСЕ поля разом; остальной код читает готовую запись).
+    """Простая запись-слепок (build_observed — ОДНА функция, вычисляющая
+    ВСЕ поля разом; остальной код читает готовую запись). ЧЕСТНАЯ
+    ОГОВОРКА (находка ревью PR #1299): design.md §1.2 называет запись
+    «иммутабельной», но SimpleNamespace мутабелен — любое поле
+    переприсваивается молча; иммутабельность здесь — договорённость
+    («build_observed_* вычислил и больше не трогает»), не механизм
+    языка. Потребитель, которому нужна настоящая неизменяемость
+    (Этап 1+ tasks.md), мигрирует на frozen-структуру отдельным
+    изменением; пока — договорённость названа вслух, не выдана за
+    гвардию (AGENTS.md «Решение — это механизм, а не текст»).
     `flags` несёт только ВЫЧИСЛЕННЫЕ на этом этапе поля — отсутствующий ключ
     значит «не вычислено», а не «False» (см. докстринг раздела выше).
 
@@ -418,7 +426,9 @@ class ObservedPR(SimpleNamespace):
 
 
 class ObservedTask(SimpleNamespace):
-    """То же самое для задачи (issue с меткой task) — design.md §2.1."""
+    """То же самое для задачи (issue с меткой task) — design.md §2.1,
+    включая оговорку об иммутабельности-по-договорённости из докстринга
+    ObservedPR выше."""
 
     def __init__(self, *, repo: str, number: int, stage: str, flags: dict):
         super().__init__(repo=repo, number=number, stage=stage, flags=flags)
@@ -579,12 +589,19 @@ def post_entity_snapshot(kind: str, observed) -> tuple[bool, str]:
 
 # Номер PR/задачи, через который Этап 0 (design.md/tasks.md «Ходячий
 # скелет») реально проводит ОДНУ пару задача+PR через новый путь целиком —
-# см. tasks.md, Этап 0, пункт «в». Хардкод — намеренный и временный: ходячий
-# скелет проверяет ОДНУ конкретную сущность (эту же задачу/PR), не
-# конфигурируемый диапазон; обобщение — Этап 1+ tasks.md, где
-# build_observed_pr/build_observed_task переезжают на ВСЕ сущности, не одну.
-WALKING_SKELETON_TASK_NUMBER = 1287
-WALKING_SKELETON_PR_NUMBER = 1290
+# см. tasks.md, Этап 0, пункт «в»: «конкретный PR этой же задачи, выбранный
+# по номеру». Для задачи #1298 это её собственный PR #1299 — не родительская
+# пара #1287/#1290 (живой случай: перенос из #1290 потерял эту правку,
+# ревью PR #1299 — «пишет не ту сущность, которую обещают и критерий, и
+# само тело PR»). Хардкод — намеренный и временный: ходячий скелет
+# проверяет ОДНУ конкретную сущность (эту же задачу/PR), не
+# конфигурируемый диапазон; после слияния этого PR обе сущности сразу
+# терминальны (merged/done) — это ожидаемо, edge-triggered запись честно
+# фиксирует терминальное состояние один раз; обобщение на ВСЕ сущности —
+# Этап 1+ tasks.md, где build_observed_pr/build_observed_task переезжают
+# на весь пул, не одну пару.
+WALKING_SKELETON_TASK_NUMBER = 1298
+WALKING_SKELETON_PR_NUMBER = 1299
 
 
 def write_walking_skeleton_snapshot(repo: str, pulls: list[dict]) -> list[str]:
@@ -597,9 +614,9 @@ def write_walking_skeleton_snapshot(repo: str, pulls: list[dict]) -> list[str]:
         pr = gh(f"repos/{repo}/pulls/{WALKING_SKELETON_PR_NUMBER}")
         observed_pr = build_observed_pr(repo, pr)
         ok, detail = post_entity_snapshot("pr", observed_pr)
-        lines.append(f"{'✅' if ok else '⚠️'} снимок PR #{WALKING_SKELETON_PR_NUMBER} (#1287, ходячий скелет): {detail}")
+        lines.append(f"{'✅' if ok else '⚠️'} снимок PR #{WALKING_SKELETON_PR_NUMBER} (задача #{WALKING_SKELETON_TASK_NUMBER}, ходячий скелет): {detail}")
     except Exception as error:  # noqa: BLE001 — best-effort, см. докстринг
-        lines.append(f"⚠️ снимок PR #{WALKING_SKELETON_PR_NUMBER} (#1287, ходячий скелет) не удался: {error}")
+        lines.append(f"⚠️ снимок PR #{WALKING_SKELETON_PR_NUMBER} (задача #{WALKING_SKELETON_TASK_NUMBER}, ходячий скелет) не удался: {error}")
 
     try:
         issue = gh(f"repos/{repo}/issues/{WALKING_SKELETON_TASK_NUMBER}")

@@ -5,8 +5,11 @@ openspec/changes/orchestrator-core-v2/, tasks.md Этап 0).
 build_observed_pr/build_observed_task кормятся ПРОД-ФОРМОЙ, не пересказом:
 fixtures_pr1290_observed.json/fixtures_issue1287_observed.json — реальные
 ответы `gh api repos/mytab0r/edge-harness/pulls/1290` и
-`.../issues/1287`, снятые 2026-09-15 (та же пара задача/PR, через которую
-идёт этот ходячий скелет).
+`.../issues/1287` (родительская пара задачи #1287, снята 2026-09-15).
+Сам ходячий скелет (константы WALKING_SKELETON_* в scheduler.py) пишет
+снимок ДРУГОЙ, собственной пары этой задачи — #1298/#1299 (ревью PR
+#1299: «пишет не ту сущность, которую обещают и критерий, и само тело
+PR»); фикстуры здесь — только прод-форма данных для build_observed_*.
 
 Запуск: python -m pytest scripts/orchestra/test_snapshot_walking_skeleton.py -q
 """
@@ -280,6 +283,18 @@ def test_post_entity_snapshot_posts_real_json_body_to_pr_snapshot_route(monkeypa
 
 
 # ── write_walking_skeleton_snapshot: best-effort, не роняет main() ─────────
+
+
+def test_walking_skeleton_writes_its_own_task_pair_not_the_parent():
+    """Пин пары этой задачи (#1298/#1299) — живой случай ревью PR #1299:
+    константы, перенесённые из #1290, указывали на родительскую пару
+    #1287/#1290 — обещанная в теле PR процедура приёмки пункта (в)
+    (`GET /api/pr-snapshot/1299` на проде) вернула бы 404, никто ничего
+    не писал бы под своим номером. Константы намеренно хардкодные
+    (см. комментарий над ними в scheduler.py), поэтому пин здесь; уходит
+    вместе с ними на Этапе 1+, когда скелет переезжает на весь пул."""
+    assert sch.WALKING_SKELETON_TASK_NUMBER == 1298
+    assert sch.WALKING_SKELETON_PR_NUMBER == 1299
 
 
 def test_write_walking_skeleton_snapshot_survives_gh_failure(monkeypatch):
