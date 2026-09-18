@@ -42,10 +42,12 @@
 // Mutation proof (do this by hand before trusting the guard, per AGENTS.md
 // "поведенческий тест находит то, чего структурный не видит" — RUN it, do
 // not infer the numbers from reading the diff; that inference is exactly
-// what went stale here once before, see PR #1173 review history). All four
-// steps below were EXECUTED 2026-09-17 on this PR (verbatim outputs in the
-// PR body); steps 1-2 mutate different layers, steps 3-4 mutate the patch's
-// cache:
+// what went stale here once before, see PR #1173 review history). Steps 1-5
+// below were EXECUTED 2026-09-17 on this PR (verbatim outputs in the PR
+// body); steps 1-2 mutate different layers, steps 3-5 mutate the patch's
+// cache. Step 1 needs the bypass runner from
+// scripts/lib/test/ingest-mutation-scenario.mjs; steps 2-5 are plain text
+// edits + `node --test`:
 //   1. Reintroduce `finally { await handle.dispose()... }` around the tail of
 //      appendHarnessEvents in the patch text (the pre-#1163 shape, git
 //      history d239e324~1). LITERAL FORM (matching `assertNoUnconditionalDispose`
@@ -81,7 +83,20 @@
 //      regardless of foreign writes) and rerun test 3 (foreign write) ->
 //      stored turns rewind under the foreign turn 50 (batch 2 numbered
 //      2, 2 instead of 51, 51): the foreign-write test goes red.
-//   5. Restore the fix -> all assertions green again.
+//   5. PATCH-level (round 4 checklist — seq fail-safe): collapse the
+//      `seqIsCursor` definition to a constant (`const seqIsCursor = true` —
+//      BOTH the read gate and the cache write lose the type check) and rerun
+//      the missing-seq scenario (test 4) -> the cache stores
+//      { seq: undefined, ... } after batch 1 and then hits on
+//      `undefined === undefined` forever: turns rewind under the foreign
+//      turn (1,1,50,50,2,2,3,3) and the test goes red on `turns` (the scans
+//      check after it would fail too — the mutant scans once — but `turns`
+//      fires first). NOTE: reverting ONLY the read-side predicate to the
+//      bare `cachedBaseTurn.seq === session.seq` stays GREEN — the write
+//      side still gates on seqIsCursor and never stores a cursorless entry;
+//      the single `seqIsCursor` definition is the one place both gates share
+//      (executed 2026-09-17: that partial mutant passed all four tests).
+//   6. Restore the fix -> all assertions green again.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { runTwoBatchIngestScenario } from '../verify-ingest-resident-safety.mjs'
@@ -112,4 +127,22 @@ test('#1161: чужая запись в сессию между батчами �
     `журнал обязан продолжиться после чужого поворота 50 (батч 2 = 51,51; батч 3 = 52,52; пары turn/start+turn/end одного поворота сохраняются), а не откатиться под него; получено: ${JSON.stringify(turns)} — контракт докстринга метода "a reused session never rewinds" (#1161, ai-review PR #1173 круг 3)`,
   )
   assert.equal(scans, 2, 'ровно ДВА скана истории: холодный на батче 1 + довызов после чужой записи; батч 3 обязан взять кэш (не 3 — кэш работает, не 1 — инвалидация по seq работает)')
+})
+
+test('#1161: кэш baseTurn полностью выключается, когда session.seq не курсор (fail-safe от переименования в апстриме)', async () => {
+  // ai-review PR #1173, round 4 checklist: голый предикат
+  // `cachedBaseTurn.seq === session.seq` молча зелёный, если апстрим
+  // переименует/уберёт `seq` (undefined === undefined → вечный hit протухшего
+  // кэша). Контракт: без валидного курсора кэш ВЫКЛЮЧЕН полностью — нумерация
+  // продолжается за чужой записью (безусловный ре-скан, до-кэшное поведение),
+  // а не откатывается под неё.
+  const { batch2Error, batch3Error, turns, scans } = await runTwoBatchIngestScenario(undefined, { foreignNativeTurnBetweenBatches: true, missingSeqOnSession: true })
+  assert.equal(batch2Error, undefined, `батч 2 после чужой записи обязан пройти: ${batch2Error}`)
+  assert.equal(batch3Error, undefined, `батч 3 после чужой записи обязан пройти: ${batch3Error}`)
+  assert.deepEqual(
+    turns,
+    [1, 1, 50, 50, 51, 51, 52, 52],
+    `без валидного session.seq нумерация ОБЯЗАНА продолжиться после чужого поворота 50 (fail-safe: кэш выключен → безусловный ре-скан видит весь журнал), а не откатиться под неё через вечный hit протухшего кэша на undefined === undefined; получено: ${JSON.stringify(turns)} (#1161, ai-review PR #1173 круг 4)`,
+  )
+  assert.equal(scans, 3, 'кэш обязан быть ПОЛНОСТЬЮ выключен без валидного курсора: каждый из трёх батчей сканирует историю заново (scans 3, не 1) — выключенный кэш это наблюдаемое состояние фейл-сейфа, а не молчаливая деградация (#1161, ai-review PR #1173 круг 4)')
 })

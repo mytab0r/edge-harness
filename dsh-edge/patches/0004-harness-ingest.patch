@@ -172,7 +172,7 @@ index cfff36a..be11683 100644
      message: string,
    ) {
      super(message)
-@@ -1265,6 +1276,168 @@ export class EdgeSessionStore {
+@@ -1265,6 +1276,180 @@ export class EdgeSessionStore {
      }
    }
  
@@ -299,10 +299,20 @@ index cfff36a..be11683 100644
 +    // encodes — re-check by hand at every pin bump. The field name is
 +    // harness-namespaced on purpose: no one can confirm upstream has no own
 +    // semantics for a bare `lastTurn` field on its session object.
++    // Fail-safe (ai-review PR #1173, round 4): if upstream renames or drops
++    // `seq`, the cache must go FULLY OFF, not silently hit forever — with a
++    // bare `cached.seq === session.seq` both sides are undefined, the stale
++    // cache survives foreign writes and the rewind below comes back with no
++    // signal. seqIsCursor degrades that case to the unconditional rescan:
++    // correct numbering at the pre-cache CPU cost. The guard pins the
++    // contract behaviorally (missing-seq scenario, test 4: cache OFF is an
++    // observable state — every batch rescans); the rename itself is still
++    // not detected by the stub at a pin bump — re-check by hand above.
 +    const sessionAny = session as unknown as { __harnessBaseTurnCache?: { seq: number; turn: number } }
 +    const cachedBaseTurn = sessionAny.__harnessBaseTurnCache
 +    let baseTurn = 0
-+    if (cachedBaseTurn !== undefined && cachedBaseTurn.seq === session.seq) {
++    const seqIsCursor = typeof session.seq === 'number' && Number.isSafeInteger(session.seq)
++    if (seqIsCursor && cachedBaseTurn !== undefined && cachedBaseTurn.seq === session.seq) {
 +      baseTurn = cachedBaseTurn.turn
 +    } else {
 +      for (const event of session.snapshotEvents()) {
@@ -333,7 +343,9 @@ index cfff36a..be11683 100644
 +    }
 +    // Store the cache only after the batch's own appends: session.seq now
 +    // reflects everything this batch wrote (see the invalidation note above).
-+    sessionAny.__harnessBaseTurnCache = { seq: session.seq, turn: maxTurn }
++    // Written only when seq is a cursor (seqIsCursor): an entry without a
++    // real cursor could never be invalidated meaningfully.
++    if (seqIsCursor) sessionAny.__harnessBaseTurnCache = { seq: session.seq, turn: maxTurn }
 +    await sessions.flush(session)
 +    return { appended, lastSeq: session.seq - 1 }
 +  }
@@ -341,7 +353,7 @@ index cfff36a..be11683 100644
    /** Count live Agent owners for host.describe. */
    async attachedSessionCount(): Promise<number> {
      const { agents } = await this.services()
-@@ -1496,6 +1669,116 @@ export class EdgeSessionStore {
+@@ -1496,6 +1681,116 @@ export class EdgeSessionStore {
    }
  }
  

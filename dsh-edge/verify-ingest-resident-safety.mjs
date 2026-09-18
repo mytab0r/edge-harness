@@ -129,17 +129,23 @@ export function assertNoUnconditionalDispose(body) {
  * case — and `turns` (every stored event's turn, in order) lets the test pin
  * the cache's seq-keyed invalidation: batch 2 must renumber AFTER the foreign
  * turn, not rewind under it. Behavioral, not structural: the invariant lives
- * in the executed patch text. NOT re-confirmed as the dominant share of
+ * in the executed patch text. With opts.missingSeqOnSession the resident
+ * session carries NO `seq` field at all (upstream renamed/dropped the write
+ * cursor): the patch's seqIsCursor gate must switch the cache FULLY off —
+ * numbering still continues (unconditional rescan, the pre-cache behavior)
+ * and every batch pays the scan (scans = 3), instead of a stale cache that
+ * hits forever on `undefined === undefined` (ai-review PR #1173, round 4).
+ * NOT re-confirmed as the dominant share of
  * #1161's measured 150,898 rows_read/run on the current pin — that
  * number/estimate lives in issue #1161, not here. Never swallows a
  * scenario-setup error.
  * @param {string} patch - full unified diff text (defaults to the real patch on disk).
- * @param {{foreignNativeTurnBetweenBatches?: boolean}} [opts]
+ * @param {{foreignNativeTurnBetweenBatches?: boolean, missingSeqOnSession?: boolean}} [opts]
  * @returns {Promise<{batch1: {appended: number}, batch2Error: string|undefined, batch3Error: string|undefined, disposeCalls: number, coldLoads: number, scans: number, turns: Array<number|undefined>}>}
  */
 export async function runTwoBatchIngestScenario(
   patch = readFileSync(patchPath, 'utf8'),
-  opts = { foreignNativeTurnBetweenBatches: false },
+  opts = { foreignNativeTurnBetweenBatches: false, missingSeqOnSession: false },
 ) {
   const methodBody = extractPatchMethod(patch, 'async appendHarnessEvents(')
   assertNoUnconditionalDispose(methodBody)
@@ -156,6 +162,10 @@ export class EdgeSessionStoreError extends Error {
   }
 }
 export class LlmError extends Error {}
+// Scenario flags injected from the caller (JSON): visible at module scope so
+// the stub's session factory below can read them (class methods cannot see
+// scenario()'s locals).
+const STUB_OPTS = ${JSON.stringify(opts)}
 class DurableObjectSessionPersistence {
   hasSession(_id: unknown): boolean { return true }
   readBlankSession(_id: unknown): undefined { return undefined }
@@ -227,8 +237,14 @@ class ResidentStubStore {
     if (handle === undefined) {
       this.coldLoads += 1
       const store = this
-      const session = {
-        seq: 1,
+      const session: any = {
+        // missingSeqOnSession (ai-review PR #1173, round 4 checklist): a
+        // session WITHOUT a seq field models upstream renaming/dropping the
+        // write cursor. The patch's seqIsCursor gate must then keep the
+        // cache FULLY off (fail-safe, not a forever-hit stale cache) — the
+        // missing-seq scenario pins that: numbering still continues under a
+        // foreign write, and every batch rescans (scans = 3).
+        ...(STUB_OPTS.missingSeqOnSession === true ? {} : { seq: 1 }),
         log: [] as Array<{ type: string; data: unknown }>,
         snapshotEvents(): Array<{ type: string; data: unknown }> {
           store.scans += 1
@@ -237,7 +253,12 @@ class ResidentStubStore {
         append(type: string, data: unknown, _opts?: unknown) {
           this.log.push({ type, data })
           const event = { type, data, seq: this.seq }
-          this.seq += 1
+          // A session with NO cursor keeps having none (upstream that renamed
+          // "seq" bumps its own field, not "seq"): writing NaN here would
+          // model a corrupted cursor, not an absent one, and would mask the
+          // forever-hit stale-cache mutant the missing-seq scenario exists to
+          // catch (undefined === NaN is false; undefined === undefined hits).
+          if (typeof this.seq === 'number') this.seq += 1
           return event
         },
       }
