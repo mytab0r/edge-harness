@@ -953,6 +953,11 @@ export class Harness extends DurableObject<Env> {
     if (route.name === "messagesIssueCreated") {
       return this.#postIssueCreated(request);
     }
+    if (route.name === "messageFinish") {
+      const id = matched.rest;
+      if (!id) throw new ApiError(400, "need_message_id");
+      return this.#postMessageFinish(request, id);
+    }
     throw new ApiError(404, "not_found", { method: request.method, path: url.pathname });
   }
 
@@ -2392,6 +2397,51 @@ export class Harness extends DurableObject<Env> {
   }
 
   /**
+   * Диспетч оркестратора для chat-сообщения (repository_dispatch event_type harness-message).
+   * Аналог #dispatchIssueCreation, но для оркестратора-джоба.
+   * Возвращает тот же тип IssueDispatchOutcome для единообразия обработки ошибок.
+   */
+  async #dispatchOrchestratorMessage(
+    messageId: number,
+    claimedTs: number,
+  ): Promise<IssueDispatchOutcome> {
+    const token = this.env.GH_DISPATCH_TOKEN;
+    const repo = this.env.GH_REPO;
+    if (!token || !repo) {
+      return { ok: false, retryable: true, error: "dispatch_not_configured" };
+    }
+    try {
+      const row = this.#rows(this.#sql.exec("SELECT text, chat_id, source FROM messages WHERE id = ?", messageId))[0];
+      if (!row) return { ok: false, retryable: false, error: "message_not_found" };
+      const text = String(row.text);
+      const chatId = row.chat_id;
+      const source = String(row.source);
+      const res = await fetch(`${GITHUB.apiBase}/repos/${repo}/dispatches`, {
+        method: "POST",
+        signal: AbortSignal.timeout(LIMITS.messageIssueDispatchTimeoutMs),
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/vnd.github+json",
+          "Content-Type": "application/json",
+          "User-Agent": GITHUB.userAgent,
+          "X-GitHub-Api-Version": GITHUB.apiVersion,
+        },
+        body: JSON.stringify({
+          event_type: GITHUB.orchestratorMessageEventType,
+          client_payload: { message_id: messageId, claimed_ts: claimedTs, text, chat_id: chatId, source },
+        }),
+      });
+      if (res.status !== 204) {
+        const detail = redact((await res.text()).slice(0, 500)).text;
+        return { ok: false, retryable: res.status >= 500 || res.status === 429, error: `github_${res.status}: ${detail}` };
+      }
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, retryable: true, error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  /**
    * Финальное состояние: статус + результат + отметка времени. CAS по моменту
    * захвата: если ватчдог уже вернул сообщение в new и его забрала другая
    * проходка — наша запись устарела, перезаписывать чужой результат нельзя
@@ -2477,8 +2527,40 @@ export class Harness extends DurableObject<Env> {
       return { action: "skipped" };
     }
 
-    // chat: автоматического действия в фазе 1 нет — разобрано и припарковано
-    // с явной пометкой; триаж (морда, фаза 2) решает дальнейшее.
+    // chat: диспетчим оркестратор-джоб вместо немедленного done.
+    // Сообщение остаётся в processing — джоб подтвердит результат через
+    // #postMessageFinish (CAS по claimed_ts), либо ватчдог вернёт в new/failed.
+    if (kind === "chat") {
+      const dispatchResult = await this.#dispatchOrchestratorMessage(messageId, claimedTs);
+      if (dispatchResult.ok) {
+        // 204 — только приём dispatch'а: финальный статус НЕ пишем здесь,
+        // джоб запишет done/failed через #postMessageFinish, либо ватчдог
+        // (messageStuck) вернёт в очередь, если джоб не подтвердил.
+        return { action: "orchestrator_dispatched" };
+      }
+      const attempts = Number(
+        this.#rows(this.#sql.exec("SELECT attempts FROM messages WHERE id = ?", messageId))[0].attempts,
+      );
+      if (!dispatchResult.retryable || attempts >= MESSAGE_MAX_ATTEMPTS) {
+        if (this.#finishMessage(messageId, "failed", { error: dispatchResult.error }, claimedTs)) {
+          return { action: "orchestrator_failed", error: dispatchResult.error, attempts };
+        }
+        return { action: "skipped" };
+      }
+      // Повторяемая ошибка (токен не задан, сеть, 5xx) — обратно в очередь:
+      // пульс или ручной process доведут; кап попыток не даст штурмовать вечно.
+      // CAS: чужую захватку сбивать нельзя.
+      const released = this.#sql.exec(
+        "UPDATE messages SET status = 'new', processing_ts = NULL WHERE id = ? AND status = 'processing' AND processing_ts = ?",
+        messageId, claimedTs,
+      );
+      if (Number(released.rowsWritten) === 0) return { action: "skipped" };
+      // processing → new (повторяемая ошибка) — тот же переход, что и захват выше (#575).
+      this.#msgCountsCache = null;
+      return { action: "orchestrator_retry", error: dispatchResult.error, attempts };
+    }
+
+    // fallback (не должен сработать): паркуем как раньше
     if (this.#finishMessage(messageId, "done", { kind, note: "classified_for_manual_review" }, claimedTs)) {
       return { action: "parked" };
     }
@@ -2552,6 +2634,44 @@ export class Harness extends DurableObject<Env> {
     const finished = this.#finishMessage(messageId, "done", result, claimedTs);
     if (finished) this.#broadcastStatus();
     return this.#json({ accepted: finished, action: "issue_created", issue_number: issueNumber, issue_url: issueUrl });
+  }
+
+  /**
+   * Финализация сообщения оркестратором (Bearer HANDS_TOKEN): CAS-запись
+   * результата по claimed_ts (processing_ts). Используется джобом
+   * orchestrator-message.yml для завершения обработки chat-сообщения.
+   *
+   * Тело: {status: "done"|"failed", result: object, claimed_ts: number}
+   * Возвращает: {accepted: boolean, action: "finished"|"failed"|...}
+   *
+   * CAS защищает от двойного ответа: если ватчдог уже вернул сообщение в new
+   * и его забрала другая проходка, наша запись не проходит — accepted: false
+   * без ошибки, джоб молчит (спека orchestrator-dispatch требование 4).
+   */
+  async #postMessageFinish(request: Request, messageIdStr: string): Promise<Response> {
+    const messageId = Number(messageIdStr);
+    if (!Number.isInteger(messageId) || messageId <= 0) {
+      throw new ApiError(400, "need_message_id");
+    }
+    const body = await this.#readJson(request);
+    const status = body.status;
+    if (status !== "done" && status !== "failed") {
+      throw new ApiError(400, "bad_status", { detail: "status должен быть done или failed" });
+    }
+    const result = body.result;
+    if (!result || typeof result !== "object") {
+      throw new ApiError(400, "need_result_object");
+    }
+    const claimedTs = typeof body.claimed_ts === "number" ? body.claimed_ts : Number(asString(body.claimed_ts));
+    if (!Number.isInteger(claimedTs) || claimedTs <= 0) {
+      throw new ApiError(400, "need_claimed_ts");
+    }
+    const row = this.#rows(this.#sql.exec("SELECT text, attempts FROM messages WHERE id = ?", messageId))[0];
+    if (!row) throw new ApiError(404, "message_not_found", { message_id: messageId });
+
+    const finished = this.#finishMessage(messageId, status, result, claimedTs);
+    if (finished) this.#broadcastStatus();
+    return this.#json({ accepted: finished, action: "finished" });
   }
 
   /** Ватчдог: processing дольше порога — изолят умер посреди внешнего вызова.
@@ -2880,6 +3000,11 @@ export class Harness extends DurableObject<Env> {
    * Идемпотентность — пречтением (по образцу журнала: rowsWritten после
    * ON CONFLICT DO NOTHING в workerd признаком «свежести» не служит); блок
    * синхронный после readJson — гонки двух одновременных вставок нет.
+   *
+   * После вставки свежего сообщения закладывает ОДНОРАЗОВЫЙ ближний alarm
+   * (порядка HEARTBEAT.selfOrchestrationFirstMs), чтобы ускорить разбор
+   * и диспетч chat-сообщений — не ждать полного 15-минутного темпа пульса.
+   * Alarm ставится только если уже заложенный тик не раньше (п.33 базовой спеки).
    */
   #putMessage(f: {
     source: string; sourceMsgId: string;
@@ -2906,7 +3031,21 @@ export class Harness extends DurableObject<Env> {
     const row = this.#rows(
       this.#sql.exec("SELECT id FROM messages WHERE source = ? AND source_msg_id = ?", f.source, f.sourceMsgId),
     )[0];
-    return { id: Number(row.id), fresh: true };
+    const messageId = Number(row.id);
+    // Закладываем одноразовый alarm для ускорения разбора свежего сообщения.
+    // alarm() перезакладывается самой первой строкой, поэтому здесь просто
+    // проверяем, не заложен ли уже тик раньше ближнего порога.
+    try {
+      const scheduled = this.ctx.storage.getAlarm();
+      const soon = Date.now() + HEARTBEAT.selfOrchestrationFirstMs;
+      if (scheduled === null || scheduled > soon) {
+        this.ctx.storage.setAlarm(soon);
+      }
+    } catch {
+      // setAlarm может упасть на квоте rows_written (#320) — не роняем ingest.
+      console.log("putMessage: не удалось заложить ускоренный alarm");
+    }
+    return { id: messageId, fresh: true };
   }
 
   /** Ручное создание сообщения (для тестов/админа) — тот же класс идемпотентности,
