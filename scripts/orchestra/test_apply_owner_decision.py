@@ -6,6 +6,9 @@ Telegram тем же артефактом, что и ручной ответ в�
 """
 
 import importlib.util
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -111,6 +114,35 @@ def test_verify_signature_mismatch_distinct_message():
     wrong = _valid_signature("sekret", 471, 1)  # подпись для ДРУГОГО варианта
     with pytest.raises(RuntimeError, match="не совпадает"):
         aod.verify_signature("sekret", 471, 2, wrong)
+
+
+def test_verify_signature_non_ascii_is_mismatch_not_typeerror():
+    # Находка ревью PR #1254: строковый hmac.compare_digest бросает TypeError
+    # на не-ASCII — подделка кириллицей падала бы четвёртым,
+    # не каталогизированным отказом (сырой трейсбек мимо ::error::).
+    # Байтовое сравнение даёт обычный SignatureMismatch.
+    with pytest.raises(RuntimeError, match="не совпадает"):
+        aod.verify_signature("sekret", 471, 2, "подпись")
+
+
+def test_main_non_ascii_signature_cli_fails_classified_not_traceback():
+    """Прод-форма (находка ревью PR #1254): РЕАЛЬНЫЙ вызов строкой команды с
+    не-ASCII подписью обязан дать каталогизированный отказ — exit 1,
+    ::error:: и текст mismatch в stderr, без сырого TypeError-трейсбека."""
+    proc = subprocess.run(
+        [
+            sys.executable, str(SCRIPT),
+            "--repo", "o/r", "--issue", "471", "--option", "2",
+            "--signature", "подпись",
+        ],
+        env={**os.environ, aod.SIGNATURE_SECRET_ENV_VAR: "sekret"},
+        capture_output=True, text=True, encoding="utf-8",
+    )
+    assert proc.returncode == 1, proc.stderr
+    assert "::error::" in proc.stderr
+    assert "не совпадает" in proc.stderr
+    assert "TypeError" not in proc.stderr
+    assert "Traceback" not in proc.stderr
 
 
 def test_verify_signature_three_failure_messages_are_distinct():
