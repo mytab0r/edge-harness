@@ -111,7 +111,8 @@ def test_parse_verdict(answer, expected):
     ),
     ("Замечаний не имею.", False),
     ("", False),
-    # строка есть, но не последняя — неоднозначность, не молчание
+    # единственный маркер среди прозы — тоже «строка есть»; после #1332 такой
+    # ответ вообще валидный approve и до диагностики error не доходит
     ("ВЕРДИКТ: approve\nИ ещё одна мысль...", True),
     # два маркера — тоже «есть, но не разобрана»
     ("ВЕРДИКТ: rework\nВЕРДИКТ: approve", True),
@@ -729,15 +730,51 @@ def test_error_headline_names_the_class_not_one_text_for_all():
     assert "контракту вердикта" not in ai.error_headline(chain), (
         "отказ ДО модели не смеет называться нарушением контракта ОТВЕТА")
     assert "контракту вердикта" in ai.error_headline(contract)
+    # Шапка не дублирует начало причины (находка ревью PR #1333): строка
+    # ::error:: печатается как «<шапка> (<причина>)», и каждая причина
+    # отказа-до-модели УЖЕ начинается с префикса — шапка с ним же давала
+    # «ревью не состоялось — … (ревью не состоялось — …)».
+    assert not ai.error_headline(chain).startswith(
+        ai.REVIEW_NEVER_HAPPENED_PREFIX), ai.error_headline(chain)
 
 
 def test_every_pre_model_reason_carries_prefix():
     """Одно место правды: ветка «ревью не состоялось», написанная мимо
-    константы, молча вернула бы шапку про контракт ответа."""
+    константы, молча вернула бы шапку про контракт ответа.
+
+    Гвардия устойчива к форматированию (находка ревью PR #1333: прежние две
+    подстроки ловили только формы `return ("ревью не состоялось…` и
+    `return f"ревью не состоялось…` — голый литерал `return "ревью не
+    состоялось…` и перенос строки внутри скобок проходили зелёными, обе
+    мутации исполнены): в исходнике модуля литеральный текст «ревью не
+    состоялось» встречается РОВНО ДВАЖДЫ — комментарий над константой и
+    само её определение. Любая причина, написанная этим текстом мимо
+    константы, в любой записи увеличивает счётчик и красит тест."""
     import inspect
     src = inspect.getsource(ai)
-    assert 'return ("ревью не состоялось' not in src and 'return f"ревью не состоялось' not in src, (
-        "ветка отказа-до-модели написана строкой мимо REVIEW_NEVER_HAPPENED_PREFIX")
+    assert src.count("ревью не состоялось") == 2, (
+        "ветка отказа-до-модели написана текстом мимо REVIEW_NEVER_HAPPENED_PREFIX")
+
+
+@pytest.mark.parametrize("kwargs", [
+    {},  # транспортная ось: rc≠0 без failure_reason
+    {"failure_reason": "empty_diff"},  # (#658)
+    {"failure_reason": "diff_source_mismatch"},  # (#687)
+    {"failure_reason": "all_providers_exhausted"},  # (#727), повтор бесполезен
+    {"failure_reason": "all_providers_exhausted", "retry_useful": True},  # (#1307)
+    {"failure_reason": "quota_exhausted"},
+    {"failure_reason": "rate_limit_retry_budget_exceeded"},
+])
+def test_every_pre_model_axis_is_recognized_as_never_happened(kwargs):
+    """Поведенческая сторона той же гвардии (находка ревью PR #1333:
+    «гвардия держит форму записи, а не поведение»): КАЖДАЯ ветка
+    отказа-до-модели обязана опознаваться review_never_happened. Текстовый
+    счётчик выше не видит ветку, забывшую константу ЦЕЛИКОМ (словами она
+    не пишет «ревью не состоялось» — и счётчик не растёт); этот тест ловит
+    её по классу — на прод-форме входов, как их разбирает error_reason."""
+    reason = ai.error_reason("", "1", **kwargs)
+    assert ai.review_never_happened(reason), (
+        f"ветка отказа-до-модели не опознана: {reason}")
 
 
 def test_error_reason_transport_failure_wins_over_line_check():
