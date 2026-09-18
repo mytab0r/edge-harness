@@ -2760,15 +2760,32 @@ def run_claimed_in_comments(run_id: int | str, comments: list[dict]) -> bool:
     )
 
 
-def run_claimed_task(repo: str, task_number: int, run_id: int | str) -> bool:
+def run_claimed_task(
+    repo: str, task_number: int, run_id: int | str, max_pages: int | None = None
+) -> bool:
     """След аренды: работал ли прогон `worker run <run_id>` над задачей #N.
 
     Формат следа — одно место правды в scripts/worker/task.sh (CLAIM_VIA =
     «worker run <GITHUB_RUN_ID>», гвардия формата — в test_scheduler.py);
-    в задачу его кладёт claim_task.claim. Здесь только чтение. Одиночный
-    прогон — ок; для СТРАНИЦЫ прогонов (last_worker_run) используйте
-    run_claimed_in_comments с одним чтением комментариев на страницу."""
-    return run_claimed_in_comments(run_id, all_issue_comments(repo, task_number))
+    в задачу его кладёт claim_task.claim. Здесь только чтение, матчинг —
+    run_claimed_in_comments (граница по цифре там же, второй копии нет).
+    Одиночный прогон — ок; для СТРАНИЦЫ прогонов (last_worker_run)
+    используйте run_claimed_in_comments с одним чтением комментариев
+    на страницу.
+
+    `max_pages` — граница цены читателя (класс #1100/#607: без неё обход
+    растёт с историей задачи). Для АТРИБУЦИИ АКТИВНОГО прогона достаточно
+    первой СВЕЖЕЙ страницы (все_issue_comments при max_pages читает именно
+    свежий хвост, #1100): след пишется в первые минуты прогона, а история
+    задачи растёт в конец — для механического гейта worker_blocks_pr
+    передаётся max_pages=1. Гонка «след лег на страницу за границей»
+    самозаживляется следующим тактом — так же, как в докстринге
+    all_issue_comments. Дефолт None (вся история) сохранён для прежних
+    читателей (resume_series_by_merge ищет след КРАСНОГО прогона, которому
+    могут быть месяцы)."""
+    return run_claimed_in_comments(
+        run_id, all_issue_comments(repo, task_number, max_pages=max_pages)
+    )
 
 
 def last_worker_run(repo: str, task_number: int, *, since: datetime | None = None) -> dict | None:
@@ -3607,6 +3624,23 @@ def _stalled_run_task_number(
             return number
     return None
 
+# Окно молодого in_progress-прогона без CLAIM_VIA-следа (issue #1032, находка
+# ai-review PR #1033, требование 2): след аренды появляется в задаче не в
+# первые секунды статуса in_progress — до `claim_task.py claim` (первые секунды
+# САМОГО job'а, scripts/worker/task.sh) прогон проходит выборку пула (GraphQL),
+# dup-гардию (два `gh api`), чтение замков, квоту и PAT-авторизацию workflow'а —
+# реально это десятки секунд-минуты. in_progress-прогон БЕЗ следа МЛАДШЕ этого
+# порога НЕ доказывает «воркер занят другим PR», поэтому per-task гейт
+# mechanical_rebase (worker_blocks_pr) блокирует его консервативно. Порог —
+# тормоз с газом: самоосвобождается, когда прогон (а) завершился (исчез из
+# списка активных) или (б) перешагнул порог — дальше решает CLAIM_VIA-след;
+# оба пути короче следующего такта `conflict-mechanical-rebase.yml` (15-минутный
+# крон), так что максимальная цена отказа — один такт, как у `queued`.
+# Значение: с запасом сверху против наблюдаемого времени до claim (минуты),
+# но заведомо меньше 15-минутного такта — иначе газ не наступал бы к следующему
+# такту никогда.
+WORKER_CLAIM_TRACE_GRACE_MINUTES = 10
+
 # ── До двух воркеров параллельно (#827) ──────────────────────────────────────
 # Постановка задачи #827, 2026-09-09 (не отдельное подтверждение владельца —
 # машиночитаемого артефакта решения нет, см. docs/research/31, раздел
@@ -3657,10 +3691,16 @@ def _run_slot(run: dict) -> int:
     return int(match.group(1)) if match else 1
 
 
-def _run_age_minutes(run: dict, now: datetime) -> float | None:
+
+def run_age_minutes(run: dict, now: datetime) -> float | None:
     """Возраст прогона в минутах от `run_started_at` (когда GitHub его знает)
     или `created_at` (queued/раннее, пока job ещё не подхватил раннер) —
-    `None`, если ни одного поля нет вовсе (не прод-форма ответа)."""
+    `None`, если ни одного поля нет вовсе (не прод-форма ответа).
+
+    Публичное имя (без подчёркивания) — не стилистика: per-task гейт
+    mechanical_rebase.py (issue #1032) читает им возраст ЧУЖОГО прогона против
+    порога WORKER_CLAIM_TRACE_GRACE_MINUTES — частной копии этой арифметики
+    там не заводим."""
     started = run.get("run_started_at") or run.get("created_at")
     return minutes_between(parse_time(started), now) if started else None
 
@@ -3675,7 +3715,7 @@ def _run_is_stalled(run: dict, now: datetime,
     хрупкости, которого правило репозитория «тест кормится прод-формой»
     требует избегать: фиксированная дата фикстуры неизбежно «стареет» по
     календарю сама по себе)."""
-    age = _run_age_minutes(run, now)
+    age = run_age_minutes(run, now)
     return age is not None and age >= threshold_minutes
 
 
@@ -3737,13 +3777,35 @@ def active_worker_runs(repo: str, now: datetime | None = None) -> list[dict]:
     наблюдаемых случаях, но queued-прогон, вытесненный за страницу более
     новыми, останется невидимым — free_worker_slot тогда назовёт слот
     свободным, и диспатч встанет в хвост занятой группы. Двойной работы не
-    будет (GitHub сериализует группу), соврёт только отчёт о запуске."""
+    будет (GitHub сериализует группу), соврёт только отчёт о запуске.
+
+    Зависший прогон (#815, `_run_is_stalled`) исключён из списка для ОБОИХ
+    статусов — и in_progress, и queued (#1032). Для queued порог применим
+    через fallback `run_age_minutes` на `created_at`: прогон виден в API с
+    момента постановки в очередь. Это газ queued-блока: застрявшая очередь
+    раннеров/биллинг перестаёт держать и диспетчеров, и per-task гейт
+    механического ребейза по тому же порогу WORKER_STALL_MINUTES, что и
+    зависший in_progress — тормоз не односторонний.
+
+    ЧЕСТНАЯ ГРАНИЦА этого газа: он снимает блок ЧИТАТЕЛЕЙ списка, но САМ
+    зависший queued-прогон никем не отменяется — `reap_stalled_worker_run`
+    читает только in_progress, а у queued нет ни сессии морды для признака
+    тишины, ни, как правило, взятой аренды. Следствие, которое надо знать
+    читателю отчёта: диспатч уходит, но встаёт ПОЗАДИ зомби в той же
+    concurrency-группе (`cancel-in-progress: false`) и не стартует, пока
+    GitHub держит очередь — «диспатч отправлен» правда, «воркер поехал» из
+    этого НЕ следует. Асимметрия названа, а не выдана за полный газ; отмена
+    зависшего queued (тот же `POST .../runs/<id>/cancel`) — отдельная узкая
+    задача, не этот change."""
     now = now or datetime.now(timezone.utc)
     active = [run for run in in_progress_worker_runs(repo) if not _run_is_stalled(run, now)]
     payload = gh(
         f"repos/{repo}/actions/workflows/{WORKER_WORKFLOW}/runs?status=queued&per_page={QUEUED_RUNS_PAGE_SIZE}"
     ) or {}
-    active.extend(payload.get("workflow_runs") or [])
+    active.extend(
+        run for run in (payload.get("workflow_runs") or [])
+        if not _run_is_stalled(run, now)
+    )
     return active
 
 
@@ -3757,14 +3819,23 @@ def worker_runs_active(repo: str, now: datetime | None = None) -> bool:
 
     Зависший in_progress (#815, stalled_worker_runs выше) — ИСКЛЮЧЕНИЕ: дольше
     WORKER_STALL_MINUTES без завершения не блокирует ни один из трёх
-    диспетчеров, читающих эту функцию (dispatch_conflict_rework — обе точки
-    чтения ниже используют её как консервативный признак «расшивка/попытка,
-    вероятно, ещё идёт», не как гейт для самого dispatch; сам выбор слота под
-    dispatch — free_worker_slot, #827). Сама отмена зависшего прогона и
+    читателей этой функции. Читатель сегодня ОДИН (сверено по исходнику при
+    сведении #827 и #1032): гейт эскалации авто-ребейза в
+    dispatch_conflict_rework — он использует её как консервативный признак
+    «расшивка/попытка, вероятно, ещё идёт» («хотя бы один прогон в ЛЮБОМ
+    слоте»), не как гейт самого dispatch; выбор слота под dispatch —
+    free_worker_slot (#827), а per-task гейт механического ребейза ушёл на
+    active_worker_runs + worker_blocks_pr (#1032), с неё снят. Сама отмена
+    зависшего прогона и
     освобождение его задачи — отдельный шаг main() (reap_stalled_worker_run),
     не побочный эффект этой read-only проверки: функцию читают несколько мест
     за один пульс, мутировать GitHub при каждом чтении было бы сюрпризом и
-    лишними вызовами."""
+    лишними вызовами.
+
+    Реализация сведена к `active_worker_runs` (тот же фетч, что у per-task
+    гейта mechanical_rebase, — одно место правды, находка ai-review PR #1033),
+    но сам вопрос «кто именно активен» эта функция не раскрывает: потребителю
+    нужен только булев факт."""
     return bool(active_worker_runs(repo, now))
 
 
