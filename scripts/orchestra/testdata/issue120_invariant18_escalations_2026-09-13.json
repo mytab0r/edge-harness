@@ -1,0 +1,110 @@
+[
+  {
+    "id": 5656316227,
+    "created_at": "2026-09-13T21:37:20Z",
+    "user_login": "github-actions[bot]",
+    "body": "[инвариант 18: 3ce89312d6db14a7]\n🚨 edge-harness: инвариант 18 (маркер статуса конвейера в #120 опубликован НЕ токеном job'а — performed_via_github_app=null, #1101) — 193 таких комментариев, последний 2026-09-13T17:57:48Z от mytab0r (https://github.com/mytab0r/edge-harness/issues/120#issuecomment-5655035914). Различение по токену публикации, не по логину (AGENTS.md, «Атрибуция событий»). Ложный маркер здесь реально двигает решение: conveyor_gate читает PAUSE/RESUME из #120 без trusted_login, поддельный RESUME работает виртуальным success. Кто пишет вне GitHub Actions — не подтверждено (нужен второй, независимый источник данных; логин различить не может), см. #1101."
+  },
+  {
+    "id": 5657055195,
+    "created_at": "2026-09-13T23:31:41Z",
+    "user_login": "github-actions[bot]",
+    "body": "[инвариант 18: 783b590eb85cd7e2]\n🚨 edge-harness: инвариант 18 (маркер статуса конвейера в #120 опубликован НЕ токеном job'а — performed_via_github_app=null, #1101) — 194 таких комментариев, последний 2026-09-13T23:29:57Z от mytab0r (https://github.com/mytab0r/edge-harness/issues/120#issuecomment-5657045906). Различение по токену публикации, не по логину (AGENTS.md, «Атрибуция событий»). Ложный маркер здесь реально двигает решение: conveyor_gate читает PAUSE/RESUME из #120 без trusted_login, поддельный RESUME работает виртуальным success. Кто пишет вне GitHub Actions — не подтверждено (нужен второй, независимый источник данных; логин различить не может), см. #1101."
+  },
+  {
+    "id": 5657154509,
+    "created_at": "2026-09-13T23:50:40Z",
+    "user_login": "github-actions[bot]",
+    "body": "[инвариант 18: d657478cf0df48c7]\n🚨 edge-harness: инвариант 18 (маркер статуса конвейера в #120 опубликован НЕ токеном job'а — performed_via_github_app=null, #1101) — 199 таких комментариев, последний 2026-09-13T23:48:14Z от mytab0r (https://github.com/mytab0r/edge-harness/issues/120#issuecomment-5657142198). Различение по токену публикации, не по логину (AGENTS.md, «Атрибуция событий»). Ложный маркер здесь реально двигает решение: conveyor_gate читает PAUSE/RESUME из #120 без trusted_login, поддельный RESUME работает виртуальным success. Кто пишет вне GitHub Actions — не подтверждено (нужен второй, независимый источник данных; логин различить не может), см. #1101."
+  },
+  {
+    "id": 5657316643,
+    "created_at": "2026-09-14T00:17:15Z",
+    "user_login": "github-actions[bot]",
+    "body": "[инвариант 18: d5b2de09a6c96cac]\n🚨 edge-harness: инвариант 18 (маркер статуса конвейера в #120 опубликован НЕ токеном job'а — performed_via_github_app=null, #1101) — 202 таких комментариев, последний 2026-09-14T00:01:33Z от mytab0r (https://github.com/mytab0r/edge-harness/issues/120#issuecomment-5657209766). Различение по токену публикации, не по логину (AGENTS.md, «Атрибуция событий»). Ложный маркер здесь реально двигает решение: conveyor_gate читает PAUSE/RESUME из #120 без trusted_login, поддельный RESUME работает виртуальным success. Кто пишет вне GitHub Actions — не подтверждено (нужен второй, независимый источник данных; логин различить не может), см. #1101."
+  },
+  {
+    "id": 5657589163,
+    "created_at": "2026-09-14T01:00:49Z",
+    "user_login": "github-actions[bot]",
+    "body": "[инвариант 18: d788e92550fdb94c]\n🚨 edge-harness: инвариант 18 (маркер статуса конвейера в #120 опубликован НЕ токеном job'а — performed_via_github_app=null, #1101) — 204 таких комментариев, последний 2026-09-14T00:45:54Z от mytab0r (https://github.com/mytab0r/edge-harness/issues/120#issuecomment-5657498185). Различение по токену публикации, не по логину (AGENTS.md, «Атрибуция событий»). Ложный маркер здесь реально двигает решение: conveyor_gate читает PAUSE/RESUME из #120 без trusted_login, поддельный RESUME работает виртуальным success. Кто пишет вне GitHub Actions — не подтверждено (нужен второй, независимый источник данных; логин различить не может), см. #1101."
+  },
+  {
+    "id": 5658655842,
+    "created_at": "2026-09-14T03:40:56Z",
+    "user_login": "github-actions[bot]",
+    "body": "[инвариант 18: 903f6422771e957d]\n🚨 edge-harness: инвариант 18 (маркер статуса конвейера в #120 опубликован НЕ токеном job'а — performed_via_github_app=null, #1101) — 205 таких комментариев, последний 2026-09-14T03:24:51Z от mytab0r (https://github.com/mytab0r/edge-harness/issues/120#issuecomment-5658547856). Различение по токену публикации, не по логину (AGENTS.md, «Атрибуция событий»). Ложный маркер здесь реально двигает решение: conveyor_gate читает PAUSE/RESUME из #120 без trusted_login, поддельный RESUME работает виртуальным success. Кто пишет вне GitHub Actions — не подтверждено (нужен второй, независимый источник данных; логин различить не может), см. #1101."
+  },
+  {
+    "id": 5659050839,
+    "created_at": "2026-09-14T04:32:27Z",
+    "user_login": "github-actions[bot]",
+    "body": "[инвариант 18: 8b642bc94da7549a]\n🚨 edge-harness: инвариант 18 (маркер статуса конвейера в #120 опубликован НЕ токеном job'а — performed_via_github_app=null, #1101) — 209 таких комментариев, последний 2026-09-14T04:28:54Z от mytab0r (https://github.com/mytab0r/edge-harness/issues/120#issuecomment-5659022177). Различение по токену публикации, не по логину (AGENTS.md, «Атрибуция событий»). Ложный маркер здесь реально двигает решение: conveyor_gate читает PAUSE/RESUME из #120 без trusted_login, поддельный RESUME работает виртуальным success. Кто пишет вне GitHub Actions — не подтверждено (нужен второй, независимый источник данных; логин различить не может), см. #1101."
+  },
+  {
+    "id": 5659360576,
+    "created_at": "2026-09-14T05:16:12Z",
+    "user_login": "github-actions[bot]",
+    "body": "[инвариант 18: e0949ad22e86718b]\n🚨 edge-harness: инвариант 18 (маркер статуса конвейера в #120 опубликован НЕ токеном job'а — performed_via_github_app=null, #1101) — 210 таких комментариев, последний 2026-09-14T05:14:56Z от mytab0r (https://github.com/mytab0r/edge-harness/issues/120#issuecomment-5659350705). Различение по токену публикации, не по логину (AGENTS.md, «Атрибуция событий»). Ложный маркер здесь реально двигает решение: conveyor_gate читает PAUSE/RESUME из #120 без trusted_login, поддельный RESUME работает виртуальным success. Кто пишет вне GitHub Actions — не подтверждено (нужен второй, независимый источник данных; логин различить не может), см. #1101."
+  },
+  {
+    "id": 5661063285,
+    "created_at": "2026-09-14T08:18:24Z",
+    "user_login": "github-actions[bot]",
+    "body": "[инвариант 18: 6c51588159225cf0]\n🚨 edge-harness: инвариант 18 (маркер статуса конвейера в #120 опубликован НЕ токеном job'а — performed_via_github_app=null, #1101) — 211 таких комментариев, последний 2026-09-14T08:13:21Z от mytab0r (https://github.com/mytab0r/edge-harness/issues/120#issuecomment-5661000845). Различение по токену публикации, не по логину (AGENTS.md, «Атрибуция событий»). Ложный маркер здесь реально двигает решение: conveyor_gate читает PAUSE/RESUME из #120 без trusted_login, поддельный RESUME работает виртуальным success. Кто пишет вне GitHub Actions — не подтверждено (нужен второй, независимый источник данных; логин различить не может), см. #1101."
+  },
+  {
+    "id": 5661319794,
+    "created_at": "2026-09-14T08:41:47Z",
+    "user_login": "github-actions[bot]",
+    "body": "[инвариант 18: 8493d35ec4801325]\n🚨 edge-harness: инвариант 18 (маркер статуса конвейера в #120 опубликован НЕ токеном job'а — performed_via_github_app=null, #1101) — 212 таких комментариев, последний 2026-09-14T08:19:46Z от mytab0r (https://github.com/mytab0r/edge-harness/issues/120#issuecomment-5661079136). Различение по токену публикации, не по логину (AGENTS.md, «Атрибуция событий»). Ложный маркер здесь реально двигает решение: conveyor_gate читает PAUSE/RESUME из #120 без trusted_login, поддельный RESUME работает виртуальным success. Кто пишет вне GitHub Actions — не подтверждено (нужен второй, независимый источник данных; логин различить не может), см. #1101."
+  },
+  {
+    "id": 5662987655,
+    "created_at": "2026-09-14T11:07:44Z",
+    "user_login": "github-actions[bot]",
+    "body": "[инвариант 18: 82eb29d7a433feab]\n🚨 edge-harness: инвариант 18 (маркер статуса конвейера в #120 опубликован НЕ токеном job'а — performed_via_github_app=null, #1101) — 213 таких комментариев, последний 2026-09-14T11:01:27Z от mytab0r (https://github.com/mytab0r/edge-harness/issues/120#issuecomment-5662919405). Различение по токену публикации, не по логину (AGENTS.md, «Атрибуция событий»). Ложный маркер здесь реально двигает решение: conveyor_gate читает PAUSE/RESUME из #120 без trusted_login, поддельный RESUME работает виртуальным success. Кто пишет вне GitHub Actions — не подтверждено (нужен второй, независимый источник данных; логин различить не может), см. #1101."
+  },
+  {
+    "id": 5663244821,
+    "created_at": "2026-09-14T11:31:24Z",
+    "user_login": "github-actions[bot]",
+    "body": "[инвариант 18: 7776469bdf4f7451]\n🚨 edge-harness: инвариант 18 (маркер статуса конвейера в #120 опубликован НЕ токеном job'а — performed_via_github_app=null, #1101) — 214 таких комментариев, последний 2026-09-14T11:18:22Z от mytab0r (https://github.com/mytab0r/edge-harness/issues/120#issuecomment-5663108212). Различение по токену публикации, не по логину (AGENTS.md, «Атрибуция событий»). Ложный маркер здесь реально двигает решение: conveyor_gate читает PAUSE/RESUME из #120 без trusted_login, поддельный RESUME работает виртуальным success. Кто пишет вне GitHub Actions — не подтверждено (нужен второй, независимый источник данных; логин различить не может), см. #1101."
+  },
+  {
+    "id": 5663551361,
+    "created_at": "2026-09-14T12:00:32Z",
+    "user_login": "github-actions[bot]",
+    "body": "[инвариант 18: dcd7a2f525a8fc94]\n🚨 edge-harness: инвариант 18 (маркер статуса конвейера в #120 опубликован НЕ токеном job'а — performed_via_github_app=null, #1101) — 217 таких комментариев, последний 2026-09-14T11:51:05Z от mytab0r (https://github.com/mytab0r/edge-harness/issues/120#issuecomment-5663451458). Различение по токену публикации, не по логину (AGENTS.md, «Атрибуция событий»). Ложный маркер здесь реально двигает решение: conveyor_gate читает PAUSE/RESUME из #120 без trusted_login, поддельный RESUME работает виртуальным success. Кто пишет вне GitHub Actions — не подтверждено (нужен второй, независимый источник данных; логин различить не может), см. #1101."
+  },
+  {
+    "id": 5665008731,
+    "created_at": "2026-09-14T13:47:47Z",
+    "user_login": "github-actions[bot]",
+    "body": "[инвариант 18: 82f2ba04a604b41b]\n🚨 edge-harness: инвариант 18 (маркер статуса конвейера в #120 опубликован НЕ токеном job'а — performed_via_github_app=null, #1101) — 219 таких комментариев, последний 2026-09-14T13:47:30Z от mytab0r (https://github.com/mytab0r/edge-harness/issues/120#issuecomment-5665003751). Различение по токену публикации, не по логину (AGENTS.md, «Атрибуция событий»). Ложный маркер здесь реально двигает решение: conveyor_gate читает PAUSE/RESUME из #120 без trusted_login, поддельный RESUME работает виртуальным success. Кто пишет вне GitHub Actions — не подтверждено (нужен второй, независимый источник данных; логин различить не может), см. #1101."
+  },
+  {
+    "id": 5665674000,
+    "created_at": "2026-09-14T14:35:06Z",
+    "user_login": "github-actions[bot]",
+    "body": "[инвариант 18: c6a3f6ad3d2d8e46]\n🚨 edge-harness: инвариант 18 (маркер статуса конвейера в #120 опубликован НЕ токеном job'а — performed_via_github_app=null, #1101) — 223 таких комментариев, последний 2026-09-14T14:21:59Z от mytab0r (https://github.com/mytab0r/edge-harness/issues/120#issuecomment-5665490107). Различение по токену публикации, не по логину (AGENTS.md, «Атрибуция событий»). Ложный маркер здесь реально двигает решение: conveyor_gate читает PAUSE/RESUME из #120 без trusted_login, поддельный RESUME работает виртуальным success. Кто пишет вне GitHub Actions — не подтверждено (нужен второй, независимый источник данных; логин различить не может), см. #1101."
+  },
+  {
+    "id": 5666298015,
+    "created_at": "2026-09-14T15:19:41Z",
+    "user_login": "github-actions[bot]",
+    "body": "[инвариант 18: 4aa38f0def9c8fe2]\n🚨 edge-harness: инвариант 18 (маркер статуса конвейера в #120 опубликован НЕ токеном job'а — performed_via_github_app=null, #1101) — 227 таких комментариев, последний 2026-09-14T15:19:11Z от mytab0r (https://github.com/mytab0r/edge-harness/issues/120#issuecomment-5666290947). Различение по токену публикации, не по логину (AGENTS.md, «Атрибуция событий»). Ложный маркер здесь реально двигает решение: conveyor_gate читает PAUSE/RESUME из #120 без trusted_login, поддельный RESUME работает виртуальным success. Кто пишет вне GitHub Actions — не подтверждено (нужен второй, независимый источник данных; логин различить не может), см. #1101."
+  },
+  {
+    "id": 5666626315,
+    "created_at": "2026-09-14T15:43:21Z",
+    "user_login": "github-actions[bot]",
+    "body": "[инвариант 18: 4c4991e70d063c04]\n🚨 edge-harness: инвариант 18 (маркер статуса конвейера в #120 опубликован НЕ токеном job'а — performed_via_github_app=null, #1101) — 229 таких комментариев, последний 2026-09-14T15:41:30Z от mytab0r (https://github.com/mytab0r/edge-harness/issues/120#issuecomment-5666601319). Различение по токену публикации, не по логину (AGENTS.md, «Атрибуция событий»). Ложный маркер здесь реально двигает решение: conveyor_gate читает PAUSE/RESUME из #120 без trusted_login, поддельный RESUME работает виртуальным success. Кто пишет вне GitHub Actions — не подтверждено (нужен второй, независимый источник данных; логин различить не может), см. #1101."
+  },
+  {
+    "id": 5666960771,
+    "created_at": "2026-09-14T16:07:52Z",
+    "user_login": "github-actions[bot]",
+    "body": "[инвариант 18: af131d3a70987cfe]\n🚨 edge-harness: инвариант 18 (маркер статуса конвейера в #120 опубликован НЕ токеном job'а — performed_via_github_app=null, #1101) — 232 таких комментариев, последний 2026-09-14T16:07:11Z от mytab0r (https://github.com/mytab0r/edge-harness/issues/120#issuecomment-5666950983). Различение по токену публикации, не по логину (AGENTS.md, «Атрибуция событий»). Ложный маркер здесь реально двигает решение: conveyor_gate читает PAUSE/RESUME из #120 без trusted_login, поддельный RESUME работает виртуальным success. Кто пишет вне GitHub Actions — не подтверждено (нужен второй, независимый источник данных; логин различить не может), см. #1101."
+  }
+]
