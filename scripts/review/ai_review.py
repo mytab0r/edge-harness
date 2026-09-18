@@ -1514,9 +1514,20 @@ def notify_head_moved(repo: str, pr: int, verdict: str, old_head: str, new_head:
 def cmd_verdict(args: argparse.Namespace) -> int:
     repo = os.environ["GITHUB_REPOSITORY"]
     answer = Path(args.answer).read_text(encoding="utf-8") if Path(args.answer).exists() else ""
+    # Цитата машиночитаемой строки в ```-фенсе — разбор чужого текста, не
+    # сигнал (находка ai-ревью PR #1333, head 4732d12): ВСЕ потребители
+    # машиночитаемых строк (задачи, замечания, класс, закрытия находок;
+    # вердикт и РАЗМЕР срезают фенсы внутри своих парсеров) читают ответ
+    # без фенсов. «Починил случай — закрой класс»: до этого фенсы срезали
+    # только 2 из 5 потребителей, и цитата блока ЗАДАЧА доезжала до
+    # file_tasks.py настоящей issue пула, а цитата «НАХОДКА-ЗАКРЫТА» —
+    # до реестра находок. findings_of — исключение: он публикует прозу
+    # ответа (цитата остаётся видимой как цитата), machine-строки из неё
+    # снимает по форме сам.
+    answer_unfenced = strip_fenced(answer)
     verdict = parse_verdict(answer)
-    tasks = parse_tasks(answer)
-    remarks = review_checklist.parse_remarks(answer)
+    tasks = parse_tasks(answer_unfenced)
+    remarks = review_checklist.parse_remarks(answer_unfenced)
     findings = redact(findings_of(answer, tasks, remarks))
     tasks = [{"title": redact(t["title"]).strip(), "body": redact(t["body"]).strip(),
               "scope": t.get("scope")}
@@ -1527,15 +1538,16 @@ def cmd_verdict(args: argparse.Namespace) -> int:
                for r in remarks]
     remarks = [r for r in remarks if r["title"]]
 
-    # Классификация класса дефекта (#1237) — на СЫРОМ answer, до redact():
-    # slug состоит из русских/латинских букв и дефисов (SLUG_RE), redact
+    # Классификация класса дефекта (#1237) — на answer без фенсов (цитата
+    # «КЛАСС: …» решением не является, см. блок выше) и до redact(): slug
+    # состоит из русских/латинских букв и дефисов (SLUG_RE), redact
     # маскирует только формы секретов, находку не тронет, но считать на
-    # исходном тексте — не тратить время на редактирование ради поля, которое
-    # заведомо не несёт секретов. Отсутствие поля — НЕ ошибка контракта (см.
+    # неотредактированном тексте — не тратить время на редактирование ради
+    # поля, которое заведомо не несёт секретов. Отсутствие поля — НЕ ошибка контракта (см.
     # docstring defect_classes.classify): старые ответы без строки КЛАСС
     # (контракт используют параллельные PR, #1237 п.8) разбираются как
     # state=not_named, verdict не трогается.
-    class_signal = defect_classes.classify(answer)
+    class_signal = defect_classes.classify(answer_unfenced)
     if verdict == "rework" and class_signal.state == defect_classes.STATE_NOT_NAMED:
         print("::warning::ai-review: вердикт rework без единой строки КЛАСС — "
               "блокирующие находки не классифицированы (#1237), промоушен "
@@ -1683,13 +1695,14 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     # ответа pulls/{pr} ДО первого стёр бы его результат — тело не
     # перечитывается между двумя вызовами).
     # Реестр находок (#1262) — id, которые модель считает исправленными в
-    # этом раунде (на СЫРОМ answer, тот же выбор, что class_signal выше:
-    # НАХОДКА-ЗАКРЫТА не несёт секретов, редактировать нечего). Маркер живёт
+    # этом раунде (на answer без фенсов — цитата «НАХОДКА-ЗАКРЫТА» закрытием
+    # не является, тот же выбор, что class_signal выше: секретов в строке
+    # нет, редактировать нечего). Маркер живёт
     # в теле PR (review_findings.merge_resolved_marker), не в шапке
     # комментария — after_merge уже читает pull["body"] без сетевого
     # запроса, второй источник (сканирование истории комментариев) не
     # заводится.
-    resolved_findings = review_findings.parse_resolved_ids(answer)
+    resolved_findings = review_findings.parse_resolved_ids(answer_unfenced)
     current_body = pull_after_files.get("body") or ""
     checklist_body = review_checklist.merge_checklist(current_body, remarks) if remarks else None
     body_with_checklist = checklist_body if checklist_body is not None else current_body

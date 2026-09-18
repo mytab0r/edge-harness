@@ -758,7 +758,12 @@ def test_every_pre_model_reason_carries_prefix():
     import inspect
     src = inspect.getsource(ai)
     assert src.count("ревью не состоялось") == 2, (
-        "ветка отказа-до-модели написана текстом мимо REVIEW_NEVER_HAPPENED_PREFIX")
+        "литерал «ревью не состоялось» в исходнике модуля должен "
+        "встречаться ровно дважды (комментарий над REVIEW_NEVER_HAPPENED_"
+        "PREFIX и само определение). Третье вхождение — либо причина, "
+        "написанная текстом мимо константы (верни константу), либо новое "
+        "упоминание в комментарии/докстринге (переформулируй без литерала "
+        "или обнови инвариант осознанно с обоснованием)")
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -2393,6 +2398,54 @@ def test_cmd_verdict_huge_diff_missing_size_verdict_is_contract_violation(monkey
     assert "контракту строки РАЗМЕР" in error_line, error_line
     assert "контракту вердикта" not in error_line, error_line
     assert ai.size_missing_reason(added) in error_line, error_line
+
+
+def test_cmd_verdict_quoted_machine_lines_in_fence_are_not_signals(monkeypatch, tmp_path, capsys):
+    """Находка ai-ревью PR #1333 (head 4732d12): strip_fenced был подключён
+    к 2 из 5 потребителей машиночитаемых строк — цитата блока ЗАДАЧА в
+    фенсе доезжала до file_tasks.py НАСТОЯЩЕЙ issue пула, цитата
+    «НАХОДКА-ЗАКРЫТА: #5» — до реестра находок, «КЛАСС: …» — до классификации.
+    Промпт теперь сам велит цитировать строки формата в фенсах, так что
+    прод-форма «цитата в фенсе + своя строка вне» — норма следующего
+    ревью этого же диффа. Видимый результат: tasks_from_comment (единственный
+    вход file_tasks) задач не находит, маркер закрытия не ставится, класс
+    не назван."""
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+    fake_gh, _ = _fake_gh_verdict("deadbeef", "deadbeef", files, [])
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    answer = (
+        "Дифф чист. Цитирую формат задач конвейера как в комментариях:\n\n"
+        "```text\n"
+        "ЗАДАЧА: Фантомная задача из цитаты формата\n"
+        "МАСШТАБ: отдельно\n"
+        "Критерий готовности цитаты.\n"
+        "БЛОКИРУЕТСЯ: ничем\n"
+        "КОНЕЦ ЗАДАЧИ\n"
+        "НАХОДКА-ЗАКРЫТА: #5\n"
+        "КЛАСС: скрытая-регрессия\n"
+        "```\n\n"
+        "ВЕРДИКТ: approve\n")
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, answer))
+
+    assert rc == 0
+    posted = next(" ".join(c) for c in run_gh_calls if "/comments" in " ".join(c))
+    # Ровно тот путь, по которому фантом доезжал до пула: file_tasks.py
+    # читает комментарий через tasks_from_comment.
+    assert ai.tasks_from_comment(posted) == [], "цитата стала задачей беклога"
+    # Цитата «НАХОДКА-ЗАКРЫТА: #5» не отметила находку исправленной:
+    # маркера в PR-теле нет и служебной печати нет.
+    out = capsys.readouterr().out
+    assert "resolved-findings:" not in out
+    assert not any("-X" in " ".join(c) and "pulls/294" in " ".join(c) and "body=" in " ".join(c)
+                   for c in run_gh_calls), "цитата изменила тело PR"
+    # Цитата «КЛАСС: …» не стала сигналом класса (шапка комментария не несёт
+    # class: кандидата).
+    assert "class:" not in posted
 
 
 def test_cmd_verdict_empty_rework_prod_form_becomes_error_not_changes_requested(monkeypatch, tmp_path):
