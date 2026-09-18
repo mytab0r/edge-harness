@@ -438,6 +438,7 @@ cat >"$TMP/bin/gh" <<'GHSTUB'
 sig=" $* "
 state="${SMOKE_STATE:?SMOKE_STATE не задан}/locks"
 touch "$state"
+mkdir -p "${SMOKE_STATE}/msgs"
 log() { printf '%s\n' "$*" >>"${CALLLOG:?CALLLOG не задан}"; }
 resp() { printf '%s\n' "$1"; exit 0; }
 case "$sig" in
@@ -452,10 +453,43 @@ case "$sig" in
       out="[$items]"
     fi
     resp "$out" ;;
-  *"commits/main "*|*"commits/"*)
+  *"commits/main "*)
+    resp '{"sha":"basesha","commit":{"tree":{"sha":"treesha"}}}' ;;
+  *"git/commits/"*)
+    # GET конкретного коммита замка (#1190): _lock_state() читает message
+    # (строку `holder:`) и committer.date из ОДНОГО GET. Сообщение сохраняется
+    # при POST git/commits ниже — prod-форма «что записали, то и читаете»
+    # (как FakeServer в test_claim_task.py). Для затравочных замков сценария
+    # (scenario_start, без записи) message пуст — честный «замок старого
+    # формата, держатель неизвестен», третье состояние из #1190.
+    sha="${sig##*git/commits/}"; sha="${sha%% }"
+    if [ -f "${SMOKE_STATE}/msgs/$sha" ]; then
+      resp "$(jq -rn --arg sha "$sha" --arg m "$(cat "${SMOKE_STATE}/msgs/$sha")" \
+        --arg d "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{sha:$sha, message:$m, commit:{committer:{date:$d}}}')"
+    fi
+    resp '{"sha":"'"$sha"'","message":"","commit":{"committer":{"date":"2026-09-18T00:00:00Z"}}}' ;;
+  *"commits/"*)
     resp '{"sha":"basesha","commit":{"tree":{"sha":"treesha"}}}' ;;
   *"git/commits "*)
-    resp '{"sha":"locksha"}' ;;
+    msg=""
+    for a in "$@"; do case "$a" in message=*) msg="${a#message=}" ;; esac; done
+    n=$(( $(cat "${SMOKE_STATE}/msgs/.n" 2>/dev/null || echo 0) + 1 ))
+    printf '%s' "$n" >"${SMOKE_STATE}/msgs/.n"
+    printf '%s' "$msg" >"${SMOKE_STATE}/msgs/msgsha-$n"
+    resp '{"sha":"msgsha-'"$n"'"}' ;;
+  *"git/ref/locks/"*)
+    # GET единичного рефа замка (#1190): claim при 422, release/_ensure_owned
+    # читают состояние ДО мутаций. Отсутствие — HTTP 404 («рефа нет», его
+    # различает _ref_missing), не неизвестный вызов.
+    pathref="refs/${sig##*git/ref/}"; pathref="${pathref%% }"
+    if grep -qxF -- "$pathref" "$state"; then
+      sha="$(grep -F -- "$(printf '%s\t' "$pathref")" "${state}.shas" 2>/dev/null | head -1 | cut -f2)"
+      [ -n "$sha" ] || sha="sha-$pathref"
+      resp '{"ref":"'"$pathref"'","object":{"sha":"'"$sha"'"}}'
+    fi
+    echo "gh: HTTP 404: Not Found [$pathref]" >&2
+    exit 1 ;;
   *"git/refs"*)
     ref=""
     for a in "$@"; do case "$a" in ref=*) ref="${a#ref=}" ;; esac; done
@@ -465,6 +499,13 @@ case "$sig" in
         exit 1
       fi
       printf '%s\n' "$ref" >>"$state"
+      sha=""
+      for a in "$@"; do case "$a" in sha=*) sha="${a#sha=}" ;; esac; done
+      # sha коммита запоминается: GET git/ref/locks вернёт его, а по нему —
+      # сохранённое сообщение с держателем (roundtrip #1190).
+      if [ -n "$sha" ]; then
+        printf '%s\t%s\n' "$ref" "$sha" >>"${state}.shas"
+      fi
       log "GH-API-LOCK-CREATE $ref"
       exit 0
     fi
@@ -474,6 +515,10 @@ case "$sig" in
       pathref="${pathref%% }"
       if grep -qxF -- "$pathref" "$state"; then
         printf '%s\n' "$(grep -vxF -- "$pathref" "$state")" >"$state"
+        if [ -f "${state}.shas" ]; then
+          grep -vF -- "$(printf '%s\t' "$pathref")" "${state}.shas" >"${state}.shas.tmp" || true
+          mv "${state}.shas.tmp" "${state}.shas"
+        fi
         log "GH-API-LOCK-DELETE $pathref"
         exit 0
       fi
@@ -626,6 +671,11 @@ scenario_start() { # [SEED_REF...] — замки, живые ДО запуск�
   rm -f "$JOURNAL_CAPT"
   rm -f "$DSH_PROMPT_FILE"
   : >"$SMOKE_STATE/locks"
+  # Карта ref→sha (locks.shas) и сохранённые сообщения коммитов замков (msgs/)
+  # — состояние мини-сервера аренды (#1190): пережить сценарий они не должны,
+  # иначе замок из прошлого сценария прочтётся «своим» держателем в следующем.
+  rm -f "${SMOKE_STATE}/locks.shas"
+  rm -rf "${SMOKE_STATE}/msgs"
   # #876: маркер «новый коммит этой попытки» (см. dsh()/git-заглушку) не
   # должен пережить сценарий — иначе сценарий, где dsh честно проваливается,
   # унаследовал бы «успешную» git-историю ПРЕДЫДУЩЕГО сценария.
