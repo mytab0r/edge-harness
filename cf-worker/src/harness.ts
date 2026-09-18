@@ -1003,11 +1003,15 @@ export class Harness extends DurableObject<Env> {
     return constantTimeEqual(chatId, expected);
   }
 
-  async #hmac(payload: string): Promise<string> {
+  /** `secret` по умолчанию — SESSION_SECRET (кука браузера, исходное
+   *  назначение); #dispatchOwnerDecision (#1251) зовёт с явным вторым
+   *  аргументом — TELEGRAM_WEBHOOK_SECRET, подписывающим client_payload
+   *  dispatch'а, другой секрет и другой потребитель ключа. */
+  async #hmac(payload: string, secret: string = this.env.SESSION_SECRET): Promise<string> {
     const encoder = new TextEncoder();
     const key = await crypto.subtle.importKey(
       "raw",
-      encoder.encode(this.env.SESSION_SECRET),
+      encoder.encode(secret),
       { name: "HMAC", hash: "SHA-256" },
       false,
       ["sign"],
@@ -2675,12 +2679,16 @@ export class Harness extends DurableObject<Env> {
    *   3. РОВНО ОДИН РАЗ (идемпотентность по update_id, тот же #putMessage, что
    *      у сообщений) уходит repository_dispatch (event_type owner-decision,
    *      GH_DISPATCH_TOKEN — тот же секрет и та же роль, что у dispatch задач,
-   *      ADR 0008: только Contents+Actions, Issues здесь не нужны) в тонкий
-   *      job (.github/workflows/owner-decision.yml, только issues:write),
-   *      который оставляет комментарий «РЕШЕНИЕ: N» — тот же артефакт, что и
-   *      ручной ответ владельца (#470/#471); метку waiting:owner снимает
-   *      гвардия waiting_owner_guard.py (#470/#471, слит) на следующем
-   *      пульсе orchestra. Второй "apply" здесь не заводится.
+   *      ADR 0008: только Contents+Actions, Issues здесь не нужны), подписанный
+   *      HMAC(TELEGRAM_WEBHOOK_SECRET) над `issue:option` (#1251 — иначе любой
+   *      держатель Actions-write токена вызывает dispatch напрямую и получает
+   *      тот же артефакт, см. #dispatchOwnerDecision), в тонкий job
+   *      (.github/workflows/owner-decision.yml, только issues:write), который
+   *      проверяет подпись и только потом оставляет комментарий «РЕШЕНИЕ: N» —
+   *      тот же артефакт, что и ручной ответ владельца (#470/#471); метку
+   *      waiting:owner снимает гвардия waiting_owner_guard.py (#470/#471,
+   *      слит) на следующем пульсе orchestra. Второй "apply" здесь не
+   *      заводится.
    * Отвечает Telegram'у 200 всегда (кроме полностью нечитаемого апдейта без
    * единого идентификатора) — 4xx на кривой callback_data заставил бы
    * Telegram ретраить апдейт, которому ретраи не помогут. Исключение — chat
@@ -2806,11 +2814,45 @@ export class Harness extends DurableObject<Env> {
    * эндпоинт, что у #postTask/alarm, другой event_type (не поднимает
    * hands.yml). Секрет/репозиторий не заданы — честный «not_configured», как
    * и у остальных dispatch-путей морды (alarm, #postTask).
+   *
+   * Подпись client_payload (issue #1251, разбор от 2026-09-14): дыра
+   * установлена тем же разбором — repository_dispatch не проверяет, каким
+   * токеном его вызвали, только scope, а любой держатель токена с правом
+   * Actions-write на этот репозиторий (в т.ч. каждый агент) получает от
+   * `.github/workflows/owner-decision.yml` тот же артефакт «РЕШЕНИЕ: N», что
+   * и настоящее нажатие кнопки, вызвав `POST /repos/{owner}/{repo}/dispatches`
+   * напрямую с произвольным client_payload. Секрет — TELEGRAM_WEBHOOK_SECRET,
+   * существующий (аутентифицирует бота вебхука, #telegramWebhookAuthorized),
+   * новый не заводим — подпись даёт ему ВТОРУЮ роль, принятую ЯВНО, не молча
+   * (класс «секрет-шире-имени», находка ревью PR #1254): цена — секрет
+   * известен третьей стороне (Telegram через setWebhook), и компрометация
+   * роли вебхука каскадом открывает роль подписи; условие возврата —
+   * выделенный секрет подписи (ADR 0014, «Изменение 2026-09-17»). Это и НЕ
+   * изоляция от агентов: Actions-копию секрета читает любой слитый workflow,
+   * а сам артефакт подделываем дешевле комментарием «РЕШЕНИЕ: N» (принятый
+   * риск #1251) — назначение подписи: происхождение артефакта («Источник:
+   * нажатие инлайн-кнопки») не врёт и цена подделки артефакта-кнопки выше,
+   * чем у комментария. Подписывается СОДЕРЖИМОЕ `${issueNumber}:${option}` — подпись
+   * привязана к конкретной паре issue+вариант, переносить её на другую задачу
+   * или другой вариант нельзя. Повтор ТОГО ЖЕ (issue, option) сознательно НЕ
+   * защищён нонсом: повтор валидной подписи произвёл бы ровно тот же текст
+   * «РЕШЕНИЕ: N» — не другое решение, а дубль комментария; «протухшая
+   * кнопка другого раунда» (та же пара issue+option значит другое в новом
+   * раунде) — существующий пробел apply_owner_decision.py: проверка
+   * issue_still_waiting закрывает из него случай «метка снята/задача
+   * закрыта», остаточный кейс ручной переразметки метки под новый раунд
+   * назван ОТКРЫТЫМ в докстринге apply_owner_decision.py, вне области этой
+   * подписи. Секрет не
+   * настроен в воркере — signature уходит пустой строкой (не отсутствующим
+   * полем: контракт client_payload стабилен), workflow отвечает на это
+   * отдельным отказом («нет подписи»), не молча.
    */
   async #dispatchOwnerDecision(issueNumber: number, option: number): Promise<{ ok: boolean; error?: string }> {
     const token = this.env.GH_DISPATCH_TOKEN;
     const repo = this.env.GH_REPO;
     if (!token || !repo) return { ok: false, error: "dispatch_not_configured" };
+    const webhookSecret = this.env.TELEGRAM_WEBHOOK_SECRET;
+    const signature = webhookSecret ? await this.#hmac(`${issueNumber}:${option}`, webhookSecret) : "";
     try {
       const res = await fetch(`${GITHUB.apiBase}/repos/${repo}/dispatches`, {
         method: "POST",
@@ -2823,7 +2865,7 @@ export class Harness extends DurableObject<Env> {
         },
         body: JSON.stringify({
           event_type: TELEGRAM.ownerDecisionDispatchType,
-          client_payload: { issue_number: issueNumber, option },
+          client_payload: { issue_number: issueNumber, option, signature },
         }),
       });
       if (res.status !== 204) return { ok: false, error: `github_${res.status}` };
