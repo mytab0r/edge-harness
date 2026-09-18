@@ -2,8 +2,9 @@
 """Тесты AI-ревью — второго гейта конвейера (#18).
 
 Кормятся прод-формой: контракт вердикта и блоки задач — как их реально
-исполняет модель (последняя строка «ВЕРДИКТ: …», блоки ЗАДАЧА/КОНЕЦ ЗАДАЧИ —
-паттерн живого решения владельца в Harness, pr_loop.py); шапка-факты и фенсы
+исполняет модель (единственная строка «ВЕРДИКТ: …» — в любом месте ответа,
+#1332; блоки ЗАДАЧА/КОНЕЦ ЗАДАЧИ — паттерн живого решения владельца в
+Harness, pr_loop.py); шапка-факты и фенсы
 задач — как их строит транспорт ai_review.build_comment. Сеть не нужна:
 gh не вызывается ни одной тестируемой функцией.
 
@@ -38,8 +39,21 @@ AI_REVIEW_YML = Path(__file__).resolve().parents[2] / ".github" / "workflows" / 
 @pytest.mark.parametrize("answer,expected", [
     ("Всё чисто, влита ровно задача.\nВЕРДИКТ: approve", "approve"),
     ("ВЕРДИКТ: rework", "rework"),
-    # маркер не последний — ответ считается битым
-    ("ВЕРДИКТ: approve\nИ ещё одна мысль...", "error"),
+    # #1332: ожидание ПЕРЕВЁРНУТО осознанно. Раньше маркер не на последней
+    # строке считался битым ответом; требование позиции снято, потому что при
+    # уже действующей единственности оно не снимало неоднозначности, а живые
+    # прогоны показали цену — три из одиннадцати упавших ai-review за сутки
+    # 2026-09-16 выбросили КОРРЕКТНЫЙ вердикт (PR #1328, прогон 35155260819:
+    # `ВЕРДИКТ: approve` первой строкой, следом разбор). Это прод-форма
+    # ответа моделей цепочки: решение, затем мета-комментарий.
+    # дословная форма живого случая PR #1328 (прогон 35155260819), как она
+    # сохранена в замере #1332: маркер первой строкой, следом разбор задачи
+    ("ВЕРДИКТ: approve\nPR #1328 корректно решает проблему из задачи #1322",
+     "approve"),
+    # Единственность — НЕ снята: два маркера это противоречие модели себе.
+    ("ВЕРДИКТ: approve\nразбор\nВЕРДИКТ: rework", "error"),
+    # Маркер в середине длинной прозы — тоже принимается (позиции нет вовсе).
+    ("Начало разбора.\nВЕРДИКТ: rework\nДальше подробности и КЛАСС: x", "rework"),
     # два маркера — двусмысленность
     ("ВЕРДИКТ: rework\nВЕРДИКТ: approve", "error"),
     # маркера нет вообще
@@ -100,8 +114,11 @@ def test_parse_verdict(answer, expected):
     ),
     ("Замечаний не имею.", False),
     ("", False),
-    # строка есть, но не последняя — неоднозначность, не молчание
-    ("ВЕРДИКТ: approve\nИ ещё одна мысль...", True),
+    # единственный маркер среди прозы — тоже «строка есть»; после #1332 такой
+    # ответ вообще валидный approve и до диагностики error не доходит
+    # та же дословная форма живого случая PR #1328 (см. test_parse_verdict)
+    ("ВЕРДИКТ: approve\nPR #1328 корректно решает проблему из задачи #1322",
+     True),
     # два маркера — тоже «есть, но не разобрана»
     ("ВЕРДИКТ: rework\nВЕРДИКТ: approve", True),
     # markdown-обрамлённый маркер тоже считается «строка есть»
@@ -689,9 +706,141 @@ def test_error_reason_empty_answer_without_transport_error():
 
 
 def test_error_reason_ambiguous_verdict_line_not_transport():
-    reason = ai.error_reason("ВЕРДИКТ: approve\nещё мысль", "0")
-    assert "не единственная" in reason or "не последняя" in reason
+    # #1332: прежняя прод-форма («вердикт, затем мысль») больше НЕ error —
+    # теперь неоднозначность это именно ДВА маркера, и текст обязан называть
+    # противоречие модели самой себе, а не позицию строки.
+    reason = ai.error_reason("ВЕРДИКТ: approve\nещё\nВЕРДИКТ: rework", "0")
+    assert "несколько" in reason
     assert "провайдера" not in reason
+
+
+def test_pre_model_failure_is_not_reported_as_contract_violation():
+    """#1332, дефект 2: исчерпание цепочки печаталось под шапкой «ответ не
+    соответствует контракту вердикта», хотя модель ничего не отвечала."""
+    reason = ai.error_reason("", "1")
+    assert ai.review_never_happened(reason), (
+        "отказ до модели обязан опознаваться как таковой, иначе шапка соврёт")
+    assert not ai.review_never_happened(
+        "модель ответила, но строки «ВЕРДИКТ: …» нет вообще")
+
+
+def test_error_headline_names_the_class_not_one_text_for_all():
+    """#1332, дефект 2: шапка обязана различать «модель не ответила» и
+    «ответ не по контракту» — лечатся они противоположным (ждать сброса
+    квоты против починить промпт/парсер)."""
+    chain = ai.error_reason("", "1")          # цепочка не дала ответа
+    contract = "модель ответила, но строки «ВЕРДИКТ: …» нет вообще"
+    assert ai.error_headline(chain) != ai.error_headline(contract), (
+        "одна шапка на оба класса — ровно то, что #1332 и заводился закрывать")
+    assert "контракту вердикта" not in ai.error_headline(chain), (
+        "отказ ДО модели не смеет называться нарушением контракта ОТВЕТА")
+    assert "контракту вердикта" in ai.error_headline(contract)
+    # Шапка не дублирует начало причины (находка ревью PR #1333): строка
+    # ::error:: печатается как «<шапка> (<причина>)», и каждая причина
+    # отказа-до-модели УЖЕ начинается с префикса — шапка с ним же давала
+    # «ревью не состоялось — … (ревью не состоялось — …)».
+    assert not ai.error_headline(chain).startswith(
+        ai.REVIEW_NEVER_HAPPENED_PREFIX), ai.error_headline(chain)
+
+
+def test_every_pre_model_reason_carries_prefix():
+    """Одно место правды: ветка «ревью не состоялось», написанная мимо
+    константы, молча вернула бы шапку про контракт ответа.
+
+    Гвардия устойчива к форматированию (находка ревью PR #1333: прежние две
+    подстроки ловили только формы `return ("ревью не состоялось…` и
+    `return f"ревью не состоялось…` — голый литерал `return "ревью не
+    состоялось…` и перенос строки внутри скобок проходили зелёными, обе
+    мутации исполнены): в исходнике модуля литеральный текст «ревью не
+    состоялось» встречается РОВНО ДВАЖДЫ — комментарий над константой и
+    само её определение. Любая причина, написанная этим текстом мимо
+    константы, в любой записи увеличивает счётчик и красит тест."""
+    import inspect
+    src = inspect.getsource(ai)
+    assert src.count("ревью не состоялось") == 2, (
+        "литерал «ревью не состоялось» в исходнике модуля должен "
+        "встречаться ровно дважды (комментарий над REVIEW_NEVER_HAPPENED_"
+        "PREFIX и само определение). Третье вхождение — либо причина, "
+        "написанная текстом мимо константы (верни константу), либо новое "
+        "упоминание в комментарии/докстринге (переформулируй без литерала "
+        "или обнови инвариант осознанно с обоснованием)")
+
+
+@pytest.mark.parametrize("kwargs", [
+    {},  # транспортная ось: rc≠0 без failure_reason
+    {"failure_reason": "empty_diff"},  # (#658)
+    {"failure_reason": "diff_source_mismatch"},  # (#687)
+    {"failure_reason": "all_providers_exhausted"},  # (#727), повтор бесполезен
+    {"failure_reason": "all_providers_exhausted", "retry_useful": True},  # (#1307)
+    {"failure_reason": "quota_exhausted"},
+    {"failure_reason": "rate_limit_retry_budget_exceeded"},
+])
+def test_every_pre_model_axis_is_recognized_as_never_happened(kwargs):
+    """Поведенческая сторона той же гвардии (находка ревью PR #1333:
+    «гвардия держит форму записи, а не поведение»): КАЖДАЯ ветка
+    отказа-до-модели обязана опознаваться review_never_happened. Текстовый
+    счётчик выше не видит ветку, забывшую константу ЦЕЛИКОМ (словами она
+    не пишет «ревью не состоялось» — и счётчик не растёт); этот тест ловит
+    её по классу — на прод-форме входов, как их разбирает error_reason."""
+    reason = ai.error_reason("", "1", **kwargs)
+    assert ai.review_never_happened(reason), (
+        f"ветка отказа-до-модели не опознана: {reason}")
+
+
+def test_verdict_quoted_in_fence_is_not_a_decision():
+    """Находка ai-ревью PR #1333 (head 816405b), прод-форма: ревьюят тесты
+    ЭТОГО парсера — строки «ВЕРДИКТ: …» стоят в каждом параметризованном
+    кейсе и модель ЦИТИРУЕТ их в фенсах. Цитата без своей строки — это класс
+    «модель ответила, но своей строки нет» (5 из 11 отказов замера #1332) и
+    обязан оставаться ГРОМКИМ error, а не молчаливым чужим вердиктом."""
+    quoted = ("Разбор:\n\n```text\nВЕРДИКТ: approve\n```\n\n"
+              "Этот формат строк встречается в параметризованных тестах парсера.")
+    assert ai.parse_verdict(quoted) == "error", "цитата — не решение"
+    assert not ai.verdict_line_present(quoted)
+    assert ai.verdict_shaped_anywhere(quoted)
+    reason = ai.error_reason(quoted, "0")
+    assert "несколько" not in reason, reason       # цитата не «противоречие»
+    assert "нет вообще" not in reason, reason      # и не «нет вовсе» — она видна
+    # Своя строка + цитата — решение считается по своей строке
+    assert ai.parse_verdict(quoted + "\nВЕРДИКТ: rework") == "rework"
+    # Цитата чужого вердикта не переигрывает несогласие своей строки
+    two = quoted + "\nВЕРДИКТ: rework\nВЕРДИКТ: rework"
+    assert ai.parse_verdict(two) == "error"
+    # Симметрично для РАЗМЕР (#939): цитата без своей строки — missing
+    size_quoted = "```text\nРАЗМЕР: оправдан\n```"
+    assert ai.parse_size_verdict(size_quoted) == ("missing", None)
+    assert ai.size_judgment_missing(ai.size_missing_reason(10))  # связь классов
+    # Свой маркер, завёрнутый в фенс вопреки промпту, — error (громко)
+    assert ai.parse_verdict("```text\nВЕРДИКТ: approve\n```") == "error"
+    # Незакрытый фенс — в громкую сторону: error, не угадывание
+    assert ai.parse_verdict("```text\nВЕРДИКТ: approve\nи текст без закрытия") == "error"
+
+
+def test_size_missing_reason_gets_its_own_headline():
+    """#1332, третий класс шапки (находка ai-ревью PR #1333, head 7804149):
+    причина «гигантский дифф без строки РАЗМЕР» (#939) печаталась под шапкой
+    «ответ не соответствует контракту вердикта», хотя контракт ВЕРДИКТ здесь
+    выполнен — вердикт-строка единственная, модель ответила. Причина берётся
+    ИЗ РЕАЛЬНОГО источника (size_missing_reason — тот же вызов, что в
+    cmd_verdict), не из пересказа. Три класса шапки различимы попарно."""
+    reason = ai.size_missing_reason(ai.check_pr.LARGE_DIFF_HUGE_LINES + 1)
+    assert ai.size_judgment_missing(reason), reason
+    assert not ai.review_never_happened(reason), reason
+    headline = ai.error_headline(reason)
+    assert "контракту вердикта" not in headline, (
+        "РАЗМЕР-класс не смеет печататься под шапкой контракта ВЕРДИКТ")
+    chain = ai.error_reason("", "1")
+    contract = "модель ответила, но строки «ВЕРДИКТ: …» нет вообще"
+    heads = {ai.error_headline(chain), ai.error_headline(contract), headline}
+    assert len(heads) == 3, heads
+
+
+def test_size_missing_headline_not_duplicated_with_reason_prefix():
+    # Причина size-класса начинается со СВОЕГО префикса; шапка не повторяет
+    # его начало (тот же класс дублирования, что найден у до-модельной шапки).
+    reason = ai.size_missing_reason(ai.check_pr.LARGE_DIFF_HUGE_LINES + 1)
+    assert not ai.error_headline(reason).startswith(
+        ai.SIZE_JUDGMENT_MISSING_PREFIX)
 
 
 def test_error_reason_transport_failure_wins_over_line_check():
@@ -2217,7 +2366,7 @@ def test_cmd_verdict_huge_diff_bloated_size_becomes_rework_naming_files(monkeypa
     assert "vendor/lodash.min.js" in body
 
 
-def test_cmd_verdict_huge_diff_missing_size_verdict_is_contract_violation(monkeypatch, tmp_path):
+def test_cmd_verdict_huge_diff_missing_size_verdict_is_contract_violation(monkeypatch, tmp_path, capsys):
     """Модель одобрила гигантский дифф (approve), но не дала суждения о
     размере вовсе — нарушение контракта (тот же класс, что пустой rework,
     #210): verdict уходит как error/ai:failed, а не тихий ai:ok.
@@ -2241,6 +2390,62 @@ def test_cmd_verdict_huge_diff_missing_size_verdict_is_contract_violation(monkey
     assert f"labels[]={ai.AI_FAILED}" in joined
     assert f"labels[]={ai.AI_OK}" not in joined
     assert f"labels[]={rl.LARGE_OK}" not in joined
+    # Шапка ::error:: называет РАЗМЕР-класс, не контракт ВЕРДИКТ (находка
+    # ai-ревью PR #1333, head 7804149): печатается на реальной строке причины
+    # из cmd_verdict, а не на пересказе.
+    printed = capsys.readouterr().out
+    error_line = next(l for l in printed.splitlines() if l.startswith("::error::"))
+    assert "контракту строки РАЗМЕР" in error_line, error_line
+    assert "контракту вердикта" not in error_line, error_line
+    assert ai.size_missing_reason(added) in error_line, error_line
+
+
+def test_cmd_verdict_quoted_machine_lines_in_fence_are_not_signals(monkeypatch, tmp_path, capsys):
+    """Находка ai-ревью PR #1333 (head 4732d12): strip_fenced был подключён
+    к 2 из 5 потребителей машиночитаемых строк — цитата блока ЗАДАЧА в
+    фенсе доезжала до file_tasks.py НАСТОЯЩЕЙ issue пула, цитата
+    «НАХОДКА-ЗАКРЫТА: #5» — до реестра находок, «КЛАСС: …» — до классификации.
+    Промпт теперь сам велит цитировать строки формата в фенсах, так что
+    прод-форма «цитата в фенсе + своя строка вне» — норма следующего
+    ревью этого же диффа. Видимый результат: tasks_from_comment (единственный
+    вход file_tasks) задач не находит, маркер закрытия не ставится, класс
+    не назван."""
+    files = [{"filename": "a.py", "status": "modified", "sha": "aaa111", "additions": 3}]
+    fake_gh, _ = _fake_gh_verdict("deadbeef", "deadbeef", files, [])
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    answer = (
+        "Дифф чист. Цитирую формат задач конвейера как в комментариях:\n\n"
+        "```text\n"
+        "ЗАДАЧА: Фантомная задача из цитаты формата\n"
+        "МАСШТАБ: отдельно\n"
+        "Критерий готовности цитаты.\n"
+        "БЛОКИРУЕТСЯ: ничем\n"
+        "КОНЕЦ ЗАДАЧИ\n"
+        "НАХОДКА-ЗАКРЫТА: #5\n"
+        "КЛАСС: скрытая-регрессия\n"
+        "```\n\n"
+        "ВЕРДИКТ: approve\n")
+    rc = ai.cmd_verdict(_verdict_args(tmp_path, answer))
+
+    assert rc == 0
+    posted = next(" ".join(c) for c in run_gh_calls if "/comments" in " ".join(c))
+    # Ровно тот путь, по которому фантом доезжал до пула: file_tasks.py
+    # читает комментарий через tasks_from_comment.
+    assert ai.tasks_from_comment(posted) == [], "цитата стала задачей беклога"
+    # Цитата «НАХОДКА-ЗАКРЫТА: #5» не отметила находку исправленной:
+    # маркера в PR-теле нет и служебной печати нет.
+    out = capsys.readouterr().out
+    assert "resolved-findings:" not in out
+    assert not any("-X" in " ".join(c) and "pulls/294" in " ".join(c) and "body=" in " ".join(c)
+                   for c in run_gh_calls), "цитата изменила тело PR"
+    # Цитата «КЛАСС: …» не стала сигналом класса (шапка комментария не несёт
+    # class: кандидата).
+    assert "class:" not in posted
 
 
 def test_cmd_verdict_empty_rework_prod_form_becomes_error_not_changes_requested(monkeypatch, tmp_path):
