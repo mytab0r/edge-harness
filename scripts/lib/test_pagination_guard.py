@@ -113,11 +113,32 @@ ALLOWED_SINGLE_PAGE_CALLS = {
         "проверок этого репозитория, не растущий список.",
     ("scripts/orchestra/scheduler.py", "merge_queue"):
         "тот же check-runs, что pr_check_runs — тело инлайн внутри merge_queue.",
+    ("scripts/orchestra/scheduler.py", "in_progress_worker_runs"):
+        "до WORKER_MAX_CONCURRENCY воркеров параллельно (#827): "
+        "`per_page=WORKER_MAX_CONCURRENCY+1` — запрошено ровно на один "
+        "прогон больше, чем слотов, тот же контракт «дай N последних», что "
+        "у recent_runs (сама природа списка ограничена числом слотов "
+        "параллельности, не растёт). Единственное место запроса "
+        "in_progress-прогонов воркера: stalled_worker_runs, "
+        "active_worker_runs и reap_stalled_worker_run читают его, своего "
+        "вызова не имеют.",
+    ("scripts/orchestra/scheduler.py", "active_worker_runs"):
+        "единый источник занятости слотов для worker_runs_active/"
+        "free_worker_slot (#827); собственный вызов здесь один, на "
+        "`status=queued`. Обоснование НЕ «список ограничен по природе» "
+        "(находка ai-review PR #831 это опровергла замером: при "
+        "`cancel-in-progress: false` очередь группы копится, 4+3 queued в "
+        "двух слотах), а явный потолок одной страницы "
+        "`QUEUED_RUNS_PAGE_SIZE = 100` — максимум страницы REST. Остаточный "
+        "риск назван в докстринге active_worker_runs: очередь длиннее 100 "
+        "прячет старый queued-прогон, слот будет назван свободным, диспатч "
+        "встанет в хвост занятой группы — соврёт отчёт о запуске, двойной "
+        "работы не будет (GitHub сериализует группу).",
     ("scripts/orchestra/scheduler.py", "worker_runs_active"):
         "явный `per_page=1` — запрошен только последний прогон, не список.",
     ("scripts/orchestra/scheduler.py", "_active_worker_run"):
         "тот же контракт, что worker_runs_active выше (#815, тот же запрос "
-        "`?status=in_progress&per_page=1` — вынесенный из stalled_worker_run в "
+        "`?status=in_progress&per_page=1` — вынесенный из stalled_worker_runs в "
         "отдельную функцию #1085, чтобы и возрастной, и тишинный признак "
         "(reap_stalled_worker_run) переиспользовали ОДИН сетевой вызов, не "
         "заводили по обходу каждый) — явный `per_page=1`, запрошен только "
@@ -147,7 +168,7 @@ ALLOWED_SINGLE_PAGE_CALLS = {
         "растущий пользователем список.",
     ("scripts/lib/merge_reactions.py", "has_run_for_sha"):
         "явный `per_page=1` — тот же контракт, что "
-        "scheduler.worker_runs_active/stalled_worker_run выше (#955): вопрос "
+        "scheduler.worker_runs_active/stalled_worker_runs выше (#955): вопрос "
         "«есть ли ХОТЯ БЫ ОДИН прогон на этот head_sha», не список, серверный "
         "фильтр `head_sha=` уже сужает выборку до прогонов одного коммита.",
     ("scripts/orchestra/repo_invariants.py", "check_conveyor_gate_phantom_pause"):

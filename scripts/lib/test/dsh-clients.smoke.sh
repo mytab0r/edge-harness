@@ -199,8 +199,11 @@ gh() { # canned-ответ на сигнатуру вызова; --jq приме
   elif [[ "$sig" == *"pr list"* ]]; then
     payload='[]'
   elif [[ "$sig" == *"run list"* ]]; then
-    # Гвардия дублей воркера: в smoke нет живых прогонов.
-    payload='[]'
+    # Гвардия дублей воркера. По умолчанию живых прогонов нет; сценарии #827
+    # подменяют ответ ПРОД-ФОРМОЙ `gh run list --json databaseId,displayTitle`
+    # (именно объектами с displayTitle вида «worker (slot N)» — из него
+    # гвардия и читает слот), не пересказом.
+    payload="${GH_RUN_LIST_JSON:-[]}"
   elif [[ "$sig" == *"api users"* ]]; then
     payload='{"id":7416604}'
   elif [[ "$sig" == *" comment "* ]]; then
@@ -925,6 +928,62 @@ assert_not_log "refs/locks/task-200" "worker-auto: задача под живы�
 assert_log "MORDE-RPC session.create" "worker-auto: сессия морды не создана"
 assert_log "GH-COMMENT" "worker-auto: нет отчёта в задачу"
 echo "SMOKE: worker-auto — ок"
+
+# ── #827: гвардия дублей различает слоты (блокирующая находка ai-review PR #831)
+# До этого она перечисляла ВСЕ прогоны worker.yml и выходила no-op при любом
+# чужом id — то есть второй слот в 100% случаев умирал зелёным no-op ПОСЛЕ
+# полного checkout/setup/auth, и N=2 обнулялась молча. Прод-форма ответа взята
+# настоящая: `gh run list --json databaseId,displayTitle` отдаёт displayTitle
+# вида «worker (slot N)», из него гвардия и читает слот.
+scenario_start
+WORKER_LOGIN="mytab0r" \
+WORKER_TASK="8271" \
+WORKER_SLOT="2" \
+GITHUB_RUN_ID="777" \
+RUNNER_TEMP="$TMP/rt-w-slot2-free" \
+GH_TOKEN="smoke-pat-token" \
+GH_ISSUE_JSON='{"number":8271,"title":"Smoke: слот 2 при занятом слоте 1","body":"## Цель\nпрогон\n\n## Критерий готовности\nсессия","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
+GH_RUN_LIST_JSON='[{"databaseId":555,"displayTitle":"worker (slot 1): задача #99"}]' \
+  run_client "worker-slot2-runs-while-slot1-busy" "$REPO/scripts/worker/task.sh" "$TMP/out-slot2-free"
+grep -qF "Живёт другой прогон воркера" "$TMP/out-slot2-free" \
+  && { echo "::error::SMOKE: слот 2 вышел no-op при занятом слоте 1 — N=2 обнулена (#827)" >&2; \
+       cat "$TMP/out-slot2-free" >&2; exit 1; }
+echo "SMOKE: worker-slot2-runs-while-slot1-busy — ок (#827)"
+
+# Парный сценарий: дубль В ТОМ ЖЕ слоте по-прежнему обязан выходить no-op —
+# иначе «починить» первый сценарий можно было бы, выкинув гвардию целиком.
+scenario_start
+WORKER_LOGIN="mytab0r" \
+WORKER_TASK="8272" \
+WORKER_SLOT="1" \
+GITHUB_RUN_ID="777" \
+RUNNER_TEMP="$TMP/rt-w-slot1-dup" \
+GH_TOKEN="smoke-pat-token" \
+GH_ISSUE_JSON='{"number":8272,"title":"Smoke: дубль в своём слоте","body":"## Цель\nпрогон\n\n## Критерий готовности\nсессия","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
+GH_RUN_LIST_JSON='[{"databaseId":555,"displayTitle":"worker (slot 1): задача #99"}]' \
+  run_client "worker-slot1-dup-is-noop" "$REPO/scripts/worker/task.sh" "$TMP/out-slot1-dup"
+grep -qF "В ТОМ ЖЕ слоте 1" "$TMP/out-slot1-dup" \
+  || { echo "::error::SMOKE: дубль в своём слоте не остановлен — гвардия #121 потеряна" >&2; \
+       cat "$TMP/out-slot1-dup" >&2; exit 1; }
+echo "SMOKE: worker-slot1-dup-is-noop — ок (#121/#827)"
+
+# Прогон без метки слота в run-name (ручной dispatch) считается слотом 1 —
+# зеркало scheduler.py::_run_slot. Иначе ручной запуск был бы невидим для
+# гвардии и столкнулся бы с автоматическим слотом 1.
+scenario_start
+WORKER_LOGIN="mytab0r" \
+WORKER_TASK="8273" \
+WORKER_SLOT="1" \
+GITHUB_RUN_ID="777" \
+RUNNER_TEMP="$TMP/rt-w-slot-unlabeled" \
+GH_TOKEN="smoke-pat-token" \
+GH_ISSUE_JSON='{"number":8273,"title":"Smoke: прогон без метки слота","body":"## Цель\nпрогон\n\n## Критерий готовности\nсессия","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
+GH_RUN_LIST_JSON='[{"databaseId":556,"displayTitle":"worker"}]' \
+  run_client "worker-unlabeled-run-counts-as-slot1" "$REPO/scripts/worker/task.sh" "$TMP/out-slot-unlabeled"
+grep -qF "В ТОМ ЖЕ слоте 1" "$TMP/out-slot-unlabeled" \
+  || { echo "::error::SMOKE: прогон без метки слота не отнесён к слоту 1 — расхождение с scheduler.py::_run_slot" >&2; \
+       cat "$TMP/out-slot-unlabeled" >&2; exit 1; }
+echo "SMOKE: worker-unlabeled-run-counts-as-slot1 — ок (#827)"
 
 # ── Живая форма инцидента #876: PR по ветке УЖЕ существует (дефолтный
 # GH_PR_LIST_URL_JSON, открыт с диффом) — исход «dsh отчитался успехом при
