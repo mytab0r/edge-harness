@@ -19,10 +19,16 @@ git-репозитории на диске. Атомарность «созда�
 Запуск: python -m pytest scripts/lib/test_claim_task_real_refs.py -q
 """
 
+# --- console_utf8 bootstrap (класс: печать кириллицы валит encoding на Windows, issue #723) ---
 import importlib.util
+from pathlib import Path
+_console_utf8_spec = importlib.util.spec_from_file_location(
+    "console_utf8", Path(__file__).resolve().parent / "console_utf8.py")
+_console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))
+# --- конец console_utf8 bootstrap ---
+
 import subprocess
 from datetime import datetime, timezone
-from pathlib import Path
 from types import SimpleNamespace
 
 SCRIPT = Path(__file__).with_name("claim_task.py")
@@ -136,11 +142,16 @@ class RealGitServer:
             return ok('{"ref": "%s", "object": {"sha": "%s"}}' % (ref, sha))
         if method == "GET" and path is not None and "/git/commits/" in path:
             sha = path.rsplit("/", 1)[1]
-            proc = _git(self.repo, "log", "-1", "--format=%B", sha)
+            # Прод-форма ответа GitHub: message (держатель) И committer.date
+            # (TTL) приходят из ОДНОГО GET коммита — %cI даёт настоящую дату
+            # коммита реального git, не подставку.
+            proc = _git(self.repo, "log", "-1", "--format=%H%x00%cI%x00%B", sha)
             if proc.returncode != 0:
                 return fail(404, "Not Found")
-            escaped = proc.stdout.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
-            return ok('{"sha": "%s", "message": "%s"}' % (sha, escaped))
+            real_sha, iso_date, message = proc.stdout.split("\x00", 2)
+            escaped = message.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+            return ok('{"sha": "%s", "message": "%s", "commit": '
+                      '{"committer": {"date": "%s"}}}' % (real_sha, escaped, iso_date))
         if method == "DELETE" and path is not None and "/git/refs/locks/task-" in path:
             ref = "refs/" + path.split("/git/refs/", 1)[1]
             proc = _git(self.repo, "update-ref", "-d", ref)
@@ -193,6 +204,11 @@ def test_real_refs_foreign_holder_named_then_self_reclaim_idempotent(tmp_path, m
     result_a2 = ct.claim("o/r", 42, "worker-a", now=_now(), holder="run:A")
     assert result_a2.claimed is True
     assert "идемпотентна" in result_a2.detail
+    # Замечание ревью PR #1206: идемпотентный перезабор НЕ продлевает TTL и
+    # честно сообщает остаток (дата — из реального коммита git). Мутация:
+    # убери из claim() хвост «; TTL НЕ продлевается…» — этот assert краснеет.
+    assert "TTL НЕ продлевается" in result_a2.detail, result_a2.detail
+    assert "осталось" in result_a2.detail
     assert _lock_sha(repo) == sha_after_a  # реф — тот же самый объект
 
 

@@ -391,6 +391,7 @@ else
     else
       export GITHUB_REPOSITORY="$repo"
       export CLAIM_VIA="${CLAIM_VIA:-task-branch (local)}"
+      source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/lease.sh"
       # Держатель (#1190) — путь БУДУЩЕГО рабочего дерева, не cwd вызова
       # (находка ai-review PR #1206, некритичная): `wt_dir` уже вычислен
       # (не-CI ветка, строка выше «Разрешение дерева стоит ДО аренды») и не

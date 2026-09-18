@@ -748,8 +748,13 @@ def test_release_full_with_foreign_holder_refuses(monkeypatch):
     with pytest.raises(ct.ForeignLockError, match="tree:/work/A"):
         ct.release_full("o/r", 5, holder="tree:/work/B")
     assert "refs/locks/task-5" in server.existing_refs
-    # Замок не удалён — DELETE git/refs/locks/task-5 не ушёл (assignee DELETE — это видимость, он может уйти до проверки holder)
     assert not any("-X" in c and "DELETE" in c and "git/refs/locks/task-5" in c for c in server.calls)
+    # Находка ai-review PR #1206 (блокирующая): проверка владения стоит ДО
+    # мутаций — отказ не снимает и НАЗНАЧЕНИЕ чужой аренды (частично
+    # применённый вред запрещён). Мутация: перенеси _ensure_owned() в
+    # release_full() после блока assignees — этот assert краснеет.
+    assert not any("-X" in c and "DELETE" in c and "issues/5/assignees" in c
+                   for c in server.calls)
 
 
 def test_release_full_with_unknown_holder_lock_refuses(monkeypatch):
@@ -763,6 +768,9 @@ def test_release_full_with_unknown_holder_lock_refuses(monkeypatch):
     with pytest.raises(ct.ForeignLockError, match="старого формата"):
         ct.release_full("o/r", 5, holder="tree:/work/B")
     assert not any("-X" in c and "DELETE" in c and "git/refs/locks/task-5" in c for c in server.calls)
+    # Тот же precheck-до-мутаций: назначение тоже не тронуто.
+    assert not any("-X" in c and "DELETE" in c and "issues/5/assignees" in c
+                   for c in server.calls)
 
 
 def test_release_full_without_holder_is_force_behavior(monkeypatch):
@@ -872,6 +880,43 @@ def test_cli_locks_empty_pool_prints_empty_line(monkeypatch):
     with contextlib.redirect_stdout(out):
         assert ct.main(["x", "locks"]) == ct.EXIT_OK
     assert out.getvalue().strip() == ""
+
+
+def test_cli_status_prints_holder(monkeypatch):
+    # Некритичное замечание ревью PR #1206: замок, знающий держателя,
+    # бесполезен, если `status` не умеет его показать. Сообщение коммита
+    # идёт прод-путём (commit_messages → GET /git/commits → _parse_holder),
+    # подменяется только источник даты (TTL не то, что здесь проверяется).
+    # Мутация: убери из main() строку `holder = _parse_holder(...)` — колонка
+    # «держатель:» пропадёт, этот тест краснеет.
+    server = install(monkeypatch, FakeServer(
+        {"git/matching-refs/locks/": [{"ref": "refs/locks/task-5", "object": {"sha": "s5"}}]}))
+    server.commit_messages["s5"] = ("lock: task #5 claimed by a at t (ttl 24h)\n"
+                                    "holder: run:42:task")
+    monkeypatch.setattr(ct, "lock_commit_date",
+                        lambda repo, sha: datetime.now(timezone.utc))
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert ct.main(["x", "status"]) == ct.EXIT_OK
+    assert "держатель: run:42:task" in out.getvalue()
+
+
+def test_cli_status_legacy_lock_says_unknown_not_empty(monkeypatch):
+    # Третье состояние видно и в status: замок старого формата печатается
+    # «НЕИЗВЕСТЕН (старый формат)», не пустой строкой, которую легко принять
+    # за «свой» (класс #1190). Мутация: замени fallback на `or ""` — тест
+    # краснеет.
+    server = install(monkeypatch, FakeServer(
+        {"git/matching-refs/locks/": [{"ref": "refs/locks/task-5", "object": {"sha": "s5"}}]}))
+    server.commit_messages["s5"] = "lock: task #5 claimed by a at t"
+    monkeypatch.setattr(ct, "lock_commit_date",
+                        lambda repo, sha: datetime.now(timezone.utc))
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert ct.main(["x", "status"]) == ct.EXIT_OK
+    assert "держатель: НЕИЗВЕСТЕН (старый формат)" in out.getvalue()
 
 
 def test_cli_exit_codes_contract(monkeypatch):

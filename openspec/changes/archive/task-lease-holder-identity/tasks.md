@@ -1,8 +1,9 @@
 # tasks: task-lease-holder-identity (#1190)
 
 - [x] `current_holder()` — одно место правды для идентификатора держателя
-      (`CLAIM_HOLDER` → `run:<GITHUB_RUN_ID>` → `tree:<cwd>` →
-      `proc:<hostname>:<pid>`), `scripts/lib/claim_task.py`.
+      (`CLAIM_HOLDER` → `run:<GITHUB_RUN_ID>:<GITHUB_JOB>` → `tree:<cwd>` →
+      `proc:<hostname>:<pid>`; суффикс job'а — находка ревью PR #1206: run id
+      один на все job'ы прогона), `scripts/lib/claim_task.py`.
 - [x] Коммит замка несёт `holder: <id>` второй строкой; `claim()` при отказе
       различает свой/чужой/неизвестный держатель (`_lock_state`,
       `_parse_holder`).

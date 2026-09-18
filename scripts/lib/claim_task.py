@@ -253,23 +253,32 @@ def is_stale(commit_date: str | datetime, now: datetime,
 # ── Claim / release ──────────────────────────────────────────────────────────────
 
 
-def _lock_state(repo: str, task: int) -> tuple[bool, str | None]:
-    """(существует ли замок, держатель или None). None-держатель при
-    exists=True — замок старого формата (создан до #1190, без строки
-    `holder:`) — третье состояние, вызывающий (claim/release) решает сам, что
-    с ним делать. Один GET единичного рефа + один GET коммита (не
-    `list_locks`/matching-refs — тому нужен весь список, здесь один номер)."""
+def _lock_state(repo: str, task: int) -> tuple[bool, str | None, datetime | None]:
+    """(существует ли замок, держатель или None, date коммита замка или None).
+    None-держатель при exists=True — замок старого формата (создан до #1190,
+    без строки `holder:`) — третье состояние, вызывающий (claim/release)
+    решает сам, что с ним делать. Один GET единичного рефа + один GET коммита
+    (не `list_locks`/matching-refs — тому нужен весь список, здесь один
+    номер). Дата — из ТОГО ЖЕ GET коммита, что и держатель, нулевой ценой:
+    её читает идемпотентная ветка claim(), чтобы сообщить остаток TTL
+    (замечание ревью PR #1206), сам TTL она НЕ продлевает. Даты в ответе нет
+    (мок/нестандартный ответ) — None, отчёт просто без хвоста про TTL."""
     try:
         ref_obj = gh(f"repos/{repo}/git/ref/locks/task-{task}")
     except GhError as error:
         if _ref_missing(error):
-            return False, None
+            return False, None, None
         raise
     if ref_obj is None:
-        return False, None
+        return False, None, None
     sha = ref_obj["object"]["sha"]
-    commit = gh(f"repos/{repo}/git/commits/{sha}")
-    return True, _parse_holder((commit or {}).get("message", ""))
+    commit = gh(f"repos/{repo}/git/commits/{sha}") or {}
+    try:
+        date = datetime.fromisoformat(
+            commit["commit"]["committer"]["date"].replace("Z", "+00:00"))
+    except (KeyError, TypeError, ValueError):
+        date = None
+    return True, _parse_holder(commit.get("message", "")), date
 
 
 def claim(repo: str, task: int, actor: str, now: datetime | None = None,
@@ -345,15 +354,25 @@ def claim(repo: str, task: int, actor: str, now: datetime | None = None,
             # «замок стоит, но старого формата без holder:» — РАЗНЫЕ причины,
             # и данные их различить уже в руке (правило «Алерт не гадает»,
             # AGENTS.md) — не гадаем «либо A, либо B» в одном сообщении.
-            exists, existing_holder = _lock_state(repo, task)
+            exists, existing_holder, lock_date = _lock_state(repo, task)
             if existing_holder == holder:
                 # Свой же держатель перезабирает (#1190): идемпотентный
                 # успех БЕЗ снятия и пересоздания замка — тот же процесс/
                 # дерево реально продолжает держать то, что уже держал.
-                return ClaimResult(
-                    claimed=True, task=task, holder=holder,
-                    detail=f"замок {ref} уже держит этот же держатель ({holder}) — "
-                           "переаренда идемпотентна, замок не тронут")
+                # TTL при этом НЕ продлевается (замок не тронут — в этом
+                # смысл): честно сообщаем остаток (данные уже в руке,
+                # замечание ревью PR #1206), чтобы «успех» на 23-м часу
+                # аренды не выглядел как новая аренда. Продление — только
+                # release + новый claim (свежий коммит, свежий TTL).
+                detail = (f"замок {ref} уже держит этот же держатель ({holder}) — "
+                          "переаренда идемпотентна, замок не тронут")
+                if lock_date is not None:
+                    left = LOCK_TTL_HOURS - lock_age_hours(lock_date, now)
+                    detail += (f"; TTL НЕ продлевается, осталось {left:.1f} ч "
+                               f"из {LOCK_TTL_HOURS} (продление — release и "
+                               "новый claim)")
+                return ClaimResult(claimed=True, task=task, holder=holder,
+                                   detail=detail)
             if not exists:
                 # Ref пропал между попыткой создать его (422) и чтением
                 # состояния — задача уже свободна, не занята. Честный отказ
@@ -408,6 +427,31 @@ class ForeignLockError(RuntimeError):
     вызывающий код (CLI) обязан отличать его от инфраструктурной поломки."""
 
 
+def _ensure_owned(repo: str, task: int, holder: str) -> None:
+    """Проверка владения ДО любой мутации (#1190) — общий precheck `release()`
+    и `release_full()`, одно место правды. Чужой держатель или неизвестный
+    (замок старого формата) — `ForeignLockError`, ни замок, ни назначение ещё
+    не тронуты. Находка ai-review PR #1206 (блокирующая): у `release_full()`
+    проверка должна стоять ПЕРЕД снятием assignee — иначе отказ был громким,
+    но назначение чужой аренды уже улетело (частично применённый чужой вред —
+    ровно то, что класс #1190 запрещает)."""
+    exists, existing_holder, _lock_date = _lock_state(repo, task)
+    if existing_holder is not None and existing_holder != holder:
+        raise ForeignLockError(
+            f"замок task-{task} принадлежит держателю {existing_holder}, не тебе ({holder}) — "
+            f"снятие отказано; уверен, что можно снять — вызови с force=True")
+    if exists and existing_holder is None:
+        # Замок ЕСТЬ, но держателя не установить (замок старого формата
+        # без строки `holder:`) — третье состояние, то же, что у claim():
+        # безопасный дефолт — отказ, не молчаливое снятие вслепую.
+        # Рефа вообще нет — идемпотентный DELETE ниже сам скажет
+        # «отсутствовал», сюда доходить не нужно.
+        raise ForeignLockError(
+            f"замок task-{task} существует, но держатель неизвестен "
+            "(замок старого формата без записи держателя) — "
+            "снятие отказано по умолчанию; уверен, что можно снять — вызови с force=True")
+
+
 def release(repo: str, task: int, holder: str | None = None, force: bool = False) -> str:
     """Снять замок. Идемпотентно: отсутствующий замок — не ошибка.
 
@@ -434,21 +478,7 @@ def release(repo: str, task: int, holder: str | None = None, force: bool = False
     а не по одному зашитому статусу, иначе withstand real-world ответа не будет.
     403/500 и прочие статусы — настоящая поломка, пробрасываются дальше."""
     if holder is not None and not force:
-        exists, existing_holder = _lock_state(repo, task)
-        if existing_holder is not None and existing_holder != holder:
-            raise ForeignLockError(
-                f"замок task-{task} принадлежит держателю {existing_holder}, не тебе ({holder}) — "
-                f"снятие отказано; уверен, что можно снять — вызови с force=True")
-        if exists and existing_holder is None:
-            # Замок ЕСТЬ, но держателя не установить (замок старого формата
-            # без строки `holder:`) — третье состояние, то же, что у claim():
-            # безопасный дефолт — отказ, не молчаливое снятие вслепую.
-            # Рефа вообще нет — идемпотентный DELETE ниже сам скажет
-            # «отсутствовал», сюда доходить не нужно.
-            raise ForeignLockError(
-                f"замок task-{task} существует, но держатель неизвестен "
-                "(замок старого формата без записи держателя) — "
-                "снятие отказано по умолчанию; уверен, что можно снять — вызови с force=True")
+        _ensure_owned(repo, task, holder)
     try:
         gh("-X", "DELETE", f"repos/{repo}/git/refs/locks/task-{task}")
     except WriteGateSkipped:
@@ -487,7 +517,15 @@ def release_full(repo: str, task: int, holder: str | None = None) -> str:
     (чужой/неизвестный держатель назван в сообщении) — то же правило, что у
     `release()` без --force. Это и есть газ для «тормоза»: раньше `release-full`
     молча снимал чужой/неопределённый замок (#1190), теперь оно проверяемо
-    безопасно по умолчанию для CLI, а scheduler-пути остаются форс-снятием."""
+    безопасно по умолчанию для CLI, а scheduler-пути остаются форс-снятием.
+
+    Проверка владения стоит ДО снятия assignee (общий precheck `_ensure_owned`,
+    находка ai-review PR #1206, блокирующая): отказ не применяет НИКАКОЙ части
+    снятия — ни замка, ни назначения. Раньше назначение чужой аренды снималось
+    до проверки, и `ForeignLockError` сообщал о замке, молча при этом уже
+    почистив видимость."""
+    if holder is not None:
+        _ensure_owned(repo, task, holder)
     issue = gh(f"repos/{repo}/issues/{task}")
     assignees = issue.get("assignees") or []
     lines = []
