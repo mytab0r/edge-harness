@@ -105,9 +105,16 @@ leased -> pool             (release / просроченная аренда >24�
 leased -> has_pr           (открыт PR, чья ветка называет эту задачу)
 has_pr -> leased           (PR закрыт без слияния / заменён другой задачей, replace_closed_task_prs)
 has_pr -> done              (accept_merged_tasks подтвердил улику)
+{pool,leased,has_pr} -> done       (владелец закрыл issue руками — GitHub ставит
+                                   state_reason=completed; живые прецеденты —
+                                   #111/#114/#115/#158; тот же terminal done,
+                                   что и у приёмки, источник события различает)
 {pool,leased,has_pr} -> abandoned  (владелец закрывает issue как not_planned, в любой момент)
 {done,abandoned} -> reopened_invalid  (внешний reopen — GitHub не отклоняет нативно)
-reopened_invalid -> {done,abandoned}  (reject_reopened_tasks закрывает обратно, тем же исходом, что был)
+reopened_invalid -> done     (reject_reopened_tasks закрывает обратно голым
+                              state=closed без state_reason — GitHub проставляет
+                              completed; исхода «как был» код сегодня не читает
+                              и не восстанавливает)
 ```
 
 Флаги (не стадии, читаются как булевы поля ObservedTask):
@@ -154,12 +161,21 @@ ready -> merged                    (scheduler.merge_queue)
   (None/unknown) НЕ снимает флаг — это отдельное значение (см. п.3).
 - checks_red — есть непройденный check-run вне самих гейтов ревью
   (scheduler.pr_bad_checks).
-- needs_rework — на текущем head стоит метка из `scheduler.REWORK_LABELS`
-  (scheduler.py:3794): `ai:changes-requested`, `conflict` ИЛИ
-  `contract:failed` (тот же состав вычисляет `pr_needs_rework`,
-  scheduler.py:3821). `review:changes-requested` в флаг НЕ входит — цикл
-  доработки гейта 1 выражается стадией `awaiting_gate1` (выше), не этим
-  флагом.
+- needs_rework — ЦЕЛЕВОЙ состав флага снимка: метки из
+  `scheduler.REWORK_LABELS` (scheduler.py:3794): `ai:changes-requested`,
+  `conflict` ИЛИ `contract:failed` (тот же состав вычисляет
+  `pr_needs_rework`, scheduler.py:3821 — агрегат wip и приоритет
+  dispatch-каналов считают именно его). `review:changes-requested` в флаг
+  НЕ входит — цикл доработки гейта 1 выражается стадией `awaiting_gate1`
+  (выше), не этим флагом. ЧЕСТНО О ЖИВОМ РАСХОЖДЕНИИ: слитый Этап 0
+  (`build_observed_pr`, scheduler.py:483) сегодня кладёт во флаг ДРУГОЙ
+  состав — {review:changes-requested, ai:changes-requested}; это
+  временная граница скелета, а не целевое определение. Этап 4
+  ОБЯЗАН свести состав флага к `REWORK_LABELS` (одно место правды с
+  решающим слоем, который флаг обслуживает) — сведение входит в критерий
+  эквивалентности Этапа 4 наравне с переносом источника данных; до
+  схождения этих двух определений флаг снимка не потребляется
+  решающими функциями.
 - gate2_error — ai:failed, с evidence-полем reason_tag (quota_exhausted /
   rate_limit_retry_budget_exceeded / transport_error / contract_violation
   — те же четыре значения, что уже даёт review_labels.reason_tag).
@@ -188,10 +204,12 @@ scheduler.REWORK_LABELS, scheduler.py:3794 / pr_needs_rework,
 scheduler.py:3821) определён здесь как в ЖИВОМ КОДЕ — множество
 {ai:changes-requested, conflict, contract:failed}; `review:changes-requested`
 в него НЕ входит (вердикт гейта 1 живёт в стадии awaiting_gate1, раздел
-2.2), и `checks_red` тоже НЕ входит — ни до, ни после Этапа 4. Этап 4
-(tasks.md) мигрирует ТОЛЬКО источник данных для `checks_red`/`needs_rework`
-(`pr_bad_checks`/`pr_needs_rework` -> чтение снимка вместо пересчёта по
-`gh api`) — он не переопределяет их значение и не трогает решающий код
+2.2), и `checks_red` тоже НЕ входит — ни до, ни после Этапа 4. Улика этой
+улики не меняется от расхождения слитого скелета (см. §2.2): PR #1263 не
+несёт НИ ОДНОЙ метки ни одного из двух составов — не обслужен он при
+обоих. Этап 4 (tasks.md) мигрирует источник данных для
+`checks_red`/`needs_rework` И сводит состав флага к `REWORK_LABELS`
+(см. §2.2) — он не трогает решающий код
 (`dispatch_conflict_rework`/`dispatch_ai_review_rework`/`wip_gate`/
 `dispatch_worker` в сегодняшнем scheduler.py), который читает эти флаги и
 решает, какой PR получит адресный `workflow_dispatch`. Раздел 1, п.3
@@ -324,10 +342,12 @@ dsh-edge в замеренный день уже потратил 60 382 (60%) �
 merged) плюс сопоставимое число переходов задач (pool -> leased -> has_pr
 -> done) — около 300-500 переходов/сутки с запасом.
 
-500 переходов x 6 rows_written = 3 000 rows_written/сутки — на треть
-меньше, чем СЕГОДНЯШНИЙ heartbeat edge-harness (1 308/сутки в замеренный
-день) плюс сопоставимая величина, суммарно порядка 4 300 rows_written/
-сутки на весь edge-harness namespace, то есть 4.3% АККАУНТНОГО лимита —
+500 переходов x 6 rows_written = 3 000 rows_written/сутки. Сравнение,
+чтобы масштаб читался: этот НОВЫЙ бюджет сопоставим по порядку с
+СЕГОДНЯШНЕЙ собственной записью edge-harness (heartbeat — 1 308/сутки в
+замеренный день); сумма нового и сегодняшнего — порядка 4 300 rows_
+written/сутки на весь edge-harness namespace, то есть 4.3% АККАУНТНОГО
+лимита —
 даже если dsh-edge продолжит потреблять свои 60-98%, у edge-harness
 остаётся комфортный запас. rows_read (сравнение снимка перед решением о
 записи) — 136 SELECT x 96 тактов = 13 056/сутки, 0.26% лимита 5 000 000,
@@ -422,9 +442,12 @@ throughput измерен на N=10000 (заведомо больше design §3
 задержки/шедулинг реального трафика Cloudflare сюда не входят (они и не
 входят в CPU-бюджет invocation'а ни там, ни здесь — считается именно
 синхронный участок, который в обоих случаях исполняет один и тот же движок
-SQLite). Живое подтверждение `wrangler tail` на задеплоенном проде — после
-слияния и деплоя `deploy-worker.yml`, вне объёма Этапа 0 (разработчик не
-деплоит сам).
+SQLite). Живое подтверждение `wrangler tail` на задеплоенном проде — законная
+часть ПРИЁМКИ Этапа 0, идущая после слияния и деплоя
+`deploy-worker.yml` (деплой делает workflow, не разработчик —
+разработчик этапа не деплоит сам; последовательность приёмки:
+слияние -> deploy-worker.yml -> замер на проде = закрытие пункта (г)
+Этапа 0), см. tasks.md Этап 0.
 
 ### 3.7 Реальная частота переходов — измерено (2026-09-15, Этап 0-1)
 
@@ -624,7 +647,9 @@ REVIEW_FINDINGS_HEADER (review_labels.py:795-796) — заголовки ком�
 (идемпотентность публикации, #203) — ЭТА функция идемпотентности мигрирует
 в снимок (поле last_comment_hash), но сам ТЕКСТ комментария/заголовок
 остаётся как есть — человек должен видеть прозу, не код состояния.
-Аналогично DEPENDABOT_WATCH_CAP_MARKER/CAP_EXHAUSTED_MARKER (health_audit.py) —
+Аналогично DEPENDABOT_WATCH_CAP_MARKER (dependabot_alert_watch.py:120) и
+CAP_EXHAUSTED_MARKER (health_audit.py:79; тот же маркер-суффикс живёт
+отдельной константой и в stall_detector.py:187) —
 дата в маркере это часть текста для человека ("потолок на сегодня
 исчерпан"), а факт "исчерпан ли потолок сегодня" схлопывается в поле
 (группа 4.1), даже если строка-уведомление продолжает публиковаться.
@@ -654,7 +679,16 @@ observers/инварианты (влияют на эскалацию, не на 
 merge, dispatch), в последнюю очередь — функции с недавней историей
 расхождения (#303/#432/#740 — самый высокий риск регресса при переносе,
 переносятся последними, когда приём уже проверен на менее рискованных
-точках). Способ доказательства эквивалентности — общий для всех точек:
+точках). Проводка читателей (замечание ревью, закрыто здесь): писатель снимка —
+только `orchestra.yml` (orchestra.yml:117-118, слитый Этап 0); ЧИТАТЕЛИ
+снимка живут и в других workflows — `repo-ci.yml` (инварианты
+repo_invariants.py, точки 6 и 9) и `conflict-mechanical-rebase.yml`
+(точка 4) — сегодня эти workflows секретов `HANDS_TOKEN`/`HARNESS_URL`
+не получают, и этапы, переводящие их на чтение снимка, обязаны в том же
+PR провести ту же проводку (те же две строки env, ноль новых секретов)
+ИЛИ явно ограничить точку чтением только в orchestra-прогоне. Выбор —
+за задачей этапа, назван в её критерии (tasks.md Этап 3).
+Способ доказательства эквивалентности — общий для всех точек:
 тест на РЕАЛЬНОЙ фикстуре прод-формы (существующие fixtures_*.json в
 scripts/lib и scripts/orchestra/testdata уже дают образцы) — старая
 функция и поле снимка `build_observed_pr`/`build_observed_task`
@@ -673,8 +707,14 @@ task_ref.resolve_pr_task).
 3. `scripts/orchestra/checklist_tail_labels.py:191-210` (`resolve_parent_task`) — использование
    task_ref.resolve_pr_task для заведения задачи-хвоста после ревью;
    consumer уже потребляет ГОТОВУЮ функцию (не дублирует логику), перенос
-   — замена вызова на чтение pr_snapshots.task_number, тест на
-   эквивалентность тривиален.
+   — замена вызова на чтение task_number из снимка, тест на
+   эквивалентность тривиален. В слитой схеме Этапа 0 (harness.ts,
+   `pr_snapshots`: repo, number, stage, flags_json, updated_ts;
+   is_terminal читается из STAGE_META на стороне клиента, колонки нет)
+   отдельной колонки task_number НЕТ — Этап 2 называет в своём критерии
+   одно из двух: выделение `task_number` в колонку миграцией или чтение
+   по `json_extract(flags_json, '$.task_number')`; то же относится к
+   индексу в точке 7.
 4. `scripts/orchestra/mechanical_rebase.py:14-90` — собственная
    перепроверка mergeable_state до/после попытки ребейза (гонка с
    пересчётом GitHub уже описана в комментариях модуля). Перенос на чтение
@@ -700,8 +740,12 @@ task_ref.resolve_pr_task).
 7. `scripts/orchestra/contract_check.py:93-97,218-264` — `_all_open_pulls`
    + собственная проверка "другой открытый PR ссылается на ту же задачу";
    дублирует то, что merged_pr_map/replace_closed_task_prs в scheduler.py
-   тоже вычисляют. Перенос — оба консьюмера читают pr_snapshots.task_number
-   с уникальным индексом (task_number, is_terminal=false) вместо повторного
+   тоже вычисляют. Перенос — оба консьюмера читают task_number из снимка;
+   уникальность «одна открытая сущность на задачу» обеспечивается
+   частичным уникальным индексом ПО ВЫРАЖЕНИЮ
+   `json_extract(flags_json, '$.task_number')` (колонок task_number и
+   is_terminal в слитой схеме Этапа 0 нет — см. пункт 3) либо миграцией
+   колонки; выбор назван в критерии Этапа 3 (tasks.md), вместо повторного
    full-scan.
 8. `scripts/orchestra/scheduler.py:2187,2217,2230` — pr_check_runs/
    bad_check_names/pr_bad_checks (флаг checks_red снимка).
