@@ -3,8 +3,19 @@
 # `type: string` принимала недопустимые слоты (например 3) — концу
 # concurrency-группа `worker-3` не учитывается WORKER_MAX_CONCURRENCY=2 в
 # scheduler.py (диапазон слотов 1..2 в free_worker_slot). Гвардия читает
-# исходник worker.yml (yaml.safe_load) и красит регресс на `type: string` —
-# доказано мутацией (снятие `type: choice` краснит все три теста).
+# исходник worker.yml (yaml.safe_load) и красит регресс на `type: string`.
+#
+# Доказано мутацией — ИСПОЛНЕНО 2026-09-18, не пересказано (находка ai-review
+# PR #831: прежняя формулировка «снятие `type: choice` краснит все три теста»
+# была неверна). Обе мутации прогнаны на живом файле, вывод дословно:
+#   1) только `type: choice` → `type: string`, блок `options` оставлен —
+#      «1 failed, 4 passed», краснеет test_slot_input_is_choice_type_not_free_string;
+#   2) `type: choice` + `options` сняты целиком (реальный вид регресса: GitHub
+#      не принимает `options` у `type: string`) — «3 failed, 2 passed»,
+#      краснеют test_slot_input_is_choice_type_not_free_string,
+#      test_slot_input_options_match_worker_max_concurrency,
+#      test_slot_input_default_is_a_valid_slot.
+# База до мутаций и после отката — «5 passed».
 #
 # Регистрируется каталогом (#749), не рукописным шагом repo-ci.yml —
 # ci-guard-registration.sh замораживает список рукописных шагов, новый шаг

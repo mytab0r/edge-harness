@@ -3334,7 +3334,7 @@ WORKER_STALL_MINUTES = 295
 
 # ── Признак тишины: seq сессии harness-<N> не растёт, не только возраст (#1085) ──
 # Возраст (WORKER_STALL_MINUTES выше) — единственный признак зависания сегодня,
-# и он же признаёт это честно (докстринг stalled_worker_run ниже): «отличить
+# и он же признаёт это честно (докстринг stalled_worker_runs ниже): «отличить
 # зависший прогон от легитимно медленного, оставаясь ниже стены job'а,
 # невозможно» — потому что признак один. Воркер уже пишет построчный
 # транскрипт хода работы в сессию harness-<N> морды dsh-edge (#119,
@@ -3635,6 +3635,13 @@ def _stalled_run_task_number(
 # раньше сериализовала все прогоны репозитория в одну группу.
 WORKER_MAX_CONCURRENCY = 2
 
+# Потолок одной страницы для списка queued-прогонов воркера (см.
+# active_worker_runs). Отдельная константа, а не WORKER_MAX_CONCURRENCY + 1:
+# число слотов ограничивает in_progress, но НЕ очередь — при
+# `cancel-in-progress: false` в группе копится сколько угодно диспатчей
+# (замер ai-review PR #831). 100 — максимум страницы GitHub REST.
+QUEUED_RUNS_PAGE_SIZE = 100
+
 # run-name worker.yml несёт номер слота как есть (`worker (slot N)...`) —
 # REST-объект прогона не отдаёт workflow_dispatch inputs ни в каком поле
 # (только `display_title`, вычисленный из `run-name`), поэтому слот читается
@@ -3661,7 +3668,7 @@ def _run_age_minutes(run: dict, now: datetime) -> float | None:
 def _run_is_stalled(run: dict, now: datetime,
                      threshold_minutes: float = WORKER_STALL_MINUTES) -> bool:
     """Чистое решение по уже полученному прогону (без сетевого вызова) —
-    вынесено отдельно от stalled_worker_run/worker_runs_active, чтобы тесты,
+    вынесено отдельно от stalled_worker_runs/worker_runs_active, чтобы тесты,
     не относящиеся к обнаружению зависания, могли зафиксировать «прогон не
     завис» одной строкой monkeypatch, не подбирая правдоподобный recent
     timestamp под реальные wall-clock часы прогона тестов (тот же класс
@@ -3718,11 +3725,23 @@ def active_worker_runs(repo: str, now: datetime | None = None) -> list[dict]:
     """Прогоны worker.yml, реально занимающие слот параллельности (#827):
     in_progress (кроме зависших, см. stalled_worker_runs) + queued. Один
     источник для всех потребителей занятости (worker_runs_active,
-    free_worker_slot) — второе место правды не заводится."""
+    free_worker_slot) — второе место правды не заводится.
+
+    Про `per_page` у queued (находка ai-review PR #831, замерена): очередь
+    НЕ ограничена числом слотов — при `cancel-in-progress: false` в одной
+    concurrency-группе копится сколько угодно ручных диспатчей (замер ревью:
+    4 queued в слоте 1 + 3 в слоте 2). Поэтому берём максимум одной страницы
+    (`QUEUED_RUNS_PAGE_SIZE = 100`), а не «на один больше числа слотов», как
+    у in_progress_worker_runs. Честная оговорка вместо обхода страниц: если
+    очередь длиннее 100, свежих 100 хватает для ответа «слот занят» во всех
+    наблюдаемых случаях, но queued-прогон, вытесненный за страницу более
+    новыми, останется невидимым — free_worker_slot тогда назовёт слот
+    свободным, и диспатч встанет в хвост занятой группы. Двойной работы не
+    будет (GitHub сериализует группу), соврёт только отчёт о запуске."""
     now = now or datetime.now(timezone.utc)
     active = [run for run in in_progress_worker_runs(repo) if not _run_is_stalled(run, now)]
     payload = gh(
-        f"repos/{repo}/actions/workflows/{WORKER_WORKFLOW}/runs?status=queued&per_page={WORKER_MAX_CONCURRENCY + 1}"
+        f"repos/{repo}/actions/workflows/{WORKER_WORKFLOW}/runs?status=queued&per_page={QUEUED_RUNS_PAGE_SIZE}"
     ) or {}
     active.extend(payload.get("workflow_runs") or [])
     return active
