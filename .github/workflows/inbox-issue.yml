@@ -14,6 +14,15 @@
 # сообщение в инбоксе остаётся processing — ватчдог DO вернёт его в очередь,
 # если этот job не запустился вовсе или упал раньше callback'а (fail loud,
 # не silent-wrong: 204 ≠ issue создана).
+#
+# #720: заведённая issue обязана нести машиночитаемое объявление связи —
+# это задача пула (`labels[]=task`). Тело директивы владельца при этом НЕ
+# блокируется на форме записи: недостающее объявление дописывает сам job
+# (`БЛОКИРУЕТСЯ: ничем`, тот же ответ, каким автосоздатели объявляют
+# «связей не знаю»), а решает «дописывать или нет» общий парсер гейта
+# заведения (scripts/lib/pool_issue.py check-body — единственный парсер на
+# Python-гейт, bash-обёртку и этот job; локальной копии регэкспа здесь нет).
+# Своё объявление в теле директивы не трогается.
 name: inbox-issue
 
 on:
@@ -21,6 +30,7 @@ on:
     types: [inbox-issue]
 
 permissions:
+  contents: read
   issues: write
 
 # Группа — по сообщению: два дубля dispatch'а одного message_id (ретрай DO
@@ -35,6 +45,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      # Общий парсер объявления связи живёт в репозитории (#720) — job без
+      # чекаута его не видит. persist-credentials: false — токен нужен
+      # только явным шагам ниже, git-клиенту не остаётся.
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
       - name: Issue из директивы инбокса
         id: create
         env:
@@ -47,6 +64,12 @@ jobs:
           BODY: ${{ github.event.client_payload.body }}
         run: |
           set -euo pipefail
+          # #720: дописать объявление связи, если в теле его нет (парсер —
+          # тот же, что у гейтов заведения; stderr парсера с готовой строкой
+          # остаётся в логе — это объяснение, почему объявление дописано).
+          if ! printf '%s' "$BODY" | python3 scripts/lib/pool_issue.py check-body >/dev/null; then
+            BODY="${BODY}"$'\n'"БЛОКИРУЕТСЯ: ничем"
+          fi
           created=$(gh api -X POST "repos/$REPO/issues" \
             -f "title=$TITLE" -f "body=$BODY" \
             -f "labels[]=task" -f "labels[]=source:inbox")

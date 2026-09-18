@@ -13,13 +13,21 @@ labels: raise ...` в scripts/lib/pool_issue.py — test_missing_task_label_*
 test_missing_declared_dependency_* перестают падать и начинают звать fake gh,
 тест краснеет.
 
+Мутация, которой доказан перенос объявления в _append_note (#720, находка
+ревью PR #804): замени тело _append_note на `return body + note` —
+test_append_note_moves_inline_declaration_after_note и
+test_append_note_keeps_inline_declaration_with_numbers краснеют (объявление
+перестаёт быть последней непустой строкой).
+
 Распознавание здесь НЕ своя копия регэкспа: `_has_declared_dependency`
-делегирует существующему объединённому читателю
-(`declared_deps.declared_blocked_by` — структурное поле + инлайн-строка, тот
-же предикат, что читают `auto_wire`/`repo_invariants`) — тесты ниже кормят
-гейт прод-формами обеих записи, включая пограничные (ответ из одних пробелов
-— случай, на котором awk-копия первого захода PR #804 разошлась с
-Python-гейтом).
+делегирует существующим объединённым читателям declared_deps —
+`declared_blocked_by` (структурное поле «Чем блокируется» + инлайн-строка)
+и `blocking_field_numbers` (обратное поле «Что блокирует», задача #710) —
+тот же предикат, что читают `auto_wire`/`repo_invariants`; тесты ниже кормят
+гейт прод-формами всех трёх записей, включая пограничные (ответ из одних
+пробелов — случай, на котором awk-копия первого захода PR #804 разошлась с
+Python-гейтом; неразобранный ответ обратного поля — данные есть, качество
+ответа не дело гейта).
 
 CLI `check-body` (единственный парсер для bash-обёртки scripts/gh/issue-create)
 проверяется живым подпроцессом: rc/поток/готовая строка в stderr.
@@ -189,6 +197,104 @@ def test_empty_body_never_calls_gh():
     with pytest.raises(RuntimeError, match="машиночитаемого объявления связи"):
         pool_issue.create_pool_issue(gh, "o/r", "title", "", ["task"])
     assert gh.calls == []
+
+
+# ── #720: обратное поле «Что блокирует» — та же связь, другое направление ────
+# Задача #710: поле «Что блокирует: B» переносится auto_wire'ом с разворотом
+# (B получает blockedBy A), то есть тело с этим полем УЖЕ несёт разбираемую
+# связь. Гейт, требующий только прямого поля/инлайна, отказывал бы телу,
+# которое граф потом разберёт (находка ревью PR #804).
+
+def test_declared_dependency_reverse_field_calls_gh():
+    """Обратное поле «Что блокирует» с номерами — валидно, gh вызван."""
+    gh = RecordingGh()
+    body = "### Что блокирует\n#123\n"
+    created = pool_issue.create_pool_issue(gh, "o/r", "title", body, ["task"])
+    assert created["number"] == 999
+    assert len(gh.calls) == 1
+
+
+def test_declared_dependency_reverse_field_nichem_calls_gh():
+    """Обратное поле с ответом «ничем» — валидно, gh вызван."""
+    gh = RecordingGh()
+    body = "## Что блокирует\nничем\n"
+    created = pool_issue.create_pool_issue(gh, "o/r", "title", body, ["task"])
+    assert created["number"] == 999
+    assert len(gh.calls) == 1
+
+
+def test_declared_dependency_reverse_field_unparseable_answer_calls_gh():
+    """Обратное поле с неразобранным ответом — данные на входе есть, гейт
+    пропускает (UNRECOGNIZED_FORM — не None; качество ответа — дело
+    auto_wire, а не гейта заведения; то же правило, что у прямого поля)."""
+    gh = RecordingGh()
+    body = "### Что блокирует\nвсё упирается в согласование\n"
+    created = pool_issue.create_pool_issue(gh, "o/r", "title", body, ["task"])
+    assert created["number"] == 999
+    assert len(gh.calls) == 1
+
+
+# ── #720: _append_note — приписка не разрушает объявление ────────────────────
+# Живой случай — находка ревью PR #804: футер --confirm-not-duplicate
+# дописывался к проверенному телу, и инлайн-объявление переставало быть
+# последней непустой строкой — созданная issue объявление не несла.
+
+def test_append_note_moves_inline_declaration_after_note():
+    """Инлайн-объявление переносится в конец ЗА приписку — объявление
+    остаётся последней непустой строкой созданного тела."""
+    body = "Тело задачи\nБЛОКИРУЕТСЯ: ничем"
+    result = pool_issue._append_note(body, "\n\n---\nПриписка про дубли")
+    lines = [line.strip() for line in result.splitlines() if line.strip()]
+    assert lines[-1] == "БЛОКИРУЕТСЯ: ничем"
+    assert "Приписка про дубли" in result
+    # итог проходит тот же предикат
+    assert pool_issue._has_declared_dependency(result)
+
+
+def test_append_note_keeps_inline_declaration_with_numbers():
+    """Инлайн с номерами переносится дословно — формат не перечитывается."""
+    body = "Тело\nБЛОКИРУЕТСЯ: #12 #34"
+    result = pool_issue._append_note(body, "\n---\nПриписка")
+    lines = [line.strip() for line in result.splitlines() if line.strip()]
+    assert lines[-1] == "БЛОКИРУЕТСЯ: #12 #34"
+
+
+def test_append_note_structural_body_untouched():
+    """Тело со структурным полем приписка не переставляет: заголовок с
+    ответом положения последней строки не обязан — после приписки
+    предикат и так true."""
+    body = "### Чем блокируется\n#55\n"
+    result = pool_issue._append_note(body, "\n---\nПриписка")
+    assert result == body + "\n---\nПриписка"
+    assert pool_issue._has_declared_dependency(result)
+
+
+def test_append_note_without_declaration_unchanged():
+    """Тело без объявления не «чинится» — его не пропустил бы гейт
+    заведения; _append_note не второй гейт и молча дописывать «ничем»
+    за автора не должен."""
+    body = "просто тело без связи"
+    result = pool_issue._append_note(body, "\n---\nПриписка")
+    assert result == body + "\n---\nПриписка"
+    assert not pool_issue._has_declared_dependency(result)
+
+
+def test_append_note_cli_writes_body_with_declaration_last(tmp_path):
+    """CLI append-note: тело из stdin, приписка из файла, объявление —
+    последней непустой строкой результата."""
+    note_file = tmp_path / "note.txt"
+    note_file.write_text("\n---\nПриписка", encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPT), "append-note", str(note_file)],
+        input="Тело задачи\nБЛОКИРУЕТСЯ: ничем".encode("utf-8"),
+        capture_output=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr.decode("utf-8")
+    out = proc.stdout.decode("utf-8")
+    lines = [line.strip() for line in out.splitlines() if line.strip()]
+    assert lines[-1] == "БЛОКИРУЕТСЯ: ничем"
+    assert "Приписка" in out
 
 
 # ── #720: CLI check-body — единственный парсер для bash-обёртки ─────────────
