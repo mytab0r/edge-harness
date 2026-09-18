@@ -56,18 +56,21 @@ Given/When/Then для проверки. Формат текста сообще�
 ## Диспетчер поднимает оркестратор-джоб по событию
 
 3. Разбор, классифицировавший сообщение как требующий суждения
-   (`kind='chat'`), инициирует `workflow_dispatch` на
-   `orchestrator-message.yml` (`POST /repos/{repo}/actions/workflows/
-   orchestrator-message.yml/dispatches`) НА ТОМ ЖЕ тике разбора.
+   (`kind='chat'`), инициирует `repository_dispatch`
+   (`POST /repos/{repo}/dispatches` с `event_type: harness-message`)
+   НА ТОМ ЖЕ тике разбора.
    МЕХАНИЗМ ЗАКРЕПЛЁН — один эндпоинт, без «или» (находка ревью
    PR #262, десятый раунд: прежняя редакция оставляла развилку «или
-   `repository_dispatch` с отдельным `event_type`», хотя требование 5 уже
-   считает dispatch'и этого workflow, а tasks.md п.3 строит триггер);
+   `workflow_dispatch` по имени workflow»; выбран `repository_dispatch`,
+   потому что батчинг требования 5 кладёт id сообщений списком в
+   `client_payload` — у `workflow_dispatch` вместо него только строковые
+   `inputs`; `tasks.md` п.3 строит тот же триггер);
    тот же класс вызова, что уже
-   доказан (`cf-worker/src/harness.ts::attemptOrchestraDispatch` дёргает
-   `orchestra.yml`, `::#checkDshEdgeUpdate` — `deploy-dsh-edge.yml`,
-   оба — `workflow_dispatch` по имени workflow; `::#postTask` —
-   `repository_dispatch`; искать по имени функции, номера
+   доказан (`cf-worker/src/harness.ts::#postTask` — `repository_dispatch`
+   `harness-task`, `::#dispatchIssueCreation` — `inbox-issue`,
+   `::#dispatchOwnerDecision` — `owner-decision`; `attemptOrchestraDispatch`
+   доказывает смежный класс — `workflow_dispatch` по имени workflow;
+   искать по имени функции, номера
    строк дрейфуют между ребейзами). Момент диспетча назван точно (находка
    ревью PR #262, третий раунд, п.1 — прежний сценарий вешал диспетч на
    завершение `#postMessageIngest`, где `kind` всегда `'raw'`: `#putMessage`
@@ -113,11 +116,11 @@ Given/When/Then для проверки. Формат текста сообще�
    Когда — тик DO (`alarm()` -> `#processInbox` -> `#processSingleMessage`)
    захватил сообщение и классифицировал его как `chat`. Тогда — НА ТОМ ЖЕ
    тике инициирован HTTP-запрос на
-   `POST /repos/{repo}/actions/workflows/orchestrator-message.yml/dispatches`
+   `POST /repos/{repo}/dispatches` с `event_type: harness-message`
    (механизм закреплён телом требования) — НЕ уже
-   существующий `orchestra.yml` (15-минутный пульс, тот же класс
-   `workflow_dispatch`-вызова,
-   но другой workflow, этот change его не трогает), best-effort (сбой
+   диспетчимый `orchestra.yml` (15-минутный пульс, его поднимает
+   `attemptOrchestraDispatch` через `workflow_dispatch`, этот change его
+   не трогает), best-effort (сбой
    диспетча не роняет разбор — по образцу `dispatch_worker` в
    `scheduler.py`), а сообщение остаётся в захваченном `processing` и ждёт
    результат джоба (владение окном — требование 4).
@@ -249,8 +252,10 @@ Given/When/Then для проверки. Формат текста сообще�
    `docs/research/21-github-actions.md`, «API-лимиты: настоящий потолок —
    500/час, а не 5 000»). Счётчик и порог названы (находка ревью PR #262,
    девятый раунд — «при приближении к лимиту» без счётчика и порога
-   непроверяемо): DO считает dispatch'и ЭТОГО workflow
-   (`orchestrator-message`) за скользящий час в своём состоянии — он и есть
+   непроверяемо): DO считает dispatch'и С ЭТИМ event_type
+   (`harness-message`; считаются собственные POST'ы на
+   `/repos/{repo}/dispatches` с ним) за скользящий час в своём состоянии —
+   он и есть
    инициатор каждого такого вызова, поэтому его счётчик полон без внешнего
    источника (иначе пришлось бы читать чужой бюджет — второй источник
    правды). Батчинг начинается при достижении порога **400 dispatch'ов за

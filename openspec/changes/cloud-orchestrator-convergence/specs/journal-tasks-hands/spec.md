@@ -33,12 +33,12 @@
 отправлять оркестратору шум).
 
 Сценарий: сообщение классифицировано как `chat` -> пульс DO на том же
-тике инициирует `workflow_dispatch` на `orchestrator-message.yml` — тот
-же асинхронный `fire-and-forget` класс вызова, что dispatch issue-пути;
-механизм закреплён требованием 3 `specs/orchestrator-dispatch/spec.md`
-(находка ревью PR #262, десятый раунд: прежняя редакция «тем же путём,
-что `directive`/`doc_edit`» читалась как тот же эндпоинт, а те идут
-через `repository_dispatch`); после приёма
+тике инициирует `repository_dispatch` (`event_type: harness-message`)
+тем же асинхронным `fire-and-forget` путём, что `directive`/`doc_edit`
+создают issue; механизм закреплён требованием 3
+`specs/orchestrator-dispatch/spec.md`, без «или» (находка ревью
+PR #262, десятый раунд: прежняя редакция оставляла развилку
+«или `workflow_dispatch`»); после приёма
 сообщения тик ускоряется одноразовым alarm'ом — MODIFIED п.33 ниже
 -> статус `messages` проставляется джобом через CAS владения
 (`done` — после успешной CAS-записи результата; исход отправки в канал —
@@ -59,7 +59,8 @@
 без изменений. Пульс DO остаётся ЕДИНСТВЕННЫМ
 драйвером перехода `new -> processing` и захвата сообщения. Требование 3
 `specs/orchestrator-dispatch/spec.md` добавляет ВТОРОЕ действие на том же
-тике — диспетч `workflow_dispatch` на `orchestrator-message.yml` для
+тике — диспетч `repository_dispatch` (`event_type: harness-message`)
+для
 `chat`, не второй захват и не второй классификатор. Один водитель
 разбора, одно
 дополнительное действие после разбора — два места правды для «кто

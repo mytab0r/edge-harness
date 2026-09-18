@@ -68,13 +68,17 @@ archive этого change.
    и `WORKER-PLAYBOOK.md` сохраняется).
 - [ ] 3. Новый workflow `orchestrator-message.yml` по образцу `ai-review.yml`
    (`gather` -> DSH headless reasoning -> `verdict`/action, без сохранённого
-   состояния), триггер — `workflow_dispatch` по имени workflow: механизм
-   закреплён требованием 3 дельта-спеки (находка ревью PR #262, десятый
-   раунд — прежняя редакция оставляла развилку «или `repository_dispatch`
-   с новым `event_type`, например `harness-message`», хотя требование 5
-   уже считает dispatch'и этого workflow); тот же класс вызова, что уже
-   доказан — `attemptOrchestraDispatch` дёргает `orchestra.yml`,
-   `#checkDshEdgeUpdate` — `deploy-dsh-edge.yml` (искать по имени
+   состояния), триггер — `repository_dispatch` с новым `event_type`
+   `harness-message` (по аналогии с существующим `harness-task` — поле
+   `dispatchEventType` в объекте `GITHUB`, `cf-worker/src/config.ts` —
+   искать по имени поля, не по строке): механизм ЗАКРЕПЛЁН требованием 3
+   дельта-спеки, без «или» (находка ревью PR #262, десятый раунд —
+   прежняя редакция оставляла развилку «или `workflow_dispatch`»);
+   `repository_dispatch` выбран потому, что батчинг требования 5 кладёт id
+   сообщений списком в `client_payload`, а у `workflow_dispatch` вместо
+   него только строковые `inputs`; тот же класс вызова, что уже доказан —
+   `#postTask` (`harness-task`), `#dispatchIssueCreation` (`inbox-issue`),
+   `#dispatchOwnerDecision` (`owner-decision`; искать по имени
    функции, не по строке). Имя выбрано подальше от уже диспетчимого
    `orchestra.yml`
    (15-минутный пульс) — пара имён на «or» была бы готовым классом
