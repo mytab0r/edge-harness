@@ -20,3 +20,12 @@
   `test_parse_mutation_claims_accepts_parameterized_test_id`,
   `test_broken_ere_is_error_with_gas_not_traceback`; мутация механизма перегнана живьём
   (дословный вывод в ADR 0026).
+- [x] Находки ai-review PR #1028 (круг 4): требования дельты влиты в центральный файл
+  `openspec/specs/journal-tasks-hands.md` как 18.3.1–18.3.6 с провенанс-пометкой (пункт 19
+  занят «Аутентификацией»); дословная цитата мутации в ADR 0026 исправлена на фактический
+  вывод (`assert 'proved' == 'false_claim'`, прогон 2026-09-18); носитель патча — блок
+  ровно ```diff (парсер больше не берёт первый fence любым маркером). Исполнитель: воркер
+  PR #1028. Приёмка: тесты
+  `test_parse_mutation_claims_takes_diff_fence_not_first_foreign_fence`,
+  `test_parse_mutation_claims_only_non_diff_fence_gets_targeted_error` (оба краснеют под
+  мутацией «вернуть любой fence»); требования 18.3.* присутствуют в центральном файле.

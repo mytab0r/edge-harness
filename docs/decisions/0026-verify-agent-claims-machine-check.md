@@ -121,8 +121,11 @@
 
 Снят ветку `if mutated.passed: return …("false_claim", …)` в `run_mutation_proof` (патчем
 из тела PR #1028) — `test_run_mutation_proof_false_claim_on_pr893_fixture` покраснел,
-дословный вывод прогона 2026-09-17: `AssertionError: assert 'false_claim' == 'proved'`,
-`1 failed in 0.54s`. Возврат патча — `1 passed`, дерево чистое. Тот же патч прогнан
+дословный вывод прогона 2026-09-18: `AssertionError: assert 'proved' == 'false_claim'`,
+`1 failed in 0.50s` (pytest рендерит сравнение как в исходнике теста —
+`outcome.verdict == "false_claim"` — фактическое значение слева, заявленное справа;
+находка ai-review PR #1028: в прежней цитате операнды были перепутаны местами —
+цитата не дословная). Возврат патча — `1 passed`, дерево чистое. Тот же патч прогнан
 end-to-end самим механизмом в CI PR #1028 (`mutation-claim[proved]`).
 
 ## Цена и газ

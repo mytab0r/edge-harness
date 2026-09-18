@@ -120,6 +120,17 @@ UNVERIFIABLE_PHRASES = [
 
 _HEADING_LINE_RE = re.compile(r"^##\s+\S")
 _FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
+# Носитель патча заявления — блок РОВНО с маркером «diff» на открывающей
+# строке (```diff … ```): контракт блоков (ADR 0026) требует diff-блок, а
+# _FENCE_RE матчит любой fence. Прежний разбор брал ПЕРВЫЙ fence секции
+# любым маркером: встань в секции цитата вывода или пример кода раньше
+# диффа — парсер молча взял бы его как патч, и автор получил бы «патч не
+# накладывается — обнови патч» на визуально корректном диффе дальше
+# (некритичная находка ai-review PR #1028 в чеклисте тела). Этот RE —
+# ТОЛЬКО для разбора заявления; _strip_fences/_sections не трогать: там
+# «любой fence» — правильный смысл (учёт фенсов при скане секций и снятие
+# цитат при поиске непроверяемых формулировок не зависят от маркера).
+_DIFF_FENCE_RE = re.compile(r"```diff[ \t]*\n(.*?)```", re.DOTALL)
 _DIFF_GIT_HEADER_RE = re.compile(r"^diff --git a/(.+) b/(.+)$", re.MULTILINE)
 
 # Формат MUTATION-PROOF (ADR 0023, движок `mutation_recipe_guard.py`) в теле
@@ -251,8 +262,18 @@ def parse_mutation_claims(body: str) -> list[MutationClaim]:
                 "(параметризованные id со скобками и запятыми разрешены; "
                 "без shell-операторов)"
             )
-        fence_match = _FENCE_RE.search(section)
-        if not fence_match or not fence_match.group(1).strip():
+        diff_match = _DIFF_FENCE_RE.search(section)
+        if not diff_match or not diff_match.group(1).strip():
+            wrong_fence = _FENCE_RE.search(section)
+            if wrong_fence is not None and wrong_fence.group(1).strip():
+                raise MutationClaimFormatError(
+                    f"{MUTATION_HEADING} (блок {idx}): в секции есть блок "
+                    "```…```, но маркер на его открывающей строке — не "
+                    "«diff»; носитель патча обязан быть блоком ровно "
+                    "«```diff … ```» (маркер diff без других слов). "
+                    "Переложи патч в блок ```diff — иначе он не будет "
+                    "исполнен гейтом"
+                )
             raise MutationClaimFormatError(
                 f"{MUTATION_HEADING} (блок {idx}): не найден непустой блок "
                 "```diff ... ``` с unified diff, снимающим заявленный фикс"
@@ -260,7 +281,7 @@ def parse_mutation_claims(body: str) -> list[MutationClaim]:
         claims.append(MutationClaim(
             test_cmd=test_cmd,
             test_target=cmd_match.group(1),
-            patch_text=fence_match.group(1),
+            patch_text=diff_match.group(1),
         ))
     return claims
 

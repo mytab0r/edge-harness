@@ -124,6 +124,49 @@ def test_parse_mutation_claims_missing_diff_fence_raises():
         mutation_claim.parse_mutation_claims(body)
 
 
+def test_parse_mutation_claims_takes_diff_fence_not_first_foreign_fence():
+    """Носитель патча — блок ровно ```diff: чужой fence (цитата вывода,
+    пример кода) раньше диффа не подменяет патч (некритичная находка
+    ai-review PR #1028 в чеклисте тела: парсер брал первый fence любым
+    маркером, и автор получал «патч не накладывается» на визуально
+    корректный дифф дальше по секции)."""
+    body = (
+        "## Доказательство мутацией\n"
+        "Тест: `python -m pytest scripts/lib/test_x.py -q`\n"
+        "Дословный вывод прошлого прогона:\n"
+        "```text\n"
+        "1 passed in 0.01s\n"
+        "```\n"
+        "```diff\n"
+        "--- a/scripts/lib/x.py\n"
+        "+++ b/scripts/lib/x.py\n"
+        "@@ -1,1 +1,1 @@\n"
+        "-old\n"
+        "+new\n"
+        "```\n"
+    )
+    claims = mutation_claim.parse_mutation_claims(body)
+    assert len(claims) == 1
+    assert "1 passed in 0.01s" not in claims[0].patch_text
+    assert "-old" in claims[0].patch_text and "+new" in claims[0].patch_text
+
+
+def test_parse_mutation_claims_only_non_diff_fence_gets_targeted_error():
+    """Секция с блоком ```…``` чужого маркера и без ```diff — адресная
+    ошибка про носитель патча, а не общее «не найден блок» без указания,
+    что именно не так с маркером."""
+    body = (
+        "## Доказательство мутацией\n"
+        "Тест: `python -m pytest scripts/lib/test_x.py -q`\n"
+        "```\n"
+        "--- a/scripts/lib/x.py\n"
+        "+++ b/scripts/lib/x.py\n"
+        "```\n"
+    )
+    with pytest.raises(mutation_claim.MutationClaimFormatError, match="ровно"):
+        mutation_claim.parse_mutation_claims(body)
+
+
 def test_parse_mutation_claims_accepts_parameterized_test_id():
     """Параметризованный pytest-id (`test_x[param-1,2]`) проходит — находка
     ai-review PR #1028 в чеклисте: прежний класс символов отвергал `[]` и
