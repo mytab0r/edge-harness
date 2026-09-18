@@ -13,10 +13,23 @@ labels: raise ...` в scripts/lib/pool_issue.py — test_missing_task_label_*
 test_missing_declared_dependency_* перестают падать и начинают звать fake gh,
 тест краснеет.
 
+Распознавание здесь НЕ своя копия регэкспа: `_has_declared_dependency`
+делегирует существующему объединённому читателю
+(`declared_deps.declared_blocked_by` — структурное поле + инлайн-строка, тот
+же предикат, что читают `auto_wire`/`repo_invariants`) — тесты ниже кормят
+гейт прод-формами обеих записи, включая пограничные (ответ из одних пробелов
+— случай, на котором awk-копия первого захода PR #804 разошлась с
+Python-гейтом).
+
+CLI `check-body` (единственный парсер для bash-обёртки scripts/gh/issue-create)
+проверяется живым подпроцессом: rc/поток/готовая строка в stderr.
+
 Запуск: python -m pytest scripts/lib/test_pool_issue.py -q
 """
 
 import importlib.util
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -142,3 +155,71 @@ def test_declared_dependency_empty_answer_valid():
     created = pool_issue.create_pool_issue(gh, "o/r", "title", body, ["task"])
     assert created["number"] == 999
     assert len(gh.calls) == 1
+
+
+def test_declared_dependency_whitespace_only_answer_line_valid():
+    """Ответ из одних пробелов между заголовком и «ничем» — валиден.
+
+    Живой случай — находка AI-ревью PR #804: awk-копия проверки считала
+    строку из пробелов «ответом-прозой» и отказывала тело, которое
+    Python-гейт и declared_deps (место правды) принимали. Теперь парсер
+    один — гейт обязан соглашаться с читателем графа на этой же форме."""
+    gh = RecordingGh()
+    body = "### Чем блокируется\n   \nничем\n"
+    created = pool_issue.create_pool_issue(gh, "o/r", "title", body, ["task"])
+    assert created["number"] == 999
+    assert len(gh.calls) == 1
+
+
+def test_declared_dependency_bare_numbers_in_field_valid():
+    """Голый номер без `#` в ответе поля — валиден (то же, что читает
+    auto_wire: declared_deps._VALUE_NUMBER_RE берёт `#?\\d{2,5}`; гейт,
+    требующий `#`, отвергал бы тело, которое граф потом разберёт)."""
+    gh = RecordingGh()
+    body = "### Чем блокируется\n55\n"
+    created = pool_issue.create_pool_issue(gh, "o/r", "title", body, ["task"])
+    assert created["number"] == 999
+    assert len(gh.calls) == 1
+
+
+def test_empty_body_never_calls_gh():
+    """Пустое тело — объявления нет, отказ ДО сети (то же, что ответит
+    check-body bash-обёртке; первый заход PR #804 пустое тело пропускал)."""
+    gh = RecordingGh()
+    with pytest.raises(RuntimeError, match="машиночитаемого объявления связи"):
+        pool_issue.create_pool_issue(gh, "o/r", "title", "", ["task"])
+    assert gh.calls == []
+
+
+# ── #720: CLI check-body — единственный парсер для bash-обёртки ─────────────
+
+def _run_check_body(body: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), "check-body"],
+        input=body.encode("utf-8"),
+        capture_output=True,
+        timeout=60,
+    )
+
+
+def test_check_body_cli_accepts_both_forms():
+    rc_structural = _run_check_body("### Чем блокируется\nничем\n")
+    assert rc_structural.returncode == 0, rc_structural.stderr.decode("utf-8")
+    rc_inline = _run_check_body("Тело задачи\nБЛОКИРУЕТСЯ: #720\n")
+    assert rc_inline.returncode == 0, rc_inline.stderr.decode("utf-8")
+
+
+def test_check_body_cli_refuses_without_declaration_and_prints_hint():
+    rc = _run_check_body("просто тело без связи")
+    assert rc.returncode == 1
+    err = rc.stderr.decode("utf-8")
+    assert "машиночитаемого объявления связи" in err
+    # газ: готовая строка для вставки
+    assert "### Чем блокируется" in err
+    assert "ничем" in err
+
+
+def test_check_body_cli_refuses_empty_body():
+    rc = _run_check_body("")
+    assert rc.returncode == 1
+    assert "### Чем блокируется" in rc.stderr.decode("utf-8")

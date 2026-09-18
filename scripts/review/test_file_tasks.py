@@ -69,7 +69,9 @@ ADD_BLOCKED_BY_RESPONSE = {"data": {"addBlockedBy": {"issue": {"number": 1}}}}
 
 def test_main_files_only_separate_scope_skips_tail_and_unscoped(monkeypatch, capsys):
     tasks = [
-        {"title": "Заводи меня", "body": "Цель.\nКритерий.", "scope": "отдельно"},
+        # #720: тело, идущее в issue, обязано нести объявление связи —
+        # create_pool_issue иначе откажет ДО сети (гейт на живом гейте).
+        {"title": "Заводи меня", "body": "Цель.\nКритерий.\nБЛОКИРУЕТСЯ: ничем", "scope": "отдельно"},
         {"title": "Хвост, не заводи", "body": "Тело хвоста.", "scope": "хвост"},
         {"title": "Без масштаба, не заводи", "body": "Тело без поля.", "scope": None},
     ]
@@ -116,9 +118,10 @@ def test_main_only_tail_and_unscoped_files_nothing(monkeypatch, capsys):
 
 def test_main_files_multiple_separate_tasks_ignores_mixed_scope(monkeypatch):
     tasks = [
-        {"title": "Отдельно раз", "body": "Тело раз.", "scope": "отдельно"},
+        # #720: тела, идущие в issue, несут объявление связи (см. первый тест).
+        {"title": "Отдельно раз", "body": "Тело раз.\nБЛОКИРУЕТСЯ: ничем", "scope": "отдельно"},
         {"title": "Хвост между", "body": "Тело хвоста.", "scope": "хвост"},
-        {"title": "Отдельно два", "body": "Тело два.", "scope": "отдельно"},
+        {"title": "Отдельно два", "body": "Тело два.\nБЛОКИРУЕТСЯ: ничем", "scope": "отдельно"},
     ]
     body = build_verdict_comment(tasks)
     comment = trusted_comment(3, body)
@@ -147,8 +150,9 @@ def test_main_defensively_skips_fenced_task_with_non_separate_scope(monkeypatch,
     body = (
         "pr: 160\nhead: abc\nreviewer: rework\n\n"
         "Находки.\n\n"
+        # #720: заводимый фенс несёт объявление связи — иначе гейт откажет.
         f"{ai_review.TASK_FENCE}\nЗаводи меня\nМАСШТАБ: отдельно\nЦель.\n"
-        f"{'`' * 4}\n\n"
+        f"БЛОКИРУЕТСЯ: ничем\n{'`' * 4}\n\n"
         f"{ai_review.TASK_FENCE}\nНе заводи — искажённый фенс\nМАСШТАБ: хвост\nЦель.\n"
         f"{'`' * 4}\n"
     )
@@ -310,3 +314,37 @@ def test_main_dry_run_previews_blocked_by_without_creating(monkeypatch, capsys):
     # dry-run не мутирует ничего — ни POST issues, ни PATCH комментария,
     # ни граф зависимостей
     assert not fake.mutating_calls()
+
+
+# ── #720: тело задачи из контракта ревью проходит настоящий гейт ────────────
+
+
+def test_file_task_body_from_review_contract_passes_declared_dependency_gate(monkeypatch):
+    """file_task берёт тело из контракта AI-ревью (`БЛОКИРУЕТСЯ: …` обязана
+    быть последней строкой, иначе parse_tasks отбрасывает блок целиком) —
+    такое тело обязано проходить НАСТОЯЩИЙ гейт create_pool_issue. Мок только
+    транспорт file_tasks. Мутация: сними гейт объявления в pool_issue.py —
+    test_missing_declared_dependency_never_calls_gh краснеет; сломай парсер
+    в ai_review/declared_deps — краснеют их собственные тесты."""
+    calls = []
+
+    def fake_gh(*args):
+        calls.append(args)
+        return {"number": 999}
+
+    patch_gh(monkeypatch, fake_gh)
+    # Прод-форма: ответ модели в формате контракта (блок ЗАДАЧА … КОНЕЦ
+    # ЗАДАЧИ, «БЛОКИРУЕТСЯ: …» последней) — то, что parse_tasks отбирает
+    # в беклог, main() фенсит и file_task заводит.
+    answer = (
+        "ЗАДАЧА: Новая задача\n"
+        "МАСШТАБ: отдельно\n"
+        "Цель.\n"
+        "БЛОКИРУЕТСЯ: ничем\n"
+        "КОНЕЦ ЗАДАЧИ\n"
+    )
+    tasks = ai_review.parse_tasks(answer)
+    assert tasks, "контракт ревью обязан сохранить задачу со строкой БЛОКИРУЕТСЯ"
+    number = fts.file_task(REPO, tasks[0])
+    assert number == 999
+    assert len(calls) == 1, "реальный гейт пропустил тело — объявление связи на месте"
