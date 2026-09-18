@@ -18,7 +18,8 @@ directory-записи), но реестр так и остался ПУСТЫМ
 
 Транспорт — тот же RPC, которым пишет сам UI, без единого нового серверного
 роута (контракт перепроверен по `dsh-edge/registry-integration/check.mjs`):
-  POST /api/auth/login      accessKey=...            → кука владельца
+  POST /api/auth/login      accessKey=...            → 303 + кука владельца
+                                                     (редирект НЕ идём, UA явный — #1337/#225)
   POST /api/settings.mutate {ns, ops:[{op,path,value}]}
   POST /api/credentials.set {ref, value}
   POST /api/llm.providers   {}                       → сверка
@@ -45,6 +46,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from http.cookiejar import CookieJar
 
 MANIFEST_DEFAULT = Path(__file__).resolve().parent.parent.parent / "config" / "provider-usage.json"
@@ -55,6 +57,16 @@ RESERVED_ROUTES = frozenset({"deepseek-official"})
 # Клиентский ROUTE_PATTERN плагина (plugins-src/provider-registry/server/index.js:90).
 ROUTE_PATTERN = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
 DEFAULT_CONTEXT_WINDOW = 131072
+# Явное клиентское имя для морды (#225, находитка ревью PR #1338): дефолтный
+# `Python-urllib/3.x` urllib.request фильтр Cloudflare перед мордой режет
+# 403'м text/plain «error code: 1010» ДО приложения — логин не дошёл бы вовсе,
+# а 403 выглядел бы как отказ ключа (живой прогон 35187895910). Своё имя
+# фильтр пропускает (проверено экспериментом #225). Заголовок ставится на
+# opener — летит и в логин, и в каждый RPC, без копии на каждый Request.
+# Сведение с scheduler.py::MORDE_USER_AGENT в общий scripts/lib — отдельная
+# задача из ревью PR #1338 (МАСШТАБ: отдельно), здесь тихо не дублируется.
+CLIENT_USER_AGENT = ("edge-harness-seed-registry/1.0 "
+                     "(+https://github.com/mytab0r/edge-harness)")
 
 
 class SeedError(RuntimeError):
@@ -145,6 +157,31 @@ def manifest_profiles(manifest: dict, chain_name: str | None = None) -> dict[str
     return profiles
 
 
+def describe_login_failure(code: int, content_type: str, body_head: str) -> str:
+    """Причина отказа логина — из данных, которые уже в руках (правило
+    «алерт не гадает», находитка ревью PR #1338): код + Content-Type + голова
+    тела различают причины тем же ответом, без нового запроса. Прод-формы —
+    docs/research/12-dsh-edge-session-api.md: фильтр CF — 403 text/plain
+    «error code: 1010» ДО приложения (ключ не проверялся); отказ ключа — 401
+    от приложения; чужой адрес — 404. Что не различимо — называется честным
+    пробелом, а не списком гипотез."""
+    body = (body_head or "").strip()
+    if code == 403 and "text/plain" in content_type and "error code: 1010" in body:
+        return ("запрос срезал фильтр Cloudflare по подписи клиента (403 "
+                "text/plain «error code: 1010») — ДО приложения, ключ не "
+                "проверялся и не виноват: HTTP-клиент морды обязан нести "
+                "явный User-Agent не-Python-urllib (#225, "
+                "docs/research/12-dsh-edge-session-api.md)")
+    if code == 401:
+        return ("ответ приложения: access-ключ отвергнут — проверь "
+                "secrets.DSH_EDGE_ACCESS_KEY")
+    if code == 404:
+        return ("пути /api/auth/login по этому адресу нет — проверь "
+                "DSH_EDGE_URL (должен указывать на морду dsh-edge)")
+    return (f"причину по этим данным установить нельзя (Content-Type: "
+            f"{content_type or 'не задан'}, тело: {body[:120]})")
+
+
 class MordaRpc:
     """RPC-конверт морды: POST /api/<method>. Кука владельца берётся тем же
     обменом access-ключа, что уже делает scripts/lib/dsh-edge-session.sh."""
@@ -153,27 +190,72 @@ class MordaRpc:
         self.origin = origin.rstrip("/")
         self.access_key = access_key
         self.timeout = timeout
+        # Редирект НЕ следуем (#1337): 303 — это успех логина, а не промежуточный
+        # шаг; поход на цель редиректа возвращал 403 и маскировал успех отказом.
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *_args, **_kwargs):
+                return None
+
         self.opener = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(CookieJar()))
+            urllib.request.HTTPCookieProcessor(CookieJar()), _NoRedirect())
+        self.opener.addheaders = [("User-Agent", CLIENT_USER_AGENT)]
 
     def login(self) -> None:
+        """Обмен access-ключа на куку владельца. Успех — РОВНО 303, и по
+        редиректу идти НЕЛЬЗЯ (#1337).
+
+        Эталон — `scripts/lib/dsh-edge-session.sh::dsh_edge_login`: `curl`
+        БЕЗ `-L`, `case "$code" in *303*`. Здесь тот же контракт, не своя
+        копия логики: редирект гасится обработчиком, 303 принимается как
+        успех, кука уже поставлена ответом логина (HTTPCookieProcessor
+        обрабатывает Set-Cookie до редирект-обработчика). 303 приходит
+        исключением HTTPError — с _NoRedirect нет обработчика по умолчанию,
+        который вернул бы ответ как успешный.
+
+        Отказ логина называет причину по данным ответа (describe_login_failure),
+        не списком гипотез: живой прогон 35187895910 винил ключ, который был
+        исправен, потому что текст называл причину вслепую."""
         body = urllib.parse.urlencode({"accessKey": self.access_key}).encode()
         req = urllib.request.Request(
             f"{self.origin}/api/auth/login", data=body,
             headers={"Content-Type": "application/x-www-form-urlencoded"})
         try:
-            # 303 — штатный ответ логина; opener сам идёт по редиректу.
-            self.opener.open(req, timeout=self.timeout).read()
+            response = self.opener.open(req, timeout=self.timeout)
+            code = response.getcode()
+            content_type = response.headers.get("Content-Type", "")
+            body_head = response.read(200).decode("utf-8", "replace")
         except urllib.error.HTTPError as error:
-            raise SeedError(
-                f"логин в морду отказан (HTTP {error.code}) — проверь "
-                "DSH_EDGE_ACCESS_KEY; значение ключа здесь намеренно не печатается") from error
+            code = error.code
+            content_type = error.headers.get("Content-Type", "")
+            body_head = error.read(200).decode("utf-8", "replace")
         except OSError as error:
             raise SeedError(f"морда недоступна по {self.origin}: {error}") from error
+        if code == 303:
+            return
+        # Значение ключа может попасть в тело чужого ответа (страницы ошибок
+        # иногда эхом возвращают запрос) — наружу идёт замаскированная форма.
+        if self.access_key:
+            body_head = body_head.replace(self.access_key, "…")
+        cause = describe_login_failure(code, content_type, body_head)
+        raise SeedError(f"логин в морду не дал 303 (HTTP {code}) — {cause}")
 
     def call(self, method: str, payload: dict) -> dict:
+        """RPC-метод морды. Тело — ТОЛЬКО в конверте `client-request`
+        ({type, rpcId, method, payload}), не голый payload: хост строит
+        RpcRequest из конверта, и тело без `type` он не разворачивает — живой
+        прогон 35330225676 отказал `settings.mutate` ровно поэтому
+        («for "undefined" must be an array of path ops»: payload не дошёл),
+        а `settings.describe` пережил то же нарушение случайно, потому что
+        ему аргументов не нужно. Эталон конверта — scripts/lib/
+        dsh-edge-session.sh::dsh_edge_rpc и docs/research/12-dsh-edge-session-api.md."""
         req = urllib.request.Request(
-            f"{self.origin}/api/{method}", data=json.dumps(payload).encode(),
+            f"{self.origin}/api/{method}",
+            data=json.dumps({
+                "type": "client-request",
+                "rpcId": f"seed-{uuid.uuid4().hex}",
+                "method": method,
+                "payload": payload,
+            }).encode(),
             headers={"Content-Type": "application/json"})
         try:
             raw = self.opener.open(req, timeout=self.timeout).read().decode()
