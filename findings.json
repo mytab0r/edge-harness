@@ -413,7 +413,25 @@
       "source_pr": 1206,
       "status": "open",
       "title": "status читает коммит замка двумя GET вместо одного"
+    },
+    {
+      "detail": "В `test_run_escalations_wip_gate_state_change_escalates_immediately` докстринг говорит «literal_false_zero перестаёт выполняться, потому что actual тоже упал в ноль», но второй сценарий — (claimed=0, actual=2): literal_false_zero остаётся True, реально переворачивается actual_closes_gate True→False (проверено прогоном: сигнатуры «False:True:True» → «False:False:True»), что инлайн-комментарий внутри того же теста называет верно. Поправь одну строку докстринга — тест закрепляет ровно этот случай, пусть и описание о нём же.",
+      "file": "scripts/orchestra/test_repo_invariants.py",
+      "id": 47,
+      "opened_at": "2026-09-18T15:02:15.287958+00:00",
+      "source_pr": 1263,
+      "status": "open",
+      "title": "докстринг теста про смену состояния называет не тот булевый, что реально переворачивается"
+    },
+    {
+      "detail": "`moment.timestamp()` для datetime без tzinfo интерпретирует момент как локальное время: один и тот же наивный `marker_at` даёт бакет 82837 при TZ=UTC и 82836 при TZ=Europe/Moscow (проверено прогоном) — дедуп-идентичность тихо поехала бы между CI и локальным прогоном. Все текущие вызовы несут tz-aware (прод: `parse_time(...).isoformat()`, тесты: `utc()`), так что сегодня ничего не сломано, но докстринг прямо зовёт другие `check_*` переиспользовать функцию, а живой прецедент записи в #120 вне CI уже был (#1074). Добавь громкий отказ на `moment.tzinfo is None` — одна строка закрывает класс.",
+      "file": "scripts/orchestra/repo_invariants.py",
+      "id": 48,
+      "opened_at": "2026-09-18T15:02:15.287958+00:00",
+      "source_pr": 1263,
+      "status": "open",
+      "title": "escalation_state_key молча принимает наивный datetime — ключ тогда зависит от пояса машины"
     }
   ],
-  "next_id": 47
+  "next_id": 49
 }
