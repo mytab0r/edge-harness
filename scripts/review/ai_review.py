@@ -172,6 +172,48 @@ _dc_spec.loader.exec_module(defect_classes)
 # форма это исключают.
 VERDICT_RE = re.compile(r"^(\*\*|__|)ВЕРДИКТ:\s*(approve|rework)\s*\.?\1$")
 
+def strip_fenced(text: str) -> str:
+    """Ответ без markdown-фенсов (``` … ```): в фенсах модель ЦИТИРУЕТ
+    контракт — примеры формата, разбор тестов парсера, сравнение вариантов, —
+    это разбор чужого текста, а не её решение. Считать маркеры вердикта и
+    РАЗМЕР нужно только вне фенсов (находка ai-ревью PR #1333, head 816405b:
+    цитата «ВЕРДИКТ: approve» в фенсе при отсутствии своей строки парсилась
+    как approve — измеренный класс «модель ответила, но своей строки нет»
+    превращался из громкого error в молчаливый ai:ok). Незакрытый фенс
+    прячет всё после открытия — намеренно в громкую сторону: маркеров ноль,
+    error, угадывания нет. Пара с FENCE_CLOSE_RE (фенсы задач в
+    комментариях), отдельная — потому что форма другая: в ответе это
+    обычные ```-фенсы markdown с языком или без."""
+    out: list[str] = []
+    inside = False
+    for line in (text or "").splitlines():
+        if line.lstrip().startswith("```"):
+            inside = not inside
+            continue
+        if not inside:
+            out.append(line)
+    return "\n".join(out)
+
+
+def verdict_shaped_anywhere(answer: str) -> bool:
+    """Есть ли в ответе маркер-ПОХОЖАЯ строка ГДЕ УГОДНО, включая цитаты
+    в фенсах. Это НЕ признак решения (решение считает verdict_marks) —
+    только для честной диагностики причины: «нет вовсе» и «есть, но только
+    в цитатах» лечатся одинаково, но называть цитату решением или говорить
+    «нет вообще», когда цитата видна, — вранье читателю (алерт не гадает)."""
+    lines = [line.strip() for line in (answer or "").splitlines() if line.strip()]
+    return any(VERDICT_RE.match(line) for line in lines)
+
+
+def verdict_marks(answer: str) -> list[str]:
+    """Строки вердикта РЕШЕНИЯ в ответе — вне фенсов; одно место подсчёта
+    для parse_verdict и диагностики verdict_line_present (класс #925: две
+    копии подсчёта расходятся молча)."""
+    lines = [line.strip() for line in strip_fenced(answer).splitlines()
+             if line.strip()]
+    return [m.group(2) for line in lines for m in [VERDICT_RE.match(line)] if m]
+
+
 # #1332, дефект 2: отказы ДО ответа модели (цепочка не дала ответа, дифф пуст,
 # транспорт) отличаются от нарушения контракта ОТВЕТА ровно этим префиксом —
 # одно место правды, а не подстрока, повторённая в семи ветках. Гвардия
@@ -313,9 +355,14 @@ def parse_verdict(answer: str) -> str:
     себе), ноль маркеров по-прежнему error (решения нет — угадывать его по
     прозе запрещено, «алерт не гадает»). Промпт по-прежнему просит ставить
     строку последней — это остаётся хорошей практикой чтения человеком, но
-    машина больше не отвергает ответ за её нарушение."""
-    lines = [line.strip() for line in (answer or "").splitlines() if line.strip()]
-    marks = [m.group(2) for line in lines for m in [VERDICT_RE.match(line)] if m]
+    машина больше не отвергает ответ за её нарушение.
+
+    ЦИТАТА маркера (в ```-фенсе — тест парсера, пример формата) решением не
+    считается: подсчёт идёт по strip_fenced/verdict_marks, иначе измеренный
+    класс «модель ответила, но своей строки нет» молча превращался бы в
+    чужой вердикт (находка ai-ревью PR #1333, head 816405b). Свой маркер,
+    завёрнутый моделью в фенс вопреки промпту, теперь error — громко."""
+    marks = verdict_marks(answer)
     if len(marks) == 1:
         return marks[0]
     return "error"
@@ -332,8 +379,11 @@ def parse_size_verdict(answer: str) -> tuple[str, str | None]:
     вместе с самим требованием позиции, #1332: теперь ОБА маркера ищутся по
     всему ответу и оба держатся единственностью) — ноль (строки нет) или
     несколько (модель сама себе противоречит) одинаково считаются 'missing':
-    неоднозначность не одобряет размер молча, как и у вердикта."""
-    lines = [line.strip() for line in (answer or "").splitlines() if line.strip()]
+    неоднозначность не одобряет размер молча, как и у вердикта. Цитаты
+    РАЗМЕР в фенсах не считаются — тот же strip_fenced, что у вердикта
+    (находка ai-ревью PR #1333, head 816405b)."""
+    lines = [line.strip() for line in strip_fenced(answer).splitlines()
+             if line.strip()]
     justified = [line for line in lines if SIZE_JUSTIFIED_RE.match(line)]
     bloated = [m for line in lines for m in [SIZE_BLOATED_RE.match(line)] if m]
     if len(justified) + len(bloated) != 1:
@@ -545,6 +595,13 @@ def error_reason(answer: str, dsh_rc: str, failure_reason: str = "",
     # делит на подпричины; текст для человека делит дальше.
     if verdict_line_present(answer):
         return "модель ответила, но строк «ВЕРДИКТ: …» несколько — модель противоречит сама себе"
+    if verdict_shaped_anywhere(answer):
+        # Цитата в фенсе — не решение (находка ai-ревью PR #1333,
+        # head 816405b): вердикта нет, но сказать «нет вообще» значило бы
+        # соврать про видимый в ответе текст.
+        return ("модель ответила, но своей строки «ВЕРДИКТ: …» нет — "
+                "похожие строки есть только в цитатах (фенсах) и решением "
+                "не считаются")
     return "модель ответила, но строки «ВЕРДИКТ: …» нет вообще"
 
 
@@ -598,13 +655,13 @@ def error_headline(reason: str) -> str:
 
 
 def verdict_line_present(answer: str) -> bool:
-    """Есть ли в ответе хоть одна строка, похожая на строку вердикта (в любом
-    количестве и с любым обрамлением) — используется только для диагностики:
-    различить «модель не написала вердикт вовсе» от «написала, но неоднозначно»
-    в сообщении об ошибке. На сам вердикт не влияет — граница контракта не
-    меняется, это чисто текст для человека."""
-    lines = [line.strip() for line in (answer or "").splitlines() if line.strip()]
-    return any(VERDICT_RE.match(line) for line in lines)
+    """Есть ли в ответе строка РЕШЕНИЯ (вне фенсов, в любом количестве) —
+    только диагностика: различить «модель не написала свой вердикт вовсе»
+    от «написала, но неоднозначно» в сообщении об ошибке. Считает тем же
+    verdict_marks, что parse_verdict (класс #925 — одна копия подсчёта):
+    цитата в фенсе присутствием решения не является, и диагностика не смеет
+    звать её «несколько»."""
+    return bool(verdict_marks(answer))
 
 
 def rework_without_findings(verdict: str, findings: str, tasks: list[dict],

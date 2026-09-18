@@ -46,7 +46,10 @@ AI_REVIEW_YML = Path(__file__).resolve().parents[2] / ".github" / "workflows" / 
     # 2026-09-16 выбросили КОРРЕКТНЫЙ вердикт (PR #1328, прогон 35155260819:
     # `ВЕРДИКТ: approve` первой строкой, следом разбор). Это прод-форма
     # ответа моделей цепочки: решение, затем мета-комментарий.
-    ("ВЕРДИКТ: approve\nИ ещё одна мысль...", "approve"),
+    # дословная форма живого случая PR #1328 (прогон 35155260819), как она
+    # сохранена в замере #1332: маркер первой строкой, следом разбор задачи
+    ("ВЕРДИКТ: approve\nPR #1328 корректно решает проблему из задачи #1322",
+     "approve"),
     # Единственность — НЕ снята: два маркера это противоречие модели себе.
     ("ВЕРДИКТ: approve\nразбор\nВЕРДИКТ: rework", "error"),
     # Маркер в середине длинной прозы — тоже принимается (позиции нет вовсе).
@@ -113,7 +116,9 @@ def test_parse_verdict(answer, expected):
     ("", False),
     # единственный маркер среди прозы — тоже «строка есть»; после #1332 такой
     # ответ вообще валидный approve и до диагностики error не доходит
-    ("ВЕРДИКТ: approve\nИ ещё одна мысль...", True),
+    # та же дословная форма живого случая PR #1328 (см. test_parse_verdict)
+    ("ВЕРДИКТ: approve\nPR #1328 корректно решает проблему из задачи #1322",
+     True),
     # два маркера — тоже «есть, но не разобрана»
     ("ВЕРДИКТ: rework\nВЕРДИКТ: approve", True),
     # markdown-обрамлённый маркер тоже считается «строка есть»
@@ -775,6 +780,35 @@ def test_every_pre_model_axis_is_recognized_as_never_happened(kwargs):
     reason = ai.error_reason("", "1", **kwargs)
     assert ai.review_never_happened(reason), (
         f"ветка отказа-до-модели не опознана: {reason}")
+
+
+def test_verdict_quoted_in_fence_is_not_a_decision():
+    """Находка ai-ревью PR #1333 (head 816405b), прод-форма: ревьюят тесты
+    ЭТОГО парсера — строки «ВЕРДИКТ: …» стоят в каждом параметризованном
+    кейсе и модель ЦИТИРУЕТ их в фенсах. Цитата без своей строки — это класс
+    «модель ответила, но своей строки нет» (5 из 11 отказов замера #1332) и
+    обязан оставаться ГРОМКИМ error, а не молчаливым чужим вердиктом."""
+    quoted = ("Разбор:\n\n```text\nВЕРДИКТ: approve\n```\n\n"
+              "Этот формат строк встречается в параметризованных тестах парсера.")
+    assert ai.parse_verdict(quoted) == "error", "цитата — не решение"
+    assert not ai.verdict_line_present(quoted)
+    assert ai.verdict_shaped_anywhere(quoted)
+    reason = ai.error_reason(quoted, "0")
+    assert "несколько" not in reason, reason       # цитата не «противоречие»
+    assert "нет вообще" not in reason, reason      # и не «нет вовсе» — она видна
+    # Своя строка + цитата — решение считается по своей строке
+    assert ai.parse_verdict(quoted + "\nВЕРДИКТ: rework") == "rework"
+    # Цитата чужого вердикта не переигрывает несогласие своей строки
+    two = quoted + "\nВЕРДИКТ: rework\nВЕРДИКТ: rework"
+    assert ai.parse_verdict(two) == "error"
+    # Симметрично для РАЗМЕР (#939): цитата без своей строки — missing
+    size_quoted = "```text\nРАЗМЕР: оправдан\n```"
+    assert ai.parse_size_verdict(size_quoted) == ("missing", None)
+    assert ai.size_judgment_missing(ai.size_missing_reason(10))  # связь классов
+    # Свой маркер, завёрнутый в фенс вопреки промпту, — error (громко)
+    assert ai.parse_verdict("```text\nВЕРДИКТ: approve\n```") == "error"
+    # Незакрытый фенс — в громкую сторону: error, не угадывание
+    assert ai.parse_verdict("```text\nВЕРДИКТ: approve\nи текст без закрытия") == "error"
 
 
 def test_size_missing_reason_gets_its_own_headline():
