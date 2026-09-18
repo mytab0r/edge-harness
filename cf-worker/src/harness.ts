@@ -160,6 +160,40 @@ const SCHEMA = [
      id      INTEGER PRIMARY KEY CHECK (id = 1),
      alerted INTEGER NOT NULL DEFAULT 0
    )`,
+  // Снимок наблюдаемого состояния задача/PR (#1287, orchestrator-core-v2,
+  // openspec/changes/orchestrator-core-v2/design.md §5, ходячий скелет —
+  // Этап 0 tasks.md). Пишет ТОЛЬКО реконсилятор (scripts/orchestra/
+  // scheduler.py, workflow orchestra.yml), читают остальные консьюмеры через
+  // GET /api/tasks-snapshot|/api/pr-snapshot. Ключ (repo, number) — design.md
+  // §1.5: снимок не привязан к одному репозиторию жёстко, хотя сегодня этот
+  // DO обслуживает ровно один (GH_REPO). stage — одна строка малого числа
+  // значений (design.md §2, is_terminal читается из STAGE_META на стороне
+  // клиента/сервера, не хранится битом здесь — терминальность атрибут
+  // ЗНАЧЕНИЯ stage, не отдельная колонка, которая могла бы разойтись с ним).
+  // flags_json — JSON-объект ортогональных булевых флагов с evidence
+  // (design.md §2.1/2.2) — не отдельные колонки на каждый флаг: набор флагов
+  // ещё не стабилен (проект, не финальная реализация), а миграция схемы на
+  // проде (ALTER TABLE) — риск, которого эта таблица с первого дня избегает.
+  // updated_ts — момент ПОСЛЕДНЕЙ записи (edge-triggered write, design.md
+  // §3.1): не тика, в который стадию ПЕРЕСЧИТАЛИ (это происходит каждый такт
+  // level-triggered чтением GitHub и не бьёт по CF-квоте), а тика, в который
+  // stage/flags РЕАЛЬНО изменились относительно уже сохранённой строки.
+  `CREATE TABLE IF NOT EXISTS task_snapshots (
+     repo       TEXT NOT NULL,
+     number     INTEGER NOT NULL,
+     stage      TEXT NOT NULL,
+     flags_json TEXT NOT NULL,
+     updated_ts INTEGER NOT NULL,
+     PRIMARY KEY (repo, number)
+   )`,
+  `CREATE TABLE IF NOT EXISTS pr_snapshots (
+     repo       TEXT NOT NULL,
+     number     INTEGER NOT NULL,
+     stage      TEXT NOT NULL,
+     flags_json TEXT NOT NULL,
+     updated_ts INTEGER NOT NULL,
+     PRIMARY KEY (repo, number)
+   )`,
 ];
 
 /**
@@ -227,6 +261,18 @@ export interface TaskRow {
   dispatch_ts: number | null;
   latency_ms: number | null;
   status: "queued" | "dispatched" | "running" | "done" | "failed";
+}
+
+/** Снимок наблюдаемого состояния задача/PR (#1287, orchestrator-core-v2,
+ *  design.md §2). flags — объект ортогональных булевых/строковых evidence-полей,
+ *  форма НЕ фиксирована здесь жёстко (проект, не финальная реализация) —
+ *  сервер хранит и отдаёт то, что прислал реконсилятор, не проверяет состав. */
+export interface EntitySnapshotRow {
+  repo: string;
+  number: number;
+  stage: string;
+  flags: Record<string, unknown>;
+  updated_ts: number;
 }
 
 /** Пульс оркестрации (#269): исход последней попытки alarm() дёрнуть orchestra.
@@ -858,6 +904,24 @@ export class Harness extends DurableObject<Env> {
     }
     if (route.name === "heartbeat") {
       return this.#postHeartbeat(request);
+    }
+    if (route.name === "taskSnapshots" && request.method === "GET") {
+      return this.#json({ task_snapshots: this.#listSnapshots("task_snapshots") });
+    }
+    if (route.name === "taskSnapshots" && request.method === "POST") {
+      return this.#postSnapshot("task_snapshots", request);
+    }
+    if (route.name === "taskSnapshot") {
+      return this.#getSnapshotByNumber("task_snapshots", url, matched.rest);
+    }
+    if (route.name === "prSnapshots" && request.method === "GET") {
+      return this.#json({ pr_snapshots: this.#listSnapshots("pr_snapshots") });
+    }
+    if (route.name === "prSnapshots" && request.method === "POST") {
+      return this.#postSnapshot("pr_snapshots", request);
+    }
+    if (route.name === "prSnapshot") {
+      return this.#getSnapshotByNumber("pr_snapshots", url, matched.rest);
     }
     if (route.name === "session" && request.method === "POST") {
       return this.#issueSession();
@@ -2030,6 +2094,106 @@ export class Harness extends DurableObject<Env> {
       this.#rows(this.#sql.exec("SELECT id FROM events WHERE task_id = ? AND seq = ?", taskId, seq))[0].id,
     );
     this.#broadcastEvent({ id, task_id: taskId, seq, ts: now, source: "system", kind, data });
+  }
+
+  // ── Снимок наблюдаемого состояния задача/PR (#1287, orchestrator-core-v2) ──────────
+  // Ходячий скелет (design.md §3.6/tasks.md Этап 0): пишет ТОЛЬКО реконсилятор
+  // (scripts/orchestra/scheduler.py), читают остальные консьюмеры GET-маршрутами.
+  // Обе таблицы (task_snapshots/pr_snapshots) устроены и обслуживаются одинаково —
+  // имя таблицы параметром, а не две почти одинаковые копии метода (тот же класс
+  // дублирования, ради закрытия которого существует этот проект).
+
+  #snapshotTableName(table: "task_snapshots" | "pr_snapshots"): "task_snapshots" | "pr_snapshots" {
+    // SQL-идентификатор таблицы нельзя параметризовать плейсхолдером (?),
+    // поэтому явная проверка по литеральному union вместо интерполяции
+    // произвольной строки — единственные два значения приходят из кода
+    // маршрутов выше (#route), не из тела запроса.
+    if (table !== "task_snapshots" && table !== "pr_snapshots") {
+      throw new ApiError(500, "internal", { detail: "unknown_snapshot_table" });
+    }
+    return table;
+  }
+
+  #listSnapshots(table: "task_snapshots" | "pr_snapshots"): EntitySnapshotRow[] {
+    const name = this.#snapshotTableName(table);
+    return this.#rows(
+      this.#sql.exec(
+        `SELECT repo, number, stage, flags_json, updated_ts FROM ${name} ORDER BY updated_ts DESC LIMIT ?`,
+        LIMITS.snapshotsListMax,
+      ),
+    ).map((row) => this.#snapshotRow(row));
+  }
+
+  #getSnapshotByNumber(table: "task_snapshots" | "pr_snapshots", url: URL, rest: string): Response {
+    const number = Number(rest);
+    if (!rest || !Number.isInteger(number)) {
+      throw new ApiError(400, "need_number", { detail: "путь обязан заканчиваться целым номером" });
+    }
+    const repo = url.searchParams.get("repo") || this.env.GH_REPO || "";
+    const name = this.#snapshotTableName(table);
+    const row = this.#rows(
+      this.#sql.exec(`SELECT repo, number, stage, flags_json, updated_ts FROM ${name} WHERE repo = ? AND number = ?`, repo, number),
+    )[0];
+    const key = table === "task_snapshots" ? "task_snapshot" : "pr_snapshot";
+    if (!row) throw new ApiError(404, "snapshot_not_found", { repo, number });
+    return this.#json({ [key]: this.#snapshotRow(row) });
+  }
+
+  /** POST — edge-triggered write (design.md §3.1/§3.4): один SELECT дешёвый по
+   *  rows_read сравнивает вычисленные stage/flags с уже сохранённой строкой;
+   *  UPSERT (rows_written) происходит ТОЛЬКО при расхождении. Слепая безусловная
+   *  запись каждый такт измеримо не проходит по аккаунтному бюджету CF Free
+   *  (design.md §3.3) — это не оптимизация, а условие, без которого проект не
+   *  укладывается в лимит. {written:false} — легальный, ожидаемый ответ (стадия
+   *  не изменилась), не ошибка. */
+  async #postSnapshot(table: "task_snapshots" | "pr_snapshots", request: Request): Promise<Response> {
+    const name = this.#snapshotTableName(table);
+    const body = await this.#readJson(request);
+    const repo = typeof body.repo === "string" && body.repo ? body.repo : this.env.GH_REPO;
+    const number = body.number;
+    const stage = body.stage;
+    if (!repo) throw new ApiError(400, "need_repo");
+    if (typeof number !== "number" || !Number.isInteger(number)) throw new ApiError(400, "need_number");
+    if (typeof stage !== "string" || !stage) throw new ApiError(400, "need_stage");
+    const flags = body.flags && typeof body.flags === "object" && !Array.isArray(body.flags) ? body.flags : {};
+    const flagsJson = JSON.stringify(flags);
+
+    const existing = this.#rows(
+      this.#sql.exec(`SELECT stage, flags_json FROM ${name} WHERE repo = ? AND number = ?`, repo, number),
+    )[0];
+    const unchanged = existing !== undefined && String(existing.stage) === stage && String(existing.flags_json) === flagsJson;
+    if (unchanged) {
+      return this.#json({ written: false, repo, number, stage, flags });
+    }
+
+    const now = Date.now();
+    this.#sql.exec(
+      `INSERT INTO ${name} (repo, number, stage, flags_json, updated_ts) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(repo, number) DO UPDATE SET stage = excluded.stage, flags_json = excluded.flags_json, updated_ts = excluded.updated_ts`,
+      repo,
+      number,
+      stage,
+      flagsJson,
+      now,
+    );
+    return this.#json({ written: true, repo, number, stage, flags, updated_ts: now }, { status: 201 });
+  }
+
+  #snapshotRow(row: Record<string, SqlStorageValue>): EntitySnapshotRow {
+    let flags: Record<string, unknown> = {};
+    try {
+      const parsed: unknown = JSON.parse(String(row.flags_json));
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) flags = parsed as Record<string, unknown>;
+    } catch {
+      flags = {};
+    }
+    return {
+      repo: String(row.repo),
+      number: Number(row.number),
+      stage: String(row.stage),
+      flags,
+      updated_ts: Number(row.updated_ts),
+    };
   }
 
   // ── Heartbeat ─────────────────────────────────────────────────────────────────────
