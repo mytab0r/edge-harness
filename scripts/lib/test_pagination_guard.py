@@ -136,6 +136,12 @@ ALLOWED_SINGLE_PAGE_CALLS = {
         "работы не будет (GitHub сериализует группу).",
     ("scripts/orchestra/scheduler.py", "worker_runs_active"):
         "явный `per_page=1` — запрошен только последний прогон, не список.",
+    ("scripts/orchestra/scheduler.py", "active_worker_runs"):
+        "тот же контракт, что worker_runs_active выше (issue #1032: единое "
+        "место правды фетча — список активных прогонов собран из ТЕХ ЖЕ "
+        "запросов `?status=…&per_page=1`, что и булев предикат): "
+        "concurrency-группа worker держит один активный прогон на "
+        "репозиторий, `per_page=1` запрашивает его и есть, листать нечего.",
     ("scripts/orchestra/scheduler.py", "_active_worker_run"):
         "тот же контракт, что worker_runs_active выше (#815, тот же запрос "
         "`?status=in_progress&per_page=1` — вынесенный из stalled_worker_runs в "

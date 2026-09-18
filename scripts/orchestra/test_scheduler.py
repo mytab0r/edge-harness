@@ -3195,6 +3195,9 @@ def test_dispatch_conflict_rework_silent_while_both_worker_slots_busy(monkeypatc
                 workflow_run_at_slot(33814313381, "in_progress", 1),
                 workflow_run_at_slot(33814313382, "in_progress", 2),
             ]},
+        # active_worker_runs (#1032, одно место правды фетча) читает ОБА статуса
+        # всегда: у сведённого к списку предиката больше нет раннего return на
+        # in_progress, поэтому queued-фетч доходит и при занятом воркере.
         "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
     })
     patch_gh(monkeypatch, fake)
@@ -6443,10 +6446,19 @@ def test_dispatch_worker_targets_free_slot_while_other_slot_queued(monkeypatch):
     # поставит второй прогон в ту же группу-слот в очередь. С двумя слотами
     # (#827) занятый слотом 1 queued-прогон не молчит весь dispatch — второй
     # слот свободен.
+    #
+    # created_at — относительно реального now, а не фиксированной датой (#1032):
+    # queued старше WORKER_STALL_MINUTES считается зависшим и слот НЕ занимает
+    # (тест ниже), поэтому фикстура с зашитой датой «постарела» бы сама и
+    # начала бы проверять не тот случай — dispatch ушёл бы в слот 1.
+    fresh_queued = workflow_run(33814313390, "queued")
+    fresh_queued["created_at"] = (
+        datetime.now(timezone.utc) - timedelta(minutes=5)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
     fake = FakeGh({
         "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
         "workflows/worker.yml/runs?status=queued": {
-            "workflow_runs": [workflow_run(33814313390, "queued")]},
+            "workflow_runs": [fresh_queued]},
         "graphql": graphql_pool_response([issue(89, assignees=())]),
         "workflows/worker.yml/dispatches": None,
     })
@@ -6475,6 +6487,33 @@ def test_dispatch_worker_silent_while_both_slots_queued_or_running(monkeypatch):
         f"👷 все {sch.WORKER_MAX_CONCURRENCY} слота воркера заняты — dispatch не нужен"]
     assert actions == []
     assert fake.mutating_calls() == []
+
+
+def test_dispatch_worker_proceeds_when_queued_run_is_stalled(monkeypatch):
+    """Газ queued-блока (находка ai-review PR #1033, круг 3): queued-прогон
+    старше WORKER_STALL_MINUTES (возраст по created_at — GitHub отдаёт его
+    и для ещё не стартовавшего прогона) — зависший, worker_runs_active
+    отвечает False, диспетчер НЕ блокируется бессрочно. Тот же класс #815
+    «зависший прогон не держит пул вечно», распространённый на queued.
+    Мутационное доказательство: верни `_run_is_stalled` только для
+    in_progress в active_worker_runs — тест краснеет (dispatch снова
+    молчит), свежий queued выше остаётся зелёным."""
+    stale_queued = workflow_run(33814313390, "queued")
+    stale_queued["created_at"] = (
+        datetime.now(timezone.utc) - timedelta(minutes=300)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    fake = FakeGh({
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {
+            "workflow_runs": [stale_queued]},
+        "workflows/worker.yml/dispatches": None,  # 204 без тела — прод-форма ответа dispatch
+    })
+    patch_gh(monkeypatch, fake)
+    observations, actions = sch.dispatch_worker(
+        REPO, [issue(89, assignees=())], wip_allowed=True, pulls=[])
+
+    assert observations != ["👷 воркер уже работает — dispatch не нужен"]
+    assert any("dispatch" in call for call in fake.mutating_calls())
 
 
 # ── Зависший (но по GH ещё in_progress) прогон worker.yml не блокирует пул

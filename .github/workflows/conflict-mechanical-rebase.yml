@@ -94,4 +94,15 @@ jobs:
         if: steps.quota.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GH_PIPELINE_PAT }}
-        run: python scripts/orchestra/mechanical_rebase.py
+        run: |
+          # pytest (issue #1032): верификация аддитивного слияния
+          # (additive_conflict_merge.try_resolve) гоняет pytest соседних
+          # test_*.py ПЕРЕД `git rebase --continue` — предустановка pytest на
+          # образе раннера не гарантирована, а «молча нет pytest» означало бы
+          # вечный отказ рычага (пусть и с печатаемой причиной). Провал
+          # установки НЕ роняет весь job: рычаг 1 (гейт/чистый ребейз) от
+          # pytest не зависит, а рычаг 2 откажет сам, напечатав причину
+          # (additive_conflict_merge._refuse).
+          python -m pip install --disable-pip-version-check --quiet pytest \
+            || echo "::warning::pytest недоступен для верификации аддитивного слияния (issue #1032) — оно будет отказывать с этой причиной, ребейз без конфликтов продолжит работать"
+          python scripts/orchestra/mechanical_rebase.py
