@@ -539,7 +539,16 @@
       "source_pr": 1033,
       "status": "open",
       "title": "грейс-порог описан как «молодой прогон без следа», а код блокирует любого молодого, след не читая"
+    },
+    {
+      "detail": "Последняя строка докстринга — «Запуск: python scripts/orchestra/apply_owner_decision.py --repo o/r --issue N --option M» — без env и `--signature` теперь гарантированно падает первыми двумя отказами. Выше в том же докстринге контракт описан верно, но строка быстрого запуска противоречит ему в одном файле; допиши в неё env + `--signature \"$(python3 -c '…compute_signature…')\"` или отсылку к разделу «Ручной запуск с ноута».",
+      "file": "scripts/orchestra/apply_owner_decision.py",
+      "id": 61,
+      "opened_at": "2026-09-18T17:01:45.512442+00:00",
+      "source_pr": 1254,
+      "status": "open",
+      "title": "докстринг apply_owner_decision.py кончается устаревшей строкой «Запуск:»"
     }
   ],
-  "next_id": 61
+  "next_id": 62
 }
