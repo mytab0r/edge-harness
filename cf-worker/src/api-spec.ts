@@ -62,6 +62,46 @@ const spec = {
       "summary": "Отметка живости рук {job_id, task_id?}. Первая отметка задачи фиксирует latency_ms."
     },
     {
+      "name": "taskSnapshots",
+      "path": "/api/tasks-snapshot",
+      "methods": [
+        "GET",
+        "POST"
+      ],
+      "auth": true,
+      "summary": "Снимок наблюдаемого состояния задач (#1287, orchestrator-core-v2, ходячий скелет). GET — список (LIMITS.snapshotsListMax строк, по updated_ts DESC). POST {repo, number, stage, flags} — пишет ТОЛЬКО реконсилятор (scripts/orchestra/scheduler.py); edge-triggered — запись в SQLite происходит только если stage/flags изменились относительно сохранённой строки (design.md §3.1/§3.4), ответ {written: boolean} различает оба случая явно."
+    },
+    {
+      "name": "taskSnapshot",
+      "path": "/api/tasks-snapshot/",
+      "methods": [
+        "GET"
+      ],
+      "auth": true,
+      "rest": true,
+      "summary": "Один снимок задачи по номеру (?repo= — иначе GH_REPO по умолчанию)."
+    },
+    {
+      "name": "prSnapshots",
+      "path": "/api/pr-snapshot",
+      "methods": [
+        "GET",
+        "POST"
+      ],
+      "auth": true,
+      "summary": "Снимок наблюдаемого состояния PR (#1287, orchestrator-core-v2, ходячий скелет) — тот же контракт, что taskSnapshots, для сущности PR."
+    },
+    {
+      "name": "prSnapshot",
+      "path": "/api/pr-snapshot/",
+      "methods": [
+        "GET"
+      ],
+      "auth": true,
+      "rest": true,
+      "summary": "Один снимок PR по номеру (?repo= — иначе GH_REPO по умолчанию)."
+    },
+    {
       "name": "session",
       "path": "/api/session",
       "methods": [

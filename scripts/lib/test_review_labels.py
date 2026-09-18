@@ -133,6 +133,33 @@ def test_merge_label_gate_still_closed_on_large_ok_without_ai_ok():
     assert "ai:ok" in reason
 
 
+# ── gate1_open (#1287, orchestrator-core-v2): формула вынесена из
+# merge_label_gate, чтобы build_observed_pr читал ту же функцию, не копию.
+
+
+def test_gate1_open_false_for_review_large_without_large_ok():
+    # Живой случай PR #1290 (мержится этим же change): review:large без
+    # review:large-ok — design.md §2.2 относит это к awaiting_gate1, не
+    # awaiting_gate2, хотя gate1_decided() для него уже true (#432).
+    assert review_labels.gate1_open(["review:large"]) is False
+
+
+def test_gate1_open_true_for_review_ok():
+    assert review_labels.gate1_open(["review:ok"]) is True
+
+
+def test_gate1_open_true_for_review_large_with_large_ok():
+    assert review_labels.gate1_open(["review:large", "review:large-ok"]) is True
+
+
+def test_gate1_open_matches_merge_label_gate_reason_boundary():
+    # gate1_open — ровно та ветка, которую merge_label_gate проверяет первой:
+    # если gate1_open лжёт, обе функции расходятся молча (класс #303/#432).
+    labels = ["review:large", "review:large-ok", "ai:ok"]
+    assert review_labels.gate1_open(labels) is True
+    assert review_labels.merge_label_gate(labels) is None
+
+
 def test_gate1_decided_accepts_label_name_set_and_dict_list():
     assert review_labels.gate1_decided([{"name": "review:large"}]) is True
     assert review_labels.gate1_decided({"review:ok"}) is True
