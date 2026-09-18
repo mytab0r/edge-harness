@@ -305,7 +305,16 @@
       "source_pr": 1299,
       "status": "open",
       "title": "слияние раньше #1290 оставит в main ссылки на несуществующую спеку"
+    },
+    {
+      "detail": "vitest-plugin 1.1.5 пинит wrangler 4.129.1, поэтому после бампа vitest-ворота остались на workerd 1.20260907.1, а `wrangler dev`/`deploy` — на 1.20260911.1 (см. `node_modules/workerd` против `node_modules/wrangler/node_modules/workerd` в lockfile). Чинить здесь нечего — но при следующем бампе `@cloudflare/vitest-plugin` ожидай переезда тестов на новый стек и возможных поздних красных, это хвост текущего бампа, а не регрессия того PR.",
+      "file": "cf-worker/package.json",
+      "id": 35,
+      "opened_at": "2026-09-18T05:46:45.023567+00:00",
+      "source_pr": 1357,
+      "status": "open",
+      "title": "тесты и канарейка после бампа едут на разных wrangler/workerd"
     }
   ],
-  "next_id": 35
+  "next_id": 36
 }
