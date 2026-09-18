@@ -24,6 +24,9 @@ import json
 import subprocess
 import sys
 import threading
+import urllib.error
+import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
@@ -31,16 +34,28 @@ import pytest
 SCRIPT = Path(__file__).resolve().parent / "seed_provider_registry.py"
 SECRET_VALUE = "sk-живой-ключ-который-не-должен-утечь-12345"
 
+_spec = importlib.util.spec_from_file_location("seed_provider_registry_under_test", SCRIPT)
+seed_module = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(seed_module)
+
 
 class FakeMorda:
-    """Морда в прод-форме: копит записанные профили, отдаёт их в describe."""
+    """Морда в прод-форме: копит записанные профили, отдаёт их в describe.
 
-    def __init__(self, *, namespace_mounted: bool = True, preset: dict | None = None):
+    Прод-форма здесь означает И фильтр Cloudflare перед приложением (#225):
+    запрос с библиотечным User-Agent режется до веток ниже. Зелёный тест —
+    значит клиент засева несёт явное собственное имя, а не то, что сервер
+    ест всё подряд."""
+
+    def __init__(self, *, namespace_mounted: bool = True, preset: dict | None = None,
+                 login_status: int = 303):
         self.namespace_mounted = namespace_mounted
         self.providers: dict = dict(preset or {})
         self.calls: list[tuple[str, dict]] = []
         self.credentials: dict[str, str] = {}
         self.redirect_target_hits = 0
+        self.login_status = login_status
+        self.login_user_agents: list[str] = []
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -71,8 +86,35 @@ class FakeMorda:
                 length = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(length).decode() if length else ""
                 method = self.path.rsplit("/", 1)[-1]
+                # Гвардия класса #225 — фильтр Cloudflare ПЕРЕД приложением:
+                # библиотечный User-Agent (дефолт urllib.request) режется
+                # 403'м text/plain «error code: 1010», до веток ниже запрос
+                # не доходит и в calls не попадает. Форма скопирована с живой
+                # морды (docs/research/12-dsh-edge-session-api.md).
+                if self.headers.get("User-Agent", "").startswith("Python-urllib"):
+                    body = b"error code: 1010"
+                    self.send_response(403)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 if method == "login":
+                    outer.login_user_agents.append(self.headers.get("User-Agent", ""))
                     outer.calls.append(("auth.login", {}))
+                    if outer.login_status != 303:
+                        # Прод-форма ответа приложения на неверный ключ:
+                        # 401 + конверт ошибки приложения (research/12:
+                        # «curl/8.x → 401 (ответ приложения)», ошибки
+                        # приложения — {ok:false,error}).
+                        payload = json.dumps({"ok": False, "error": {
+                            "code": "unauthorized", "message": "bad accessKey"}}).encode()
+                        self.send_response(outer.login_status)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(payload)))
+                        self.end_headers()
+                        self.wfile.write(payload)
+                        return
                     self.send_response(303)
                     self.send_header("Set-Cookie", "__Host-dsh_edge_owner=fake; Path=/")
                     self.send_header("Location", "/")
@@ -147,6 +189,64 @@ def test_login_does_not_follow_the_303_redirect(morda):
     assert morda.redirect_target_hits == 0, (
         "клиент пошёл по 303-редиректу — цель отвечает 403, и логин будет "
         "объявлен отказом, хотя он удался")
+
+
+def test_seed_carries_explicit_user_agent_past_cf_filter(morda):
+    """#225 (находитка ревью PR #1338): фильтр CF в фикстуре вооружён, значит
+    зелёный прогон означает, что клиент засева дошёл до приложения с явным
+    собственным именем, а не с дефолтным библиотечным Python-urllib."""
+    result = run_seed(morda.origin, extra_env={"DEEPSEEK_API_KEY": SECRET_VALUE})
+    assert result.returncode == 0, result.stderr
+    assert morda.login_user_agents, "логин не дошёл до морды"
+    assert not any(ua.startswith("Python-urllib") for ua in morda.login_user_agents), (
+        f"клиент засева шлёт дефолтный библиотечный UA: {morda.login_user_agents}")
+
+
+def test_cf_filter_in_fixture_bites_bare_python_urllib(morda):
+    """Контроль живости фильтра наоборот: голый urllib БЕЗ явного UA режется
+    403 «error code: 1010» ДО приложения — как живая Cloudflare перед мордой.
+    Доказывает, что предыдущий тест зелёный не потому, что сервер ест всё."""
+    data = urllib.parse.urlencode({"accessKey": "fake-access-key"}).encode()
+    req = urllib.request.Request(f"{morda.origin}/api/auth/login", data=data)
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        urllib.request.urlopen(req, timeout=5)
+    assert excinfo.value.code == 403
+    assert "error code: 1010" in excinfo.value.read().decode()
+    assert ("auth.login", {}) not in morda.calls, "фильтр пропустил запрос до приложения"
+
+
+def test_login_failure_message_names_the_real_cause():
+    """#1337, «алерт не гадает» (находитка ревью PR #1338): данные ответа
+    различают причину — фильтр CF, отказ ключа, неверный URL. Иначе владелец
+    снова ротирует рабочий ключ: так 403 от CF в прогоне 35187895910 был
+    прочитан как «проверь DSH_EDGE_ACCESS_KEY»."""
+    describe = seed_module.describe_login_failure
+    cf = describe(403, "text/plain", "error code: 1010")
+    assert "Cloudflare" in cf and "1010" in cf
+    assert "DSH_EDGE_ACCESS_KEY" not in cf, (
+        "фильтр CF стоит ДО приложения — ключ не проверялся, текст не вправе винить его")
+    key = describe(401, "application/json", '{"ok":false,"error":{}}')
+    assert "DSH_EDGE_ACCESS_KEY" in key, "401 — отказ ключа приложением, текст обязан это назвать"
+    url = describe(404, "application/json", "not found")
+    assert "DSH_EDGE_URL" in url
+    unknown = describe(500, "", "")
+    assert "нельзя" in unknown, "данных для причины нет — так и сказать, не перечислять гипотезы"
+
+
+def test_real_login_rejection_is_loud_and_writes_nothing():
+    """Критерий 2 задачи: на НАСТОЯЩЕМ отказе логина (морда ответила 401)
+    прогон красный, причина названа, в морду не записано ничего."""
+    server = FakeMorda(login_status=401)
+    try:
+        result = run_seed(server.origin)
+        assert result.returncode == 1, result.stderr
+        assert "не дал 303" in result.stderr
+        assert "DSH_EDGE_ACCESS_KEY" in result.stderr, (
+            "401 — это ответ приложения, отказ ключа: текст обязан назвать его")
+        assert server.mutated_routes() == [], "писал в морду мимо отказанного логина"
+        assert "fake-access-key" not in result.stderr, "значение ключа утекло в отказ"
+    finally:
+        server.stop()
 
 
 def test_second_run_is_noop(morda):
