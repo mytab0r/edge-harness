@@ -62,8 +62,13 @@ class FakeMorda:
             def log_message(self, *_args):  # тишина в выводе теста
                 pass
 
-            def _send(self, payload: dict, code: int = 200):
-                body = json.dumps(payload).encode()
+            def _send(self, result: dict, code: int = 200):
+                # Прод-форма ответа RPC — конверт server-response с эхом rpcId
+                # (docs/research/12-dsh-edge-session-api.md, dsh-edge/registry-
+                # integration/check.mjs читает .result из того же конверта).
+                body = json.dumps({"type": "server-response",
+                                   "rpcId": getattr(self, "_rpc_id", ""),
+                                   "result": result}).encode()
                 self.send_response(code)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
@@ -121,26 +126,45 @@ class FakeMorda:
                     self.send_header("Content-Length", "0")
                     self.end_headers()
                     return
-                payload = json.loads(raw or "{}")
+                # ПРОД-ФОРМА RPC (живой прогон 35330225676): тело — конверт
+                # client-request {type, rpcId, method, payload}; хост строит
+                # RpcRequest из конверта и голый payload НЕ разворачивает
+                # (settings.mutate отказал с «for "undefined"», payload не
+                # дошёл). Фикстура требует конверт так же — раньше она читала
+                # голый payload, то есть кормилась нашим пересказом, и девиация
+                # клиента была бы зелёной, как в живом прогоне.
+                try:
+                    envelope = json.loads(raw or "{}")
+                except json.JSONDecodeError:
+                    envelope = {}
+                if (envelope.get("type") != "client-request"
+                        or envelope.get("method") != method):
+                    self._rpc_id = str(envelope.get("rpcId") or "")
+                    return self._send({"ok": False, "error": {
+                        "code": "bad-request",
+                        "message": (f"ожидал конверт client-request c method={method!r}, "
+                                    f"получено type={envelope.get('type')!r}")}})
+                self._rpc_id = str(envelope.get("rpcId") or "")
+                payload = envelope.get("payload") or {}
                 outer.calls.append((method, payload))
                 if method == "settings.describe":
                     namespaces = [{"ns": "llm-pi-ai"}] if outer.namespace_mounted else []
-                    return self._send({"result": {"ok": True, "value": {
+                    return self._send({"ok": True, "value": {
                         "namespaces": namespaces, "writable": True,
-                        "settings": {"llm-pi-ai": {"providers": outer.providers}}}}})
+                        "settings": {"llm-pi-ai": {"providers": outer.providers}}}})
                 if method == "settings.mutate":
                     for op in payload.get("ops", []):
                         outer.providers[op["path"][1]] = op["value"]
-                    return self._send({"result": {"ok": True, "value": {}}})
+                    return self._send({"ok": True, "value": {}})
                 if method == "credentials.set":
                     outer.credentials[payload["ref"]] = payload["value"]
-                    return self._send({"result": {"ok": True, "value": {}}})
+                    return self._send({"ok": True, "value": {}})
                 if method == "llm.providers":
                     rows = [{"provider": route, "active": outer.providers[route]["apiKeyEnv"]
                              in outer.credentials, "settingsNs": "llm-pi-ai"}
                             for route in outer.providers]
-                    return self._send({"result": {"ok": True, "value": {"providers": rows}}})
-                return self._send({"result": {"ok": False, "error": {"message": f"нет метода {method}"}}})
+                    return self._send({"ok": True, "value": {"providers": rows}})
+                return self._send({"ok": False, "error": {"message": f"нет метода {method}"}})
 
         self.server = HTTPServer(("127.0.0.1", 0), Handler)
         self.origin = f"http://127.0.0.1:{self.server.server_port}"

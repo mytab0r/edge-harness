@@ -46,6 +46,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from http.cookiejar import CookieJar
 
 MANIFEST_DEFAULT = Path(__file__).resolve().parent.parent.parent / "config" / "provider-usage.json"
@@ -239,8 +240,22 @@ class MordaRpc:
         raise SeedError(f"логин в морду не дал 303 (HTTP {code}) — {cause}")
 
     def call(self, method: str, payload: dict) -> dict:
+        """RPC-метод морды. Тело — ТОЛЬКО в конверте `client-request`
+        ({type, rpcId, method, payload}), не голый payload: хост строит
+        RpcRequest из конверта, и тело без `type` он не разворачивает — живой
+        прогон 35330225676 отказал `settings.mutate` ровно поэтому
+        («for "undefined" must be an array of path ops»: payload не дошёл),
+        а `settings.describe` пережил то же нарушение случайно, потому что
+        ему аргументов не нужно. Эталон конверта — scripts/lib/
+        dsh-edge-session.sh::dsh_edge_rpc и docs/research/12-dsh-edge-session-api.md."""
         req = urllib.request.Request(
-            f"{self.origin}/api/{method}", data=json.dumps(payload).encode(),
+            f"{self.origin}/api/{method}",
+            data=json.dumps({
+                "type": "client-request",
+                "rpcId": f"seed-{uuid.uuid4().hex}",
+                "method": method,
+                "payload": payload,
+            }).encode(),
             headers={"Content-Type": "application/json"})
         try:
             raw = self.opener.open(req, timeout=self.timeout).read().decode()
