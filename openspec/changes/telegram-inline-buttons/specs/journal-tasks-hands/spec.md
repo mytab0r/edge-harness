@@ -64,8 +64,12 @@
 `repository_dispatch` (`event_type: owner-decision`, `GH_DISPATCH_TOKEN` —
 тот же секрет и роль, что у остального dispatch-пути морды, ADR 0008:
 Contents+Actions, без Issues) в тонкий job (`.github/workflows/
-owner-decision.yml`, только `issues: write` из `permissions`, `github.token`,
-без единого нового секрета), который оставляет комментарий первой строкой
+owner-decision.yml`, `issues: write` из `permissions`, `github.token`, плюс
+существующий секрет `TELEGRAM_WEBHOOK_SECRET` — MODIFIED 2026-09-17, PR
+#1254: ранее здесь было «без единого нового секрета»; job проверяет
+HMAC-подпись `client_payload` (#1251) ДО записи комментария, НОВЫЙ секрет
+не заводился, но существующий получил ВТОРУЮ роль, принятую явно — ADR 0014,
+«Изменение 2026-09-17»), который оставляет комментарий первой строкой
 «РЕШЕНИЕ: N» — тот же артефакт, что и ручной ответ владельца комментарием
 (#470/#471). Второй "apply"-путь не заводится: метку `waiting:owner`
 снимает гвардия `scripts/orchestra/waiting_owner_guard.py` (#470/#471) на
