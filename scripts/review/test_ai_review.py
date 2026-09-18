@@ -777,6 +777,33 @@ def test_every_pre_model_axis_is_recognized_as_never_happened(kwargs):
         f"ветка отказа-до-модели не опознана: {reason}")
 
 
+def test_size_missing_reason_gets_its_own_headline():
+    """#1332, третий класс шапки (находка ai-ревью PR #1333, head 7804149):
+    причина «гигантский дифф без строки РАЗМЕР» (#939) печаталась под шапкой
+    «ответ не соответствует контракту вердикта», хотя контракт ВЕРДИКТ здесь
+    выполнен — вердикт-строка единственная, модель ответила. Причина берётся
+    ИЗ РЕАЛЬНОГО источника (size_missing_reason — тот же вызов, что в
+    cmd_verdict), не из пересказа. Три класса шапки различимы попарно."""
+    reason = ai.size_missing_reason(ai.check_pr.LARGE_DIFF_HUGE_LINES + 1)
+    assert ai.size_judgment_missing(reason), reason
+    assert not ai.review_never_happened(reason), reason
+    headline = ai.error_headline(reason)
+    assert "контракту вердикта" not in headline, (
+        "РАЗМЕР-класс не смеет печататься под шапкой контракта ВЕРДИКТ")
+    chain = ai.error_reason("", "1")
+    contract = "модель ответила, но строки «ВЕРДИКТ: …» нет вообще"
+    heads = {ai.error_headline(chain), ai.error_headline(contract), headline}
+    assert len(heads) == 3, heads
+
+
+def test_size_missing_headline_not_duplicated_with_reason_prefix():
+    # Причина size-класса начинается со СВОЕГО префикса; шапка не повторяет
+    # его начало (тот же класс дублирования, что найден у до-модельной шапки).
+    reason = ai.size_missing_reason(ai.check_pr.LARGE_DIFF_HUGE_LINES + 1)
+    assert not ai.error_headline(reason).startswith(
+        ai.SIZE_JUDGMENT_MISSING_PREFIX)
+
+
 def test_error_reason_transport_failure_wins_over_line_check():
     # rc≠0 обязан побеждать даже если в пустом/мусорном ответе случайно есть
     # что-то похожее на строку вердикта — транспорт упал раньше любого текста.
@@ -2300,7 +2327,7 @@ def test_cmd_verdict_huge_diff_bloated_size_becomes_rework_naming_files(monkeypa
     assert "vendor/lodash.min.js" in body
 
 
-def test_cmd_verdict_huge_diff_missing_size_verdict_is_contract_violation(monkeypatch, tmp_path):
+def test_cmd_verdict_huge_diff_missing_size_verdict_is_contract_violation(monkeypatch, tmp_path, capsys):
     """Модель одобрила гигантский дифф (approve), но не дала суждения о
     размере вовсе — нарушение контракта (тот же класс, что пустой rework,
     #210): verdict уходит как error/ai:failed, а не тихий ai:ok.
@@ -2324,6 +2351,14 @@ def test_cmd_verdict_huge_diff_missing_size_verdict_is_contract_violation(monkey
     assert f"labels[]={ai.AI_FAILED}" in joined
     assert f"labels[]={ai.AI_OK}" not in joined
     assert f"labels[]={rl.LARGE_OK}" not in joined
+    # Шапка ::error:: называет РАЗМЕР-класс, не контракт ВЕРДИКТ (находка
+    # ai-ревью PR #1333, head 7804149): печатается на реальной строке причины
+    # из cmd_verdict, а не на пересказе.
+    printed = capsys.readouterr().out
+    error_line = next(l for l in printed.splitlines() if l.startswith("::error::"))
+    assert "контракту строки РАЗМЕР" in error_line, error_line
+    assert "контракту вердикта" not in error_line, error_line
+    assert ai.size_missing_reason(added) in error_line, error_line
 
 
 def test_cmd_verdict_empty_rework_prod_form_becomes_error_not_changes_requested(monkeypatch, tmp_path):
