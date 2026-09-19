@@ -122,6 +122,12 @@ set -euo pipefail
 die() { echo "::error::$*" >&2; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# HTTP с телом отказа (#1371/#1373) — одно место правды на печать причины.
+# Подключается ЯВНО, хотя dsh-edge-session.sh ниже тянет ту же библиотеку:
+# полагаться на транзитивный сёрс значит сломаться молча, если тот порядок
+# когда-нибудь изменят. Повторный сёрс безвреден — файл только определяет.
+# shellcheck source=scripts/lib/canary_http.sh
+source "$SCRIPT_DIR/../lib/canary_http.sh"
 # Пины DSH, integrity, GLM-патч профиля, redact — единственное место правды в lib.
 # shellcheck source=scripts/lib/dsh-ci.sh
 source "$SCRIPT_DIR/../lib/dsh-ci.sh"
@@ -242,7 +248,14 @@ telegram_report() { # $1 — текст (динамические части —
     echo "::warning::TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID не заданы — Telegram-отчёт не отправлен"
     return 1
   fi
-  if ! curl -fsS --max-time 30 -X POST \
+  # Уровень warning: комментарий в задаче остаётся местом правды, отказ
+  # Telegram не фатален (см. сообщение ниже). Тело ответа при этом печатается:
+  # Telegram отвечает осмысленным JSON («chat not found», «message is too
+  # long»), и раньше эта причина выбрасывалась флагом -f (#1371/#1373).
+  # Токен в URL в печать не попадает: библиотека печатает метку, код и тело,
+  # а не аргументы вызова.
+  if ! CANARY_ERROR_LEVEL=warning canary_http "Telegram sendMessage" \
+      --max-time 30 -X POST \
       "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
       --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
       --data-urlencode "parse_mode=HTML" \
@@ -505,11 +518,16 @@ if [ -n "${HANDS_TOKEN:-}" ] && [ -n "${HARNESS_URL:-}" ]; then
   (
     while :; do
       sleep "${HEARTBEAT_SECS:-60}"
-      curl -fsS --max-time 20 -X POST "$HARNESS_URL/api/heartbeat" \
+      # Уровень warning: heartbeat повторяется каждые HEARTBEAT_SECS, отказ
+      # одного такта не фатален. Тело печатается — раньше и код, и причина
+      # уходили в /dev/null, и «журнал лежит» было неотличимо от «токен
+      # протух» (#1371/#1373).
+      CANARY_ERROR_LEVEL=warning canary_http "Heartbeat журнала" \
+        --max-time 20 -X POST "$HARNESS_URL/api/heartbeat" \
         -H "Authorization: Bearer $HANDS_TOKEN" \
         -H "content-type: application/json" \
         -d "{\"job_id\":\"worker-${GITHUB_RUN_ID:-local}\",\"task_id\":\"issue-$number\"}" \
-        >/dev/null 2>&1 || echo "::warning::heartbeat не принят журналом"
+        >/dev/null || echo "::warning::heartbeat не принят журналом"
     done
   ) &
   HB_PID=$!

@@ -48,6 +48,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# HTTP с телом отказа (#1371/#1373) — одно место правды на печать причины.
+# Подключается ЯВНО, а не транзитивно через dsh-edge-session.sh: порядок тех
+# сёрсов может измениться, и тогда обёртки api/api_post сломались бы молча.
+# shellcheck source=scripts/lib/canary_http.sh
+source "$SCRIPT_DIR/../lib/canary_http.sh"
 # Пины версий/целостности, установка и redact — единственное место правды:
 # scripts/lib/dsh-ci.sh (общее с автономным воркером).
 # shellcheck source=scripts/lib/dsh-ci.sh
@@ -106,13 +111,18 @@ SPOOL_FILE="$WORK/session-stream.ndjson"      # NDJSON-спул плагина d
 SEQ_FILE="$WORK/.seq"                         # журнал-seq — единственный владелец: bash (этот клиент)
 : >"$ANSWER_FILE"; : >"$ERR_FILE"; : >"$EVENTS_FILE"
 
+# HTTP — через общую библиотеку (#1371/#1373): отказ журнала обязан нести тело
+# ответа, а не один код. Уровень warning: обе обёртки зовутся внутри циклов
+# ретрая, итоговый отказ красит вызывающий код своим сообщением.
 api() {
-  curl -fsS --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIMEOUT" \
+  CANARY_ERROR_LEVEL=warning canary_http "Журнал GET" \
+    --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIMEOUT" \
     -H "Authorization: Bearer $HANDS_TOKEN" "$@"
 }
 api_post() {
   local path=$1 body=$2
-  curl -fsS --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIMEOUT" \
+  CANARY_ERROR_LEVEL=warning canary_http "Журнал POST $path" \
+    --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIMEOUT" \
     -X POST -H "Authorization: Bearer $HANDS_TOKEN" \
     -H "Content-Type: application/json" -d "$body" "$HANDS_URL$path"
 }

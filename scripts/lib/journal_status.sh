@@ -21,6 +21,11 @@
 #   HARNESS_URL  — база журнала (vars.HARNESS_URL)
 #   HANDS_TOKEN  — токен журнала (secrets.HANDS_TOKEN)
 
+# Путь от расположения ЭТОГО файла, а не от $GITHUB_WORKSPACE: обёртки статусов
+# зовутся и вне job'а, где такой переменной нет.
+# shellcheck source=canary_http.sh
+. "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/canary_http.sh"
+
 # Гвардия однократного сёрса: библиотека содержит только определения.
 journal_post_event() {
   : "${TASK_ID:?TASK_ID не задан}"
@@ -29,9 +34,17 @@ journal_post_event() {
   local source="${SOURCE:-deploy}"
   local final="${FINAL:-0}"
 
-  api() { curl -fsS -H "Authorization: Bearer $HANDS_TOKEN" "$@"; }
+  # HTTP — через общую библиотеку (#1371/#1373): отказ журнала обязан нести
+  # тело ответа. Уровень warning: обе обёртки зовутся внутри циклов ретрая,
+  # и ::error:: на повторяемой попытке заставил бы читателя гадать; итоговый
+  # отказ красит вызывающий код своим сообщением.
+  api() {
+    CANARY_ERROR_LEVEL=warning canary_http "Журнал GET" \
+      -H "Authorization: Bearer $HANDS_TOKEN" "$@"
+  }
   api_post() {
-    curl -fsS -X POST -H "Authorization: Bearer $HANDS_TOKEN" \
+    CANARY_ERROR_LEVEL=warning canary_http "Журнал POST $1" \
+      -X POST -H "Authorization: Bearer $HANDS_TOKEN" \
       -H "Content-Type: application/json" -d "$2" "$1"
   }
 
