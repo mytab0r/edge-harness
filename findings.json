@@ -665,7 +665,16 @@
       "source_pr": 1372,
       "status": "open",
       "title": "опрос session.history в канарейке runner-bridge красит зелёный деплой error-аннотациями"
+    },
+    {
+      "detail": "При CREATE_OUTCOME != success ветка ошибки DO достижима (issue_retry с устаревшим CAS даёт accepted:false), и тогда строка «Issue МОГЛА быть создана этим прогоном … проверь дубль» отправляет читателя искать дубль, которого не может быть, — outcome=failure печатается рядом, но данные, которые шаг и так читает, позволяют не гадать, а ветвить текст по CREATE_OUTCOME (или звать проверять дубль только при success).",
+      "file": ".github/workflows/inbox-issue.yml",
+      "id": 75,
+      "opened_at": "2026-09-19T15:42:14.491272+00:00",
+      "source_pr": 1382,
+      "status": "open",
+      "title": "второй ::error:: советует искать дубль issue и там, где issue заведомо не было"
     }
   ],
-  "next_id": 75
+  "next_id": 76
 }
