@@ -1689,7 +1689,7 @@ def edit_issue_comment(repo: str, comment_id: int, text: str) -> None:
     gh("-X", "PATCH", f"repos/{repo}/issues/comments/{comment_id}", "-f", "body=" + text)
 
 
-def send_telegram(text: str, as_html: bool = False, reply_markup: dict | None = None, chat_id: str | None = None) -> bool:
+def send_telegram(text: str, as_html: bool = False, reply_markup: dict | None = None) -> bool:
     """Best-effort: место правды — комментарий в задаче #120, Telegram — активный
     канал. Промах кричит warning'ом в лог, не молчит (см. WORKER-PLAYBOOK).
 
@@ -1705,10 +1705,7 @@ def send_telegram(text: str, as_html: bool = False, reply_markup: dict | None = 
 
     reply_markup (#254) — инлайн-клавиатура решения владельца (см.
     build_decision_keyboard); необязательна, обычные алерты её не передают —
-    сигнатура обратно совместима, поведение существующих вызовов не меняется.
-
-    chat_id — адрес доставки; по умолчанию TELEGRAM_CHAT_ID из окружения
-    (обратная совместимость с pulse_guard.escalate и WORKER-PLAYBOOK.md)."""
+    сигнатура обратно совместима, поведение существующих вызовов не меняется."""
     if not prod_writes_allowed():
         # Тот же класс, что gh() -X POST/PUT/PATCH/DELETE (2026-09-11, закрыт
         # безусловно issue #1074): вне GitHub Actions реальный алерт владельцу
@@ -1718,7 +1715,7 @@ def send_telegram(text: str, as_html: bool = False, reply_markup: dict | None = 
               "снимает этот запрет) — Telegram-сигнал пропущен", file=sys.stderr)
         return False
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat = chat_id or os.environ.get("TELEGRAM_CHAT_ID")
+    chat = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat:
         print("::warning::TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID не заданы — сигнал не отправлен",
               file=sys.stderr)

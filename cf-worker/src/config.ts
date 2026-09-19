@@ -173,9 +173,6 @@ export const GITHUB = {
    *  (.github/workflows/inbox-issue.yml, штатный github.token, ADR 0015:
    *  замена ADR 0011 — без отдельного секрета GH_ISSUES_TOKEN). */
   inboxIssueEventType: "inbox-issue",
-  /** event_type для repository_dispatch сообщения владельца → оркестратор
-   *  (.github/workflows/orchestrator-message.yml, GH_DISPATCH_TOKEN). */
-  orchestratorMessageEventType: "harness-message",
 } as const;
 
 /** Инлайн-кнопки решения владельца в Telegram (#254). callback_data ограничен
