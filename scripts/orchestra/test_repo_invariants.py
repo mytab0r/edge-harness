@@ -4092,6 +4092,35 @@ def test_check_pipeline_status_marker_impersonation_silent_on_genuine_bot_only()
         [_GENUINE_BOT_WIP_OPEN_COMMENT]) == []
 
 
+def test_check_pipeline_status_marker_impersonation_flags_foreign_app(monkeypatch):
+    """Третий канал публикации — непустое, но ЧУЖОЕ приложение (#1389).
+
+    Почему тест нужен именно здесь, а не только у предиката: инвариант 18 —
+    ЕДИНСТВЕННЫЙ потребитель, ради которого сужение делалось, и его покрытие
+    было слепым — все существующие случаи здесь про `None` и про
+    `github-actions`. Мутация это показала: откат делегирования обратно к
+    `performed_via_github_app is not None` оставлял десять тестов инварианта
+    ЗЕЛЁНЫМИ (исполнено ai-ревью PR #1390). То есть слепота, ради которой
+    задача заведена, могла вернуться молча.
+
+    Фикстура — та же, что у test_pulse_guard (один источник, не вторая
+    копия живого ответа): issuecomment-5744398934, `slug: "claude"`,
+    2026-09-19T18:35:45Z — ровно тот маркер «0 < 12», чью ложность в ту же
+    минуту доказал инвариант 16 независимым пересчётом (21)."""
+    foreign = json.loads(
+        (_DIR / "fixtures_issue120_foreign_app_wip_close_marker.json")
+        .read_text(encoding="utf-8"))
+    assert foreign["performed_via_github_app"]["slug"] != "github-actions", (
+        "фикстура обязана нести ЧУЖОЕ приложение — иначе тест проверяет не то")
+
+    violations = ri.check_pipeline_status_marker_impersonation(
+        [_GENUINE_BOT_WIP_OPEN_COMMENT, foreign])
+
+    assert [v["id"] for v in violations] == [5744398934], (
+        "маркер чужого приложения обязан быть нарушением, а честный маркер "
+        f"job'а — нет: {violations!r}")
+
+
 def test_check_pipeline_status_marker_impersonation_ignores_unrelated_user_comment():
     """Комментарий человека БЕЗ маркера семейства «статус конвейера» (обычное
     обсуждение) не должен считаться нарушением, даже если автор — не job:

@@ -1558,31 +1558,62 @@ def _marker_present(marker: str, body: str) -> bool:
     return re.search(pattern, body) is not None
 
 
+# Приложение штатного `GITHUB_TOKEN` job'а. Сравнение по `slug`, а не по `id`
+# (15368): slug читается человеком в логе отказа, а id пришлось бы сверять с
+# документацией — при одинаковой устойчивости выигрывает читаемость. Константа
+# одна на модуль, чтобы «доверенный токен» не размножился литералами.
+GITHUB_ACTIONS_APP_SLUG = "github-actions"
+
+
 def comment_is_job_authored(comment: dict) -> bool:
-    """True — комментарий опубликован токеном job'а (`performed_via_github_app`
-    непустой), не личным PAT (issue #1242, доводка #1101/#1074, AGENTS.md
-    «Атрибуция событий»: различение по ТОКЕНУ, не по логину/личности автора —
-    тот же приём, что уже использует `repo_invariants.
-    check_pipeline_status_marker_impersonation`, инвариант 18).
+    """True — комментарий опубликован токеном job'а (приложение
+    `github-actions`), не личным PAT и не посторонним GitHub App (issue #1242,
+    доводка #1101/#1074/#1389, AGENTS.md «Атрибуция событий»: различение по
+    ТОКЕНУ, не по логину/личности автора — тот же приём, что использует
+    `repo_invariants.check_pipeline_status_marker_impersonation`, инвариант 18).
+
+    **Правка #1389 — третий случай, которого не было в этом рассуждении.**
+    Прежняя редакция считала доверенным ЛЮБОЙ непустой
+    `performed_via_github_app`, потому что живые формы знали ровно два
+    значения: приложение `github-actions` и `None` (личный PAT). Живой случай
+    2026-09-19 (#1386): маркер `✅ [статус конвейера: WIP-лимит снят] …0 < 12`,
+    ложность которого в ту же минуту доказал инвариант 16 независимым
+    пересчётом (21), пришёл третьим каналом —
+
+      {"id": 1236702, "slug": "claude", "owner": {"login": "anthropics"}}
+
+    то есть через сторонний GitHub App (Claude-Code-сессия, гонявшая
+    scheduler.py с прод-записями). Предикат отвечал «доверяй», и инвариант 18,
+    зовущий его же, оказался слеп ровно к той подделке, ради которой написан:
+    в прогоне 18:37 он сообщал «последний маркер не от job'а — 11:17:26Z»,
+    когда 18:33:41 и 18:35:45 уже лежали.
+
+    Почему сужение ничего не ломает — замер, а не рассуждение. Все 1682
+    комментария #120 разложены по сырому `performed_via_github_app`
+    (2026-09-19): `github-actions` — 1320, `None` (личный PAT) — 347,
+    `claude` — 15. Четвёртого канала в issue нет вовсе; из 680 маркеров
+    семейства `[статус конвейера:` — 331 / 337 / 12 соответственно.
 
     Почему не логин: `trusted_login` (см. ниже) сравнивает `user.login` с
     заданной строкой — работает, ПОКА единственный легитимный писатель
     аутентифицируется штатным `GITHUB_TOKEN` (тогда `user.login ==
     "github-actions[bot]"`). Но это НАДО знать заранее про каждого
-    конкретного писателя; сам REST-ответ несёт более прямой признак —
-    `performed_via_github_app` пусто ИМЕННО когда запрос ушёл под личным PAT,
-    независимо от того, где физически исполнялся код (внутри Actions или
-    локально: PAT остаётся PAT). Живые прод-формы (`gh api repos/mytab0r/
-    edge-harness/issues/120/comments`, 2026-09-14, issuecomment-5665006692 vs
-    issuecomment-5665003751):
+    конкретного писателя; сам REST-ответ несёт более прямой признак — какое
+    ИМЕННО приложение выпустило токен запроса, независимо от того, где
+    физически исполнялся код (внутри Actions или локально: PAT остаётся PAT,
+    чужой App остаётся чужим App). Живые прод-формы (`gh api repos/mytab0r/
+    edge-harness/issues/120/comments`, 2026-09-14 и 2026-09-19):
       честный маркер:  {"performed_via_github_app": {"slug": "github-actions", ...},
                          "user": {"login": "github-actions[bot]", "type": "Bot"}}
-      поддельный:      {"performed_via_github_app": None,
+      личный PAT:      {"performed_via_github_app": None,
                          "user": {"login": "mytab0r", "type": "User"}}
-    Замер того же дня по всей истории #120 (1137 комментариев,
-    `--paginate`): 907 с `performed_via_github_app.slug == "github-actions"`,
-    230 с `None` — split ровно по семейству токена, без промежуточных форм."""
-    return comment.get("performed_via_github_app") is not None
+      чужой App:       {"performed_via_github_app": {"slug": "claude", ...},
+                         "user": {"login": "mytab0r", "type": "User"}}
+    """
+    app = comment.get("performed_via_github_app")
+    if not isinstance(app, dict):
+        return False
+    return app.get("slug") == GITHUB_ACTIONS_APP_SLUG
 
 
 def issue_marker_times(
