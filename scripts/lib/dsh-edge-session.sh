@@ -18,7 +18,12 @@
 # Имена secret/var репозитория — те же: secrets.DSH_EDGE_ACCESS_KEY, vars.DSH_EDGE_URL.
 
 DSH_EDGE_WORKSPACE_PATH="/workspace/edge-harness"
-DSH_EDGE_CURL="curl -fsS --connect-timeout 5 --max-time 30"
+# HTTP — через общую библиотеку (#1371/#1373): отказ обязан нести ТЕЛО ответа,
+# а не один код. Путь от расположения ЭТОГО файла, а не от $GITHUB_WORKSPACE:
+# руки запускаются и вне job'а, где такой переменной нет.
+# shellcheck source=canary_http.sh
+. "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/canary_http.sh"
+DSH_EDGE_CURL_ARGS=(--connect-timeout 5 --max-time 30)
 # Потолки батча дрена: тело морды 1 MiB (MAX_HARNESS_INGEST_BODY_BYTES,
 # патч 0004) с запасом на конверт; ≤256 событий за батч (лимит маршрута).
 DSH_EDGE_BATCH=50
@@ -65,9 +70,14 @@ dsh_edge_login() { # обмен access-ключа на куку владельц
   for attempt in 1 2 3 4; do
     # Сетевой сбой может склеить «код + 000» в одном значении — распознаём
     # вхождение 303, а не равенство: строгое равенство ловит только чистый прогон.
-    code=$($DSH_EDGE_CURL -o /dev/null -w '%{http_code}' -c "$DSH_EDGE_CJAR" \
+    # Уровень warning: КАЖДАЯ попытка кроме последней — повторяемая, и
+    # ::error:: на ней заставил бы читателя гадать, сломалось ли что-то.
+    # Итоговый отказ после цикла остаётся error — он ниже.
+    code=$(CANARY_ERROR_LEVEL=warning canary_probe \
+      "Логин в морду (попытка $attempt/4)" 303 \
+      "${DSH_EDGE_CURL_ARGS[@]}" -c "$DSH_EDGE_CJAR" \
       -X POST "$DSH_EDGE_URL/api/auth/login" \
-      --data-urlencode "accessKey=$DSH_EDGE_ACCESS_KEY" 2>/dev/null || echo 000)
+      --data-urlencode "accessKey=$DSH_EDGE_ACCESS_KEY")
     case "$code" in *303*) break ;; esac
     echo "::warning::логин в морду не удался (HTTP $code), попытка $attempt/4" >&2
     sleep $((attempt * 2))
@@ -78,8 +88,10 @@ dsh_edge_login() { # обмен access-ключа на куку владельц
   esac
   local attempt
   for attempt in 1 2 3; do
-    if $DSH_EDGE_CURL -b "$DSH_EDGE_CJAR" "$DSH_EDGE_URL/api/auth/session" 2>/dev/null \
-        | grep -q '"authenticated":true'; then
+    if CANARY_ERROR_LEVEL=warning canary_http \
+        "Проверка куки владельца (попытка $attempt/3)" \
+        "${DSH_EDGE_CURL_ARGS[@]}" -b "$DSH_EDGE_CJAR" \
+        "$DSH_EDGE_URL/api/auth/session" | grep -q '"authenticated":true'; then
       return 0
     fi
     sleep $((attempt * 2))
@@ -96,8 +108,11 @@ dsh_edge_rpc() { # METHOD PAYLOAD_JSON → stdout: .result.value; fail loud по
     '{type:"client-request", rpcId:$rpcId, method:$method, payload:$payload}') \
     || { echo "::error::Не собрали RPC-конверт для $method (payload не JSON?)" >&2; return 1; }
   for attempt in 1 2 3; do
-    if response=$($DSH_EDGE_CURL -b "$DSH_EDGE_CJAR" -H 'content-type: application/json' \
-        -X POST "$DSH_EDGE_URL/api/$method" --data-binary "$body" 2>/dev/null); then
+    if response=$(CANARY_ERROR_LEVEL=warning canary_http \
+        "RPC $method (попытка $attempt/3)" \
+        "${DSH_EDGE_CURL_ARGS[@]}" -b "$DSH_EDGE_CJAR" \
+        -H 'content-type: application/json' \
+        -X POST "$DSH_EDGE_URL/api/$method" --data-binary "$body"); then
       if jq -e '.result.ok == true' <<<"$response" >/dev/null; then
         jq '.result.value' <<<"$response"
         return 0
@@ -177,31 +192,26 @@ dsh_edge_session_begin() { # SESSION_ID TITLE — создать/переисп�
 }
 
 dsh_edge_ingest() { # SESSION_ID SPOOL_LINES_FILE — батч строк спула → события морды
-  local session_id=$1 lines_file=$2 batch_file resp_file appended
+  local session_id=$1 lines_file=$2 batch_file
   dsh_edge_init || return 1
   [ -s "$lines_file" ] || return 0   # пустой батч — не ошибка
   batch_file="$WORK/dsh-edge.ingest.json"
   # redact — единственное место обезвреживания секретов на пути спула в морду.
   redact <"$lines_file" | jq -s '{events: [.[] | {type: .type, data: .data}]}' >"$batch_file" \
     || { echo "::error::Не собрали ingest-батч (jq по строкам спула)" >&2; return 1; }
-  # БЕЗ curl -f: отказ морды (404/409/413/500) должен доехать до лога job телом,
-  # а не «curl: (22) The requested URL returned error» без причины.
-  local http_code out appended resp_file="$WORK/dsh-edge.ingest.resp"
-  http_code=$(curl -sS --connect-timeout 5 --max-time 30 -o "$resp_file" -w '%{http_code}' \
+  # Раньше здесь жил рукописный разбор кода и тела — ВТОРАЯ копия того, что
+  # делает canary_http (#1371). Копия и библиотека расходятся молча, поэтому
+  # копия убрана, а не «улучшена»: одно место правды на печать тела отказа.
+  local response appended
+  response=$(canary_http "Ingest сессии $session_id" \
+    "${DSH_EDGE_CURL_ARGS[@]}" \
     -b "$DSH_EDGE_CJAR" -H 'content-type: application/json' \
     -X POST "$DSH_EDGE_URL/api/sessions/$session_id/ingest" \
-    --data-binary "@$batch_file" 2>"$WORK/dsh-edge.ingest.err") \
-    || { echo "::error::Ingest не дошёл до морды (curl): $(cat "$WORK/dsh-edge.ingest.err")" >&2; return 1; }
-  case "$http_code" in
-    2*) : ;;
-    *)
-      echo "::error::Ingest отклонён мордой (HTTP $http_code): $(cat "$resp_file" 2>/dev/null || echo "<нет тела>")" >&2
-      return 1 ;;
-  esac
-  appended=$(jq -r '.appended // empty' "$resp_file" 2>/dev/null) \
+    --data-binary "@$batch_file") || return 1
+  appended=$(jq -r '.appended // empty' <<<"$response" 2>/dev/null) \
     || appended=""
   if [ -z "$appended" ]; then
-    echo "::error::Ingest: морда ответила 2xx без appended: $(cat "$resp_file" 2>/dev/null || echo "<нет тела>")" >&2
+    echo "::error::Ingest: морда ответила 2xx без appended: ${response:-<нет тела>}" >&2
     return 1
   fi
   [ "$appended" -ge 1 ] \
@@ -210,14 +220,28 @@ dsh_edge_ingest() { # SESSION_ID SPOOL_LINES_FILE — батч строк спу
 
 dsh_edge_drain_batch() { # MODE LINES_FILE — один батч в морду; soft: одна попытка
   local mode=$1 lines=$2
-  if dsh_edge_ingest "${DSH_EDGE_SESSION_ID:?DSH_EDGE_SESSION_ID не задан}" "$lines"; then
+  # Уровень аннотации выбирает ВЫЗЫВАЮЩИЙ, потому что только он знает, будет
+  # ли ещё попытка: в hard-режиме их пять и итоговый ::error:: ниже, в soft —
+  # одна, и тогда отказ ingest'а и есть итог. ::error:: на повторяемой попытке
+  # заставлял бы читателя гадать, сломалось ли что-то (находка ai-ревью
+  # PR #1380; тот же расклад, что у обёрток журнала).
+  # Форма `if`, а не `[ … ] && level=warning`: у второй на ложном условии статус
+  # 1, и стоит ей однажды оказаться последней строкой функции — функция начнёт
+  # возвращать «отказ» на ровном месте. Проверено исполнением, что СЕЙЧАС
+  # `set -e` на ней не срывается (bash освобождает левую часть `&&`), так что
+  # это запас прочности, а не починка живого дефекта — сказано, чтобы читатель
+  # не принял одно за другое.
+  local level=error
+  if [ "$mode" = "hard" ]; then level=warning; fi
+  if CANARY_ERROR_LEVEL=$level \
+     dsh_edge_ingest "${DSH_EDGE_SESSION_ID:?DSH_EDGE_SESSION_ID не задан}" "$lines"; then
     return 0
   fi
   [ "$mode" = "hard" ] || return 1
   local attempt
   for attempt in 2 3 4 5; do
     sleep $((attempt * 2))
-    dsh_edge_ingest "$DSH_EDGE_SESSION_ID" "$lines" && return 0
+    CANARY_ERROR_LEVEL=warning dsh_edge_ingest "$DSH_EDGE_SESSION_ID" "$lines" && return 0
   done
   echo "::error::Морда не приняла батч транскрипта из 5 попыток — часть хода работы не доехала до морды" >&2
   return 1
@@ -299,7 +323,13 @@ dsh_edge_verify_transcript() { # SESSION_ID — прочитать событи�
   # отдаётся сразу, дальше соединение держится для живых событий — режем по
   # --max-time и разбираем то, что успело прийти (curl пишет в stdout по мере
   # получения, поэтому обрыв по таймауту не теряет уже присланные строки).
-  curl -sS --max-time 12 -b "$DSH_EDGE_CJAR" "$DSH_EDGE_URL/api/sessions/$session_id/events" 2>/dev/null \
+  # Почему здесь ГОЛЫЙ curl, а не canary_http (сказано вслух, а не умолчанием —
+  # находка ai-ревью PR #1380): canary_http копит тело в файл и выносит вердикт
+  # по коду, а этот вызов ЗАВЕДОМО обрывается по --max-time на открытом
+  # SSE-потоке и разбирает то, что успело прийти. Флага `-f` здесь нет, тело не
+  # выбрасывается; stderr тоже НЕ глушится — иначе «replay не разобран» ниже
+  # скрыл бы причину, ровно тот класс, ради которого написан #1371.
+  curl -sS --max-time 12 -b "$DSH_EDGE_CJAR" "$DSH_EDGE_URL/api/sessions/$session_id/events" \
     | sed -n 's/^data: //p' | jq -s '.' >"$events_file" 2>/dev/null
   if [ ! -s "$events_file" ] || ! jq -e 'type == "array"' "$events_file" >/dev/null 2>&1; then
     echo "::warning::Транскрипт-проверка (#131): replay сессии $session_id не разобран — проверка пропущена" >&2

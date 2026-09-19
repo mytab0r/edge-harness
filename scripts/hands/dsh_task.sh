@@ -48,6 +48,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# HTTP с телом отказа (#1371/#1373) — одно место правды на печать причины.
+# Подключается ЯВНО, а не транзитивно через dsh-edge-session.sh: порядок тех
+# сёрсов может измениться, и тогда обёртки api/api_post сломались бы молча.
+# shellcheck source=scripts/lib/canary_http.sh
+source "$SCRIPT_DIR/../lib/canary_http.sh"
 # Пины версий/целостности, установка и redact — единственное место правды:
 # scripts/lib/dsh-ci.sh (общее с автономным воркером).
 # shellcheck source=scripts/lib/dsh-ci.sh
@@ -106,13 +111,18 @@ SPOOL_FILE="$WORK/session-stream.ndjson"      # NDJSON-спул плагина d
 SEQ_FILE="$WORK/.seq"                         # журнал-seq — единственный владелец: bash (этот клиент)
 : >"$ANSWER_FILE"; : >"$ERR_FILE"; : >"$EVENTS_FILE"
 
+# HTTP — через общую библиотеку (#1371/#1373): отказ журнала обязан нести тело
+# ответа, а не один код. Уровень warning: обе обёртки зовутся внутри циклов
+# ретрая, итоговый отказ красит вызывающий код своим сообщением.
 api() {
-  curl -fsS --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIMEOUT" \
+  CANARY_ERROR_LEVEL=warning canary_http "Журнал GET" \
+    --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIMEOUT" \
     -H "Authorization: Bearer $HANDS_TOKEN" "$@"
 }
 api_post() {
   local path=$1 body=$2
-  curl -fsS --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIMEOUT" \
+  CANARY_ERROR_LEVEL=warning canary_http "Журнал POST $path" \
+    --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIMEOUT" \
     -X POST -H "Authorization: Bearer $HANDS_TOKEN" \
     -H "Content-Type: application/json" -d "$body" "$HANDS_URL$path"
 }
@@ -187,7 +197,14 @@ trap 'exit 143' TERM
 TASK_TEXT="${TASK_TEXT:-}"
 after=0
 while :; do
-  resp=$(api "$HANDS_URL/api/events?task_id=$TASK_ID&after=$after&limit=256")
+  # Посев seq — голый вызов без ретрая: отказ здесь фатален (дальше set -e
+  # уронит job), поэтому фатальность называется ЗДЕСЬ громко. Обёртка api
+  # остаётся warning: она зовётся и из мест, где отказ повторяем, и кричать
+  # за них она права не имеет (находка ai-ревью PR #1380).
+  resp=$(api "$HANDS_URL/api/events?task_id=$TASK_ID&after=$after&limit=256") || {
+    echo "::error::Посев seq из журнала не удался (код и тело ответа — строками выше): без него события задачи ушли бы с чужой нумерацией и перетёрли историю" >&2
+    exit 1
+  }
   n=$(jq '.events | length' <<<"$resp")
   if [ "$n" -eq 0 ]; then break; fi
   ms=$(jq '[.events[] | select(.source == "job") | .seq] | max // 0' <<<"$resp")
