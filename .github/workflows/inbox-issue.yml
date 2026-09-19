@@ -104,6 +104,22 @@ jobs:
             body=$(jq -n --argjson id "$MESSAGE_ID" --argjson ts "$CLAIMED_TS" --arg e "inbox-issue job: создание issue не удалось (outcome=$CREATE_OUTCOME)" \
               '{message_id: $id, claimed_ts: $ts, error: $e}')
           fi
-          curl -fsS --connect-timeout 10 --max-time 30 \
+          # HTTP через общую библиотеку (#1371/#1381): отказ DO обязан нести ТЕЛО.
+          # Прежний `curl -fsS` выбрасывал его, и «400 need_claimed_ts» приходил
+          # как «curl: (22) The requested URL returned error» — причина, которую
+          # DO назвал прямо, терялась по дороге.
+          source "$GITHUB_WORKSPACE/scripts/lib/canary_http.sh"
+          response=$(canary_http "Подтверждение issue-created" \
+            --connect-timeout 10 --max-time 30 \
             -X POST -H "Authorization: Bearer $HANDS_TOKEN" -H "Content-Type: application/json" \
-            -d "$body" "$HANDS_URL/api/messages/issue-created"
+            -d "$body" "$HANDS_URL/api/messages/issue-created")
+          # 2xx — ещё НЕ приём (#1381). Устаревший claimed_ts DO отвечает
+          # 200 + {"accepted": false}: чужая проходка уже увела сообщение, и
+          # запись этого job'а отброшена. Раньше шаг выходил нулём — issue
+          # создана, DO о ней не знает, дубль всплывёт позже и никто не свяжет
+          # его с этим прогоном. Молчать об этом нельзя.
+          if [ "$(jq -r '.accepted' <<<"$response")" != "true" ]; then
+            echo "::error::DO отклонил подтверждение (accepted != true): $response" >&2
+            echo "::error::Issue МОГЛА быть создана этим прогоном (outcome=$CREATE_OUTCOME, number=$ISSUE_NUMBER) — проверь дубль по сообщению $MESSAGE_ID: обычная причина в том, что ватчдог увёл сообщение другой проходке, и её claimed_ts новее нашего" >&2
+            exit 1
+          fi
