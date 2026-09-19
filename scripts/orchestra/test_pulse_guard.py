@@ -3252,3 +3252,34 @@ def test_stale_base_signatures_no_dead_strings():
         "awaiting conflict" not in signature
         for signature in pg.STALE_BASE_SIGNATURES
     )
+
+
+# ── #720: тело автозадачи failure-watch несёт объявление связи ──────────────
+
+
+def test_failure_watch_task_body_passes_declared_dependency_gate():
+    """failure_watch_task_body — единственное тело, которое failure_watch
+    передает create_pool_issue: обязано проходить НАСТОЯЩИЙ гейт, а строка
+    «БЛОКИРУЕТСЯ: ничем» обязана остаться последней непустой (после
+    HTML-комментария с отпечатком — его ищут поиском по телу, положение
+    не важно). Мутация: сними строку из failure_watch_task_body —
+    RuntimeError ДО сети, тест краснеет."""
+    pi_spec = importlib.util.spec_from_file_location(
+        "pool_issue_pulse_guard_gate", Path(__file__).with_name("..").resolve() / "lib" / "pool_issue.py")
+    pool_issue = importlib.util.module_from_spec(pi_spec)
+    pi_spec.loader.exec_module(pool_issue)
+
+    body = pg.failure_watch_task_body(
+        "worker.yml", "task", "факт отказа", "https://github.com/o/r/actions/runs/1",
+        "check:red:test", "шаг А, шаг Б")
+    calls = []
+
+    def fake_gh(*args):
+        calls.append(args)
+        return {"number": 999}
+
+    pool_issue.create_pool_issue(fake_gh, "o/r", "заголовок", body, ["task", "ci-failure"])
+    assert len(calls) == 1, "реальный гейт пропустил тело — объявление связи на месте"
+    body_arg = next(a for a in calls[0] if a.startswith("body="))
+    assert body_arg.rstrip().endswith("БЛОКИРУЕТСЯ: ничем")
+    assert "failure-fingerprint: check:red:test" in body_arg  # дедуп по отпечатку жив

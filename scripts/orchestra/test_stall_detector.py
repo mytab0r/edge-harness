@@ -806,3 +806,25 @@ def test_groom_runs_before_escalation_so_resolved_task_never_escalates(monkeypat
     assert any("#555" in line and "закрыт грумом" in line for line in groom_result)
     assert escalate_calls == []
     assert escalate_result == []
+# ── #720: тело автозадачи несёт машиночитаемое объявление связи ─────────────
+
+
+def test_create_task_body_passes_declared_dependency_gate(monkeypatch):
+    """create_task идет через НАСТОЯЩИЙ гейт create_pool_issue (мок только
+    транспорт): тело, отрендеренное _render_body, обязано нести объявление
+    связи. Мутация: сними строку «БЛОКИРУЕТСЯ: ничем» из _render_body —
+    create_pool_issue бросит RuntimeError ДО сети, тест краснеет."""
+    calls = []
+
+    def fake_gh(*args):
+        calls.append(args)
+        return {"number": 999}
+
+    patch_gh(monkeypatch, fake_gh)
+    number = sd.create_task(
+        REPO, "check:red:test", ["- `check:red:test` — красный чек"],
+        "https://github.com/o/r/actions/runs/1")
+    assert number == 999
+    assert len(calls) == 1, "реальный гейт пропустил тело — объявление связи на месте"
+    body_arg = next(a for a in calls[0] if a.startswith("body="))
+    assert "БЛОКИРУЕТСЯ: ничем" in body_arg

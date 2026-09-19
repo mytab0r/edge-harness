@@ -621,3 +621,26 @@ def test_scheduler_wraps_drift_failure_into_warning_line(monkeypatch):
 def test_scheduler_passes_drift_lines_through(monkeypatch):
     monkeypatch.setattr(sch, "upstream_drift_check", lambda repo: ["🚨 дрейф пина: …"])
     assert sch.upstream_drift_lines("mytab0r/edge-harness") == ["🚨 дрейф пина: …"]
+
+
+# ── #720: тело задачи бампа несёт машиночитаемое объявление связи ───────────
+
+
+def test_create_bump_issue_body_passes_declared_dependency_gate(monkeypatch):
+    """create_bump_issue зовёт пул через pulse_guard.gh — мок только транспорт,
+    гейт create_pool_issue НАСТОЯЩИЙ: тело обязано нести объявление связи.
+    Мутация: сними строку «БЛОКИРУЕТСЯ: ничем» из тела в create_bump_issue —
+    RuntimeError ДО сети, тест краснеет."""
+    calls = []
+
+    def fake_gh(*args):
+        calls.append(args)
+        return {"number": 999}
+
+    monkeypatch.setattr(pg, "gh", fake_gh)
+    monkeypatch.setattr(ud.pulse_guard, "gh", fake_gh)
+    number = ud.create_bump_issue("o/r", {"latest_tag": "dsh-edge-v0.9.0"})
+    assert number == 999
+    assert len(calls) == 1, "реальный гейт пропустил тело — объявление связи на месте"
+    body_arg = next(a for a in calls[0] if a.startswith("body="))
+    assert "БЛОКИРУЕТСЯ: ничем" in body_arg

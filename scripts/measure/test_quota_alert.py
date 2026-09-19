@@ -870,3 +870,40 @@ def test_create_task_mixed_candidates_prefers_same_resource(monkeypatch):
     assert number == 777
     assert len(posted) == 1
     assert "тот же ресурс" in posted[0][1]  # улика называет, почему получатель — своя задача
+
+
+# ── #720: тело автозадачи квоты несёт машиночитаемое объявление связи ──────
+
+
+def test_create_or_note_task_body_passes_declared_dependency_gate(monkeypatch):
+    """create_or_note_task — единственный создатель задач пула, идущий через
+    bash-обёртку scripts/gh/issue-create, а не через create_pool_issue, поэтому
+    он не виден grep'у по вызовам гейта (блокирующая находка ревью PR #804,
+    раунд 4). Тело, собранное f-строками, обязано проходить НАСТОЯЩИЙ гейт
+    create_pool_issue (мок только транспорта — тот же приём, что
+    test_stall_detector.py::test_create_task_body_passes_declared_dependency_gate).
+    Мутация: сними строку «БЛОКИРУЕТСЯ: ничем» из create_or_note_task —
+    гейт бросит RuntimeError ДО сети, тест краснеет."""
+    captured = {}
+
+    def fake_run(args, **_kw):
+        captured["args"] = list(args)
+        return _FakeResult(0, "https://github.com/mytab0r/edge-harness/issues/4244\n")
+
+    monkeypatch.setattr(qa.subprocess, "run", fake_run)
+    number, note = qa.create_or_note_task(REPO, "DO rows_read/сутки", "cf_do_rows_read_day",
+                                          7_487_640, 5_000_000, 149.8, 80.0)
+    assert number == 4244
+
+    body = captured["args"][captured["args"].index("--body") + 1]
+    pi_spec = importlib.util.spec_from_file_location(
+        "pool_issue_quota_gate", Path(__file__).with_name("..").resolve() / "lib" / "pool_issue.py")
+    pool_issue = importlib.util.module_from_spec(pi_spec)
+    pi_spec.loader.exec_module(pool_issue)
+
+    gh_calls = []
+    pool_issue.create_pool_issue(lambda *a: gh_calls.append(a) or {"number": 1},
+                                 REPO, "заголовок", body,
+                                 ["task", qa.AREA_PROCESS_LABEL])
+    assert len(gh_calls) == 1, "реальный гейт пропустил тело — объявление связи на месте"
+    assert body.rstrip().endswith("БЛОКИРУЕТСЯ: ничем")  # инлайн-форма — последней непустой строкой

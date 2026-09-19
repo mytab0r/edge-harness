@@ -10107,3 +10107,27 @@ def test_reap_stale_reaps_reassignment_after_failed_acceptance(monkeypatch):
 
     assert len(lines) == 1 and "просрочена" in lines[0]
     assert any(c.startswith(f"-X DELETE repos/{REPO}/issues/21/assignees") for c in fake.calls)
+
+
+# ── #720: тела автозадач планировщика несут объявление связи ────────────────
+
+
+def test_create_task_replacement_body_passes_declared_dependency_gate(monkeypatch):
+    """_create_task_replacement идет через НАСТОЯЩИЙ гейт create_pool_issue
+    (мок только транспорт): тело задачи-замены обязано нести объявление связи,
+    ПОСЛЕДНЕЙ строкой — поверх цитаты тела исходного PR (чужая строка
+    «БЛОКИРУЕТСЯ: …» в цитате не должна стать объявлением этой задачи).
+    Мутация: сними строку «БЛОКИРУЕТСЯ: ничем» из тела — RuntimeError ДО сети,
+    тест краснеет."""
+    calls = []
+
+    def fake_gh(*args):
+        calls.append(args)
+        return {"number": 999}
+
+    patch_gh(monkeypatch, fake_gh)
+    p = pull(439, ref="agent/431-old-task", pr_body="тело исходного PR")
+    assert sch._create_task_replacement(REPO, p, 431) == 999
+    assert len(calls) == 1, "реальный гейт пропустил тело — объявление связи на месте"
+    body_arg = next(a for a in calls[0] if a.startswith("body="))
+    assert body_arg.rstrip().endswith("БЛОКИРУЕТСЯ: ничем")

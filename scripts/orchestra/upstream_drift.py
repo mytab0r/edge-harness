@@ -373,6 +373,11 @@ def create_bump_issue(repo: str, decision: dict) -> int:
         "## Правила\n"
         "- [x] Я прочитал docs/research/30-rejected-alternatives.md и задача не из отвергнутых\n"
         "- [x] Критерий готовности проверяем по видимому результату\n"
+        "\n"
+        # #720: тело обязано нести машиночитаемое объявление связи, иначе
+        # create_pool_issue откажет ДО сетевого вызова. Бамп зависимостей
+        # не знает — явное «ничем», не пропуск.
+        "БЛОКИРУЕТСЯ: ничем\n"
     )
     created = pool_issue.create_pool_issue(
         pulse_guard.gh, repo, f"dsh-edge: пин апстрима отстаёт от {tag_name}", body,

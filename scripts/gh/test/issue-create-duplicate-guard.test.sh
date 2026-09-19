@@ -55,6 +55,11 @@ export PRIORITY_TOP_FIXTURE="$WORK/priority-fixture.json"
 echo '[]' >"$PRIORITY_TOP_FIXTURE"
 NOT_PROCESS_ACK=(--not-process-ack "не про приоритет, тест дедупа #566")
 
+# Валидное тело с объявлением связи (#720) — используется во всех случаях ниже
+VALID_BODY="### Чем блокируется
+ничем
+"
+
 cat >"$WORK/bin/gh" <<GHEOF
 #!/usr/bin/env bash
 if [ "\$1" = "repo" ] && [ "\$2" = "view" ]; then
@@ -95,7 +100,7 @@ note() { echo "$@"; }
 
 # ── случай 1: похожий заголовок, БЕЗ --confirm-not-duplicate — отказ ─────────
 rm -f "$MARKER" "$CREATED_BODY"
-if bash "$SCRIPT_SRC" --title "$TITLE_564" --body b --label task "${NOT_PROCESS_ACK[@]}" >"$WORK/out1" 2>"$WORK/err1"; then
+if bash "$SCRIPT_SRC" --title "$TITLE_564" --body "$VALID_BODY" --label task "${NOT_PROCESS_ACK[@]}" >"$WORK/out1" 2>"$WORK/err1"; then
   note "FAIL случай 1: похожий заголовок принят без --confirm-not-duplicate"; fail=1
 elif [ -f "$MARKER" ]; then
   note "FAIL случай 1: gh issue create был вызван, хотя похожая задача есть"; fail=1
@@ -107,7 +112,9 @@ fi
 
 # ── случай 2: похожий заголовок + --confirm-not-duplicate — принято, причина в теле ──
 rm -f "$MARKER" "$CREATED_BODY"
-if ! bash "$SCRIPT_SRC" --title "$TITLE_564" --body "исходное тело" --label task \
+# Тело с объявлением связи + исходное содержимое
+BODY_WITH_DEP="${VALID_BODY}исходное тело"
+if ! bash "$SCRIPT_SRC" --title "$TITLE_564" --body "$BODY_WITH_DEP" --label task \
     --confirm-not-duplicate "разные причины отказа, не дубль" "${NOT_PROCESS_ACK[@]}" >"$WORK/out2" 2>"$WORK/err2"; then
   note "FAIL случай 2: --confirm-not-duplicate отклонён"; cat "$WORK/err2"; fail=1
 elif [ ! -f "$MARKER" ]; then
@@ -124,13 +131,67 @@ fi
 
 # ── случай 3: непохожий заголовок — принято без всякого флага ───────────────
 rm -f "$MARKER" "$CREATED_BODY"
-if ! bash "$SCRIPT_SRC" --title "Совсем другая задача про докер-канарейку" --body b --label task \
+if ! bash "$SCRIPT_SRC" --title "Совсем другая задача про докер-канарейку" --body "$VALID_BODY" --label task \
     "${NOT_PROCESS_ACK[@]}" >"$WORK/out3" 2>"$WORK/err3"; then
   note "FAIL случай 3: непохожий заголовок отклонён"; cat "$WORK/err3"; fail=1
 elif [ ! -f "$MARKER" ]; then
   note "FAIL случай 3: gh issue create не вызван для непохожего заголовка"; fail=1
 else
   note "OK случай 3: непохожий заголовок принят без --confirm-not-duplicate"
+fi
+
+# ── случай 4: инлайн-объявление + --confirm-not-duplicate — объявление ───────
+# остаётся последней непустой строкой СОЗДАННОГО тела (#720, находка ревью
+# PR #804): футер дописывался после инлайн-строки, и созданная issue
+# объявление уже не несла, хотя гейт его только что потребовал.
+#
+# Мутация: верни в scripts/gh/issue-create голый конкат
+# `new_body="${body}${footer}"` вместо вызова pool_issue.py append-note —
+# последняя непустая строка созданного тела станет футером, случай 4
+# краснеет (rc=0, но объявление в созданном теле потеряно).
+rm -f "$MARKER" "$CREATED_BODY"
+INLINE_BODY="Тело задачи про докер-канарейку
+БЛОКИРУЕТСЯ: ничем"
+if ! bash "$SCRIPT_SRC" --title "$TITLE_564" --body "$INLINE_BODY" --label task \
+    --confirm-not-duplicate "разные причины отказа, не дубль" "${NOT_PROCESS_ACK[@]}" >"$WORK/out4" 2>"$WORK/err4"; then
+  note "FAIL случай 4: инлайн-объявление + --confirm-not-duplicate отклонено"; cat "$WORK/err4"; fail=1
+elif [ ! -f "$MARKER" ]; then
+  note "FAIL случай 4: gh issue create не вызван"; fail=1
+elif [ ! -f "$CREATED_BODY" ]; then
+  note "FAIL случай 4: созданное тело не захвачено фейковым gh"; fail=1
+else
+  last_line="$(grep -v '^[[:space:]]*$' "$CREATED_BODY" | tail -1)"
+  if [ "$last_line" != "БЛОКИРУЕТСЯ: ничем" ]; then
+    note "FAIL случай 4: инлайн-объявление не последняя непустая строка созданного тела (последняя: '$last_line')"; cat "$CREATED_BODY"; fail=1
+  elif ! grep -q "разные причины отказа, не дубль" "$CREATED_BODY"; then
+    note "FAIL случай 4: причина --confirm-not-duplicate потеряна при переносе"; cat "$CREATED_BODY"; fail=1
+  elif ! grep -q "562" "$CREATED_BODY"; then
+    note "FAIL случай 4: список кандидатов потерян при переносе"; cat "$CREATED_BODY"; fail=1
+  else
+    note "OK случай 4: футер добавлен, инлайн-объявление осталось последней строкой созданного тела"
+  fi
+fi
+
+# ── случай 5: --body-file с инлайн-объявлением + --confirm-not-duplicate ─────
+# та же гарантия для файлового слота тела (новый временный файл не теряет
+# перенос и убирается cleanup'ом).
+rm -f "$MARKER" "$CREATED_BODY"
+FILE_BODY="$WORK/body-input.txt"
+printf 'Тело из файла\nБЛОКИРУЕТСЯ: #562\n' >"$FILE_BODY"
+if ! bash "$SCRIPT_SRC" --title "$TITLE_564" --body-file "$FILE_BODY" --label task \
+    --confirm-not-duplicate "не дубль, file-слот" "${NOT_PROCESS_ACK[@]}" >"$WORK/out5" 2>"$WORK/err5"; then
+  note "FAIL случай 5: --body-file + --confirm-not-duplicate отклонено"; cat "$WORK/err5"; fail=1
+elif [ ! -f "$MARKER" ]; then
+  note "FAIL случай 5: gh issue create не вызван для file-слота"; fail=1
+else
+  last_line="$(grep -v '^[[:space:]]*$' "$CREATED_BODY" | tail -1)"
+  if [ "$last_line" != "БЛОКИРУЕТСЯ: #562" ]; then
+    note "FAIL случай 5: объявление не последняя строка созданного тела (последняя: '$last_line')"; cat "$CREATED_BODY"; fail=1
+  elif ! grep -q "не дубль, file-слот" "$CREATED_BODY"; then
+    note "FAIL случай 5: причина --confirm-not-duplicate потеряна в file-слоте"; cat "$CREATED_BODY"; fail=1
+  else
+    note "OK случай 5: file-слот — футер добавлен, объявление осталось последней строкой"
+  fi
 fi
 
 exit "$fail"
