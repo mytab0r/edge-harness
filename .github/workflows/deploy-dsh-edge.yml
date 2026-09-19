@@ -805,11 +805,13 @@ jobs:
           code=$(curl -s -o /dev/null -w "%{http_code}" -c "$jar" \
             -X POST "$base/api/auth/login" --data-urlencode "accessKey=$DSH_EDGE_ACCESS_KEY")
           [ "$code" = "303" ] || { echo "::error::Логин канарейки #119 не удался (HTTP $code)"; exit 1; }
+          source "$GITHUB_WORKSPACE/scripts/lib/canary_http.sh"
           rpc() {
             local method=$1 payload=$2
-            curl -fsS -b "$jar" -H 'content-type: application/json' \
+            canary_http "RPC $method канарейки #119" \
+              -b "$jar" -H 'content-type: application/json' \
               -X POST "$base/api/$method" -d "$payload" \
-              || { echo "::error::RPC $method канарейки #119 отклонён"; exit 1; }
+              || exit 1
           }
           ws=$(rpc workspace.create '{"type":"client-request","rpcId":"canary","method":"workspace.create","payload":{"path":"/workspace/edge-harness"}}' \
             | jq -r '.result.value.workspace.workspaceId')
@@ -822,10 +824,11 @@ jobs:
             '{"type":"turn/start","data":{"turn":1}}' \
             '{"type":"turn/end","data":{"turn":1,"reason":{"kind":"completed"}}}' \
             | jq -s '{events: .}' > "$RUNNER_TEMP/dsh-edge-canary-batch.json"
-          appended=$(curl -fsS -b "$jar" -H 'content-type: application/json' \
+          appended=$(canary_http "Ingest канарейки #119" \
+            -b "$jar" -H 'content-type: application/json' \
             -X POST "$base/api/sessions/$sid/ingest" \
             --data-binary "@$RUNNER_TEMP/dsh-edge-canary-batch.json" | jq ".appended") \
-            || { echo "::error::Ingest канарейки #119 упал"; exit 1; }
+            || exit 1
           [ "$appended" -ge 2 ] \
             || { echo "::error::Ingest канарейки #119 не принял батч (appended=$appended)"; exit 1; }
           rpc workspace.archiveSession '{"type":"client-request","rpcId":"canary","method":"workspace.archiveSession","payload":{"sessionId":"'"$sid"'"}}' >/dev/null
@@ -851,8 +854,10 @@ jobs:
           code=$(curl -s -o /dev/null -w "%{http_code}" -c "$jar" \
             -X POST "$base/api/auth/login" --data-urlencode "accessKey=$DSH_EDGE_ACCESS_KEY")
           [ "$code" = "303" ] || { echo "::error::Логин канарейки #378 не удался (HTTP $code)"; exit 1; }
+          source "$GITHUB_WORKSPACE/scripts/lib/canary_http.sh"
           rpc() {
-            curl -fsS -b "$jar" -H 'content-type: application/json' -H 'User-Agent: edge-harness-deploy-canary/1.0' \
+            canary_http "RPC $1 канарейки #378" \
+              -b "$jar" -H 'content-type: application/json' -H 'User-Agent: edge-harness-deploy-canary/1.0' \
               -X POST "$base/api/$1" -d "$2"
           }
           rpc settings.describe '{"type":"client-request","rpcId":"canary114","method":"settings.describe","payload":{}}' \
@@ -919,8 +924,10 @@ jobs:
           code=$(curl -s -o /dev/null -w "%{http_code}" -c "$jar" \
             -X POST "$base/api/auth/login" --data-urlencode "accessKey=$DSH_EDGE_ACCESS_KEY")
           [ "$code" = "303" ] || { echo "::error::Логин канарейки runner-bridge не удался (HTTP $code)"; exit 1; }
+          source "$GITHUB_WORKSPACE/scripts/lib/canary_http.sh"
           rpc() {
-            curl -fsS -b "$jar" -H 'content-type: application/json' -H 'User-Agent: edge-harness-deploy-canary/1.0' \
+            canary_http "RPC $1 канарейки runner-bridge" \
+              -b "$jar" -H 'content-type: application/json' -H 'User-Agent: edge-harness-deploy-canary/1.0' \
               -X POST "$base/api/$1" -d "$2"
           }
 
