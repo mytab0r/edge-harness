@@ -220,3 +220,46 @@ def test_probe_returns_000_and_says_so_when_there_was_no_http_answer():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+@pytest.mark.skipif(shutil.which("curl") is None, reason="curl недоступен в этой среде")
+def test_default_annotation_level_is_error(server):
+    """Умолчание — `::error::`: канарейка обязана быть громкой без всяких
+    настроек. Проверка нужна ровно потому, что уровень стал переменной:
+    опечатка в умолчании (`::warning::` вместо `::error::`) превратила бы
+    КАЖДУЮ канарейку в тихую, а красный job — в жёлтую строку лога."""
+    url = server(500, json.dumps(ERROR_BODY).encode("utf-8"))
+    result = run_canary(url)
+
+    assert "::error::" in result.stderr, result.stderr
+    assert "::warning::" not in result.stderr, result.stderr
+
+
+@pytest.mark.skipif(shutil.which("curl") is None, reason="curl недоступен в этой среде")
+def test_lowered_annotation_level_still_prints_the_body(server):
+    """Шаг «Снимок версии прода до деплоя» объявляет свой отказ НЕ фатальным
+    (газ назван: автооткат дальше откажется явно), поэтому печатает
+    `::warning::`. Понижение уровня не имеет права утаскивать за собой тело
+    ответа — иначе класс #1371 возвращается через чёрный ход: причина снова
+    известна шагу и снова не видна человеку."""
+    url = server(403, json.dumps(
+        {"success": False, "errors": [{"code": 10000, "message": "Authentication error"}]}
+    ).encode("utf-8"))
+    script = (
+        f'set -euo pipefail\n'
+        f'source "{LIB}"\n'
+        f'CANARY_ERROR_LEVEL=warning\n'
+        f'canary_http "Снимок версии прода до деплоя" "{url}" || true\n'
+    )
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                            encoding="utf-8")
+
+    assert "::warning::" in result.stderr, result.stderr
+    assert "::error::" not in result.stderr, (
+        "уровень объявлен warning — ни одной error-аннотации быть не должно: "
+        f"{result.stderr}"
+    )
+    assert "HTTP 403" in result.stderr, result.stderr
+    assert "Authentication error" in result.stderr, (
+        f"тело обязано печататься и на пониженном уровне: {result.stderr}"
+    )

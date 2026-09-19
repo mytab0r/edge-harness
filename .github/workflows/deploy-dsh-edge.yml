@@ -612,11 +612,17 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -o pipefail
-          http_code=$(curl -sS -o /tmp/pre-deploy-deployments.json -w '%{http_code}' \
+          source "$GITHUB_WORKSPACE/scripts/lib/canary_http.sh"
+          # Отказ ЭТОГО запроса не фатален и у него назван газ (см. комментарий
+          # шага выше), поэтому уровень аннотации — warning, а не error. Тело
+          # ответа при этом печатается: раньше причина отказа CF API лежала в
+          # файле и не попадала в лог ни при каком исходе (issue #1371).
+          CANARY_ERROR_LEVEL=warning
+          if ! canary_http "Снимок версии прода до деплоя" \
             -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/dsh-edge/deployments")
-          if [ "$http_code" != "200" ]; then
-            echo "::warning::Снимок версии до деплоя не удался (HTTP $http_code) — если канарейка дальше покраснеет, автооткат явно откажется, а не откатится не туда"
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/dsh-edge/deployments" \
+            > /tmp/pre-deploy-deployments.json; then
+            echo "::warning::Снимок версии до деплоя не удался (код и тело ответа — строками выше) — если канарейка дальше покраснеет, автооткат явно откажется, а не откатится не туда"
             exit 0
           fi
           version_id=$(jq -r '
