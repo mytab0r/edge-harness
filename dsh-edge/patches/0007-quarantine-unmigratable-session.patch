@@ -1,0 +1,141 @@
+diff --git a/apps/dsh-edge/src/do-session-persistence.ts b/apps/dsh-edge/src/do-session-persistence.ts
+index 1adbb33..783f83a 100644
+--- a/apps/dsh-edge/src/do-session-persistence.ts
++++ b/apps/dsh-edge/src/do-session-persistence.ts
+@@ -38,7 +38,10 @@ import {
+   type SessionPersistenceStatOptions,
+   type SessionStorageMetadata,
+ } from '@deepseek-ai/dsh-session-persistence'
+-import { sessionFormatCatalog } from '@deepseek-ai/dsh-session-format-catalog'
++import {
++  sessionFormatCatalog,
++  SessionFormatUnsupportedMigrationError,
++} from '@deepseek-ai/dsh-session-format-catalog'
+ import {
+   SessionTitleProviderId,
+   type SessionTitleEventData,
+@@ -1006,13 +1009,24 @@ export class DurableObjectSessionPersistence extends SessionPersistence {
+        FROM dsh_sessions WHERE version != ?`,
+       SESSION_FORMAT_VERSION,
+     ).toArray()
++    // HARNESS (#1376): declared out here so the quarantine write below runs on
++    // EVERY startup, including the empty case — a session that became readable
++    // again must stop being listed without anyone clearing a latch.
++    let quarantined: readonly QuarantinedSession[] = []
+     if (outdated.length > 0) {
+       // Validate every old log before the first migration write. Discard each
+       // artifact after preflight to avoid retaining all decoded histories at once.
+       // The second decode runs synchronously in the same transaction/snapshot.
+-      let legacy = 0
+-      for (const row of outdated) legacy += this.prepareMigration(row.id as SessionId, row)?.physicalRows ?? 0
+-      const rebuild = this.isEventTableRebuildCheaper(legacy)
++      const preflight = this.preflightOutdatedSessions(outdated)
++      const legacy = preflight.legacy
++      quarantined = preflight.quarantined
++      const refused = new Set(quarantined.map(entry => entry.id))
++      const migratable = outdated.filter(row => !refused.has(row.id))
++      // HARNESS (#1376): the rebuild path copies ONLY current-version rows into
++      // the new table and then drops the old one — a quarantined session's
++      // events would be erased by it. With a quarantine present the in-place
++      // path is the only one that keeps that log intact.
++      const rebuild = refused.size === 0 && this.isEventTableRebuildCheaper(legacy)
+       const target: EventTable = rebuild ? 'dsh_session_events_migrating' : 'dsh_session_events'
+       if (rebuild) {
+         this.createEventTable(target)
+@@ -1022,7 +1036,7 @@ export class DurableObjectSessionPersistence extends SessionPersistence {
+            WHERE s.version = ?`, SESSION_FORMAT_VERSION,
+         )
+       }
+-      for (const row of outdated) {
++      for (const row of migratable) {
+         this.migrateSession(row.id as SessionId, row, true, target)
+       }
+       if (rebuild) {
+@@ -1035,6 +1049,73 @@ export class DurableObjectSessionPersistence extends SessionPersistence {
+       SESSION_FORMAT_VERSION,
+       SESSION_FORMAT_VERSION,
+     )
++    this.recordQuarantinedSessions(quarantined)
++  }
++
++  /**
++   * HARNESS (#1376): preflight every outdated log, isolating the ones this build
++   * cannot read instead of letting one of them abort the whole startup upgrade.
++   *
++   * Upstream commits the upgrade as one transaction, and its own comment says an
++   * incompatible later session must roll back the earlier ones. For a harness
++   * whose morda IS the Durable Object that means a single historical log takes
++   * the entire interface down — every request 500s, the deploy canary reddens,
++   * the rollback returns the previous version (live case: deploy run
++   * 35441352792, `format v2 surface before first step cannot acquire a system
++   * head without changing chronology`).
++   *
++   * Only SessionFormatUnsupportedMigrationError is isolated. Corruption and
++   * malformed headers still abort startup: those mean damage, and turning damage
++   * into a silent skip is the silent-wrong this quarantine exists to avoid. The
++   * refused log is left exactly as stored — not migrated, not rewritten, not
++   * deleted.
++   */
++  private preflightOutdatedSessions(outdated: readonly HeaderRow[]): {
++    legacy: number
++    quarantined: readonly QuarantinedSession[]
++  } {
++    let legacy = 0
++    const quarantined: QuarantinedSession[] = []
++    for (const row of outdated) {
++      try {
++        legacy += this.prepareMigration(row.id as SessionId, row)?.physicalRows ?? 0
++      } catch (error) {
++        if (!(error instanceof SessionFormatUnsupportedMigrationError)) throw error
++        quarantined.push({ id: row.id, storedVersion: row.version, reason: error.message })
++        console.error(
++          `dsh-edge: session ${row.id} (stored format v${row.version}) cannot be migrated `
++          + `to v${SESSION_FORMAT_VERSION} and is quarantined as-is: ${error.message}`,
++        )
++      }
++    }
++    return { legacy, quarantined }
++  }
++
++  /**
++   * HARNESS (#1376): durable record of every session this build refused to
++   * migrate. The console.error above lands in Workers logs, which a deploy job
++   * cannot read back; this table is what an endpoint reports to the canary.
++   * Rewritten whole on every startup — an empty list clears it — so a session
++   * that becomes readable again simply stops being listed. That is the
++   * quarantine's gas: nothing to undo by hand, and no stale row outlives its
++   * cause.
++   */
++  private recordQuarantinedSessions(entries: readonly QuarantinedSession[]): void {
++    this.storage.sql.exec(`CREATE TABLE IF NOT EXISTS dsh_edge_quarantined_sessions (
++      id TEXT PRIMARY KEY,
++      stored_version INTEGER NOT NULL,
++      reason TEXT NOT NULL,
++      observed_at INTEGER NOT NULL
++    ) STRICT`)
++    this.storage.sql.exec('DELETE FROM dsh_edge_quarantined_sessions')
++    const now = Date.now()
++    for (const entry of entries) {
++      this.storage.sql.exec(
++        `INSERT INTO dsh_edge_quarantined_sessions (id, stored_version, reason, observed_at)
++         VALUES (?, ?, ?, ?)`,
++        entry.id, entry.storedVersion, entry.reason, now,
++      )
++    }
+   }
+ 
+   private isEventTableRebuildCheaper(legacy: number): boolean {
+@@ -1305,6 +1386,13 @@ export class DurableObjectSessionPersistence extends SessionPersistence {
+ 
+ type EventTable = 'dsh_session_events' | 'dsh_session_events_migrating'
+ 
++/** HARNESS (#1376): one session this build refused to migrate, and why. */
++interface QuarantinedSession {
++  readonly id: string
++  readonly storedVersion: number
++  readonly reason: string
++}
++
+ function revisionOf(storeIdentity: string, row: HeaderRow): PersistenceRevision {
+   return SessionPersistenceRevision(
+     `${storeIdentity}:incarnation:${row.incarnation}:revision:${row.revision}`,
