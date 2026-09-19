@@ -2965,7 +2965,8 @@ def check_frontend_deploy_stale(repo: str) -> dict:
 # следующий ложный close-маркер («0 < 12» от `mytab0r`) — в 07:49:24Z, 47
 # минут ПОСЛЕ мержа (см. issue #1101).
 #
-# Признак «не токен job'а» — `performed_via_github_app is None`, СЫРОЕ поле
+# Признак «не токен job'а» — `performed_via_github_app` не называет приложение
+# `github-actions`, СЫРОЕ поле
 # REST-ответа `GET .../issues/{n}/comments` (не `user.login`: чужой логин
 # совпадает и у легитимного ручного обсуждения человеком в этом же issue,
 # не только у поддельного маркера — судить нужно о ТОКЕНЕ публикации, не о
@@ -2974,10 +2975,16 @@ def check_frontend_deploy_stale(repo: str) -> dict:
 # фильтры чтения маркеров в conveyor_gate/resume_series_by_merge/инварианте
 # 13; здесь — та же функция, вторая инлайн-копия сведена. Живые прод-формы
 # (сняты 2026-09-13, `gh api repos/mytab0r/edge-harness/issues/120/comments`):
-#   честный маркер: {"performed_via_github_app": {"id": 15368, ...},
+#   честный маркер: {"performed_via_github_app": {"id": 15368, "slug": "github-actions"},
 #                     "user": {"login": "github-actions[bot]", "type": "Bot"}}
 #   поддельный:     {"performed_via_github_app": null,
 #                     "user": {"login": "mytab0r", "type": "User"}}
+#   поддельный-2 (#1389, живой случай 2026-09-19, issuecomment-5744398934):
+#                   {"performed_via_github_app": {"id": 1236702, "slug": "claude"},
+#                     "user": {"login": "mytab0r", "type": "User"}}
+#   — третий канал, которого прежняя редакция предиката не знала: непусто,
+#   значит «честный», и инвариант был слеп ровно к той подделке, ради которой
+#   написан (разбор — #1386/#1389).
 #
 # Проверка перед приложением (ревью PR #1102 подняло верный вопрос: repo
 # легитимно пишет в #120 личным PAT из НЕСКОЛЬКИХ workflow-шагов —
@@ -3608,7 +3615,9 @@ def build_report(repo: str, now: datetime,
         ids = ", ".join(f"#{item['id']}" for item in v18)
         lines.append(
             f"🚨 [18] {len(v18)} маркеров статуса конвейера в #{WATCHDOG_ISSUE} "
-            f"опубликованы НЕ токеном job'а (performed_via_github_app=null) — "
+            "опубликованы НЕ токеном job'а (performed_via_github_app пусто — "
+            "личный PAT, либо непусто, но это ЧУЖОЕ приложение, не "
+            f"github-actions, #1389) — "
             f"последний {latest['created_at']} от {latest['login']} (id {latest['id']}); "
             f"id всех: {ids}"
         )
@@ -4017,7 +4026,9 @@ def run_escalations(repo: str, findings: dict[int, list]) -> list[str]:
         key = pipeline_status_marker_key(v18)
         text = (
             "🚨 edge-harness: инвариант 18 (маркер статуса конвейера в #120 "
-            "опубликован НЕ токеном job'а — performed_via_github_app=null, "
+            "опубликован НЕ токеном job'а — performed_via_github_app либо "
+            "пусто (личный PAT), либо называет ЧУЖОЕ приложение вместо "
+            "github-actions (#1389), "
             f"#1101) — {len(v18)} таких комментариев, последний "
             f"{latest['created_at']} от {latest['login']} ({latest['url']}). "
             "Различение по токену публикации, не по логину (AGENTS.md, "

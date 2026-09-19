@@ -1933,6 +1933,13 @@ def test_stale_resume_marker_does_not_shadow_real_success(monkeypatch):
 _FIXTURE_DIR = Path(__file__).resolve().parent
 FIXTURE_FAKE_WIP_CLOSE = _FIXTURE_DIR / "fixtures_issue120_fake_wip_close_marker.json"
 FIXTURE_HONEST_RESUME = _FIXTURE_DIR / "fixtures_issue120_honest_resume_marker.json"
+# Третий канал публикации, которого предикат не знал до #1389: непустой
+# `performed_via_github_app`, но приложение ЧУЖОЕ (`slug: "claude"`).
+# Живой комментарий issuecomment-5744398934 (2026-09-19T18:35:45Z) — тот
+# самый ложный маркер «0 < 12», чью ложность в ту же минуту доказал
+# инвариант 16 независимым пересчётом (21). Снят как есть, `gh api
+# repos/mytab0r/edge-harness/issues/comments/5744398934`.
+FIXTURE_FOREIGN_APP_WIP_CLOSE = _FIXTURE_DIR / "fixtures_issue120_foreign_app_wip_close_marker.json"
 
 
 def _load_fixture(path: Path) -> dict:
@@ -1941,11 +1948,46 @@ def _load_fixture(path: Path) -> dict:
 
 
 def test_comment_is_job_authored_on_live_fixtures():
-    """`comment_is_job_authored` — прямая проверка на прод-форме обоих
+    """`comment_is_job_authored` — прямая проверка на прод-форме ВСЕХ ТРЁХ
     классов, без прохода через issue_marker_times/gh: сама функция, сырой
-    REST-ответ."""
+    REST-ответ.
+
+    Третий класс добавлен #1389 и он не теоретический: прежняя редакция
+    предиката считала доверенным любой непустой `performed_via_github_app`,
+    и этот живой ложный маркер проходил как честный."""
     assert pg.comment_is_job_authored(_load_fixture(FIXTURE_HONEST_RESUME)) is True
     assert pg.comment_is_job_authored(_load_fixture(FIXTURE_FAKE_WIP_CLOSE)) is False
+    assert pg.comment_is_job_authored(_load_fixture(FIXTURE_FOREIGN_APP_WIP_CLOSE)) is False
+
+
+def test_foreign_app_fixture_really_carries_a_nonempty_app():
+    """Контроль самой фикстуры, а не только предиката.
+
+    Без него тест выше остался бы зелёным, даже если фикстуру однажды
+    подменят на комментарий с `performed_via_github_app: null` — то есть на
+    ВТОРОЙ экземпляр уже покрытого класса. Тогда «третий канал» исчез бы из
+    покрытия молча, а имя теста продолжало бы обещать его (класс #891/#893:
+    гвардия, зеленеющая не на том)."""
+    app = _load_fixture(FIXTURE_FOREIGN_APP_WIP_CLOSE)["performed_via_github_app"]
+    assert isinstance(app, dict), "фикстура обязана нести НЕПУСТОЕ приложение"
+    assert app["slug"] != pg.GITHUB_ACTIONS_APP_SLUG, (
+        "фикстура обязана нести ЧУЖОЕ приложение — на github-actions она "
+        "проверяла бы ровно то, что и honest-фикстура")
+
+
+def test_issue_marker_times_require_job_token_filters_foreign_app_marker(monkeypatch):
+    """Тот же живой маркер, но через реального потребителя: с
+    require_job_token=True он обязан быть отфильтрован так же, как маркер от
+    личного PAT. Именно этим чтением пользуются conveyor_gate и инвариант 18."""
+    foreign = _load_fixture(FIXTURE_FOREIGN_APP_WIP_CLOSE)
+    fake = FakeGh({"issues/120/comments": [foreign]})
+    monkeypatch.setattr(pg, "gh", fake)
+
+    marker = "[статус конвейера: WIP-лимит снят]"
+    assert pg.issue_marker_times("mytab0r/edge-harness", 120, marker) != [], (
+        "без require_job_token поведение не меняется — маркер виден")
+    assert pg.issue_marker_times(
+        "mytab0r/edge-harness", 120, marker, require_job_token=True) == []
 
 
 def test_issue_marker_times_require_job_token_filters_live_fake_marker(monkeypatch):
