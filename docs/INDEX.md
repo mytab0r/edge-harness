@@ -83,6 +83,7 @@
 - [0024. Триаж застрявшего PR: метод ADR 0021 не покрывал очередь — четыре дефекта и правки](decisions/0024-stalled-pr-triage-method-fix.md)
 - [0025. Классификация классов дефектов — в источнике, не постфактум-кластеризацией](decisions/0025-defect-class-source-classification.md)
 - [0026. Заявления агента о своей работе — машинная проверка исполнения, не критик-прочтение](decisions/0026-verify-agent-claims-machine-check.md)
+- [0027. Немигрируемая сессия изолируется, а не роняет морду](decisions/0027-quarantine-unmigratable-session.md)
 
 ## Операционные процедуры
 
