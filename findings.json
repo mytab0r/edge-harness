@@ -692,7 +692,16 @@
       "source_pr": 1380,
       "status": "open",
       "title": "у ALLOWED_CURL_CARRIER нет теста «разрешение не переживает свою причину»"
+    },
+    {
+      "detail": "`failure_reason` документа три места, и все перечисляют значения исчерпывающе: докстринг job-output (строки ~209–214: «quota_exhausted | rate_limit_retry_budget_exceeded | all_providers_exhausted | пусто — пишет ai_dsh.sh»), комментарий env шага verdict (~585–587) и комментарий шага gather (~435–443, перечисляет только empty_diff и diff_source_mismatch как единственных писателей из cmd_gather). Теперь по тому же каналу едет третий gather-писатель `head_moved` — разбирающий прогон агент прочитает enum раньше кода и не ожидают его там. Допиши `head_moved` (и честно — два других gather-значения) в те же перечисления в этом же PR, новых механизмов не нужно.",
+      "file": ".github/workflows/ai-review.yml",
+      "id": 78,
+      "opened_at": "2026-09-19T19:17:04.599690+00:00",
+      "source_pr": 1384,
+      "status": "open",
+      "title": "Комментарии workflow не знают про третье значение failure_reason"
     }
   ],
-  "next_id": 78
+  "next_id": 79
 }
