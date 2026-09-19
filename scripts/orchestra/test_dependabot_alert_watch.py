@@ -511,5 +511,31 @@ def test_main_returns_zero_on_healthy_run(monkeypatch):
     assert daw.main() == 0
 
 
+# ── #720: тело автозадачи алерта несёт машиночитаемое объявление связи ──────
+
+
+def test_alert_task_body_passes_declared_dependency_gate():
+    """alert_task_body — единственное тело, которое dependabot_alert_watch
+    передает create_pool_issue: обязано проходить НАСТОЯЩИЙ гейт (мок только
+    транспорта). Здесь refusal гейта деградирует в ⚠️-наблюдение (RuntimeError
+    ловится, задача не заводится) — регресс выцвел бы тише всех, открытый
+    алерт безопасности перестал бы становиться задачей пула, поэтому гвардия
+    обязательна (находка ревью PR #804, раунд 4). Мутация: сними строку
+    «БЛОКИРУЕТСЯ: ничем» из alert_task_body — RuntimeError ДО сети, тест
+    краснеет."""
+    pi_spec = importlib.util.spec_from_file_location(
+        "pool_issue_dependabot_gate", Path(__file__).with_name("..").resolve() / "lib" / "pool_issue.py")
+    pool_issue = importlib.util.module_from_spec(pi_spec)
+    pi_spec.loader.exec_module(pool_issue)
+
+    body = daw.alert_task_body(REAL_SHARP_ALERT)
+    calls = []
+    pool_issue.create_pool_issue(lambda *a: calls.append(a) or {"number": 1},
+                                 REPO, daw.alert_task_title(REAL_SHARP_ALERT), body,
+                                 ["task", daw.DEPENDABOT_ALERT_LABEL])
+    assert len(calls) == 1, "реальный гейт пропустил тело — объявление связи на месте"
+    assert body.rstrip().endswith("БЛОКИРУЕТСЯ: ничем")  # инлайн-форма — последней непустой строкой
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
