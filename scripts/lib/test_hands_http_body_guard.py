@@ -55,7 +55,51 @@ ALLOWED_FAIL_FLAG = {
     ),
 }
 
-_CURL_FAIL_RE = re.compile(r"curl\s+-[a-zA-Z]*f")
+def _bare_fail_flag_hits(text: str) -> list[tuple[int, str]]:
+    """Строки с голым `curl`, несущим флаг отказа-без-тела.
+
+    Разбор токенами, а не одним регекпом: регекп `curl\\s+-[a-zA-Z]*f`
+    (первая редакция этой гвардии) пропускал ДВА живых написания — длинную
+    форму `curl --fail` и естественную запись в несколько строк через `\\`,
+    где флаг стоит на продолжении. Оба варианта — тот же дефект и та же
+    потеря причины, и оба проходили молча (находка ai-ревью PR #1380).
+    Поэтому продолжения склеиваются в ЛОГИЧЕСКУЮ строку, а флаги ищутся
+    среди токенов ПОСЛЕ слова `curl`, а не по соседству с ним.
+
+    Номер строки — той, где начался вызов: читателю чинить его, а не
+    середину продолжения.
+    """
+    hits: list[tuple[int, str]] = []
+    raw = text.splitlines()
+    index = 0
+    while index < len(raw):
+        start = index
+        logical = raw[index]
+        while logical.rstrip().endswith("\\") and index + 1 < len(raw):
+            logical = logical.rstrip()[:-1] + " " + raw[index + 1]
+            index += 1
+        index += 1
+        stripped = logical.lstrip()
+        if stripped.startswith("#"):
+            continue  # комментарий, рассказывающий про класс, — не вызов
+        tokens = logical.split()
+        if "curl" not in tokens:
+            continue
+        for token in tokens[tokens.index("curl") + 1:]:
+            long_form = token == "--fail" or token.startswith("--fail-")
+            short_form = (
+                token.startswith("-")
+                and not token.startswith("--")
+                and "f" in token[1:]
+            )
+            if long_form or short_form:
+                hits.append((start + 1, stripped))
+                break
+    return hits
+
+
+def _stubs_curl_with_fail_flag(text: str) -> bool:
+    return bool(_bare_fail_flag_hits(text))
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -187,12 +231,8 @@ def test_no_bare_fail_flag_outside_allowlist():
             rel = path.relative_to(REPO_ROOT).as_posix()
             if rel in ALLOWED_FAIL_FLAG:
                 continue
-            for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-                stripped = line.lstrip()
-                if stripped.startswith("#"):
-                    continue  # комментарий, рассказывающий про класс, — не вызов
-                if _CURL_FAIL_RE.search(line):
-                    offenders.append(f"{rel}:{number}: {stripped}")
+            for number, line in _bare_fail_flag_hits(path.read_text(encoding="utf-8")):
+                offenders.append(f"{rel}:{number}: {line}")
 
     assert not offenders, (
         "голый curl с флагом -f (--fail) в клиентах рук/воркера:\n  "
@@ -212,7 +252,78 @@ def test_allowlist_entries_still_exist_and_still_need_the_flag():
     for rel, reason in ALLOWED_FAIL_FLAG.items():
         path = REPO_ROOT / rel
         assert path.exists(), f"ALLOWED_FAIL_FLAG указывает на исчезнувший {rel} — удали запись"
-        assert _CURL_FAIL_RE.search(path.read_text(encoding="utf-8")), (
+        assert _stubs_curl_with_fail_flag(path.read_text(encoding="utf-8")), (
             f"{rel} больше не содержит curl -f — разрешение («{reason}») стало "
             "мусором, удали запись из ALLOWED_FAIL_FLAG"
+        )
+
+
+# Заглушка curl, не разбирающая `-o ФАЙЛ`, написана под форму `curl -fsS …`
+# (тело в stdout) — форму, которой в клиентах журнала/рук больше нет. Ключ —
+# путь, значение — причина, которая уйдёт человеку в текст отказа гвардии.
+ALLOWED_CURL_STUB_WITHOUT_OUTFILE = {
+    "scripts/lib/test/dsh-anthropic-pool.guard.sh": (
+        "заглушка-мина: её контракт — «сюда попадать нельзя», любой вызов сразу "
+        "красит тест (exit 99). Флаги она не разбирает намеренно — разбирать "
+        "нечего, ответа она не отдаёт вовсе"
+    ),
+}
+
+_CURL_STUB_RE = re.compile(r"^\s*curl\(\)\s*\{", re.MULTILINE)
+_OUTFILE_RE = re.compile(r'-o[)"]')
+
+
+def test_curl_stubs_parse_outfile_or_name_why_not():
+    """Класс, оплаченный красным CI этого же PR: заглушка curl ПЕРЕСКАЗЫВАЕТ
+    флаги, а не исполняет их — и ломается молча, когда вызов меняет форму.
+
+    Живой случай: `scripts/plugins/test/status-scripts.smoke.sh` понимал
+    `curl -fsS …` (тело в stdout) и не понимал `curl -o ФАЙЛ -w '%{http_code}'`.
+    Перевод клиента журнала на `canary_http` дал «Журнал GET: HTTP {"events":…}»
+    и «тело ответа пустое»: код получил тело, тело — пустоту. Прод-код был
+    исправен, сломан был пересказ. Смок с тех пор ходит в НАСТОЯЩИЙ HTTP-сервер
+    (заглушки там нет вовсе), а этот рубеж закрывает ВХОД для остальных.
+
+    Рубеж структурный и назван так честно: он доказывает орфографию, а не
+    поведение (класс #891/#893). Поведение доказывают смоки на живом сервере —
+    этот тест лишь не даёт завести новый пересказ незаметно.
+
+    Газ: заглушке действительно не нужен `-o` (например, она — мина «сюда
+    попадать нельзя») — впиши путь и причину в
+    ALLOWED_CURL_STUB_WITHOUT_OUTFILE.
+    """
+    offenders = []
+    for path in sorted(REPO_ROOT.glob("scripts/**/*.sh")):
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        text = path.read_text(encoding="utf-8")
+        if not _CURL_STUB_RE.search(text):
+            continue
+        if rel in ALLOWED_CURL_STUB_WITHOUT_OUTFILE:
+            continue
+        if not _OUTFILE_RE.search(text):
+            offenders.append(rel)
+
+    assert not offenders, (
+        "заглушка curl не разбирает `-o ФАЙЛ`:\n  " + "\n  ".join(offenders)
+        + "\nЗначит, она написана под форму `curl -fsS …` (тело в stdout), а "
+        "клиенты ходят через scripts/lib/canary_http.sh: `curl -o ФАЙЛ "
+        "-w '%{http_code}'` — код в stdout, тело в файле. Такая заглушка отдаст "
+        "телу место кода и покрасит тест на исправном прод-коде (#1373). Лечится "
+        "настоящим HTTP-сервером вместо заглушки (см. "
+        "scripts/plugins/test/status-scripts.smoke.sh). Газ: если `-o` заглушке "
+        "не нужен — впиши путь и причину в ALLOWED_CURL_STUB_WITHOUT_OUTFILE."
+    )
+
+
+def test_curl_stub_allowlist_entries_still_exist_and_still_stub_curl():
+    """Разрешение не переживает свою причину — тот же рубеж, что у
+    ALLOWED_FAIL_FLAG выше."""
+    for rel, reason in ALLOWED_CURL_STUB_WITHOUT_OUTFILE.items():
+        path = REPO_ROOT / rel
+        assert path.exists(), (
+            f"ALLOWED_CURL_STUB_WITHOUT_OUTFILE указывает на исчезнувший {rel} — удали запись"
+        )
+        assert _CURL_STUB_RE.search(path.read_text(encoding="utf-8")), (
+            f"{rel} больше не подменяет curl — разрешение («{reason}») стало "
+            "мусором, удали запись из ALLOWED_CURL_STUB_WITHOUT_OUTFILE"
         )

@@ -197,7 +197,14 @@ trap 'exit 143' TERM
 TASK_TEXT="${TASK_TEXT:-}"
 after=0
 while :; do
-  resp=$(api "$HANDS_URL/api/events?task_id=$TASK_ID&after=$after&limit=256")
+  # Посев seq — голый вызов без ретрая: отказ здесь фатален (дальше set -e
+  # уронит job), поэтому фатальность называется ЗДЕСЬ громко. Обёртка api
+  # остаётся warning: она зовётся и из мест, где отказ повторяем, и кричать
+  # за них она права не имеет (находка ai-ревью PR #1380).
+  resp=$(api "$HANDS_URL/api/events?task_id=$TASK_ID&after=$after&limit=256") || {
+    echo "::error::Посев seq из журнала не удался (код и тело ответа — строками выше): без него события задачи ушли бы с чужой нумерацией и перетёрли историю" >&2
+    exit 1
+  }
   n=$(jq '.events | length' <<<"$resp")
   if [ "$n" -eq 0 ]; then break; fi
   ms=$(jq '[.events[] | select(.source == "job") | .seq] | max // 0' <<<"$resp")
