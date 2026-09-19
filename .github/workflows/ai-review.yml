@@ -422,10 +422,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.facts.outputs.pr }}
+          # head, ради которого затеян прогон. gather сверяет его с текущим
+          # ПОСЛЕДНИМ действием — рубеж ДО дорогого вызова модели (#1374):
+          # уехала голова, значит вердикт всё равно будет выброшен, и платить
+          # за него незачем. Поздний рубеж в cmd_verdict остаётся на месте.
+          EXPECTED_HEAD: ${{ steps.facts.outputs.head }}
         run: |
           AI_WORK="$RUNNER_TEMP/ai-review"
           mkdir -p "$AI_WORK"
-          python scripts/review/ai_review.py gather --pr "$PR_NUMBER" --out "$AI_WORK"
+          python scripts/review/ai_review.py gather --pr "$PR_NUMBER" --out "$AI_WORK" \
+            --expected-head "$EXPECTED_HEAD"
           # Пустой дифф (#658) ИЛИ расхождение источников диффа (#687,
           # diff_source_mismatch — список файлов пуст, а `gh pr diff` не
           # пуст): cmd_gather сам пишет failure_reason.txt (rc=0, шаг

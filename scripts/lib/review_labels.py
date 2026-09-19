@@ -94,6 +94,11 @@ FAILURE_REASON_QUOTA_EXHAUSTED = "quota_exhausted"
 FAILURE_REASON_RATE_LIMIT_BUDGET = "rate_limit_retry_budget_exceeded"
 FAILURE_REASON_TRANSPORT = "transport_error"
 FAILURE_REASON_CONTRACT = "contract_violation"
+# Не «отказ» в ряду выше, а СЭКОНОМЛЕННЫЙ прогон (#1374): голова PR уехала до
+# вызова модели, дорогой шаг пропущен, ревью придёт новым событием по новому
+# head. Метку не ставит и в reason_tag не попадает намеренно — иначе автоповтор
+# #196 гнался бы за головой, которую уже ревьюит следующий прогон.
+FAILURE_REASON_HEAD_MOVED = "head_moved"
 
 # ── Конфликт (mark_conflicts, scheduler.py) ──────────────────────────────────
 # Единственное определение (было задублировано локальной константой в

@@ -1260,6 +1260,32 @@ def cmd_gather(args: argparse.Namespace) -> int:
     # bridge после мержа (задача в беклоге).
     (out / "meta.json").write_text(
         json.dumps({"pr": args.pr, "head": pull["head"]["sha"]}), encoding="utf-8")
+    # Сверка головы — ПОСЛЕДНЕЕ, что делает gather, и единственное место, где
+    # она стоит ДО дорогого шага (issue #1374). Раньше рубеж был один и стоял
+    # ПОСЛЕ вызова модели (cmd_verdict): минуты раннера и квота тратились
+    # целиком, вердикт вычислялся — и выбрасывался. Замер, ради которого это
+    # написано: PR #1372, 2026-09-19 — три `approve` подряд за 27 минут, все
+    # три выброшены; PR #1380 в тот же день — четвёртый.
+    #
+    # Почему в конце, а не в начале: чем позже сверка, тем уже окно гонки.
+    # Окно не закрывается совсем — пуш во время самого вызова модели поймает
+    # только рубеж в cmd_verdict, и он остаётся на месте (страховка, а не
+    # дубль: здесь мы экономим вызов, там — не применяем протухший вердикт).
+    #
+    # Отдельный запрос, а не `pull` со входа функции: тот прочитан до сбора
+    # диффа и промпта, то есть заведомо устарел на длину этой работы.
+    if args.expected_head:
+        current_head = gh(f"repos/{repo}/pulls/{args.pr}")["head"]["sha"]
+        if current_head != args.expected_head:
+            (out / "failure_reason.txt").write_text(
+                review_labels.FAILURE_REASON_HEAD_MOVED, encoding="utf-8")
+            (out / "answer.txt").write_text("", encoding="utf-8")
+            print(f"::warning::gather: head PR #{args.pr} уехал "
+                  f"({args.expected_head[:12]} → {current_head[:12]}) ДО вызова "
+                  "модели — дорогой прогон DSH пропущен, ревью придёт новым "
+                  "событием по новому head")
+            return 0
+
     print(f"gather: PR #{args.pr} head {pull['head']['sha'][:12]}, "
           f"+{added} строк, промпт {len(prompt)} байт, пак {pack}")
     return 0
@@ -1502,9 +1528,15 @@ def notify_head_moved(repo: str, pr: int, verdict: str, old_head: str, new_head:
     for comment in review_labels.list_pages(f"repos/{repo}/issues/{pr}/comments?per_page=100", gh):
         if marker in (comment.get("body") or ""):
             return
+    # Пустой verdict — случай «вердикта не было вовсе»: голову поймал рубеж ДО
+    # вызова модели (#1374), и писать «вердикт не применён» было бы неправдой:
+    # применять было нечего, зато дорогой прогон сэкономлен, и это ровно то,
+    # что читателю здесь важно.
+    what = (f"Вердикт `{verdict}` не применён"
+            if verdict else "Дорогой прогон не исполнялся")
     body = (
         f"{marker}\n"
-        f"⏭️ Вердикт `{verdict}` не применён: head PR сменился "
+        f"⏭️ {what}: head PR сменился "
         f"`{old_head[:12]}` → `{new_head[:12]}` во время ревью — по новому "
         "head поднимется новое ревью."
     )
@@ -1513,6 +1545,19 @@ def notify_head_moved(repo: str, pr: int, verdict: str, old_head: str, new_head:
 
 def cmd_verdict(args: argparse.Namespace) -> int:
     repo = os.environ["GITHUB_REPOSITORY"]
+    # Голова уехала ДО вызова модели — gather сэкономил прогон (#1374). Выход
+    # здесь, ПЕРВОЙ строкой: дальше по функции пустой answer разобрался бы как
+    # нарушение контракта и поставил `ai:failed`, то есть сэкономленный прогон
+    # выглядел бы как сломанный. Метку не трогаем вовсе — по новому head уже
+    # идёт своё ревью, и автоповтор #196 гнался бы за ним вхолостую. След тот
+    # же, что у позднего рубежа ниже: один комментарий с дедупом по паре голов.
+    if args.failure_reason == review_labels.FAILURE_REASON_HEAD_MOVED:
+        new_head = gh(f"repos/{repo}/pulls/{args.pr}")["head"]["sha"]
+        print(f"::warning::ai-review: head PR #{args.pr} уехал "
+              f"({args.head[:12]} → {new_head[:12]}) ДО вызова модели — "
+              "дорогой прогон не исполнялся, метку не трогаю")
+        notify_head_moved(repo, args.pr, "", args.head, new_head)
+        return 0
     answer = Path(args.answer).read_text(encoding="utf-8") if Path(args.answer).exists() else ""
     # Цитата машиночитаемой строки в ```-фенсе — разбор чужого текста, не
     # сигнал (находка ai-ревью PR #1333, head 4732d12): ВСЕ потребители
@@ -1764,6 +1809,12 @@ def main() -> int:
     gather = sub.add_parser("gather", help="факты PR + дифф-пак + промпт")
     gather.add_argument("--pr", type=int, required=True)
     gather.add_argument("--out", required=True)
+    # head, ради которого этот прогон затеян (step-output доверенного шага
+    # facts). Пусто — сверка не делается: так ведёт себя ручной вызов gather
+    # из отладки, и ломать его ради гвардии нельзя. Что workflow ФЛАГ
+    # ПЕРЕДАЁТ, проверяет отдельная гвардия по исходнику — иначе «забыли
+    # передать» выглядело бы как «голова не уезжала».
+    gather.add_argument("--expected-head", default="")
     gather.set_defaults(func=cmd_gather)
 
     should_run = sub.add_parser(

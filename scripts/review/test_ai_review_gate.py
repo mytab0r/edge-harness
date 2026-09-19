@@ -124,3 +124,51 @@ def test_facts_gate_opens_on_review_ok_or_review_large(tmp_path, labels, expecte
     if expected_go == "true":
         assert out.get("pr") == "42"
         assert out.get("head") == "deadbeef0123456789abcdef"
+
+
+# ── #1374: ранний рубеж головы обязан быть ПОДКЛЮЧЁН, а не только написан ────
+
+def gather_step() -> dict:
+    """Шаг сбора фактов и промпта — последний доверенный шаг ПЕРЕД дорогим
+    вызовом модели."""
+    doc = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    steps = [step
+             for job in (doc.get("jobs") or {}).values()
+             for step in (job.get("steps") or [])
+             if "ai_review.py gather" in (step.get("run") or "")]
+    assert len(steps) == 1, (
+        f"ожидался ровно один шаг, зовущий `ai_review.py gather`, найдено "
+        f"{len(steps)} — workflow уехал от этой гвардии, почини её сознательно")
+    return steps[0]
+
+
+def test_gather_step_passes_expected_head_from_trusted_facts():
+    """Рубеж #1374 срабатывает только если workflow ПЕРЕДАЛ голову.
+
+    Проверка структурная и названа так честно: она доказывает проводку, а не
+    поведение (поведение доказывают тесты cmd_gather в test_ai_review.py).
+    Но без неё «забыли передать флаг» выглядело бы ровно как «голова ни разу
+    не уезжала» — то есть гвардия зеленела бы молча на выключенном рубеже,
+    класс #891/#893.
+
+    Голова берётся из ДОВЕРЕННОГО шага facts, а не из сырого события: событие
+    workflow_run у ai-review несёт head самого прогона (всегда main, см.
+    блок-комментарий workflow), и сверка с ним была бы всегда ложной.
+    """
+    step = gather_step()
+    script = step["run"]
+    env = step.get("env") or {}
+
+    assert "--expected-head" in script, (
+        "шаг gather не передаёт --expected-head — ранний рубеж (#1374) "
+        "выключен, и дорогой вызов модели снова будет тратиться на уехавшую "
+        "голову; вердикт выбросит поздний рубеж в cmd_verdict, как до #1374")
+    head_vars = [name for name, value in env.items()
+                 if "steps.facts.outputs.head" in str(value)]
+    assert head_vars, (
+        f"ни одна переменная окружения шага не берёт steps.facts.outputs.head: "
+        f"{sorted(env)} — значит --expected-head получает не ту голову")
+    assert any(f"${name}" in script or f"${{{name}}}" in script for name in head_vars), (
+        f"переменная с головой ({head_vars}) объявлена, но в скрипт шага не "
+        "подставлена — флаг ушёл бы пустым, а пустой --expected-head означает "
+        "«сверку не делать»")
