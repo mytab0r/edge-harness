@@ -612,11 +612,17 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -o pipefail
-          http_code=$(curl -sS -o /tmp/pre-deploy-deployments.json -w '%{http_code}' \
+          source "$GITHUB_WORKSPACE/scripts/lib/canary_http.sh"
+          # Отказ ЭТОГО запроса не фатален и у него назван газ (см. комментарий
+          # шага выше), поэтому уровень аннотации — warning, а не error. Тело
+          # ответа при этом печатается: раньше причина отказа CF API лежала в
+          # файле и не попадала в лог ни при каком исходе (issue #1371).
+          CANARY_ERROR_LEVEL=warning
+          if ! canary_http "Снимок версии прода до деплоя" \
             -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/dsh-edge/deployments")
-          if [ "$http_code" != "200" ]; then
-            echo "::warning::Снимок версии до деплоя не удался (HTTP $http_code) — если канарейка дальше покраснеет, автооткат явно откажется, а не откатится не туда"
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/dsh-edge/deployments" \
+            > /tmp/pre-deploy-deployments.json; then
+            echo "::warning::Снимок версии до деплоя не удался (код и тело ответа — строками выше) — если канарейка дальше покраснеет, автооткат явно откажется, а не откатится не туда"
             exit 0
           fi
           version_id=$(jq -r '
@@ -669,7 +675,8 @@ jobs:
       # прогонять через синк секретов/интеграций.
       - name: Канарейка прода
         run: |
-          code=$(curl -sL -o /dev/null -w "%{http_code}" https://dsh-edge.mytab0r.workers.dev/)
+          source "$GITHUB_WORKSPACE/scripts/lib/canary_http.sh"
+          code=$(canary_probe "Канарейка прода" 200 -L https://dsh-edge.mytab0r.workers.dev/)
           if [ "$code" != "200" ]; then
             echo "::error::Морда отвечает $code после деплоя $VERSION_DEPLOYED"
             exit 1
@@ -800,16 +807,18 @@ jobs:
           DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
         run: |
           set -euo pipefail
+          source "$GITHUB_WORKSPACE/scripts/lib/canary_http.sh"
           base="https://dsh-edge.mytab0r.workers.dev"
           jar="$RUNNER_TEMP/dsh-edge-canary.cookies"
-          code=$(curl -s -o /dev/null -w "%{http_code}" -c "$jar" \
+          code=$(canary_probe "Логин канарейки #119" 303 -c "$jar" \
             -X POST "$base/api/auth/login" --data-urlencode "accessKey=$DSH_EDGE_ACCESS_KEY")
           [ "$code" = "303" ] || { echo "::error::Логин канарейки #119 не удался (HTTP $code)"; exit 1; }
           rpc() {
             local method=$1 payload=$2
-            curl -fsS -b "$jar" -H 'content-type: application/json' \
+            canary_http "RPC $method канарейки #119" \
+              -b "$jar" -H 'content-type: application/json' \
               -X POST "$base/api/$method" -d "$payload" \
-              || { echo "::error::RPC $method канарейки #119 отклонён"; exit 1; }
+              || exit 1
           }
           ws=$(rpc workspace.create '{"type":"client-request","rpcId":"canary","method":"workspace.create","payload":{"path":"/workspace/edge-harness"}}' \
             | jq -r '.result.value.workspace.workspaceId')
@@ -822,10 +831,11 @@ jobs:
             '{"type":"turn/start","data":{"turn":1}}' \
             '{"type":"turn/end","data":{"turn":1,"reason":{"kind":"completed"}}}' \
             | jq -s '{events: .}' > "$RUNNER_TEMP/dsh-edge-canary-batch.json"
-          appended=$(curl -fsS -b "$jar" -H 'content-type: application/json' \
+          appended=$(canary_http "Ingest канарейки #119" \
+            -b "$jar" -H 'content-type: application/json' \
             -X POST "$base/api/sessions/$sid/ingest" \
             --data-binary "@$RUNNER_TEMP/dsh-edge-canary-batch.json" | jq ".appended") \
-            || { echo "::error::Ingest канарейки #119 упал"; exit 1; }
+            || exit 1
           [ "$appended" -ge 2 ] \
             || { echo "::error::Ingest канарейки #119 не принял батч (appended=$appended)"; exit 1; }
           rpc workspace.archiveSession '{"type":"client-request","rpcId":"canary","method":"workspace.archiveSession","payload":{"sessionId":"'"$sid"'"}}' >/dev/null
@@ -846,13 +856,15 @@ jobs:
           DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
         run: |
           set -euo pipefail
+          source "$GITHUB_WORKSPACE/scripts/lib/canary_http.sh"
           base="https://dsh-edge.mytab0r.workers.dev"
           jar="$RUNNER_TEMP/dsh-edge-registry-canary.cookies"
-          code=$(curl -s -o /dev/null -w "%{http_code}" -c "$jar" \
+          code=$(canary_probe "Логин канарейки #378" 303 -c "$jar" \
             -X POST "$base/api/auth/login" --data-urlencode "accessKey=$DSH_EDGE_ACCESS_KEY")
           [ "$code" = "303" ] || { echo "::error::Логин канарейки #378 не удался (HTTP $code)"; exit 1; }
           rpc() {
-            curl -fsS -b "$jar" -H 'content-type: application/json' -H 'User-Agent: edge-harness-deploy-canary/1.0' \
+            canary_http "RPC $1 канарейки #378" \
+              -b "$jar" -H 'content-type: application/json' -H 'User-Agent: edge-harness-deploy-canary/1.0' \
               -X POST "$base/api/$1" -d "$2"
           }
           rpc settings.describe '{"type":"client-request","rpcId":"canary114","method":"settings.describe","payload":{}}' \
@@ -914,13 +926,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          source "$GITHUB_WORKSPACE/scripts/lib/canary_http.sh"
           base="https://dsh-edge.mytab0r.workers.dev"
           jar="$RUNNER_TEMP/dsh-edge-runner-bridge-canary.cookies"
-          code=$(curl -s -o /dev/null -w "%{http_code}" -c "$jar" \
+          code=$(canary_probe "Логин канарейки runner-bridge" 303 -c "$jar" \
             -X POST "$base/api/auth/login" --data-urlencode "accessKey=$DSH_EDGE_ACCESS_KEY")
           [ "$code" = "303" ] || { echo "::error::Логин канарейки runner-bridge не удался (HTTP $code)"; exit 1; }
           rpc() {
-            curl -fsS -b "$jar" -H 'content-type: application/json' -H 'User-Agent: edge-harness-deploy-canary/1.0' \
+            canary_http "RPC $1 канарейки runner-bridge" \
+              -b "$jar" -H 'content-type: application/json' -H 'User-Agent: edge-harness-deploy-canary/1.0' \
               -X POST "$base/api/$1" -d "$2"
           }
 
@@ -1103,7 +1117,8 @@ jobs:
       - name: Канарейка после автооткота
         if: failure() && steps.deploy.outcome == 'success'
         run: |
-          code=$(curl -sL -o /dev/null -w "%{http_code}" https://dsh-edge.mytab0r.workers.dev/)
+          source "$GITHUB_WORKSPACE/scripts/lib/canary_http.sh"
+          code=$(canary_probe "Канарейка после автооткота" 200 -L https://dsh-edge.mytab0r.workers.dev/)
           if [ "$code" = "200" ]; then
             echo "✅ После автооткота прод отвечает 200 — интерфейс восстановлен на прошлой версии"
           else

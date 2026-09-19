@@ -19,7 +19,10 @@
 
 Доказательство — поведенческое (класс #891/#893, не грепаем исходник, а
 реально исполняем bash-фрагмент шага из workflow), не текстовый анализ:
-`curl` подменяется стабом, возвращающим управляемый HTTP-код.
+`curl` подменяется стабом, возвращающим управляемый HTTP-код. Подменяется
+ровно `curl`: `$GITHUB_WORKSPACE` указывает на настоящий корень репозитория,
+и шаг подключает НАСТОЯЩУЮ `scripts/lib/canary_http.sh` (#1371) — ни одна
+строка шага не заменяется пересказом.
 
 Запуск: python -m pytest scripts/lib/test_deploy_post_rollback_canary_guard.py -q
 """
@@ -83,6 +86,10 @@ def _run_canary_step(http_code: str, tmp_path: Path):
 
     env = dict(os.environ)
     env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
+    # Шаг подключает общую библиотеку канареек по $GITHUB_WORKSPACE (#1371).
+    # В реальном job'е это корень чекаута — здесь корень репозитория, чтобы
+    # гвардия исполняла тот же source, что и прод, а не обходила его.
+    env["GITHUB_WORKSPACE"] = str(REPO_ROOT)
 
     bash_path = shutil.which("bash") or "bash"
     proc = subprocess.run(
@@ -97,8 +104,22 @@ def _run_canary_step(http_code: str, tmp_path: Path):
     return proc.returncode, proc.stdout + proc.stderr
 
 
+def _assert_library_loaded(out: str) -> None:
+    """Ветка `else` шага печатает свой `::error::` и падает ЛЮБОЙ причиной —
+    в том числе если общая библиотека канареек не подключилась. Без этой
+    проверки сломанный `source` красил бы тест на 503 ложно-зелёным: падение
+    по «command not found» неотличимо от падения по неотвеченной канарейке
+    (класс «проверяй видимый результат, а не шаг», AGENTS.md)."""
+    for broken in ("command not found", "No such file or directory"):
+        assert broken not in out, (
+            f"шаг не смог подключить scripts/lib/canary_http.sh — падение не "
+            f"доказывает ничего про канарейку, вывод: {out!r}"
+        )
+
+
 def test_canary_step_succeeds_when_prod_answers_200(tmp_path):
     code, out = _run_canary_step("200", tmp_path)
+    _assert_library_loaded(out)
     assert code == 0, f"ожидался успех при HTTP 200, получен код {code}:\n{out}"
     assert "восстановлен на прошлой версии" in out, (
         f"ожидалось сообщение об успешном восстановлении, вывод: {out!r}"
@@ -110,6 +131,11 @@ def test_canary_step_fails_loud_when_prod_does_not_answer_200(tmp_path):
     лишь аннотацией `::error::` в логе — неотличимой по статусу шага от
     нормального прогона."""
     code, out = _run_canary_step("503", tmp_path)
+    _assert_library_loaded(out)
+    assert "HTTP 503, ожидался 200" in out, (
+        "общая библиотека канареек (#1371) обязана назвать фактический код "
+        f"ответа — без неё падение шага ничем не доказано, вывод: {out!r}"
+    )
     assert code != 0, (
         "шаг обязан падать (exit != 0), когда прод после автоотката НЕ "
         f"отвечает 200 — иначе провал восстановления виден только в логе, "
