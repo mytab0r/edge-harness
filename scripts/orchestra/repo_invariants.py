@@ -283,9 +283,11 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
       (общий литеральный префикс PAUSE_MARKER/PROBE_MARKER/PAUSE_REMINDER_
       MARKER/RESUME_MARKER — pulse_guard.py; WIP_GATE_OPEN_MARKER/
       WIP_GATE_CLOSE_MARKER — scheduler.py), опубликован НЕ через GitHub
-      App/job-токен (`performed_via_github_app is None` — прямой машинный
-      признак, AGENTS.md «Атрибуция событий»: логин не различает
-      исполнителей, а токен различает, и это разрешено явной оговоркой) —
+      App/job-токен (`performed_via_github_app` НЕ называет приложение
+      `github-actions`: либо пусто — личный PAT, либо непусто, но это чужое
+      приложение, #1389 — прямой машинный признак, AGENTS.md «Атрибуция
+      событий»: логин не различает исполнителей, а токен различает, и это
+      разрешено явной оговоркой) —
       нарушение САМО ПО СЕБЕ, независимо от того, что маркер утверждает.
       Отличие от инварианта 16 одной фразой: 16 сравнивает ЗАЯВЛЕННОЕ ЧИСЛО
       с независимым пересчётом (расхождение фактов о состоянии), 18
@@ -3044,8 +3046,11 @@ def check_pipeline_status_marker_impersonation(comments: list[dict]) -> list[dic
     разбор внутри, см. модульный докстринг).
 
     Нарушение — комментарий, чья ПЕРВАЯ СТРОКА содержит
-    PIPELINE_STATUS_MARKER_FAMILY_RE, и чей `performed_via_github_app` —
-    `None` (опубликован НЕ через GitHub App/job-токен). Условие абсолютное
+    PIPELINE_STATUS_MARKER_FAMILY_RE, и чей `performed_via_github_app` НЕ
+    называет приложение `github-actions`: либо пусто (личный PAT), либо
+    непусто, но это ЧУЖОЕ приложение (#1389, живой случай — `slug: "claude"`,
+    issuecomment-5744398934). Предикат один на репозиторий —
+    `pulse_guard.comment_is_job_authored`. Условие абсолютное
     для найденных так маркеров, без freshness-окна и без сравнения с
     содержимым (в отличие от инварианта 16).
 
