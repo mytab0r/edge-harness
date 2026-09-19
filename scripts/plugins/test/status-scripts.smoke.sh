@@ -46,7 +46,13 @@ done
 
 JOURNAL_PID=""
 stop_journal() {
-  [ -n "$JOURNAL_PID" ] && kill "$JOURNAL_PID" 2>/dev/null || true
+  # `wait` обязателен: `kill` только ПОСЫЛАЕТ сигнал, и без ожидания сценарий
+  # «журнал лежит» мог начаться, пока сокет ещё принимает соединения — тест
+  # проверял бы живой стаб под видом мёртвого (находка ai-ревью PR #1380).
+  # Порт закрывается вместе с процессом, поэтому ждать больше нечего.
+  [ -n "$JOURNAL_PID" ] || return 0
+  kill "$JOURNAL_PID" 2>/dev/null || true
+  wait "$JOURNAL_PID" 2>/dev/null || true
   JOURNAL_PID=""
 }
 cleanup() { stop_journal; rm -rf "$TMP"; }

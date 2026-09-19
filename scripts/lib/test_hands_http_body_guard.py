@@ -55,16 +55,47 @@ ALLOWED_FAIL_FLAG = {
     ),
 }
 
+# `curl` как СЛОВО, а не как отдельный токен: вызов живёт и внутри подстановки
+# (`resp=$(curl -fsS …)`), и спрятанным в переменную (`DSH_EDGE_CURL="curl -fsS …"`)
+# — обе формы реальны, обе были в этом же репозитории, и обе этот PR удалял.
+# Косая черта перед словом разрешена намеренно: `/usr/bin/curl` — такой же вызов.
+_CURL_WORD_RE = re.compile(r"(?<![A-Za-z0-9_-])curl(?![A-Za-z0-9_-])")
+
+# Дальше слова `curl` флаги ищутся только ДО конца команды: иначе `curl … | grep -f …`
+# приписал бы curl'у чужой флаг.
+_COMMAND_END_RE = re.compile(r"^(\||\|\||;|&|&&|>|>>|<|\d?>&?\d?)$")
+
+
+def _fail_flag_follows(rest: str) -> bool:
+    for token in rest.split():
+        if _COMMAND_END_RE.match(token):
+            return False
+        if token == "--fail" or token.startswith("--fail-"):
+            return True
+        if token.startswith("-") and not token.startswith("--") and "f" in token[1:]:
+            return True
+    return False
+
+
 def _bare_fail_flag_hits(text: str) -> list[tuple[int, str]]:
     """Строки с голым `curl`, несущим флаг отказа-без-тела.
 
-    Разбор токенами, а не одним регекпом: регекп `curl\\s+-[a-zA-Z]*f`
-    (первая редакция этой гвардии) пропускал ДВА живых написания — длинную
-    форму `curl --fail` и естественную запись в несколько строк через `\\`,
-    где флаг стоит на продолжении. Оба варианта — тот же дефект и та же
-    потеря причины, и оба проходили молча (находка ai-ревью PR #1380).
-    Поэтому продолжения склеиваются в ЛОГИЧЕСКУЮ строку, а флаги ищутся
-    среди токенов ПОСЛЕ слова `curl`, а не по соседству с ним.
+    Две итерации этой функции — две половины одного класса, и обе найдены
+    ai-ревью PR #1380, а не чтением:
+
+    1. Регекп `curl\\s+-[a-zA-Z]*f` пропускал длинную форму `curl --fail`
+       и естественную запись в несколько строк через `\\`, где флаг стоит
+       на продолжении.
+    2. Заменивший его разбор по ТОЧНОМУ токену `curl` чинил обе, но открывал
+       две другие: `resp=$(curl -fsS …)` и `DSH_EDGE_CURL="curl -fsS …"` —
+       токены там `$(curl` и `="curl`. Обе формы жили в этом репозитории, обе
+       удалены этим же PR, и обе прошли бы мимо гвардии молча. Хуже того,
+       критерий задачи (`git grep -nE "curl -[a-zA-Z]*f"`) их ЛОВИТ: машинный
+       носитель был слабее правила, которое обязан держать.
+
+    Поэтому сейчас: продолжения склеиваются в ЛОГИЧЕСКУЮ строку, `curl`
+    ищется как СЛОВО (подстановка, кавычка, путь — не помеха), флаги
+    сканируются после него и только до конца команды.
 
     Номер строки — той, где начался вызов: читателю чинить его, а не
     середину продолжения.
@@ -82,17 +113,8 @@ def _bare_fail_flag_hits(text: str) -> list[tuple[int, str]]:
         stripped = logical.lstrip()
         if stripped.startswith("#"):
             continue  # комментарий, рассказывающий про класс, — не вызов
-        tokens = logical.split()
-        if "curl" not in tokens:
-            continue
-        for token in tokens[tokens.index("curl") + 1:]:
-            long_form = token == "--fail" or token.startswith("--fail-")
-            short_form = (
-                token.startswith("-")
-                and not token.startswith("--")
-                and "f" in token[1:]
-            )
-            if long_form or short_form:
+        for match in _CURL_WORD_RE.finditer(logical):
+            if _fail_flag_follows(logical[match.end():]):
                 hits.append((start + 1, stripped))
                 break
     return hits
