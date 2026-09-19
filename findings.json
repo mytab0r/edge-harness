@@ -674,7 +674,25 @@
       "source_pr": 1382,
       "status": "open",
       "title": "второй ::error:: советует искать дубль issue и там, где issue заведомо не было"
+    },
+    {
+      "detail": "Строка «обёртки статусов журнала на заглушках» больше не соответствует коду: этот же PR перевёл смок на настоящий HTTP-сервер (шапка смока это и объясняет). Поправить одно слово — «на настоящем HTTP-сервере».",
+      "file": "plugins-src/integrations/README.md",
+      "id": 76,
+      "opened_at": "2026-09-19T18:21:51.107719+00:00",
+      "source_pr": 1380,
+      "status": "open",
+      "title": "README интеграций всё ещё описывает смок как стенд на заглушках"
+    },
+    {
+      "detail": "У ALLOWED_FAIL_FLAG и ALLOWED_CURL_STUB_WITHOUT_OUTFILE такие тесты есть (`test_allowlist_entries_still_exist_and_still_need_the_flag`, `test_curl_stub_allowlist_entries_still_exist_and_still_stub_curl`), у третьего газа — нет: запись переживёт переменную, переставшую нести флаг, молча. Сегодня словарь пуст, поэтому дефект латентный, но асимметрию стоит закрыть симметричным тестом, пока первый вход не появился.",
+      "file": "scripts/lib/test_hands_http_body_guard.py",
+      "id": 77,
+      "opened_at": "2026-09-19T18:21:51.107719+00:00",
+      "source_pr": 1380,
+      "status": "open",
+      "title": "у ALLOWED_CURL_CARRIER нет теста «разрешение не переживает свою причину»"
     }
   ],
-  "next_id": 76
+  "next_id": 78
 }
