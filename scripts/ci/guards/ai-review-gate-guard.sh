@@ -11,6 +11,14 @@
 # Лежал без единого шага CI (находка канарейки осиротевших тестов,
 # #583) — тот же класс, что закрывали test_waiting_owner_guard.py и
 # test_apply_owner_decision.py выше по этому же файлу.
+#
+# Расширение #1374: тот же файл держит вторую проводку того же класса —
+# ранний рубеж головы обязан быть ПОДКЛЮЧЁН, а не только написан. Проверка
+# структурная и названа так честно (поведение доказывают тесты cmd_gather в
+# scripts/review/test_ai_review.py), но без неё «забыли передать
+# --expected-head» выглядело бы ровно как «голова ни разу не уезжала».
+# Доказано мутацией — ИСПОЛНЕНО: убрать `--expected-head` из шага gather в
+# ai-review.yml — «1 failed, 5 passed», база и откат — «6 passed».
 set -euo pipefail
 pip install --quiet pytest pyyaml
 python -m pytest scripts/review/test_ai_review_gate.py -q

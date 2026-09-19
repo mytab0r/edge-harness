@@ -666,7 +666,7 @@ def test_gather_fails_on_missing_placeholder(monkeypatch, tmp_path):
     # rules_section — используем настоящий, он читает файлы с диска
     # но нам не важно содержимое, главное что он есть
 
-    args = argparse.Namespace(pr=1, out=str(tmp_path / "out"))
+    args = argparse.Namespace(pr=1, out=str(tmp_path / "out"), expected_head="")
     with pytest.raises(RuntimeError) as exc:
         ai.cmd_gather(args)
     assert "MISSING_PLACEHOLDER" in str(exc.value)
@@ -1012,7 +1012,7 @@ def test_cmd_gather_empty_diff_confirmed_by_second_source_calls_gh_pr_diff_once(
 
     monkeypatch.setattr(ai.subprocess, "run", fake_run)
 
-    args = argparse.Namespace(pr=658, out=str(tmp_path))
+    args = argparse.Namespace(pr=658, out=str(tmp_path), expected_head="")
     rc = ai.cmd_gather(args)
 
     assert rc == 0
@@ -1041,7 +1041,7 @@ def test_cmd_gather_empty_file_list_but_nonempty_diff_is_loud_mismatch_not_empty
 
     monkeypatch.setattr(ai.subprocess, "run", fake_run)
 
-    args = argparse.Namespace(pr=658, out=str(tmp_path))
+    args = argparse.Namespace(pr=658, out=str(tmp_path), expected_head="")
     rc = ai.cmd_gather(args)
 
     assert rc == 0  # шаг остаётся зелёным — терминальный вердикт, не RuntimeError
@@ -1075,7 +1075,7 @@ def test_cmd_gather_nonempty_files_normal_path_calls_gh_pr_diff_exactly_once(mon
 
     monkeypatch.setattr(ai.subprocess, "run", fake_run)
 
-    args = argparse.Namespace(pr=658, out=str(tmp_path))
+    args = argparse.Namespace(pr=658, out=str(tmp_path), expected_head="")
     rc = ai.cmd_gather(args)
 
     assert rc == 0
@@ -1094,7 +1094,7 @@ def test_cmd_gather_nonempty_files_diff_empty_or_failed_still_raises(monkeypatch
     monkeypatch.setattr(ai.review_labels, "list_pr_files", lambda repo, pr, gh: files)
     monkeypatch.setattr(ai.subprocess, "run", lambda cmd, **kw: _FakeCompleted(1, stderr="boom"))
 
-    args = argparse.Namespace(pr=658, out=str(tmp_path))
+    args = argparse.Namespace(pr=658, out=str(tmp_path), expected_head="")
     with pytest.raises(RuntimeError, match="diff пуст при непустом списке файлов"):
         ai.cmd_gather(args)
 
@@ -3106,3 +3106,124 @@ def test_ai_prompt_checklist_asks_about_mechanisms_own_failure_mode():
         "ai_prompt.md потерял пункт чеклиста про собственный отказ "
         "механизма/пустой вход/крайнее значение объекта"
     )
+
+
+# ── #1374: рубеж головы ДО дорогого вызова модели ────────────────────────────
+#
+# Замер, ради которого это написано, — не оценка: PR #1372, 2026-09-19, за 27
+# минут три прогона ai-review с вердиктом `approve`, и все три выброшены
+# комментарием head-moved; PR #1380 в тот же день дал четвёртый. Цена
+# платилась полностью (минуты раннера, квота, живой вызов модели), польза —
+# нулевая. Рубеж в cmd_verdict правильный и остаётся; добавлен ВТОРОЙ, ранний.
+
+def _gather_args(tmp_path, expected_head: str) -> argparse.Namespace:
+    return argparse.Namespace(pr=658, out=str(tmp_path), expected_head=expected_head)
+
+
+def _gather_gh_with_head(sha_first: str, sha_last: str):
+    """gh для cmd_gather, у которого голова PR МЕНЯЕТСЯ между первым запросом
+    (начало сбора) и последним (сверка перед дорогим шагом) — ровно гонка с
+    пушем автора, а не её пересказ."""
+    base = _fake_gh_pull(sha=sha_first)
+    seen = {"pull": 0}
+
+    def fake_gh(url: str):
+        if url == "repos/o/r/pulls/658":
+            seen["pull"] += 1
+            if seen["pull"] > 1:
+                return {"title": "t", "head": {"sha": sha_last, "ref": "b"},
+                        "user": {"login": "x"}}
+        return base(url)
+
+    return fake_gh, seen
+
+
+def _gather_files_and_diff(monkeypatch):
+    files = [{"filename": "a.py", "status": "modified", "sha": "a1",
+              "additions": 3, "deletions": 1}]
+    monkeypatch.setattr(ai.review_labels, "list_pr_files", lambda repo, pr, gh: files)
+    monkeypatch.setattr(
+        ai.subprocess, "run",
+        lambda cmd, **kw: _FakeCompleted(0, stdout="diff --git a/a.py b/a.py\n+x\n"))
+
+
+def test_cmd_gather_head_moved_before_model_skips_expensive_run(monkeypatch, tmp_path, capsys):
+    """Голова уехала за время сбора — дорогой шаг не должен исполняться."""
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    fake_gh, _ = _gather_gh_with_head("76913bd001", "ffffffffffff")
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    _gather_files_and_diff(monkeypatch)
+
+    rc = ai.cmd_gather(_gather_args(tmp_path, "76913bd001"))
+
+    assert rc == 0, "гонка — не ошибка кода: шаг остаётся зелёным"
+    assert (tmp_path / "failure_reason.txt").read_text(encoding="utf-8") == "head_moved"
+    assert (tmp_path / "answer.txt").read_text(encoding="utf-8") == ""
+    out = capsys.readouterr().out
+    assert "ДО вызова модели" in out, out
+    assert "76913bd001" in out and "ffffffffff" in out, (
+        f"сообщение обязано назвать ОБЕ головы, иначе оно не отличимо от любой "
+        f"другой гонки: {out!r}")
+
+
+def test_cmd_gather_head_unchanged_does_not_fake_a_race(monkeypatch, tmp_path):
+    """Контроль: голова на месте — ни файла причины, ни пропуска шага.
+
+    Без него предыдущий тест был бы зелёным и у рубежа, который срабатывает
+    ВСЕГДА, — то есть у гвардии, отменившей ai-review целиком."""
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setattr(ai, "gh", _fake_gh_pull(sha="76913bd001"))
+    _gather_files_and_diff(monkeypatch)
+
+    rc = ai.cmd_gather(_gather_args(tmp_path, "76913bd001"))
+
+    assert rc == 0
+    assert not (tmp_path / "failure_reason.txt").exists()
+    assert (tmp_path / "prompt.md").exists(), "нормальный путь обязан собрать промпт"
+
+
+def test_cmd_gather_without_expected_head_keeps_manual_call_working(monkeypatch, tmp_path):
+    """Пустой --expected-head (ручной вызов gather из отладки) сверку не делает
+    и лишнего запроса к API не тратит."""
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    fake_gh, seen = _gather_gh_with_head("76913bd001", "ffffffffffff")
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    _gather_files_and_diff(monkeypatch)
+
+    rc = ai.cmd_gather(_gather_args(tmp_path, ""))
+
+    assert rc == 0
+    assert not (tmp_path / "failure_reason.txt").exists()
+    assert seen["pull"] == 1, "сверки нет — второго запроса головы быть не должно"
+
+
+def test_cmd_verdict_head_moved_before_model_touches_no_label(monkeypatch, tmp_path, capsys):
+    """Сэкономленный прогон не должен выглядеть сломанным.
+
+    Без раннего выхода пустой answer разобрался бы как нарушение контракта и
+    поставил `ai:failed` — то есть экономия вызова читалась бы как отказ, и
+    автоповтор #196 погнался бы за головой, которую уже ревьюит следующий
+    прогон."""
+    fake_gh, calls = _fake_gh_verdict("1234567890abcdef", "1234567890abcdef", [], [])
+    run_gh_calls: list[tuple] = []
+    monkeypatch.setattr(ai, "gh", fake_gh)
+    monkeypatch.setattr(ai, "run_gh", lambda *a: run_gh_calls.append(a))
+    monkeypatch.setattr(ai, "redact", lambda text: text)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+
+    args = _verdict_args(tmp_path, "")
+    args.failure_reason = "head_moved"
+    rc = ai.cmd_verdict(args)
+
+    assert rc == 0
+    label_calls = [a for a in run_gh_calls if any("labels" in str(x) for x in a)]
+    assert label_calls == [], f"метка не должна трогаться вовсе: {label_calls!r}"
+    comment_calls = [a for a in run_gh_calls if a[:3] == ("api", "-X", "POST")
+                     and a[3].endswith("/comments")]
+    assert len(comment_calls) == 1
+    body = comment_calls[0][-1]
+    assert "Дорогой прогон не исполнялся" in body, (
+        f"писать «вердикт не применён» здесь было бы неправдой — применять было "
+        f"нечего: {body!r}")
+    assert "Вердикт `` не применён" not in body
+    assert "ДО вызова модели" in capsys.readouterr().out
