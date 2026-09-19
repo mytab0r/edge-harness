@@ -1,5 +1,5 @@
 diff --git a/apps/dsh-edge/src/do-session-persistence.ts b/apps/dsh-edge/src/do-session-persistence.ts
-index 1adbb33..783f83a 100644
+index 1adbb33..6443b33 100644
 --- a/apps/dsh-edge/src/do-session-persistence.ts
 +++ b/apps/dsh-edge/src/do-session-persistence.ts
 @@ -38,7 +38,10 @@ import {
@@ -51,7 +51,7 @@ index 1adbb33..783f83a 100644
          this.migrateSession(row.id as SessionId, row, true, target)
        }
        if (rebuild) {
-@@ -1035,6 +1049,73 @@ export class DurableObjectSessionPersistence extends SessionPersistence {
+@@ -1035,6 +1049,76 @@ export class DurableObjectSessionPersistence extends SessionPersistence {
        SESSION_FORMAT_VERSION,
        SESSION_FORMAT_VERSION,
      )
@@ -100,7 +100,10 @@ index 1adbb33..783f83a 100644
 +  /**
 +   * HARNESS (#1376): durable record of every session this build refused to
 +   * migrate. The console.error above lands in Workers logs, which a deploy job
-+   * cannot read back; this table is what an endpoint reports to the canary.
++   * cannot read back, so the list is also kept here where something can query
++   * it. Nothing queries it YET — exposing it to the deploy canary is #1379;
++   * until then the only reader is a human with DO access, and that is said out
++   * loud rather than implied.
 +   * Rewritten whole on every startup — an empty list clears it — so a session
 +   * that becomes readable again simply stops being listed. That is the
 +   * quarantine's gas: nothing to undo by hand, and no stale row outlives its
@@ -125,7 +128,7 @@ index 1adbb33..783f83a 100644
    }
  
    private isEventTableRebuildCheaper(legacy: number): boolean {
-@@ -1305,6 +1386,13 @@ export class DurableObjectSessionPersistence extends SessionPersistence {
+@@ -1305,6 +1389,13 @@ export class DurableObjectSessionPersistence extends SessionPersistence {
  
  type EventTable = 'dsh_session_events' | 'dsh_session_events_migrating'
  
