@@ -90,6 +90,19 @@ def run_canary(url: str, label: str = "Канарейка ingest-шва (#119)",
                           encoding="utf-8", env=env)
 
 
+def run_probe(url: str, expected: str, label: str = "Канарейка прода"):
+    """Вызов canary_probe ровно в той форме, в какой его зовёт workflow:
+    code=$(canary_probe ...) — то есть stdout уходит в подстановку, и любой
+    шум в нём сломал бы сравнение кода у вызывающего."""
+    script = (
+        f'set -euo pipefail\n'
+        f'source "{LIB}"\n'
+        f'code=$(canary_probe "{label}" {expected} "{url}")\n'
+        f'printf "КОД=%s" "$code"\n'
+    )
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, encoding="utf-8")
+
+
 @pytest.mark.skipif(shutil.which("curl") is None, reason="curl недоступен в этой среде")
 def test_non_2xx_prints_code_and_body(server):
     """Главное требование: и код, и ПРИЧИНА видны в логе job'а."""
@@ -150,6 +163,59 @@ def test_network_failure_says_there_was_no_http_answer():
     assert result.returncode != 0
     assert "запрос не состоялся" in result.stderr, result.stderr
     assert "HTTP-ответа нет" in result.stderr
+
+# ── canary_probe: тихая на ожидаемом коде проба (находка ai-review PR #1372) ──
+
+
+@pytest.mark.skipif(shutil.which("curl") is None, reason="curl недоступен в этой среде")
+def test_probe_is_silent_when_code_is_the_expected_one(server):
+    """Проба корня выполняется на КАЖДОМ успешном деплое. Печатать тело на
+    успехе значило бы заливать HTML страницы морды в лог каждый раз — ровно
+    поэтому у пробы контракт другой, чем у canary_http."""
+    url = server(200, b"<!doctype html><html><body>login page</body></html>")
+    result = run_probe(url, "200")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "КОД=200", result.stdout
+    assert result.stderr.strip() == "", f"на ожидаемом коде проба молчит: {result.stderr}"
+
+
+@pytest.mark.skipif(shutil.which("curl") is None, reason="curl недоступен в этой среде")
+def test_probe_prints_body_when_code_differs_from_expected(server):
+    """Не тот код — причина обязана быть видна, и код обязан дойти до
+    вызывающего: вердикт принимает он, а не проба."""
+    url = server(502, b"error code: 1042")
+    result = run_probe(url, "200")
+
+    assert result.stdout == "КОД=502", result.stdout
+    assert "HTTP 502, ожидался 200" in result.stderr, result.stderr
+    assert "error code: 1042" in result.stderr, result.stderr
+
+
+@pytest.mark.skipif(shutil.which("curl") is None, reason="curl недоступен в этой среде")
+def test_probe_treats_303_login_as_success_not_as_failure(server):
+    """Логин канареек успешен РОВНО на 303. Будь у пробы контракт «любой 2xx»,
+    успешный логин считался бы отказом, а его тело лилось бы в лог каждого
+    деплоя — поэтому ожидаемый код передаётся аргументом."""
+    url = server(303, b"")
+    result = run_probe(url, "303", label="Логин канарейки #119")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "КОД=303", result.stdout
+    assert result.stderr.strip() == "", result.stderr
+
+
+@pytest.mark.skipif(shutil.which("curl") is None, reason="curl недоступен в этой среде")
+def test_probe_returns_000_and_says_so_when_there_was_no_http_answer():
+    """Сетевой отказ: вызывающий сравнит 000 с ожидаемым и упадёт, а в логе
+    будет сказано, что HTTP-ответа не было вовсе — это другой диагноз, чем
+    «ответил не тем кодом»."""
+    result = run_probe("http://127.0.0.1:1/", "200")
+
+    assert result.stdout == "КОД=000", result.stdout
+    assert "запрос не состоялся" in result.stderr, result.stderr
+    assert "HTTP-ответа нет" in result.stderr
+
 
 
 if __name__ == "__main__":
