@@ -47,13 +47,24 @@ JOURNAL_ERROR_BODY = {"error": {"code": "unauthorized", "message": "owner token 
 # Голый `curl -f` разрешён ТОЛЬКО там, где тело ответа не диагностика, а
 # мусор, который иначе ляжет на диск вместо артефакта. Ключ — путь, значение —
 # причина, которая уйдёт человеку в текст отказа гвардии.
+# Разрешение гранулярностью «файл» пропускало бы любой НОВЫЙ `-f` в том же
+# файле, хотя причина разрешения говорит про КОНКРЕТНЫЕ строки (находка
+# ai-ревью PR #1380). Поэтому запись несёт и признак строки: разрешена только
+# та, что этому признаку отвечает.
 ALLOWED_FAIL_FLAG = {
-    "scripts/lib/dsh-ci.sh": (
-        "скачивание релизных ассетов в файл (-o): без -f HTML-страница 404 легла бы "
-        "на диск как .tgz и упала бы позже на несовпадении sha256 — причина отказа "
-        "стала бы ДАЛЬШЕ от места отказа, а не ближе"
-    ),
+    "scripts/lib/dsh-ci.sh": {
+        "must_contain": "-o ",
+        "reason": (
+            "скачивание релизных ассетов в файл (-o): без -f HTML-страница 404 легла бы "
+            "на диск как .tgz и упала бы позже на несовпадении sha256 — причина отказа "
+            "стала бы ДАЛЬШЕ от места отказа, а не ближе"
+        ),
+    },
 }
+
+# Переменная-носитель аргументов curl с флагом отказа. Пусто: сегодня таких
+# нет. Запись сюда — названный газ, а не лазейка: путь, имя и причина.
+ALLOWED_CURL_CARRIER: dict[str, str] = {}
 
 # `curl` как СЛОВО, а не как отдельный токен: вызов живёт и внутри подстановки
 # (`resp=$(curl -fsS …)`), и спрятанным в переменную (`DSH_EDGE_CURL="curl -fsS …"`)
@@ -117,6 +128,74 @@ def _bare_fail_flag_hits(text: str) -> list[tuple[int, str]]:
             if _fail_flag_follows(logical[match.end():]):
                 hits.append((start + 1, stripped))
                 break
+    return hits
+
+
+# Флаг отказа доезжает до curl не только строкой вызова. Живой случай (находка
+# ai-ревью PR #1380, третья итерация этого рубежа): `DSH_EDGE_CURL_ARGS=(-f …)`
+# в scripts/lib/dsh-edge-session.sh — массив расширяется в каждый login/rpc/
+# ingest и доезжает до curl ВНУТРИ canary_http, а слова `curl` в строке нет, и
+# строчный разбор слеп. Критерий задачи (`git grep`) тоже слеп. Поэтому здесь
+# — не третья заплатка на регекп, а другой вопрос: какие ПЕРЕМЕННЫЕ доезжают
+# до вызова, и что в них лежит.
+_CALL_WORD_RE = re.compile(r"(?<![A-Za-z0-9_-])(?:curl|canary_http|canary_probe)(?![A-Za-z0-9_-])")
+_EXPANSION_RE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)")
+_ASSIGN_RE = re.compile(
+    r"^(?:export\s+|local\s+|readonly\s+|declare\s+-\S+\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+
+
+def _logical_lines(text: str):
+    """Склеивает продолжения через `\\` и НЕзакрытые скобки массива.
+
+    Массив `ARGS=(` + строки + `)` — такое же одно присваивание, как
+    однострочное; без склейки рубеж увидел бы пустое значение и промолчал.
+    """
+    raw = text.splitlines()
+    index = 0
+    while index < len(raw):
+        start = index
+        logical = raw[index]
+        while logical.rstrip().endswith("\\") and index + 1 < len(raw):
+            logical = logical.rstrip()[:-1] + " " + raw[index + 1]
+            index += 1
+        while logical.count("(") > logical.count(")") and index + 1 < len(raw):
+            logical = logical + " " + raw[index + 1]
+            index += 1
+        index += 1
+        yield start + 1, logical
+
+
+def _curl_arg_carriers(text: str) -> set[str]:
+    """Имена переменных, расширяемых в строке вызова ПОСЛЕ слова вызова."""
+    names: set[str] = set()
+    for _, logical in _logical_lines(text):
+        if logical.lstrip().startswith("#"):
+            continue
+        match = _CALL_WORD_RE.search(logical)
+        if not match:
+            continue
+        names.update(_EXPANSION_RE.findall(logical[match.end():]))
+    return names
+
+
+def _assignments(text: str):
+    for number, logical in _logical_lines(text):
+        stripped = logical.strip()
+        if stripped.startswith("#"):
+            continue
+        match = _ASSIGN_RE.match(stripped)
+        if match:
+            yield match.group(1), number, match.group(2)
+
+
+def _carrier_fail_flag_hits(text: str, carriers: set[str]) -> list[tuple[int, str]]:
+    hits = []
+    for name, number, value in _assignments(text):
+        if name not in carriers:
+            continue
+        flat = value.replace("(", " ").replace(")", " ").replace('"', " ").replace("'", " ")
+        if _fail_flag_follows(flat):
+            hits.append((number, f"{name}={value.strip()}"))
     return hits
 
 
@@ -239,6 +318,12 @@ def test_healthy_journal_stays_quiet(journal, tmp_path):
     assert "::error::" not in result.stderr, result.stderr
 
 
+def _scanned_shell_files():
+    """Область обхода — одно место правды на все структурные рубежи ниже."""
+    for area in ("scripts/hands", "scripts/worker", "scripts/lib", "scripts/plugins"):
+        yield from sorted((REPO_ROOT / area).rglob("*.sh"))
+
+
 def test_no_bare_fail_flag_outside_allowlist():
     """Вход закрыт: вернуть `curl -f` в клиенты рук нельзя молча.
 
@@ -248,13 +333,13 @@ def test_no_bare_fail_flag_outside_allowlist():
     нужен, впиши путь и причину в ALLOWED_FAIL_FLAG.
     """
     offenders = []
-    for area in ("scripts/hands", "scripts/worker", "scripts/lib", "scripts/plugins"):
-        for path in sorted((REPO_ROOT / area).rglob("*.sh")):
-            rel = path.relative_to(REPO_ROOT).as_posix()
-            if rel in ALLOWED_FAIL_FLAG:
-                continue
-            for number, line in _bare_fail_flag_hits(path.read_text(encoding="utf-8")):
-                offenders.append(f"{rel}:{number}: {line}")
+    for path in _scanned_shell_files():
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        allowed = ALLOWED_FAIL_FLAG.get(rel)
+        for number, line in _bare_fail_flag_hits(path.read_text(encoding="utf-8")):
+            if allowed and allowed["must_contain"] in line:
+                continue  # ровно та строка, ради которой дано разрешение
+            offenders.append(f"{rel}:{number}: {line}")
 
     assert not offenders, (
         "голый curl с флагом -f (--fail) в клиентах рук/воркера:\n  "
@@ -262,8 +347,48 @@ def test_no_bare_fail_flag_outside_allowlist():
         + "\nОн выбрасывает тело ответа на не-2xx, и отказ приходит без причины "
         "(#1371/#1373). Ходи через scripts/lib/canary_http.sh: canary_http "
         "(успех → тело в stdout) или canary_probe <метка> <ожидаемый-код>. "
-        "Газ: если флаг действительно нужен — впиши путь и причину в "
-        "ALLOWED_FAIL_FLAG этой гвардии, чтобы исключение было названо."
+        "Газ: если флаг действительно нужен — впиши путь, ПРИЗНАК СТРОКИ и "
+        "причину в ALLOWED_FAIL_FLAG этой гвардии, чтобы исключение было "
+        "названо и не расползалось на весь файл."
+    )
+
+
+def test_no_fail_flag_hidden_in_curl_arg_carrier():
+    """Третий заход того же класса: флаг, спрятанный от СТРОЧНОГО разбора.
+
+    `DSH_EDGE_CURL_ARGS=(-f …)` доезжает до curl внутри `canary_http`, но
+    слова `curl` в строке присваивания нет — ни рубеж выше, ни критерий
+    задачи (`git grep -nE "curl -[a-zA-Z]*f"`) его не видят (находка
+    ai-ревью PR #1380). Поэтому проверка задаёт другой вопрос: какие
+    ПЕРЕМЕННЫЕ расширяются в строку вызова — и что в них лежит.
+
+    Носители собираются по ВСЕМ просматриваемым файлам: переменная может
+    задаваться в одном, а расширяться в другом.
+
+    Газ: значение действительно обязано нести флаг — впиши имя и причину в
+    ALLOWED_CURL_CARRIER.
+    """
+    files = list(_scanned_shell_files())
+    texts = {path: path.read_text(encoding="utf-8") for path in files}
+    carriers: set[str] = set()
+    for text in texts.values():
+        carriers |= _curl_arg_carriers(text)
+
+    offenders = []
+    for path, text in texts.items():
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        for number, line in _carrier_fail_flag_hits(text, carriers):
+            if line.split("=", 1)[0] in ALLOWED_CURL_CARRIER:
+                continue
+            offenders.append(f"{rel}:{number}: {line}")
+
+    assert not offenders, (
+        "флаг отказа лежит в переменной, которая расширяется в вызов curl:\n  "
+        + "\n  ".join(offenders)
+        + "\nДо curl он доедет так же, как написанный в строке вызова, и так же "
+        "выбросит тело ответа (#1371/#1373) — а строчный разбор его не видит. "
+        "Газ: если значение обязано нести флаг — впиши имя и причину в "
+        "ALLOWED_CURL_CARRIER этой гвардии."
     )
 
 
@@ -271,12 +396,17 @@ def test_allowlist_entries_still_exist_and_still_need_the_flag():
     """Разрешение не переживает свою причину: путь из ALLOWED_FAIL_FLAG обязан
     существовать и обязан всё ещё содержать флаг. Иначе запись — мусор,
     молча разрешающий то, чего давно нет."""
-    for rel, reason in ALLOWED_FAIL_FLAG.items():
+    for rel, rule in ALLOWED_FAIL_FLAG.items():
         path = REPO_ROOT / rel
         assert path.exists(), f"ALLOWED_FAIL_FLAG указывает на исчезнувший {rel} — удали запись"
-        assert _stubs_curl_with_fail_flag(path.read_text(encoding="utf-8")), (
-            f"{rel} больше не содержит curl -f — разрешение («{reason}») стало "
+        hits = _bare_fail_flag_hits(path.read_text(encoding="utf-8"))
+        assert hits, (
+            f"{rel} больше не содержит curl -f — разрешение («{rule['reason']}») стало "
             "мусором, удали запись из ALLOWED_FAIL_FLAG"
+        )
+        assert any(rule["must_contain"] in line for _, line in hits), (
+            f"ни одна строка {rel} с curl -f не содержит «{rule['must_contain']}» — "
+            f"признак строки разошёлся с причиной («{rule['reason']}»), почини запись"
         )
 
 

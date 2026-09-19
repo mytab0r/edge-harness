@@ -220,14 +220,28 @@ dsh_edge_ingest() { # SESSION_ID SPOOL_LINES_FILE — батч строк спу
 
 dsh_edge_drain_batch() { # MODE LINES_FILE — один батч в морду; soft: одна попытка
   local mode=$1 lines=$2
-  if dsh_edge_ingest "${DSH_EDGE_SESSION_ID:?DSH_EDGE_SESSION_ID не задан}" "$lines"; then
+  # Уровень аннотации выбирает ВЫЗЫВАЮЩИЙ, потому что только он знает, будет
+  # ли ещё попытка: в hard-режиме их пять и итоговый ::error:: ниже, в soft —
+  # одна, и тогда отказ ingest'а и есть итог. ::error:: на повторяемой попытке
+  # заставлял бы читателя гадать, сломалось ли что-то (находка ai-ревью
+  # PR #1380; тот же расклад, что у обёрток журнала).
+  # Форма `if`, а не `[ … ] && level=warning`: у второй на ложном условии статус
+  # 1, и стоит ей однажды оказаться последней строкой функции — функция начнёт
+  # возвращать «отказ» на ровном месте. Проверено исполнением, что СЕЙЧАС
+  # `set -e` на ней не срывается (bash освобождает левую часть `&&`), так что
+  # это запас прочности, а не починка живого дефекта — сказано, чтобы читатель
+  # не принял одно за другое.
+  local level=error
+  if [ "$mode" = "hard" ]; then level=warning; fi
+  if CANARY_ERROR_LEVEL=$level \
+     dsh_edge_ingest "${DSH_EDGE_SESSION_ID:?DSH_EDGE_SESSION_ID не задан}" "$lines"; then
     return 0
   fi
   [ "$mode" = "hard" ] || return 1
   local attempt
   for attempt in 2 3 4 5; do
     sleep $((attempt * 2))
-    dsh_edge_ingest "$DSH_EDGE_SESSION_ID" "$lines" && return 0
+    CANARY_ERROR_LEVEL=warning dsh_edge_ingest "$DSH_EDGE_SESSION_ID" "$lines" && return 0
   done
   echo "::error::Морда не приняла батч транскрипта из 5 попыток — часть хода работы не доехала до морды" >&2
   return 1
@@ -309,7 +323,13 @@ dsh_edge_verify_transcript() { # SESSION_ID — прочитать событи�
   # отдаётся сразу, дальше соединение держится для живых событий — режем по
   # --max-time и разбираем то, что успело прийти (curl пишет в stdout по мере
   # получения, поэтому обрыв по таймауту не теряет уже присланные строки).
-  curl -sS --max-time 12 -b "$DSH_EDGE_CJAR" "$DSH_EDGE_URL/api/sessions/$session_id/events" 2>/dev/null \
+  # Почему здесь ГОЛЫЙ curl, а не canary_http (сказано вслух, а не умолчанием —
+  # находка ai-ревью PR #1380): canary_http копит тело в файл и выносит вердикт
+  # по коду, а этот вызов ЗАВЕДОМО обрывается по --max-time на открытом
+  # SSE-потоке и разбирает то, что успело прийти. Флага `-f` здесь нет, тело не
+  # выбрасывается; stderr тоже НЕ глушится — иначе «replay не разобран» ниже
+  # скрыл бы причину, ровно тот класс, ради которого написан #1371.
+  curl -sS --max-time 12 -b "$DSH_EDGE_CJAR" "$DSH_EDGE_URL/api/sessions/$session_id/events" \
     | sed -n 's/^data: //p' | jq -s '.' >"$events_file" 2>/dev/null
   if [ ! -s "$events_file" ] || ! jq -e 'type == "array"' "$events_file" >/dev/null 2>&1; then
     echo "::warning::Транскрипт-проверка (#131): replay сессии $session_id не разобран — проверка пропущена" >&2
