@@ -732,3 +732,179 @@ def test_try_resolve_notice_names_weaker_guarantee_for_shell(tmp_path, capsys):
     assert acm.try_resolve(tmp_path, ["tool.sh"]) is not None
     out = capsys.readouterr().out
     assert "bash -n" in out and "гарантия слабее" in out, out
+
+
+# ── heredoc: блокирующая находка ai-ревью PR #1392 ───────────────────────────
+#
+# Тело heredoc — ДАННЫЕ, и все три рубежа шелла слепы на нём ОДНОВРЕМЕННО:
+# строка стоит в нулевой колонке (не отступ), не определяет имён (не
+# пересекаются), `bash -n` принимает произвольную прозу внутри heredoc
+# (синтаксис валиден). Правка ОДНОЙ строки текста двумя сторонами выглядела
+# бы как два независимых добавления. И это не теория: scripts/gh/issue-create
+# — файл ИЗ ЗАМЕРА задачи — несёт heredoc'и с markdown-телами issue.
+
+_ISSUE_CREATE_LIKE = (
+    "#!/usr/bin/env bash\n"
+    "set -euo pipefail\n"
+    "\n"
+    "body=$(cat <<'EOF_BODY'\n"
+    "### Цель\n"
+    "<<<<<<< HEAD\n"
+    "Морда обязана отвечать за 200 мс\n"
+    "=======\n"
+    "Морда обязана отвечать за 500 мс\n"
+    ">>>>>>> branch\n"
+    "EOF_BODY\n"
+    ")\n"
+    'echo "$body"\n'
+)
+
+
+def test_shell_conflict_inside_heredoc_is_refused(tmp_path):
+    """Прод-форма живого файла: конфликт ОДНОЙ строки markdown-тела внутри
+    heredoc. До правки try_resolve возвращал успех и клал в файл ОБЕ
+    взаимоисключающие строки — `bash -n` итогового файла при этом rc=0, и
+    результат уехал бы как «сведённый»."""
+    target = tmp_path / "issue-create"
+    target.write_text(_ISSUE_CREATE_LIKE, encoding="utf-8")
+
+    result = acm.try_resolve(tmp_path, ["issue-create"])
+
+    assert result is None, "конфликт внутри heredoc сводить нельзя — это правка данных"
+    text = target.read_text(encoding="utf-8")
+    assert "<<<<<<<" in text, "отказ ДО записи"
+    assert not ("200 мс" in text and "500 мс" in text and "<<<<<<<" not in text)
+
+
+def test_shell_heredoc_refusal_names_the_delimiter(tmp_path):
+    """Отказ обязан называть ограничитель, а не просто «не наш класс» —
+    иначе разбирающий не поймёт, чем этот отказ отличается от прочих."""
+    _, reason = acm.resolve_file_text(_ISSUE_CREATE_LIKE, ".sh")
+    assert "heredoc" in reason and "EOF_BODY" in reason, reason
+
+
+def test_shell_conflict_after_closed_heredoc_still_merges(tmp_path):
+    """Контроль на противоположную ошибку: heredoc ЗАКРЫТ выше по файлу —
+    состояние не должно «залипать», иначе рубеж отверг бы всё после первого
+    же heredoc'а и выключил поддержку шелла целиком, оставаясь зелёным."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        "#!/usr/bin/env bash\n"
+        "cat <<'EOF'\n"
+        "просто текст\n"
+        "EOF\n"
+        "\n"
+        "<<<<<<< HEAD\n"
+        "alpha() {\n  echo a\n}\n"
+        "=======\n"
+        "beta() {\n  echo b\n}\n"
+        ">>>>>>> branch\n",
+        encoding="utf-8",
+    )
+
+    assert acm.try_resolve(tmp_path, ["tool.sh"]) is not None
+    merged = target.read_text(encoding="utf-8")
+    assert "alpha()" in merged and "beta()" in merged
+
+
+def test_shell_herestring_is_not_mistaken_for_heredoc(tmp_path):
+    """`<<<` — herestring, не heredoc. Спутать значит отвергать безобидные
+    файлы навсегда (состояние «heredoc открыт» никогда не закроется)."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        "#!/usr/bin/env bash\n"
+        'grep x <<< "$VAR"\n'
+        "\n"
+        "<<<<<<< HEAD\n"
+        "alpha() {\n  echo a\n}\n"
+        "=======\n"
+        "beta() {\n  echo b\n}\n"
+        ">>>>>>> branch\n",
+        encoding="utf-8",
+    )
+
+    assert acm.try_resolve(tmp_path, ["tool.sh"]) is not None
+
+
+def test_shell_names_cover_alias_and_declare_without_flag():
+    """Неполный список форм определения имени означал бы «имена не
+    пересеклись» там, где они пересекаются (находка ai-ревью PR #1392)."""
+    for ours, theirs, expected in (
+        ("alias ll='ls -l'\n", "alias ll='ls -la'\n", "ll"),
+        ("declare COUNT=1\n", "declare COUNT=2\n", "COUNT"),
+        ("typeset NAME=a\n", "typeset NAME=b\n", "NAME"),
+    ):
+        reason = acm._hunk_unsafe_reason(ours, theirs, ".sh")
+        assert reason is not None and expected in reason, (ours, reason)
+
+
+def test_notice_does_not_claim_ast_parse_when_no_python_in_batch(tmp_path, capsys):
+    """Без .py говорить «только ast.parse итоговых файлов» — неправда:
+    ast.parse тут не звался вовсе."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        "#!/usr/bin/env bash\n\n"
+        "<<<<<<< HEAD\n"
+        "alpha() {\n  echo a\n}\n"
+        "=======\n"
+        "beta() {\n  echo b\n}\n"
+        ">>>>>>> branch\n",
+        encoding="utf-8",
+    )
+
+    assert acm.try_resolve(tmp_path, ["tool.sh"]) is not None
+    out = capsys.readouterr().out
+    assert "только ast.parse итоговых файлов" not in out, out
+    assert "питоновских файлов в пачке нет" in out, out
+
+
+def test_shell_two_safe_hunks_merge_despite_earlier_conflict_marker(tmp_path):
+    """Второй хунк не должен считаться «внутри heredoc» из-за строки маркера
+    ПЕРВОГО хунка.
+
+    Дыра была настоящей: регексп с одним только lookahead видел в
+    `<<<<<<< HEAD` heredoc с ограничителем «HEAD», и любой второй хунк файла
+    отвергался. Прежние тесты на это молчали — они ждали отказа и по другой
+    причине (дубликат имени), то есть зеленели не на том."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        "#!/usr/bin/env bash\n\n"
+        "<<<<<<< HEAD\n"
+        "alpha() {\n  echo a\n}\n"
+        "=======\n"
+        "beta() {\n  echo b\n}\n"
+        ">>>>>>> branch\n"
+        "echo middle\n"
+        "<<<<<<< HEAD\n"
+        "gamma() {\n  echo g\n}\n"
+        "=======\n"
+        "delta() {\n  echo d\n}\n"
+        ">>>>>>> branch\n",
+        encoding="utf-8",
+    )
+
+    assert acm.try_resolve(tmp_path, ["tool.sh"]) is not None, (
+        "оба хунка безопасны — файл обязан свестись")
+    merged = target.read_text(encoding="utf-8")
+    for name in ("alpha()", "beta()", "gamma()", "delta()"):
+        assert name in merged, (name, merged)
+
+
+def test_shell_bare_word_herestring_does_not_open_a_phantom_heredoc(tmp_path):
+    """`<<< HELLO` без кавычек — herestring. Прежний тест брал `<<< "$VAR"`,
+    который не матчился НИ ОДНИМ из регекспов, и потому не различал
+    сломанный от исправного: мутация «убрать границу» оставляла его зелёным."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        "#!/usr/bin/env bash\n"
+        "grep x <<< HELLO\n"
+        "\n"
+        "<<<<<<< HEAD\n"
+        "alpha() {\n  echo a\n}\n"
+        "=======\n"
+        "beta() {\n  echo b\n}\n"
+        ">>>>>>> branch\n",
+        encoding="utf-8",
+    )
+
+    assert acm.try_resolve(tmp_path, ["tool.sh"]) is not None
