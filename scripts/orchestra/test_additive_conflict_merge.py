@@ -1093,3 +1093,102 @@ def test_shell_heredoc_delimiter_may_start_with_digit():
     assert acm._shell_heredoc_open_before(["cat <<2", "body"], 2) == "2"
     assert acm._shell_heredoc_open_before(
         ["<<<<<<< HEAD", "text", "=======", "text", ">>>>>>> branch"], 5) is None
+
+
+# ── неопознанная форма `<<` и полное слово ограничителя ─────────────────────
+#
+# Обе сцены из третьего раунда ai-ревью, проверены прогоном НАСТОЯЩЕГО bash:
+# `cat <<\EOF` — легальный bash (тело печатается, строка «EOF» закрывает),
+# `cat <<EOF-1` читает данные до «EOF-1», а «EOF» её НЕ закрывает. До правки
+# обе проходили ВСЕ рубежи с зелёным bash -n: сканер молча пропускал
+# открытие (первый случай) или брал ограничителем часть слова (второй).
+
+
+def test_shell_escaped_delimiter_is_loudly_refused(tmp_path):
+    """`cat <<\\EOF` — легальный bash, который сканер не разбирает. По
+    контракту модуля неопознанная форма — громкий отказ, а не молчаливое
+    сведение."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        "#!/usr/bin/env bash\n"
+        "cat <<\\EOF\n"
+        "<<<<<<< HEAD\n"
+        "ours() {\n  echo o\n}\n"
+        "=======\n"
+        "theirs() {\n  echo t\n}\n"
+        ">>>>>>> branch\n"
+        "EOF\n",
+        encoding="utf-8")
+
+    assert acm.try_resolve(tmp_path, ["tool.sh"]) is None
+    _, reason = acm.resolve_file_text(target.read_text(encoding="utf-8"), ".sh")
+    assert "неопознанная форма" in reason, reason
+
+
+def test_shell_unrecognized_form_in_side_is_refused():
+    """Сторона с неопознанной формой `<<` — не самостоятельная вставка:
+    сканер не знает, где кончаются её данные."""
+    _, reason = acm.resolve_file_text(
+        "#!/usr/bin/env bash\n"
+        "<<<<<<< HEAD\n"
+        "emit() {\n  cat <<\\A\nbody\nA\n}\n"
+        "=======\n"
+        "beta() {\n  echo b\n}\n"
+        ">>>>>>> branch\n",
+        ".sh")
+    assert reason is not None and "неопознанная форма" in reason, reason
+
+
+def test_shell_hyphenated_delimiter_body_eof_does_not_close(tmp_path):
+    """`cat <<EOF-1`: ограничитель — ПОЛНОЕ слово «EOF-1». Строка «EOF» в
+    теле его НЕ закрывает, конфликт после неё — данные."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        "#!/usr/bin/env bash\n"
+        "cat <<EOF-1\n"
+        "EOF\n"
+        "<<<<<<< HEAD\n"
+        "ours() {\n  echo o\n}\n"
+        "=======\n"
+        "theirs() {\n  echo t\n}\n"
+        ">>>>>>> branch\n"
+        "EOF-1\n",
+        encoding="utf-8")
+
+    assert acm.try_resolve(tmp_path, ["tool.sh"]) is None
+    _, reason = acm.resolve_file_text(target.read_text(encoding="utf-8"), ".sh")
+    assert "незакрытого heredoc (<<EOF-1)" in reason, reason
+
+
+def test_shell_hyphenated_delimiter_real_terminator_merges(tmp_path):
+    """Контроль против перегиба: настоящий терминатор «EOF-1» закрывает, и
+    конфликт после него сводится как обычный код."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        "#!/usr/bin/env bash\n"
+        "cat <<EOF-1\n"
+        "body\n"
+        "EOF-1\n"
+        "<<<<<<< HEAD\n"
+        "alpha() {\n  echo a\n}\n"
+        "=======\n"
+        "beta() {\n  echo b\n}\n"
+        ">>>>>>> branch\n",
+        encoding="utf-8")
+
+    assert acm.try_resolve(tmp_path, ["tool.sh"]) is not None
+    merged = target.read_text(encoding="utf-8")
+    assert "alpha()" in merged and "beta()" in merged, merged
+
+
+def test_shell_herestring_and_conflict_markers_are_not_unknown_forms():
+    """`<<<` и маркеры конфликта — не «неопознанная форма»: у первого `<<`
+    сдвоено с третьим `<`, у вторых все `<<` сдвоены с соседними. Арифметика
+    вырезается до поиска. Ложное «неопознано» здесь выключало бы шелл
+    целиком."""
+    assert acm._shell_heredoc_unknown_before(
+        ["grep x <<< HELLO", "<<<<<<< HEAD"], 2) is None
+    assert acm._shell_heredoc_unknown_before(
+        ["x=$((a << b))"], 1) is None
+    assert acm._shell_heredoc_unknown_before(
+        ["<<<<<<< HEAD", "t", "=======", "t", ">>>>>>> branch"], 5) is None
