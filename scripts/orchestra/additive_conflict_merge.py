@@ -57,9 +57,17 @@ LABELS.md`, класс «обе стороны дописывают РАЗНУЮ
 исполняемых `scripts/gh/*`, `scripts/git/*`). Критерий симметричен
 питоновскому: `bash -n` каждой стороны вместо `ast.parse` плюс непересечение
 верхнеуровневых имён (функции и присваивания в НУЛЕВОЙ колонке). Отдельный,
-несимметричный рубеж — heredoc: конфликт внутри незакрытого heredoc'а
-отвергается всегда, потому что его тело — ДАННЫЕ, и все три проверки на нём
-слепы одновременно (находка ai-ревью PR #1392, воспроизведена исполнением).
+несимметричный рубеж — heredoc, и он тройной, потому что тело heredoc'а —
+ДАННЫЕ, а все три обычные проверки на данных слепы одновременно (находки
+ai-ревью PR #1392, обе воспроизведены исполнением):
+  1. хунк ВНУТРИ уже открытого heredoc'а — отказ (строки до хунка);
+  2. СТОРОНА хунка, открывшая heredoc и не закрывшая, — отказ: всё ниже по
+     файлу стало бы её телом;
+  3. ИТОГОВЫЙ файл, оставшийся с незакрытым heredoc'ом, — отказ.
+Третий не дублирует второй: heredoc может открывать ХВОСТ файла, ниже хунка,
+и тогда обе стороны самостоятельны, а итог всё равно обрывается посреди
+данных. `bash -n` ни один из трёх случаев не ловит — на незакрытом heredoc он
+печатает warning и возвращает НОЛЬ.
 Честная разница с .py, которую отчёт печатает вслух: у шелла НЕТ третьего
 рубежа — прогона соседнего теста, потому что соглашения «сосед-тест» для .sh
 в репозитории нет.
@@ -160,6 +168,13 @@ _SHEBANG_SHELL_RE = re.compile(r"^#!.*\b(?:ba|z|k)?sh\b")
 _HEREDOC_START_RE = re.compile(
     r"(?<!<)<<-?\s*(?P<q>['\"]?)(?P<delim>[A-Za-z_][A-Za-z0-9_]*)(?P=q)")
 
+# Арифметика — не heredoc: в `$(( x << SHIFT ))` и `(( x << SHIFT ))` сдвиг
+# влево выглядит для регекспа точно так же, как открытие heredoc'а с
+# ограничителем SHIFT, и файл отказывался бы навсегда с ложной причиной
+# (некритичная находка ai-ревью PR #1392). Арифметические врезки вырезаются
+# из строки ДО поиска.
+_ARITH_SPAN_RE = re.compile(r"\$?\(\(.*?\)\)")
+
 
 def _shell_heredoc_open_before(lines: list, index: int) -> str | None:
     """Имя ограничителя незакрытого heredoc'а, внутри которого оказалась
@@ -184,7 +199,7 @@ def _shell_heredoc_open_before(lines: list, index: int) -> str | None:
             if line.strip() == pending[0]:
                 pending.pop(0)
             continue
-        for match in _HEREDOC_START_RE.finditer(line):
+        for match in _HEREDOC_START_RE.finditer(_ARITH_SPAN_RE.sub(" ", line)):
             pending.append(match.group("delim"))
     return pending[0] if pending else None
 _SHEBANG_PYTHON_RE = re.compile(r"^#!.*\bpython[0-9.]*\b")
@@ -227,6 +242,22 @@ def _shell_hunk_unsafe_reason(ours: str, theirs: str) -> str | None:
         if error is not None:
             return (f"сторона {label} не разбирается как самостоятельный "
                     f"shell-фрагмент (bash -n): {error}")
+    for label, side in (("ours", ours), ("theirs", theirs)):
+        # Сторона, открывшая heredoc и не закрывшая его, — не самостоятельная
+        # вставка: всё, что идёт ниже по файлу (включая ВТОРУЮ сторону этого
+        # же хунка), становится её телом. `bash -n` тут не помощник — на
+        # незакрытом heredoc он печатает warning и возвращает НОЛЬ (проверено
+        # исполнением). Блокирующая находка ai-ревью PR #1392, второй заход:
+        # первая редакция рубежа смотрела только строки ДО хунка, и сцена
+        # «ours открывает heredoc, theirs определяет функцию» проходила все
+        # проверки, а в итоговом файле функция и весь хвост оказывались телом
+        # heredoc'а.
+        lines = side.split("\n")
+        left_open = _shell_heredoc_open_before(lines + [""], len(lines) + 1)
+        if left_open is not None:
+            return (f"сторона {label} открывает heredoc (<<{left_open}) и не "
+                    "закрывает его — не самостоятельная вставка: всё ниже по "
+                    "файлу стало бы её телом")
     collision = _shell_top_level_names(ours) & _shell_top_level_names(theirs)
     if collision:
         return f"обе стороны определяют одно и то же имя верхнего уровня: {sorted(collision)}"
@@ -608,6 +639,18 @@ def try_resolve(repo_dir, unmerged_paths: list[str]) -> list[str] | None:
                                f"(слепая конкатенация оставила бы живым только "
                                f"последнее определение): {duplicates}")
         elif languages[path] == ".sh":
+            # Зеркало перехунковой проверки выше: даже если каждая сторона
+            # выглядела самостоятельной, СОБРАННЫЙ файл не имеет права
+            # оставлять heredoc открытым. `bash -n` этого не ловит (rc=0 с
+            # warning'ом), поэтому рубеж отдельный.
+            resolved_lines = resolved.split("\n")
+            left_open = _shell_heredoc_open_before(
+                resolved_lines + [""], len(resolved_lines) + 1)
+            if left_open is not None:
+                return _refuse(f"{path.name}: итоговый файл оставляет "
+                               f"незакрытый heredoc (<<{left_open}) — bash -n "
+                               "такое принимает (warning, rc=0), поэтому "
+                               "проверка отдельная")
             error = _bash_syntax_error(resolved)
             if error is not None:
                 return _refuse(f"{path.name}: итоговый файл не принимается "

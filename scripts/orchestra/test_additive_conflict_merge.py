@@ -908,3 +908,94 @@ def test_shell_bare_word_herestring_does_not_open_a_phantom_heredoc(tmp_path):
     )
 
     assert acm.try_resolve(tmp_path, ["tool.sh"]) is not None
+
+
+def test_shell_side_that_opens_heredoc_is_refused(tmp_path):
+    """Сцена ai-ревью PR #1392 (второй заход), воспроизведённая дословно:
+    ours открывает heredoc и не закрывает, theirs определяет функцию.
+
+    До правки проходили ВСЕ рубежи: строки до хунка чисты, отступа нет, имена
+    не пересекаются, а `bash -n` на незакрытом heredoc возвращает НОЛЬ
+    (печатает warning). В записанном файле `beta()` и весь хвост становились
+    телом heredoc'а «A» — то есть правка одной конструкции, которую дифф
+    считает двумя независимыми вставками."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        "#!/usr/bin/env bash\n\n"
+        "<<<<<<< HEAD\n"
+        "cat <<A\n"
+        "BODY\n"
+        "=======\n"
+        "beta() {\n  echo b\n}\n"
+        ">>>>>>> branch\n"
+        "echo tail\n",
+        encoding="utf-8",
+    )
+
+    result = acm.try_resolve(tmp_path, ["tool.sh"])
+
+    assert result is None, "сторона, открывшая heredoc, — не самостоятельная вставка"
+    assert "<<<<<<<" in target.read_text(encoding="utf-8"), "отказ ДО записи"
+
+
+def test_shell_side_heredoc_refusal_names_the_delimiter():
+    reason = acm._hunk_unsafe_reason("cat <<A\nBODY\n", "beta() {\n  echo b\n}\n", ".sh")
+    assert reason is not None and "<<A" in reason, reason
+
+
+def test_shell_side_with_closed_heredoc_is_still_additive():
+    """Контроль на противоположную ошибку: сторона, которая открыла И
+    закрыла heredoc, самостоятельна — отвергать её нельзя, иначе рубеж
+    запретил бы любую вставку с текстовым телом."""
+    ours = "alpha() {\n  cat <<'EOF'\ntext\nEOF\n}\n"
+    theirs = "beta() {\n  echo b\n}\n"
+    assert acm._hunk_unsafe_reason(ours, theirs, ".sh") is None
+
+
+def test_shell_arithmetic_left_shift_is_not_a_heredoc():
+    """`$(( x << SHIFT ))` — сдвиг влево, не heredoc. Спутать значит
+    отвергать файл навсегда с ложной причиной (находка ai-ревью PR #1392)."""
+    text = (
+        "#!/usr/bin/env bash\n"
+        "mask=$(( 1 << SHIFT ))\n"
+        "(( y = z << BITS ))\n"
+        "\n"
+        "<<<<<<< HEAD\n"
+        "alpha() {\n  echo a\n}\n"
+        "=======\n"
+        "beta() {\n  echo b\n}\n"
+        ">>>>>>> branch\n"
+    )
+    resolved, reason = acm.resolve_file_text(text, ".sh")
+    assert resolved is not None, reason
+    assert "alpha()" in resolved and "beta()" in resolved
+
+
+def test_shell_refuses_when_resolved_file_leaves_heredoc_open_at_eof(tmp_path):
+    """Зеркальный рубеж на ИТОГОВОМ файле — случай, которого перехунковая
+    проверка не видит по построению: heredoc открывает ХВОСТ файла, ниже
+    хунка.
+
+    Обе стороны самостоятельны, строки до хунка чисты — все перехунковые
+    проверки зелёные. Но собранный файл остаётся с незакрытым heredoc'ом, и
+    `bash -n` такое принимает (warning, rc=0, проверено исполнением). Файл в
+    таком состоянии пришёл уже испорченным, и это ровно «любое сомнение —
+    полный отказ» из контракта модуля: где именно кончаются данные, мы не
+    знаем, а значит не знаем и того, не легла ли вставка внутрь них."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        "#!/usr/bin/env bash\n\n"
+        "<<<<<<< HEAD\n"
+        "alpha() {\n  echo a\n}\n"
+        "=======\n"
+        "beta() {\n  echo b\n}\n"
+        ">>>>>>> branch\n"
+        "cat <<TAIL\n"
+        "данные без ограничителя\n",
+        encoding="utf-8",
+    )
+
+    result = acm.try_resolve(tmp_path, ["tool.sh"])
+
+    assert result is None, "итог с незакрытым heredoc сводить нельзя"
+    assert "<<<<<<<" in target.read_text(encoding="utf-8"), "отказ ДО записи"
