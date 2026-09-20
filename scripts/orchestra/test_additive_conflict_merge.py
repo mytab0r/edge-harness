@@ -1720,3 +1720,126 @@ def test_shell_braced_function_name_from_both_sides_is_refused():
     assert "foo{a}" in reason, reason
     # Контроль против перегиба: сам блок `{ … }` именем не становится.
     assert acm._shell_top_level_names("{ echo x; }") == set()
+
+
+# Формы присваивания-кандидаты: и те, что сканер обязан видеть, и заведомо
+# не-присваивания — чтобы гвардия ниже проверяла обе стороны границы.
+_SH_ASSIGN_FORMS = [
+    ("plain=1", "plain"),
+    ("arr[0]=1", "arr"),
+    ("arr[idx]=1", "arr"),
+    ("P+=/a", "P"),
+    ("cnt+=1", "cnt"),
+    ("export E=1", "E"),
+    ("readonly R=1", "R"),
+    ("declare -i D=1", "D"),
+    ("declare -A m", "m"),
+    ("export PATH_Y", "PATH_Y"),
+    ("A=1 B=2", "B"),
+    ("echo hi", "hi"),
+    ("[[ a == b ]]", "a"),
+]
+
+
+def test_shell_assignment_forms_do_not_lag_behind_real_bash():
+    """Та же гвардия, что для имён функций, но для ФОРМ присваивания —
+    блокирующая находка ai-ревью PR #1392, раунд 10.
+
+    Разбор видел только `имя=…`, а `arr[0]=…` и `P+=…` — легальный bash и
+    для сканера невидимы. Прогоном подтверждено: `arr[0]=1` против
+    `arr[0]=2` даёт `2` (значение ours потеряно молча), `P+=/a` против
+    `P+=/b` даёт `/a/b` (одна правка применяется ДВАЖДЫ — для счётчика
+    `x+=1` это тихо неверный итог). Обе формы регистрируют переменную:
+    `declare -p` её находит.
+
+    Это третий раз, когда та же семья дефектов приходит другой формой
+    (раунды 6-9 — имена функций и строки ключевых слов), поэтому проверка
+    поведенческая и спрашивает сам bash, а не сверяет регекспы глазами.
+
+    Инвариант: bash зарегистрировал переменную -> сканер видит имя."""
+    for line, name in _SH_ASSIGN_FORMS:
+        probe = subprocess.run(
+            ["bash", "-c", f"{line}\n"
+                           'declare -p -- "$N" >/dev/null 2>&1 && echo REGISTERED'],
+            capture_output=True, text=True, encoding="utf-8",
+            env={"N": name, "PATH": "/usr/bin:/bin"})
+        bash_registers = "REGISTERED" in probe.stdout
+        scanner_sees = name in acm._shell_top_level_names(line)
+
+        if bash_registers:
+            assert scanner_sees, (
+                f"bash регистрирует переменную {name!r} строкой {line!r}, а "
+                f"сканер имени не видит: две стороны, правящие её, свелись бы "
+                f"молча (класс #883)")
+        else:
+            assert not scanner_sees, (
+                f"сканер считает {name!r} определённым строкой {line!r}, но "
+                f"bash переменную не регистрирует — фантом обязан быть назван")
+
+
+def test_shell_indexed_assignment_from_both_sides_is_refused():
+    """Сцена ревьюера end-to-end: до правки множества имён были ПУСТЫМИ,
+    пачка сводилась, и прогон сведённого файла давал значение theirs."""
+    resolved, reason = acm.resolve_file_text(
+        "#!/usr/bin/env bash\n"
+        "<<<<<<< HEAD\n"
+        "arr[0]=ours-value\n"
+        "=======\n"
+        "arr[0]=theirs-value\n"
+        ">>>>>>> branch\n",
+        ".sh")
+
+    assert resolved is None, "правка одного элемента массива с двух сторон не сводится"
+    assert "arr" in reason, reason
+
+
+def test_shell_append_assignment_from_both_sides_is_refused():
+    """`P+=…` с двух сторон опаснее, чем выглядит: обе строки ИСПОЛНЯЮТСЯ
+    (прогон даёт `/a/b`), то есть одна правка применяется дважды — для
+    счётчика это тихо неверный итог, а не «последний победил»."""
+    resolved, reason = acm.resolve_file_text(
+        "#!/usr/bin/env bash\n"
+        "<<<<<<< HEAD\n"
+        "PATH_X+=/a\n"
+        "=======\n"
+        "PATH_X+=/b\n"
+        ">>>>>>> branch\n",
+        ".sh")
+
+    assert resolved is None
+    assert "PATH_X" in reason, reason
+
+
+def test_missing_bash_is_a_refusal_with_a_reason_not_a_crash(monkeypatch):
+    """Некритичная находка ai-ревью PR #1392, раунд 10: `_bash_syntax_error`
+    звал `subprocess.run(["bash", …])` без обработки `FileNotFoundError`, и
+    на машине без bash проход падал исключением — очередь получала
+    инфраструктурный сбой вместо строки отказа. Контракт модуля («любое
+    сомнение — отказ С ПРИЧИНОЙ») нарушался собственной рукой.
+
+    Тест поведенческий: bash реально «исчезает» (подменён `subprocess.run`,
+    бросающий `FileNotFoundError`), и проверяется весь путь до причины
+    отказа, а не наличие `try` в исходнике (класс #891/#893)."""
+    def no_bash(cmd, *args, **kwargs):
+        if cmd and cmd[0] == "bash":
+            raise FileNotFoundError(2, "No such file or directory: 'bash'")
+        raise AssertionError(f"неожиданный вызов {cmd!r}")
+
+    monkeypatch.setattr(acm.subprocess, "run", no_bash)
+
+    # Прямой вызов не бросает, а называет причину.
+    assert acm._bash_syntax_error("alpha() { :; }") == acm.BASH_UNAVAILABLE_REASON
+    assert "bash недоступен" in acm.BASH_UNAVAILABLE_REASON
+
+    # И весь путь до отказа: причина доезжает до текста, .sh не сводится.
+    resolved, reason = acm.resolve_file_text(
+        "#!/usr/bin/env bash\n"
+        "<<<<<<< HEAD\n"
+        "alpha() { :; }\n"
+        "=======\n"
+        "beta() { :; }\n"
+        ">>>>>>> branch\n",
+        ".sh")
+
+    assert resolved is None
+    assert "bash недоступен" in reason, reason
