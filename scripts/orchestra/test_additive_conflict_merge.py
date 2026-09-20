@@ -999,3 +999,97 @@ def test_shell_refuses_when_resolved_file_leaves_heredoc_open_at_eof(tmp_path):
 
     assert result is None, "итог с незакрытым heredoc сводить нельзя"
     assert "<<<<<<<" in target.read_text(encoding="utf-8"), "отказ ДО записи"
+
+
+# ── закрытие heredoc по правилам настоящего bash ────────────────────────────
+#
+# Рубеж общий для всех трёх проверок heredoc (хунк внутри, сторона-открыватель,
+# хвост итогового файла): правило `line.strip() == delim` закрывало heredoc
+# строками, которые bash терминаторами НЕ считает. Оба негативных правила
+# проверены прогоном НАСТОЯЩЕГО bash:
+#   `cat <<'EOF'` … `EOF ` (хвостовой пробел) → тело продолжается, bash
+#     предупреждает «here-document delimited by end-of-file»;
+#   `cat <<-EOF` … `    EOF` (пробельный отступ) → то же: `<<-` снимает
+#     только ТАБУЛЯЦИИ (таб-отступ закрывает — проверено тем же прогоном:
+#     исполнение продолжается после терминатора).
+# Оба случая воспроизведены end-to-end на голове до правки: try_resolve
+# возвращал успех, и ОБЕ взаимоисключающие строки становились мёртвым телом
+# heredoc'а итогового файла (bash -n зелёный).
+
+
+def _conflict_after_false_terminator(open_line: str, bad_terminator: str) -> str:
+    return (
+        "#!/usr/bin/env bash\n"
+        f"{open_line}\n"
+        "prefix\n"
+        f"{bad_terminator}\n"
+        "<<<<<<< HEAD\n"
+        "ours() {\n  echo ours\n}\n"
+        "=======\n"
+        "theirs() {\n  echo theirs\n}\n"
+        ">>>>>>> branch\n"
+        "EOF\n"
+    )
+
+
+def test_shell_heredoc_trailing_space_terminator_does_not_close(tmp_path):
+    """`EOF ` с хвостовым пробелом — НЕ терминатор bash, конфликт после него
+    всё ещё внутри ДАННЫХ и не сводится."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        _conflict_after_false_terminator("cat <<'EOF'", "EOF "), encoding="utf-8")
+
+    assert acm.try_resolve(tmp_path, ["tool.sh"]) is None, (
+        "heredoc не закрыт — конфликт внутри тела сводить нельзя")
+    _, reason = acm.resolve_file_text(target.read_text(encoding="utf-8"), ".sh")
+    assert "heredoc" in reason and "EOF" in reason, reason
+
+
+def test_shell_dash_heredoc_space_indented_terminator_does_not_close(tmp_path):
+    """`<<-` снимает с терминатора только табуляции: `    EOF` с пробелами
+    её НЕ закрывает, конфликт после неё — данные."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        _conflict_after_false_terminator("cat <<-EOF", "    EOF"), encoding="utf-8")
+
+    assert acm.try_resolve(tmp_path, ["tool.sh"]) is None
+
+
+def test_shell_dash_heredoc_tab_indented_terminator_closes(tmp_path):
+    """Контроль против перегиба: `<<-` с ТАБУЛЯЦИЕЙ — настоящий терминатор.
+    Конфликт ПОСЛЕ него — обычный код и обязан свестись, иначе рубеж
+    «залипал» бы и выключал поддержку шелла целиком."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        "#!/usr/bin/env bash\n"
+        "cat <<-EOF\n"
+        "\tbody\n"
+        "\tEOF\n"
+        "<<<<<<< HEAD\n"
+        "alpha() {\n  echo a\n}\n"
+        "=======\n"
+        "beta() {\n  echo b\n}\n"
+        ">>>>>>> branch\n",
+        encoding="utf-8")
+
+    assert acm.try_resolve(tmp_path, ["tool.sh"]) is not None
+    merged = target.read_text(encoding="utf-8")
+    assert "alpha()" in merged and "beta()" in merged, merged
+
+
+def test_shell_heredoc_open_before_requires_exact_terminator():
+    """Юнит на само правило: хвостовой пробел терминатора оставляет heredoc
+    открытым; точное равенство закрывает."""
+    opened = ["cat <<'EOF'", "prefix", "EOF ", "more"]
+    assert acm._shell_heredoc_open_before(opened, 4) == "EOF"
+    closed = ["cat <<'EOF'", "prefix", "EOF", "more"]
+    assert acm._shell_heredoc_open_before(closed, 4) is None
+
+
+def test_shell_heredoc_delimiter_may_start_with_digit():
+    """`cat <<2` — легальный bash (прогон: тело печатается, строка «2»
+    закрывает); пропуск открытия — отказ в опасную сторону. Широкий класс не
+    открывает дверь маркерам: строка `<<<<<<< HEAD` не матчится и с ним."""
+    assert acm._shell_heredoc_open_before(["cat <<2", "body"], 2) == "2"
+    assert acm._shell_heredoc_open_before(
+        ["<<<<<<< HEAD", "text", "=======", "text", ">>>>>>> branch"], 5) is None
