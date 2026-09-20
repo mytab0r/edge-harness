@@ -1576,3 +1576,80 @@ def test_try_resolve_unsupported_type_message_comes_from_the_same_place(tmp_path
     assert acm.try_resolve(tmp_path, ["config.toml"]) is None
     printed = capsys.readouterr().out
     assert acm.UNSUPPORTED_SUFFIX_HINT in printed, printed
+
+
+def test_shell_hash_inside_function_name_is_seen():
+    """Блокирующая находка ai-ревью PR #1392 (раунд 8): `#` был исключён из
+    класса имени «от противного», хотя настоящий bash имена с `#` внутри
+    слова принимает — `#` начинает комментарий только словом с НАЧАЛА
+    строки. Прогон: `lint#all() { echo hi; }; lint#all` печатает `hi`,
+    rc=0. На таких именах класс отдавал ПУСТОЕ множество — направление
+    ошибки опасное, и спека при этом обещала «не принимается только `=`»."""
+    assert acm._shell_top_level_names("lint#all() {\n  echo ours\n}\n") == {"lint#all"}
+    assert acm._shell_top_level_names("foo#bar() { :; }") == {"foo#bar"}
+
+
+def test_shell_hash_function_collision_refuses_end_to_end(tmp_path):
+    """Сцена ревьюера раунда 8 end-to-end: обе стороны правят один `lint#all`
+    разными телами — пачка отказывает, причина называет имя; до правки
+    проходила все рубежи с пустыми множествами имён и сводилась, молча
+    оставляя живым последнее определение (класс #883)."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        "#!/usr/bin/env bash\n"
+        "<<<<<<< HEAD\n"
+        "lint#all() {\n  echo ours\n}\n"
+        "=======\n"
+        "lint#all() {\n  echo theirs\n}\n"
+        ">>>>>>> branch\n",
+        encoding="utf-8")
+
+    assert acm.try_resolve(tmp_path, ["tool.sh"]) is None
+    _, reason = acm.resolve_file_text(target.read_text(encoding="utf-8"), ".sh")
+    assert "lint#all" in reason, reason
+
+
+def test_shell_commented_out_function_is_a_phantom_in_the_safe_direction():
+    """Пин границы после включения `#`: закомментированное определение
+    `#имя() {` в нулевой колонке даёт фантом `#имя` — отказ, не пропуск
+    (модуль везде выбирает ложный отказ вместо тихого сведения). Контроль
+    против перегиба: фантом `#имя` отличен от настоящего `имя`, поэтому
+    реальная функция рядом с собственной закомментированной копией дубликата
+    НЕ создаёт и отказом пачку не валит."""
+    assert acm._shell_top_level_names("#my-func() {") == {"#my-func"}
+    assert acm._duplicate_shell_top_level_names(
+        "my-func() { :; }\n#my-func() {") == []
+
+
+def test_language_reads_shebang_when_conflict_starts_at_first_line(tmp_path):
+    """Некритичная находка ai-ревью PR #1392 (раунд 8): файл без расширения,
+    чей конфликт стоит в САМОЙ ПЕРВОЙ строке, шебангом нулевой строки не
+    обладает — она занята маркером, а шебанг лежит в стороне хунка, и
+    итоговый файл после слияния начнётся именно с неё. До правки такой файл
+    отказывал как «тип не поддержан» — по положению маркера, не по
+    существу."""
+    target = tmp_path / "tool"
+    target.write_text(
+        "<<<<<<< HEAD\n"
+        "#!/usr/bin/env bash\n"
+        "OURS=1\n"
+        "=======\n"
+        "#!/bin/sh\n"
+        "THEIRS=1\n"
+        ">>>>>>> branch\n",
+        encoding="utf-8")
+    text = target.read_text(encoding="utf-8")
+    assert acm.language_of(target, text) == ".sh"
+
+    # Контроль: пустая сторона ours — итог начинается со стороны theirs.
+    theirs_only = "<<<<<<< HEAD\n=======\n#!/bin/sh\nTHEIRS=1\n>>>>>>> branch\n"
+    assert acm.language_of(target, theirs_only) == ".sh"
+
+    # Контроль против перегиба: питоновский шебанг опознаётся так же.
+    python_top = "<<<<<<< HEAD\n#!/usr/bin/env python3\nX = 1\n=======\nX = 2\n>>>>>>> branch\n"
+    assert acm.language_of(target, python_top) == ".py"
+
+    # Контроль против перегиба: ни одна сторона не несёт шебанга — прежний
+    # честный отказ «тип не поддержан» остаётся.
+    no_shebang = "<<<<<<< HEAD\nalpha\n=======\nbeta\n>>>>>>> branch\n"
+    assert acm.language_of(target, no_shebang) is None
