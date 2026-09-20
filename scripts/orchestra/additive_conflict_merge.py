@@ -153,42 +153,116 @@ _SH_ASSIGN_RE = re.compile(
 _SHEBANG_SHELL_RE = re.compile(r"^#!.*\b(?:ba|z|k)?sh\b")
 
 # `<<` или `<<-`, но НЕ `<<<` (herestring — не heredoc) и НЕ строка маркера
-# конфликта (`<<<<<<< HEAD`).
+# конфликта (`<<<<<<< HEAD`). Регексп только НАХОДИТ открытие; ограничитель
+# разбирает `_heredoc_delimiter_at` — см. ниже, почему не регексп.
 #
-# Работу делает ЛЕВАЯ граница `(?<!<)`, и это установлено мутацией, а не
-# рассуждением. Первая редакция ставила правую, `<<(?!<)`, и этого НЕ хватало:
-# в `<<<` символы 1-2 — тоже `<<`, а следом пробел, поэтому регексп находил
-# heredoc СО СДВИГОМ НА СИМВОЛ. Последствия были два, оба тихие:
-# `grep x <<< HELLO` открывал фантомный heredoc «HELLO», который никогда не
-# закроется, а `<<<<<<< HEAD` становился heredoc'ом с ограничителем «HEAD» —
-# то есть ЛЮБОЙ второй хунк файла отвергался как «внутри heredoc». Прежние
-# тесты этого не видели: они ждали отказа и по другой причине, то есть
-# зеленели не на том (класс #891/#893).
-#
-# Симметричная правая граница при наличии левой — мёртвый код: её снятие не
-# меняет поведения ни на одном написании (`<<<`, `<<<WORD`, `a<<<b`,
-# `<<<<<<< HEAD`), проверено исполнением. Недоказуемый рубеж здесь не
-# оставлен сознательно — он выглядел бы защитой, не будучи ею.
-_HEREDOC_START_RE = re.compile(
-    r"(?<!<)<<(?P<dash>-?)\s*(?P<q>['\"]?)(?P<delim>[A-Za-z0-9_]+)(?P=q)")
-# Ограничитель — [A-Za-z0-9_]+, а не [A-Za-z_][A-Za-z0-9_]*: `cat <<2` —
-# легальный bash (прогон: тело печатается, строка «2» закрывает), а ПРОПУСК
-# открытия — отказ в опасную сторону (конфликт в теле такого heredoc'а свёлся
-# бы как код). Маркерам конфликта широкий класс двери не открывает:
-# `<<<<<<< HEAD` не матчится и с ним — левая граница отбрасывает все позиции
-# внутри марки, а класс не содержит `<`.
+# Работу делают ОБЕ границы, и это установлено мутацией, а не рассуждением.
+# Первая редакция ставила только правую, `<<(?!<)`, и этого НЕ хватало: в
+# `<<<` символы 1-2 — тоже `<<`, а следом пробел, поэтому открытие находилось
+# СО СДВИГОМ НА СИМВОЛ (`grep x <<< HELLO` открывал фантомный heredoc
+# «HELLO», а `<<<<<<< HEAD` — heredoc с ограничителем «HEAD», то есть ЛЮБОЙ
+# второй хунк файла отвергался). Тогда правая при левой оказалась мёртвым
+# кодом и была снята. Теперь она снова работает: разбор ограничителя больше
+# не требует словесного символа сразу за `<<`, поэтому на `<<<<<<< HEAD`
+# позицию 0 отбрасывает именно правая граница (`<<` за которым `<`), а
+# позиции 1-5 — левая. Снятие ЛЮБОЙ из двух красит тесты (мутации в теле PR).
+_HEREDOC_ANY_RE = re.compile(r"(?<!<)<<(?!<)")
+# Слово-ограничитель кончается на НЕэкранированном метасимволе bash. `#`
+# сюда НЕ входит: `cat <<EOF#x` — ограничитель «EOF#x» целиком, строка `EOF`
+# остаётся телом (прогон настоящего bash). А `cat <<EOF >out` и
+# `cat <<EOF;echo` — ограничитель «EOF» (тот же прогон).
+_HEREDOC_WORD_STOP = frozenset(" \t|&;()<>")
+
+
+def _heredoc_delimiter_at(line: str, start: int) -> tuple | None:
+    """(«<<»/«<<-», ограничитель) для открытия heredoc'а на позиции `start`,
+    либо None — форму разобрать НЕ удалось (блокирующая находка ai-ревью
+    PR #1392, раунд 4).
+
+    Почему не регексп. Прежний `<<-?\\s*['\"]?([A-Za-z0-9_]+)['\"]?` молча
+    промахивался мимо легальных написаний, и промах был страшнее ложного
+    отказа: НЕ увидев открытия, сканер считал тело heredoc'а кодом, и все
+    четыре рубежа шелла зеленели разом — ровно тот исход, против которого
+    рубеж и строился. Два живых промаха, оба проверены прогоном настоящего
+    bash:
+
+    - `cat <<\\EOF` — экранированный ограничитель (тело без подстановок);
+      регексп не матчился вовсе, конфликт в теле сводился как код;
+    - `cat <<EOF-1` — регексп брал ограничителем «EOF», и строка `EOF` в
+      ТЕЛЕ закрывала heredoc в глазах сканера, хотя bash держит данные до
+      `EOF-1`.
+
+    Поэтому слово читается так же, как его читает bash: `<<`, необязательный
+    `-`, пробелы, затем слово до неэкранированного метасимвола, со снятием
+    кавычек (`'X'`, `"X"`, `\\X` — все три дают ограничитель `X`, прогон
+    подтвердил и склейку `<<"EO"F` → `EOF`).
+
+    Что разобрать нельзя — не угадывается: незакрытая кавычка, обрыв на
+    экранирующем слэше, пустое слово после `<<` возвращают None, и вызывающий
+    обязан отказать ГРОМКО (контракт модуля: любое сомнение — отказ)."""
+    pos = start + 2
+    operator = "<<"
+    if pos < len(line) and line[pos] == "-":
+        operator = "<<-"
+        pos += 1
+    while pos < len(line) and line[pos] in " \t":
+        pos += 1
+    delim: list = []
+    while pos < len(line):
+        char = line[pos]
+        if char in _HEREDOC_WORD_STOP:
+            break
+        if char == "\\":
+            if pos + 1 >= len(line):
+                return None
+            delim.append(line[pos + 1])
+            pos += 2
+            continue
+        if char in "'\"":
+            close = line.find(char, pos + 1)
+            if close == -1:
+                return None
+            delim.append(line[pos + 1:close])
+            pos = close + 1
+            continue
+        delim.append(char)
+        pos += 1
+    word = "".join(delim)
+    return (operator, word) if word else None
+
+
+class _HeredocOpen:
+    """Почему нельзя обойтись `str | None`: «heredoc открыт» и «форму `<<`
+    разобрать не удалось» закрывают путь аддитивному слиянию ОБА, но по
+    разным причинам, и лечатся они по-разному — сообщение обязано их
+    различать (AGENTS.md, «fail loud, не silent-wrong»)."""
+
+    def __init__(self, delim: str | None, raw: str = "") -> None:
+        self.delim = delim
+        self.raw = raw
+
+    def describe(self) -> str:
+        if self.delim is not None:
+            return f"открыт и не закрыт heredoc (<<{self.delim})"
+        return (f"форма heredoc'а не опознана в строке «{self.raw}»: "
+                "ограничитель не разобран, а значит границы ДАННЫХ неизвестны")
+
+    def __repr__(self) -> str:  # для читаемого вывода упавшего теста
+        return f"_HeredocOpen(delim={self.delim!r}, raw={self.raw!r})"
+
 
 # Арифметика — не heredoc: в `$(( x << SHIFT ))` и `(( x << SHIFT ))` сдвиг
-# влево выглядит для регекспа точно так же, как открытие heredoc'а с
+# влево выглядит для сканера точно так же, как открытие heredoc'а с
 # ограничителем SHIFT, и файл отказывался бы навсегда с ложной причиной
 # (некритичная находка ai-ревью PR #1392). Арифметические врезки вырезаются
 # из строки ДО поиска.
 _ARITH_SPAN_RE = re.compile(r"\$?\(\(.*?\)\)")
 
 
-def _shell_heredoc_open_before(lines: list, index: int) -> str | None:
-    """Имя ограничителя незакрытого heredoc'а, внутри которого оказалась
-    строка `index`, либо None (#1383, блокирующая находка ai-ревью PR #1392).
+def _shell_heredoc_open_before(lines: list, index: int):
+    """`_HeredocOpen` — строка `index` попадает в тело heredoc'а либо форму
+    `<<` выше разобрать не удалось; None — путь чист (#1383, блокирующая
+    находка ai-ревью PR #1392, раунды 1-4).
 
     Зачем: тело heredoc — это ДАННЫЕ, а не код, и все три рубежа шелла на нём
     слепы одновременно. Строка тела стоит в нулевой колонке (значит «не
@@ -222,10 +296,15 @@ def _shell_heredoc_open_before(lines: list, index: int) -> str | None:
             if line == delim or (operator == "<<-" and line.lstrip("\t") == delim):
                 pending.pop(0)
             continue
-        for match in _HEREDOC_START_RE.finditer(_ARITH_SPAN_RE.sub(" ", line)):
-            operator = "<<-" if match.group("dash") else "<<"
-            pending.append((operator, match.group("delim")))
-    return pending[0][1] if pending else None
+        scanned = _ARITH_SPAN_RE.sub(" ", line)
+        for match in _HEREDOC_ANY_RE.finditer(scanned):
+            parsed = _heredoc_delimiter_at(scanned, match.start())
+            if parsed is None:
+                return _HeredocOpen(None, line.strip())
+            pending.append(parsed)
+    return _HeredocOpen(pending[0][1]) if pending else None
+
+
 _SHEBANG_PYTHON_RE = re.compile(r"^#!.*\bpython[0-9.]*\b")
 
 
@@ -279,9 +358,9 @@ def _shell_hunk_unsafe_reason(ours: str, theirs: str) -> str | None:
         lines = side.split("\n")
         left_open = _shell_heredoc_open_before(lines + [""], len(lines) + 1)
         if left_open is not None:
-            return (f"сторона {label} открывает heredoc (<<{left_open}) и не "
-                    "закрывает его — не самостоятельная вставка: всё ниже по "
-                    "файлу стало бы её телом")
+            return (f"сторона {label}: {left_open.describe()} — не "
+                    "самостоятельная вставка: всё ниже по файлу стало бы "
+                    "телом heredoc'а")
     collision = _shell_top_level_names(ours) & _shell_top_level_names(theirs)
     if collision:
         return f"обе стороны определяют одно и то же имя верхнего уровня: {sorted(collision)}"
@@ -507,11 +586,11 @@ def resolve_file_text(text: str, suffix: str) -> tuple[str | None, str]:
         if suffix == ".sh":
             heredoc = _shell_heredoc_open_before(lines, start)
             if heredoc is not None:
-                return None, (f"строки {start + 1}-{end + 1}: конфликт внутри "
-                              f"незакрытого heredoc (<<{heredoc}) — это ДАННЫЕ, "
-                              "а не код: отступа нет, верхнеуровневых имён нет, "
-                              "bash -n принимает любую прозу, поэтому все три "
-                              "рубежа слепы, и правка одной строки двумя "
+                return None, (f"строки {start + 1}-{end + 1}: выше по файлу "
+                              f"{heredoc.describe()} — тело heredoc'а это "
+                              "ДАННЫЕ, а не код: отступа нет, верхнеуровневых "
+                              "имён нет, bash -n принимает любую прозу, поэтому "
+                              "все рубежи слепы, и правка одной строки двумя "
                               "сторонами склеилась бы в обе сразу")
         reason = _hunk_unsafe_reason(ours, theirs, suffix)
         if reason is not None:
@@ -671,10 +750,10 @@ def try_resolve(repo_dir, unmerged_paths: list[str]) -> list[str] | None:
             left_open = _shell_heredoc_open_before(
                 resolved_lines + [""], len(resolved_lines) + 1)
             if left_open is not None:
-                return _refuse(f"{path.name}: итоговый файл оставляет "
-                               f"незакрытый heredoc (<<{left_open}) — bash -n "
-                               "такое принимает (warning, rc=0), поэтому "
-                               "проверка отдельная")
+                return _refuse(f"{path.name}: в итоговом файле "
+                               f"{left_open.describe()} — bash -n такое "
+                               "принимает (warning, rc=0), поэтому проверка "
+                               "отдельная")
             error = _bash_syntax_error(resolved)
             if error is not None:
                 return _refuse(f"{path.name}: итоговый файл не принимается "

@@ -1081,7 +1081,7 @@ def test_shell_heredoc_open_before_requires_exact_terminator():
     """Юнит на само правило: хвостовой пробел терминатора оставляет heredoc
     открытым; точное равенство закрывает."""
     opened = ["cat <<'EOF'", "prefix", "EOF ", "more"]
-    assert acm._shell_heredoc_open_before(opened, 4) == "EOF"
+    assert acm._shell_heredoc_open_before(opened, 4).delim == "EOF"
     closed = ["cat <<'EOF'", "prefix", "EOF", "more"]
     assert acm._shell_heredoc_open_before(closed, 4) is None
 
@@ -1090,6 +1090,105 @@ def test_shell_heredoc_delimiter_may_start_with_digit():
     """`cat <<2` — легальный bash (прогон: тело печатается, строка «2»
     закрывает); пропуск открытия — отказ в опасную сторону. Широкий класс не
     открывает дверь маркерам: строка `<<<<<<< HEAD` не матчится и с ним."""
-    assert acm._shell_heredoc_open_before(["cat <<2", "body"], 2) == "2"
+    assert acm._shell_heredoc_open_before(["cat <<2", "body"], 2).delim == "2"
     assert acm._shell_heredoc_open_before(
         ["<<<<<<< HEAD", "text", "=======", "text", ">>>>>>> branch"], 5) is None
+
+
+# ── Раунд 4 ревью: форма открытия heredoc'а, а не только его закрытие ────
+#
+# Все bash-семантики ниже проверены прогоном НАСТОЯЩЕГО bash, не выведены
+# из документации; дословные выводы — в теле PR #1392.
+
+
+def _shell_conflict_inside(prologue: str, epilogue: str = "") -> str:
+    """Файл, где конфликт стоит РОВНО там, куда целится сцена: сразу после
+    `prologue`. Маркеры литеральные — это синтаксис самого git."""
+    return (prologue
+            + "<<<<<<< HEAD\nстрока владельца\n=======\n"
+              "строка ветки\n>>>>>>> branch\n"
+            + epilogue)
+
+
+def test_shell_escaped_delimiter_opens_a_heredoc_and_is_not_missed():
+    """`cat <<\\EOF` — легальный bash (прогон: тело печатается без подстановок,
+    `EOF` закрывает). Прежний регексп не матчился вовсе, и конфликт в ТЕЛЕ
+    сводился как код: все четыре рубежа шелла зеленели разом, потому что
+    промах мимо открытия делает их слепыми одновременно."""
+    text = _shell_conflict_inside("cat <<\\EOF\n", "EOF\n")
+
+    resolved, reason = acm.resolve_file_text(text, ".sh")
+
+    assert resolved is None, "конфликт в теле heredoc'а не имеет права сводиться"
+    assert "heredoc" in reason and "EOF" in reason
+
+
+def test_shell_heredoc_delimiter_is_read_as_a_whole_word():
+    """`cat <<EOF-1`: настоящий bash держит данные до `EOF-1`, а строка `EOF`
+    остаётся ТЕЛОМ (прогон). Прежний регексп брал ограничителем «EOF» — и
+    хунк за этой строкой сводился как код, хотя он внутри данных."""
+    assert acm._shell_heredoc_open_before(["cat <<EOF-1", "body"], 2).delim == "EOF-1"
+
+    text = _shell_conflict_inside("cat <<EOF-1\nпролог тела\n", "EOF\nхвост\nEOF-1\n")
+    resolved, reason = acm.resolve_file_text(text, ".sh")
+
+    assert resolved is None
+    assert "EOF-1" in reason
+
+
+def test_shell_heredoc_delimiter_quotes_are_removed_like_bash_does():
+    """Три написания одного ограничителя `EOF` — прогон настоящего bash
+    подтвердил, что закрывает их все строка `EOF`, включая склейку
+    `<<"EO"F`."""
+    for opener in ("cat <<'EOF'", 'cat <<"EOF"', 'cat <<"EO"F', "cat <<E\\OF"):
+        state = acm._shell_heredoc_open_before([opener, "body"], 2)
+        assert state is not None and state.delim == "EOF", opener
+        assert acm._shell_heredoc_open_before([opener, "body", "EOF"], 3) is None, opener
+
+
+def test_shell_heredoc_word_stops_on_bash_metacharacters():
+    """`cat <<EOF >out` и `cat <<EOF;echo TAIL` — ограничитель «EOF» (прогон:
+    тело уходит в файл / хвост команды исполняется). Контроль против
+    перегиба: рубеж не должен съедать хвост строки в ограничитель, иначе
+    закрытый heredoc выглядел бы открытым и файл отказывался бы навсегда."""
+    for opener in ("cat <<EOF >out.txt", "cat <<EOF;echo TAIL", "cat <<EOF | wc -l"):
+        assert acm._shell_heredoc_open_before([opener, "body", "EOF"], 3) is None, opener
+
+
+def test_shell_heredoc_hash_does_not_end_the_delimiter_word():
+    """`cat <<EOF#x` — ограничитель «EOF#x» ЦЕЛИКОМ, строка `EOF` остаётся
+    телом (прогон настоящего bash). `#` начинает комментарий только в начале
+    слова, поэтому в список метасимволов он не входит."""
+    state = acm._shell_heredoc_open_before(["cat <<EOF#x", "body", "EOF"], 3)
+
+    assert state is not None and state.delim == "EOF#x"
+
+
+def test_shell_unparsable_heredoc_form_refuses_loudly_and_says_why():
+    """Контракт модуля — «любое сомнение — отказ», но сомнение обязано
+    назвать СЕБЯ: «форму не разобрал» и «heredoc открыт» лечатся по-разному
+    (AGENTS.md, «fail loud, не silent-wrong»)."""
+    state = acm._shell_heredoc_open_before(["cat <<'EOF", "body"], 2)
+
+    assert state is not None and state.delim is None
+    assert "не опознана" in state.describe()
+
+    resolved, reason = acm.resolve_file_text(
+        _shell_conflict_inside("cat <<'EOF\nпролог\n"), ".sh")
+
+    assert resolved is None
+    assert "не опознана" in reason and "cat <<'EOF" in reason
+
+
+def test_shell_closed_heredoc_still_lets_a_later_conflict_merge():
+    """Контроль против перегиба всей пачки выше: правильно опознанный и
+    ЗАКРЫТЫЙ heredoc не должен запирать файл — иначе новый разбор вылечил бы
+    промах ценой отказа всем шелловым файлам с heredoc'ами."""
+    text = _shell_conflict_inside("cat <<\\EOF\nтело\nEOF\n")
+    text = text.replace("строка владельца", "alpha() { :; }")
+    text = text.replace("строка ветки", "beta() { :; }")
+
+    resolved, reason = acm.resolve_file_text(text, ".sh")
+
+    assert resolved is not None, reason
+    assert "alpha()" in resolved and "beta()" in resolved
