@@ -1736,6 +1736,12 @@ _SH_ASSIGN_FORMS = [
     ("declare -A m", "m"),
     ("export PATH_Y", "PATH_Y"),
     ("A=1 B=2", "B"),
+    # Сцепленные формы — определение НЕ обязано стоять в начале строки
+    # (блокирующая находка ai-ревью PR #1392, раунд 11).
+    ('[ -z "" ] && slot=1', "slot"),
+    ("true; chained=1", "chained"),
+    ("false || fallback=1", "fallback"),
+    ("true && arr2[0]=1", "arr2"),
     ("echo hi", "hi"),
     ("[[ a == b ]]", "a"),
 ]
@@ -1843,3 +1849,54 @@ def test_missing_bash_is_a_refusal_with_a_reason_not_a_crash(monkeypatch):
 
     assert resolved is None
     assert "bash недоступен" in reason, reason
+
+
+def test_shell_chained_assignment_from_both_sides_is_refused():
+    """Блокирующая находка ai-ревью PR #1392, раунд 11: разбор был привязан
+    к НАЧАЛУ строки, а bash исполняет `a && b` как две команды.
+
+    Эта дыра опаснее уже названных границ, и разница в том, чем именно: при
+    кавычках в имени слитый файл падает ГРОМКО на строке определения, а
+    здесь он полностью рабочий — потеря стороны невидима. Прогон
+    подтверждает регистрацию: `bash -c '[ -z "" ] && slot=1; declare -p slot'`
+    находит переменную."""
+    resolved, reason = acm.resolve_file_text(
+        "#!/usr/bin/env bash\n"
+        "<<<<<<< HEAD\n"
+        '[ -z "$slot" ] && slot=ours\n'
+        "=======\n"
+        '[ -n "$other" ] && slot=theirs\n'
+        ">>>>>>> branch\n",
+        ".sh")
+
+    assert resolved is None, "правка одного имени в сцепленной форме не сводится"
+    assert "slot" in reason, reason
+
+
+def test_shell_chained_function_definition_is_seen():
+    """`setup_env;drain() { :; }` определяет ЖИВУЮ функцию `drain` (прогон:
+    вызов работает, `declare -F drain` её находит)."""
+    assert "drain" in acm._shell_top_level_names("setup_env;drain() { :; }")
+
+    resolved, reason = acm.resolve_file_text(
+        "#!/usr/bin/env bash\n"
+        "<<<<<<< HEAD\n"
+        "setup_env;drain() {\n  echo ours\n}\n"
+        "=======\n"
+        "drain() {\n  echo theirs\n}\n"
+        ">>>>>>> branch\n",
+        ".sh")
+
+    assert resolved is None
+    assert "drain" in reason, reason
+
+
+def test_shell_indent_is_checked_on_the_line_not_the_segment():
+    """Контроль против перегиба сегментного разбора: `  [ -z "$x" ] && y=1`
+    ВНУТРИ функции остаётся «внутри чего-то». Если проверять отступ у
+    сегмента, а не у строки, локальные переменные двух разных функций
+    столкнулись бы и давали ложный отказ."""
+    assert acm._shell_top_level_names('  [ -z "$x" ] && y=1') == set()
+    assert acm._shell_top_level_names("\tsetup; local tmp=1") == set()
+    # А та же форма в нулевой колонке — видна.
+    assert acm._shell_top_level_names('[ -z "$x" ] && y=1') == {"y"}
