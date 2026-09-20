@@ -1390,3 +1390,57 @@ def test_shell_quoted_delim_concatenation_scene_stays_refused(tmp_path):
     assert result is None, "склейка ограничителя — не самостоятельная вставка"
     _, reason = acm.resolve_file_text(target.read_text(encoding="utf-8"), ".sh")
     assert reason is not None and "EO" in reason and "<<E'" not in reason, reason
+
+
+def test_shell_phantom_opening_refuses_never_merges_silently():
+    """Честная граница сканера, запиненная НАПРАВЛЕНИЕМ, а не списком сцен
+    (некритичная находка ai-ревью PR #1392, раунд 5).
+
+    Кавыченный текст и комментарий сканер от кода не отличает, поэтому
+    открывает фантомы там, где bash heredoc'а не видит (все четыре строки
+    ниже настоящий bash исполняет без единой жалобы, rc=0). Цена — лишний
+    уход файла в агентский путь. Чего НЕ бывает: тихого сведения. Очередь
+    `pending` от лишнего открытия только растёт и снимается строго с головы,
+    поэтому фантом не может закрыть настоящий heredoc раньше срока — тест
+    проверяет именно это, а не конкретные формулировки отказа."""
+    phantoms = [
+        'echo "usage: tool <<option>> value"',
+        "echo 'sed s/<<>/X/'",
+        'let "mask = 1 << 4"',
+        "# пример: cat <<EOF",
+    ]
+    for line in phantoms:
+        assert acm._shell_heredoc_open_before([line, "код"], 2) is not None, line
+
+    # Фантом ПОСЛЕ настоящего открытия в той же строке: настоящий закрывается
+    # своим терминатором, фантом остаётся — файл отказан, а не сведён.
+    tail_open = acm._shell_heredoc_open_before(
+        ["cat <<EOF # пример: cat <<PHANTOM", "тело", "EOF", "код"], 4)
+    assert tail_open is not None and tail_open.delim == "PHANTOM"
+
+    # Контроль: чистая строка кода фантома не порождает — пессимизм не
+    # разлился на весь шелл.
+    assert acm._shell_heredoc_open_before(["alpha() { echo a; }", "код"], 2) is None
+    assert acm._shell_heredoc_open_before(["x=$((a << b))", "код"], 2) is None
+
+
+def test_shell_heredoc_queue_closes_strictly_from_the_head():
+    """`cmd <<A <<B` — очередь снимается СТРОГО с головы, и это правило
+    настоящего bash, а не удобство реализации.
+
+    Прогон (скрипт `cat <<A <<B` / `тело A` / `B` / `ещё тело A` / `A` /
+    `тело B` / `B` / `echo AFTER`): bash печатает «тело B» и «AFTER», rc=0 —
+    то есть строка `B` ВНУТРИ тела A осталась ДАННЫМИ, тело A кончилось на
+    `A`, и только следующая `B` закрыла второй heredoc.
+
+    Снятие не с головы (закрыть любой совпавший ограничитель) объявило бы
+    файл чистым на строке «тело B» — а она ещё ДАННЫЕ. Это тихое сведение,
+    то есть опасная сторона, поэтому правило и закреплено тестом."""
+    lines = ["cat <<A <<B", "тело A", "B", "ещё тело A", "A", "тело B", "B", "код"]
+
+    # Строка 3 (`B`) — данные тела A: heredoc всё ещё A, а не закрыт.
+    assert acm._shell_heredoc_open_before(lines, 4).delim == "A"
+    # После настоящего терминатора A открытым остаётся B.
+    assert acm._shell_heredoc_open_before(lines, 6).delim == "B"
+    # И только вторая `B` закрывает очередь целиком.
+    assert acm._shell_heredoc_open_before(lines, 8) is None
