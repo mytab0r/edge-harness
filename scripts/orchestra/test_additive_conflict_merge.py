@@ -1653,3 +1653,70 @@ def test_language_reads_shebang_when_conflict_starts_at_first_line(tmp_path):
     # честный отказ «тип не поддержан» остаётся.
     no_shebang = "<<<<<<< HEAD\nalpha\n=======\nbeta\n>>>>>>> branch\n"
     assert acm.language_of(target, no_shebang) is None
+
+
+# Символы-кандидаты для имени функции: всё, что реально встречается в именах
+# шелловых команд, плюс все метасимволы bash — чтобы гвардия ниже проверяла
+# обе стороны границы, а не только удобную.
+_SH_NAME_CANDIDATES = list("-._:@+/%,^!#{}[]~?*=|&;()<> '\"$`\\") + ["хв"]
+
+
+def test_shell_function_name_class_does_not_lag_behind_real_bash():
+    """Класс имени функции не подбирается по одному символу за раунд ревью —
+    он сверяется с НАСТОЯЩИМ bash.
+
+    История, ради которой гвардия и написана: раунд 7 расширил класс с
+    `[A-Za-z_]\\w*` (дефисные имена сводились молча), раунд 8 добавил `#`
+    (`lint#all` — та же дыра на символ в сторону), раунд 9 — `{}`
+    (`foo{a}`, `bar}x{`; `declare -F` показывает функцию ровно с этим
+    именем). Три раунда — один класс дефекта, и каждый раз направление
+    ошибки было ОПАСНЫМ: пустое множество имён, непересечения «нет», пачка
+    сводится, в файле живут оба определения.
+
+    Инвариант: bash принял имя -> сканер обязан его видеть. Обратное
+    расхождение (сканер видит то, чего bash не принимает) — фантом, то есть
+    ОТКАЗ, и оно разрешено явным списком: сегодня там один символ.
+
+    Тест поведенческий (класс #891/#893): имя не «выглядит допустимым» по
+    регекспу, а реально регистрируется — проверяется `declare -F`."""
+    scanner_only_allowed = {"["}  # `foo[bar` — незакрытая скобка подстроки массива
+
+    for char in _SH_NAME_CANDIDATES:
+        name = f"foo{char}bar"
+        probe = subprocess.run(
+            ["bash", "-c", f"{name}() {{ echo ok; }}\n"
+                           'declare -F -- "$N" >/dev/null && echo REGISTERED'],
+            capture_output=True, text=True, encoding="utf-8",
+            env={"N": name, "PATH": "/usr/bin:/bin"})
+        bash_registers = "REGISTERED" in probe.stdout
+        scanner_sees = acm._shell_top_level_names(f"{name}() {{ :; }}") == {name}
+
+        if bash_registers:
+            assert scanner_sees, (
+                f"bash регистрирует функцию {name!r} (declare -F), а сканер её "
+                f"НЕ видит: две версии такого определения свелись бы молча — "
+                f"добавь {char!r} в _SH_NAME_CHARS")
+        elif scanner_sees:
+            assert char in scanner_only_allowed, (
+                f"сканер читает {name!r} как имя, а bash такую функцию не "
+                f"регистрирует: это фантом (направление безопасное, отказ), но "
+                f"он обязан быть НАЗВАН — добавь {char!r} в scanner_only_allowed "
+                f"с причиной")
+
+
+def test_shell_braced_function_name_from_both_sides_is_refused():
+    """Сцена раунда 9 end-to-end: до правки множества имён были ПУСТЫМИ, все
+    рубежи зелёные, пачка сводилась, и в файле оставались оба определения."""
+    resolved, reason = acm.resolve_file_text(
+        "#!/usr/bin/env bash\n"
+        "<<<<<<< HEAD\n"
+        "foo{a}() {\n  echo ours\n}\n"
+        "=======\n"
+        "foo{a}() {\n  echo theirs\n}\n"
+        ">>>>>>> branch\n",
+        ".sh")
+
+    assert resolved is None, "две версии одной функции не имеют права сводиться"
+    assert "foo{a}" in reason, reason
+    # Контроль против перегиба: сам блок `{ … }` именем не становится.
+    assert acm._shell_top_level_names("{ echo x; }") == set()
