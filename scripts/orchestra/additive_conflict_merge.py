@@ -159,22 +159,22 @@ _TABLE_ROW_RE = re.compile(r"^\s*\|")
 _SH_FUNCTION_RE = re.compile(
     r"^(?:function\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(\s*\))?"
     r"|([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\))\s*\{?", re.MULTILINE)
-# `declare`/`typeset` могут идти И с флагом, И без него; `alias x=` — тоже
-# определение имени (находка ai-ревью PR #1392): неполный список означал бы
-# «имена не пересеклись» там, где они пересекаются, то есть ложное «безопасно».
-_SH_ASSIGN_RE = re.compile(
-    r"^(?:export\s+|readonly\s+|local\s+|alias\s+"
-    r"|(?:declare|typeset)\s+(?:-\S+\s+)?)?"
-    r"([A-Za-z_][A-Za-z0-9_]*)=", re.MULTILINE)
-# Строка ключевого слова может нести НЕСКОЛЬКО присваиваний (`export A=1 B=2`,
-# `readonly E1=x E2=y`): форма выше ловит только ПЕРВОЕ имя, и обе стороны,
-# правящие второй, сходились бы с молчаливой победой последнего (класс #883).
-# Имя ищется по всей строке, но НЕ считается именем, если перед ним стоит
+# Строка, которая ВООБЩЕ что-то определяет присваиванием: ключевое слово
+# (`export`/`readonly`/`local`/`alias`/`declare`/`typeset`, с флагом и без)
+# ЛИБО голое `имя=` в нулевой колонке. Разделения на «ключевая» и «обычная»
+# больше нет, и это блокирующая находка ai-ревью PR #1392 (раунд 6): пока
+# полный разбор строки применялся ТОЛЬКО к ключевым, `MODE=fast QUIET=1`
+# отдавало лишь первое имя, и сторона, правящая QUIET, сводилась с молчаливой
+# победой последнего (класс #883) — воспроизведено end-to-end.
+#
+# Имя ищется по ВСЕЙ строке, но НЕ считается именем, если перед ним стоит
 # слово-символ, кавычка или `-`: это данные значения (`--color=auto` внутри
-# `alias grep='grep --color=auto'`, `a=b` внутри кавычек), не определение;
-# остаточные фантомы направлены в ОТКАЗ (лишнее имя в множестве), не в пропуск.
-_SH_MULTI_ASSIGN_PREFIX_RE = re.compile(
-    r"^(?:export|readonly|local|alias|declare|typeset)\b")
+# `alias grep='grep --color=auto'`, `a=b` внутри кавычек), не определение.
+# Остаточные фантомы (`d3=$(REALGH_EXIT=7 …)` даёт и `REALGH_EXIT`)
+# направлены в ОТКАЗ — лишнее имя в множестве, а не пропуск.
+_SH_ASSIGN_LINE_RE = re.compile(
+    r"^(?:(?:export|readonly|local|alias|declare|typeset)\b"
+    r"|[A-Za-z_][A-Za-z0-9_]*=)")
 _SH_NAME_EQ_RE = re.compile("(?<![A-Za-z0-9_'\"-])([A-Za-z_][A-Za-z0-9_]*)=")
 _SHEBANG_SHELL_RE = re.compile(r"^#!.*\b(?:ba|z|k)?sh\b")
 
@@ -298,8 +298,13 @@ def _shell_heredoc_open_before(lines: list, index: int):
     сторонами выглядела бы как два независимых добавления и сводилась бы
     конкатенацией — в файле оказались бы ОБЕ взаимоисключающие строки.
 
-    Это не теория: `scripts/gh/issue-create` — тот самый файл из замера
-    задачи — несёт heredoc'и с markdown-телами issue.
+    Это не теория, и число замерено, а не оценено: heredoc'и несут 25
+    шелловых файлов репозитория (`git grep` по `<<` без `<<<`), больше всех —
+    `scripts/lib/test/dsh-anthropic-pool.guard.sh` (21 открытие) и
+    `scripts/worker/task.sh` (8). Первая редакция этого абзаца называла
+    носителем `scripts/gh/issue-create` — НЕПРАВДА, там только herestring'и
+    `<<<` (некритичная находка ai-ревью PR #1392, раунд 6); файл из замера
+    задачи он всё равно, но по другой причине — отсутствию расширения.
 
     ЗАКРЫТИЕ — по правилам настоящего bash, проверенным прогонами, а не по
     `strip()`. Терминатор — строка, РАВНАЯ ограничителю (колонка 0, без
@@ -375,26 +380,45 @@ def _bash_syntax_error(text: str) -> str | None:
     return (result.stderr or "").strip().split("\n")[0] or "bash -n отказал без текста"
 
 
-def _shell_top_level_names(text: str) -> set[str]:
-    """Имена, которые текст ОПРЕДЕЛЯЕТ на верхнем уровне: функции и
-    присваивания в НУЛЕВОЙ колонке. Отступ значит «внутри чего-то» — такие
-    строки в множество не попадают, иначе локальная переменная внутри функции
-    сталкивалась бы с чужой глобальной и давала ложный отказ. Строки
-    ключевых слов разбираются ПОЛНОСТЬЮ (`export A=1 B=2` — два имени), все
-    прочие — одной формой присваивания; двойного счёта нет по построению
-    (ветка `continue`)."""
-    names: set[str] = set()
+def _shell_defined_names(text: str) -> list:
+    """Имена, которые текст ОПРЕДЕЛЯЕТ на верхнем уровне, СПИСКОМ (по одному
+    вхождению на определение) — ОДНО место правды для обоих потребителей:
+    множества имён стороны и подсчёта дубликатов итогового файла.
+
+    Почему списком и почему одна функция. Раньше цикл был скопирован в обе, и
+    копии УСПЕЛИ разойтись: блокирующая находка ai-ревью PR #1392 (раунд 6)
+    показала, что полный разбор строки применялся только к строкам ключевых
+    слов, а обычное `MODE=fast QUIET=1` отдавало лишь ПЕРВОЕ имя. Проверено
+    end-to-end: сторона `MODE=fast QUIET=1` против стороны `QUIET=0`
+    проходила ВСЕ рубежи (имена не пересеклись, дубликатов нет, `bash -n`
+    зелёный), сводилась — и в итоговом файле `QUIET=0` молча побеждал,
+    значение ours терялось без единого сигнала. Это ровно класс #883, ради
+    которого критерий непересечения и существует. Два места правды тут не
+    осторожность, а отложенный рецидив: фикс пришлось бы вносить дважды.
+
+    Отступ по-прежнему значит «внутри чего-то»: строки с отступом в счёт не
+    идут, иначе `local tmp=` двух разных функций давал бы ложный отказ.
+
+    Строка разбирается ЦЕЛИКОМ — и после ключевого слова (`export A=1 B=2`),
+    и без него (`MODE=fast QUIET=1`). Цена — фантомные имена из значений:
+    `d3=$(REALGH_EXIT=7 gh …)` даст и `d3`, и `REALGH_EXIT`. Лишнее имя
+    толкает пачку в ОТКАЗ, а не в пропуск, — та же безопасная сторона, что у
+    фантомов сканера heredoc'а, и названа она здесь, а не оставлена на
+    догадку читателя."""
+    names: list = []
     for match in _SH_FUNCTION_RE.finditer(text):
-        names.add(match.group(1) or match.group(2))
+        names.append(match.group(1) or match.group(2))
     for line in text.split("\n"):
-        if _SH_MULTI_ASSIGN_PREFIX_RE.match(line):
-            for match in _SH_NAME_EQ_RE.finditer(line):
-                names.add(match.group(1))
+        if not _SH_ASSIGN_LINE_RE.match(line):
             continue
-        match = _SH_ASSIGN_RE.match(line)
-        if match:
-            names.add(match.group(1))
+        names.extend(match.group(1) for match in _SH_NAME_EQ_RE.finditer(line))
     return names
+
+
+def _shell_top_level_names(text: str) -> set:
+    """Множество имён верхнего уровня — вид `_shell_defined_names` для
+    критерия непересечения сторон."""
+    return set(_shell_defined_names(text))
 
 
 def _shell_hunk_unsafe_reason(ours: str, theirs: str) -> str | None:
@@ -430,27 +454,17 @@ def _shell_hunk_unsafe_reason(ours: str, theirs: str) -> str | None:
     return None
 
 
-def _duplicate_shell_top_level_names(text: str) -> list[str]:
+def _duplicate_shell_top_level_names(text: str) -> list:
     """Тот же класс, что _duplicate_top_level_names у .py: одно имя,
     определённое дважды РАЗНЫМИ хунками одного файла, перехунковый критерий
     не видит, а слепая конкатенация оставляет живым только последнее.
-    Разбор имён — тот же, что _shell_top_level_names (полные строки
-    ключевых слов, ветка `continue` исключает двойной счёт: строка
-    `export A=1 B=2` иначе посчитала бы `A` дважды и отвергла бы годовый
-    файл «дубликатом» из одной строки)."""
-    counts: dict[str, int] = {}
-    for match in _SH_FUNCTION_RE.finditer(text):
-        name = match.group(1) or match.group(2)
+
+    Разбор — `_shell_defined_names`, ровно тот же, что у критерия
+    непересечения: одно место правды, разойтись двум копиям больше негде
+    (блокирующая находка ai-ревью PR #1392, раунд 6 — они уже расходились)."""
+    counts: dict = {}
+    for name in _shell_defined_names(text):
         counts[name] = counts.get(name, 0) + 1
-    for line in text.split("\n"):
-        if _SH_MULTI_ASSIGN_PREFIX_RE.match(line):
-            for match in _SH_NAME_EQ_RE.finditer(line):
-                name = match.group(1)
-                counts[name] = counts.get(name, 0) + 1
-            continue
-        match = _SH_ASSIGN_RE.match(line)
-        if match:
-            counts[match.group(1)] = counts.get(match.group(1), 0) + 1
     return sorted(name for name, n in counts.items() if n > 1)
 
 
@@ -909,8 +923,9 @@ def try_resolve(repo_dir, unmerged_paths: list[str]) -> list[str] | None:
             tail += (f" ⏎ stderr: {stderr_tail[-1].strip()}" if stderr_tail else "")
             return _refuse(
                 f"pytest {' '.join(test_targets)} упал rc={result.returncode} "
-                f"(файлы оставлены слитыми на диске, откат — git rebase --abort "
-                f"вызывающего): {tail}"
+                f"(рабочее дерево ПОСРЕДИ рёбейза: файлы оставлены слитыми на "
+                f"диске и не закоммичены, восстанавливает их git rebase --abort "
+                f"вызывающего — своей точки отката здесь нет): {tail}"
             )
 
     return [str(path.relative_to(repo_dir)) for path in plans]

@@ -740,8 +740,11 @@ def test_try_resolve_notice_names_weaker_guarantee_for_shell(tmp_path, capsys):
 # строка стоит в нулевой колонке (не отступ), не определяет имён (не
 # пересекаются), `bash -n` принимает произвольную прозу внутри heredoc
 # (синтаксис валиден). Правка ОДНОЙ строки текста двумя сторонами выглядела
-# бы как два независимых добавления. И это не теория: scripts/gh/issue-create
-# — файл ИЗ ЗАМЕРА задачи — несёт heredoc'и с markdown-телами issue.
+# бы как два независимых добавления. И это не теория: heredoc'и несут 25
+# шелловых файлов репозитория (замер `git grep` по `<<` без `<<<`), больше
+# всех — scripts/lib/test/dsh-anthropic-pool.guard.sh (21) и
+# scripts/worker/task.sh (8). Фикстура ниже моделирует ИМЕННО такой файл;
+# имя `issue-create` она носит ради второго свойства — без расширения.
 
 _ISSUE_CREATE_LIKE = (
     "#!/usr/bin/env bash\n"
@@ -1444,3 +1447,54 @@ def test_shell_heredoc_queue_closes_strictly_from_the_head():
     assert acm._shell_heredoc_open_before(lines, 6).delim == "B"
     # И только вторая `B` закрывает очередь целиком.
     assert acm._shell_heredoc_open_before(lines, 8) is None
+
+
+def test_shell_plain_assignment_line_defines_every_name_on_it():
+    """Блокирующая находка ai-ревью PR #1392, раунд 6: полный разбор строки
+    применялся ТОЛЬКО к строкам ключевых слов, а обычная `MODE=fast QUIET=1`
+    отдавала лишь ПЕРВОЕ имя.
+
+    Сцена ревьюера воспроизведена дословно и сводилась end-to-end: имена не
+    пересекались (`{MODE}` против `{QUIET}`), дубликатов не было, `bash -n`
+    зелёный — а в итоговом файле `QUIET=0` молча побеждал, значение ours
+    терялось без единого сигнала. Это класс #883, ради которого критерий
+    непересечения и существует."""
+    assert acm._shell_top_level_names("MODE=fast QUIET=1") == {"MODE", "QUIET"}
+
+    resolved, reason = acm.resolve_file_text(
+        "#!/usr/bin/env bash\n"
+        "<<<<<<< HEAD\n"
+        "MODE=fast QUIET=1\n"
+        "=======\n"
+        "QUIET=0\n"
+        ">>>>>>> branch\n",
+        ".sh")
+
+    assert resolved is None, "правка одного имени двумя сторонами не имеет права сводиться"
+    assert "QUIET" in reason, reason
+
+
+def test_shell_name_parsing_has_a_single_source_of_truth():
+    """Две копии цикла разбора имён УЖЕ разошлись по направлению ошибки
+    (раунд 6), поэтому обе функции обязаны читать один разбор.
+
+    Тест поведенческий, а не структурный (класс #891/#893 — «наличие имени
+    функции» ничего не доказывает): дубликат ВТОРОГО имени обычной строки
+    виден подсчёту дубликатов ровно так же, как критерию непересечения.
+    Копия, отставшая в одной из двух функций, красит именно это."""
+    assert acm._duplicate_shell_top_level_names("MODE=fast QUIET=1\nQUIET=0") == ["QUIET"]
+    # Контроль против перегиба: одна строка с двумя РАЗНЫМИ именами — не дубль.
+    assert acm._duplicate_shell_top_level_names("MODE=fast QUIET=1") == []
+    assert acm._duplicate_shell_top_level_names("export A=1 B=2") == []
+
+
+def test_shell_value_data_is_not_mistaken_for_a_defined_name():
+    """Контроль против перегиба полного разбора: `=` внутри ЗНАЧЕНИЯ именем
+    не становится, иначе безобидные строки давали бы ложные отказы."""
+    assert acm._shell_top_level_names("alias grep='grep --color=auto'") == {"grep"}
+    assert acm._shell_top_level_names('export FOO="a=b"') == {"FOO"}
+    # Строка, которая ничего не определяет, имён не даёт вовсе.
+    assert acm._shell_top_level_names("echo hi") == set()
+    assert acm._shell_top_level_names("# MODE=fast") == set()
+    # Отступ по-прежнему значит «внутри чего-то».
+    assert acm._shell_top_level_names("    local tmp=1") == set()
