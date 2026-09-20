@@ -1498,3 +1498,81 @@ def test_shell_value_data_is_not_mistaken_for_a_defined_name():
     assert acm._shell_top_level_names("# MODE=fast") == set()
     # Отступ по-прежнему значит «внутри чего-то».
     assert acm._shell_top_level_names("    local tmp=1") == set()
+
+
+def test_shell_function_name_may_carry_dashes_and_dots():
+    """Блокирующая находка ai-ревью PR #1392, раунд 7: класс имени функции
+    был идентификатором в стиле C, а bash принимает почти любое слово.
+
+    Прогоном проверено и работает (rc=0, функция вызывается): `my-func`,
+    `foo.bar`, `foo:bar`, `foo@bar`, `foo+bar`, `a/b`, `foo%bar`, `foo,bar`,
+    `foo^bar`, `foo!bar`, `foo[1]`. Отказывает только `foo=bar` (rc=2) —
+    `=` в имени функции bash не принимает, поэтому он и исключён из класса."""
+    for name in ("my-func", "foo.bar", "foo:bar", "foo@bar", "foo+bar", "a/b"):
+        assert acm._shell_top_level_names(f"{name}() {{ :; }}") == {name}, name
+    # Форма с ключевым словом резала имя по первому «недопустимому» символу:
+    # `function my-func {` отдавала ФАНТОМНОЕ `my`.
+    assert acm._shell_top_level_names("function my-func {\n  :\n}") == {"my-func"}
+
+
+def test_shell_same_dashed_function_from_both_sides_is_refused():
+    """Сцена ревьюера end-to-end. До правки: множества имён ПУСТЫЕ,
+    непересечения нет, `bash -n` зелёный, рубежи heredoc'а чисты — пачка
+    сводилась, и в файле молча жило последнее определение (класс #883,
+    «молчаливая порча», которую контракт модуля запрещает)."""
+    resolved, reason = acm.resolve_file_text(
+        "#!/usr/bin/env bash\n"
+        "<<<<<<< HEAD\n"
+        "my-func() {\n  echo ours\n}\n"
+        "=======\n"
+        "my-func() {\n  echo theirs\n}\n"
+        ">>>>>>> branch\n",
+        ".sh")
+
+    assert resolved is None, "две версии одной функции не имеют права сводиться"
+    assert "my-func" in reason, reason
+
+
+def test_shell_wide_name_class_does_not_invent_definitions():
+    """Контроль против перегиба широкого класса: строки, которые НИЧЕГО не
+    определяют, имён не дают. Иначе широкий класс выключил бы шелл целиком —
+    цена замерена на живом корпусе: на 153 файлах `.sh` он добавляет РОВНО
+    одно новое имя (строка `httpd.serve_forever()` питоновского тела heredoc
+    в `scripts/plugins/test/status-scripts.smoke.sh`), и то в безопасную
+    сторону — лишнее имя ведёт к ОТКАЗУ, не к пропуску."""
+    for line in ("(cd x && y)", "*) echo x;;", "esac", "if [ x ]; then",
+                 "case \"$x\" in", "  indented() { :; }"):
+        assert acm._shell_top_level_names(line) == set(), line
+    # Присваивание — не функция: `x=$(foo)` даёт переменную, не `x()`.
+    assert acm._shell_top_level_names("x=$(foo)") == {"x"}
+    assert acm._shell_top_level_names("arr=(1 2)") == {"arr"}
+
+
+def test_unsupported_suffix_message_is_built_from_the_supported_list():
+    """Некритичная находка ai-ревью PR #1392, раунд 7: список типов жил в
+    трёх местах — константе и двух литералах в строках отказа. Четвёртый тип
+    устарил бы обе строки молча.
+
+    Тест поведенческий: подсказка обязана НАЗЫВАТЬ каждый поддержанный тип,
+    а обе точки отказа — нести её целиком. Литерал, отставший от константы,
+    красит это."""
+    for suffix in acm.SUPPORTED_SUFFIXES:
+        assert suffix in acm.UNSUPPORTED_SUFFIX_HINT, suffix
+
+    reason = acm._hunk_unsafe_reason("a", "b", ".txt")
+    assert acm.UNSUPPORTED_SUFFIX_HINT in reason, reason
+
+
+def test_try_resolve_unsupported_type_message_comes_from_the_same_place(tmp_path, capsys):
+    """Вторая точка отказа по типу файла — в `try_resolve`, и её литерал
+    расходился с константой ровно так же незаметно. Сцена проходит ЧЕРЕЗ
+    неё, а не через перехунковую проверку: иначе тест зеленел бы на
+    отставшем литерале (класс #891/#893)."""
+    target = tmp_path / "config.toml"
+    target.write_text(
+        "<<<<<<< HEAD\nkey = 1\n=======\nkey = 2\n>>>>>>> branch\n",
+        encoding="utf-8")
+
+    assert acm.try_resolve(tmp_path, ["config.toml"]) is None
+    printed = capsys.readouterr().out
+    assert acm.UNSUPPORTED_SUFFIX_HINT in printed, printed
