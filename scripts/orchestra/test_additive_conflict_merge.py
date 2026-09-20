@@ -1192,3 +1192,126 @@ def test_shell_closed_heredoc_still_lets_a_later_conflict_merge():
 
     assert resolved is not None, reason
     assert "alpha()" in resolved and "beta()" in resolved
+
+
+# ── Сцены раунда доводки воркера, перенесённые на разбор слова ────────────
+#
+# Воркер транспорта закрывал те же две находки другим способом (широкий класс
+# `[\w-]` + отдельный сканер «неопознанной формы»). Его СЦЕНЫ переносятся
+# сюда целиком — они ценны и проверяют вход end-to-end через try_resolve; его
+# МЕХАНИЗМ не переносится, и почему — в теле PR.
+
+
+def test_shell_escaped_delimiter_refuses_end_to_end_through_try_resolve(tmp_path):
+    """`cat <<\\EOF` разбирается в ограничитель «EOF» (прогон bash), конфликт
+    стоит в ТЕЛЕ — отказ всей пачки, файл на диске не тронут."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        "#!/usr/bin/env bash\n"
+        "cat <<\\EOF\n"
+        "<<<<<<< HEAD\n"
+        "ours() {\n  echo o\n}\n"
+        "=======\n"
+        "theirs() {\n  echo t\n}\n"
+        ">>>>>>> branch\n"
+        "EOF\n",
+        encoding="utf-8")
+
+    assert acm.try_resolve(tmp_path, ["tool.sh"]) is None
+    _, reason = acm.resolve_file_text(target.read_text(encoding="utf-8"), ".sh")
+    assert "heredoc (<<EOF)" in reason, reason
+
+
+def test_shell_side_closing_its_own_escaped_heredoc_is_a_safe_insertion():
+    """Контроль против перегиба: сторона, открывшая `<<\\A` и ЗАКРЫВШАЯ его
+    своей же строкой `A`, самостоятельна — данные не утекают ниже, и вставка
+    имеет право свестись. Пессимистичный отказ здесь выключил бы шелловые
+    функции с heredoc'ами внутри."""
+    resolved, reason = acm.resolve_file_text(
+        "#!/usr/bin/env bash\n"
+        "<<<<<<< HEAD\n"
+        "emit() {\n  cat <<\\A\nbody\nA\n}\n"
+        "=======\n"
+        "beta() {\n  echo b\n}\n"
+        ">>>>>>> branch\n",
+        ".sh")
+
+    assert resolved is not None, reason
+    assert "emit()" in resolved and "beta()" in resolved
+
+
+def test_shell_side_with_unparsable_heredoc_form_is_refused():
+    """А форма, которую разобрать НЕЛЬЗЯ, делает сторону несамостоятельной:
+    где кончаются её данные — неизвестно.
+
+    Сцена выбрана так, чтобы краснел ИМЕННО этот рубеж, а не соседний
+    (класс #891/#893 — зеленеть/краснеть не на том). `cat <<\\` с переносом
+    строки — ЛЕГАЛЬНЫЙ bash: слэш склеивает строки, ограничителем становится
+    `A` со следующей, `bash -n` возвращает 0 и тело реально печатается
+    (прогон). То есть все прочие рубежи тут зелёные, и отказ может дать
+    только неразобранная форма. Незакрытая кавычка на эту роль не годится:
+    её первым ловит `bash -n`."""
+    _, reason = acm.resolve_file_text(
+        "#!/usr/bin/env bash\n"
+        "<<<<<<< HEAD\n"
+        "emit() {\n  cat <<\\\nA\nbody\nA\n}\n"
+        "=======\n"
+        "beta() {\n  echo b\n}\n"
+        ">>>>>>> branch\n",
+        ".sh")
+
+    assert reason is not None and "не опознана" in reason, reason
+
+
+def test_shell_hyphenated_delimiter_body_eof_does_not_close(tmp_path):
+    """`cat <<EOF-1`: ограничитель — ПОЛНОЕ слово «EOF-1». Строка «EOF» в
+    теле его НЕ закрывает (прогон bash), конфликт после неё — данные."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        "#!/usr/bin/env bash\n"
+        "cat <<EOF-1\n"
+        "EOF\n"
+        "<<<<<<< HEAD\n"
+        "ours() {\n  echo o\n}\n"
+        "=======\n"
+        "theirs() {\n  echo t\n}\n"
+        ">>>>>>> branch\n"
+        "EOF-1\n",
+        encoding="utf-8")
+
+    assert acm.try_resolve(tmp_path, ["tool.sh"]) is None
+    _, reason = acm.resolve_file_text(target.read_text(encoding="utf-8"), ".sh")
+    assert "heredoc (<<EOF-1)" in reason, reason
+
+
+def test_shell_hyphenated_delimiter_real_terminator_merges(tmp_path):
+    """Контроль против перегиба: настоящий терминатор «EOF-1» закрывает, и
+    конфликт после него сводится как обычный код."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        "#!/usr/bin/env bash\n"
+        "cat <<EOF-1\n"
+        "body\n"
+        "EOF-1\n"
+        "<<<<<<< HEAD\n"
+        "alpha() {\n  echo a\n}\n"
+        "=======\n"
+        "beta() {\n  echo b\n}\n"
+        ">>>>>>> branch\n",
+        encoding="utf-8")
+
+    assert acm.try_resolve(tmp_path, ["tool.sh"]) is not None
+    merged = target.read_text(encoding="utf-8")
+    assert "alpha()" in merged and "beta()" in merged, merged
+
+
+def test_shell_herestring_and_conflict_markers_do_not_open_anything():
+    """`<<<` и маркеры конфликта — не открытие heredoc'а и не «неопознанная
+    форма»: обе границы регекспа отбрасывают все позиции внутри них.
+    Арифметика вырезается до поиска. Ложный сигнал здесь выключил бы шелл
+    целиком."""
+    assert acm._shell_heredoc_open_before(
+        ["grep x <<< HELLO", "<<<<<<< HEAD"], 2) is None
+    assert acm._shell_heredoc_open_before(["x=$((a << b))"], 1) is None
+    assert acm._shell_heredoc_open_before(
+        ["<<<<<<< HEAD", "t", "=======", "t", ">>>>>>> branch"], 5) is None
