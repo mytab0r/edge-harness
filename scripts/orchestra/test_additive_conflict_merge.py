@@ -596,3 +596,1307 @@ def test_try_resolve_end_to_end_on_a_real_git_rebase_conflict(tmp_path):
         env={**subprocess.os.environ, "GIT_EDITOR": "true"},
     )
     assert continue_result.returncode == 0, continue_result.stderr
+
+
+# ── Shell (#1383): самый частый отказ по типу файла ──────────────────────────
+#
+# Почему именно .sh, а не «файлы без расширения» из постановки: замер живого
+# прогона conflict-mechanical-rebase 35491299405 (2026-09-20T05:17Z) —
+# `.sh` ×3, `.yml` ×2, `.json` ×1, без расширения ×1. Направление выбрано по
+# замеру, а не по порядку перечисления в тексте задачи.
+
+def test_shell_hunk_safe_when_both_sides_add_disjoint_functions():
+    ours = 'alpha() {\n  echo a\n}\n'
+    theirs = 'beta() {\n  echo b\n}\n'
+    assert acm._hunk_unsafe_reason(ours, theirs, ".sh") is None
+
+
+def test_shell_hunk_unsafe_when_both_sides_define_the_same_function():
+    """Тот же класс, что #883 у питона: обе стороны правят ОДНО имя, и слепая
+    конкатенация оставит живым только последнее определение."""
+    ours = 'drain() {\n  echo ours\n}\n'
+    theirs = 'drain() {\n  echo theirs\n}\n'
+    reason = acm._hunk_unsafe_reason(ours, theirs, ".sh")
+    assert reason is not None and "drain" in reason
+
+
+def test_shell_hunk_unsafe_when_both_sides_assign_the_same_variable():
+    ours = 'TIMEOUT=30\n'
+    theirs = 'TIMEOUT=99\n'
+    reason = acm._hunk_unsafe_reason(ours, theirs, ".sh")
+    assert reason is not None and "TIMEOUT" in reason
+
+
+def test_shell_hunk_unsafe_when_a_side_is_an_unfinished_function():
+    """Оборванная половина конструкции обязана отказывать: склеивать
+    половинки в аддитивном слиянии нельзя. Ловит это `bash -n`, а не
+    самодельный разбор."""
+    ours = 'alpha() {\n  echo a\n'
+    theirs = 'beta() {\n  echo b\n}\n'
+    reason = acm._hunk_unsafe_reason(ours, theirs, ".sh")
+    assert reason is not None and "bash -n" in reason
+
+
+def test_shell_hunk_unsafe_when_a_side_starts_with_indentation():
+    ours = '  echo inside\n'
+    theirs = 'beta() {\n  echo b\n}\n'
+    reason = acm._hunk_unsafe_reason(ours, theirs, ".sh")
+    assert reason is not None and "отступа" in reason
+
+
+def test_shell_local_variable_inside_function_is_not_a_top_level_name():
+    """Контроль на ложный отказ: `local x=` внутри функции стоит с отступом и
+    в множество верхнеуровневых имён попадать не должен — иначе две
+    независимые функции с одноимённой локальной переменной давали бы отказ."""
+    ours = 'alpha() {\n  local tmp=1\n  echo $tmp\n}\n'
+    theirs = 'beta() {\n  local tmp=2\n  echo $tmp\n}\n'
+    assert acm._hunk_unsafe_reason(ours, theirs, ".sh") is None
+
+
+def test_language_of_reads_shebang_for_extensionless_file(tmp_path):
+    """Живой отказ прогона 35491299405 дословно: `scripts/gh/issue-create:
+    тип файла (без расширения) не поддержан`. Файл исполняемый и шелловый —
+    отказывать ему по отсутствию суффикса значит судить по орфографии имени."""
+    path = tmp_path / "issue-create"
+    text = "#!/usr/bin/env bash\nset -euo pipefail\n"
+    assert acm.language_of(path, text) == ".sh"
+    assert acm.language_of(tmp_path / "tool", "#!/usr/bin/env python3\nx = 1\n") == ".py"
+    assert acm.language_of(tmp_path / "data", "просто текст\n") is None
+    assert acm.language_of(tmp_path / "config.yml", "a: 1\n") is None
+
+
+def test_try_resolve_merges_extensionless_shell_script(tmp_path):
+    """Сквозной путь того самого отказа: файл без расширения, шелл, две
+    независимые функции — обязан слиться."""
+    target = tmp_path / "issue-create"
+    target.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n\n"
+        "<<<<<<< HEAD\n"
+        "alpha() {\n  echo a\n}\n"
+        "=======\n"
+        "beta() {\n  echo b\n}\n"
+        ">>>>>>> branch\n",
+        encoding="utf-8",
+    )
+
+    result = acm.try_resolve(tmp_path, ["issue-create"])
+
+    assert result is not None, "шелл без расширения обязан сводиться (#1383)"
+    merged = target.read_text(encoding="utf-8")
+    assert "alpha()" in merged and "beta()" in merged
+    assert "<<<<<<<" not in merged
+
+
+def test_try_resolve_refuses_shell_duplicate_names_across_two_hunks(tmp_path):
+    """Тот же класс «двумя РАЗНЫМИ хунками», что закрыт для .py в круге 3
+    ревью PR #1033: перехунковый критерий его не видит, bash -n зелёный,
+    молча живёт последнее определение."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        "#!/usr/bin/env bash\n\n"
+        "<<<<<<< HEAD\n"
+        "TIMEOUT=30\n"
+        "=======\n"
+        "OTHER_A=1\n"
+        ">>>>>>> branch\n"
+        "echo middle\n"
+        "<<<<<<< HEAD\n"
+        "OTHER_B=2\n"
+        "=======\n"
+        "TIMEOUT=99\n"
+        ">>>>>>> branch\n",
+        encoding="utf-8",
+    )
+
+    result = acm.try_resolve(tmp_path, ["tool.sh"])
+
+    assert result is None
+    assert "<<<<<<<" in target.read_text(encoding="utf-8"), "отказ ДО записи"
+
+
+def test_try_resolve_notice_names_weaker_guarantee_for_shell(tmp_path, capsys):
+    """Гарантия для шелла слабее питоновской (третьего рубежа — тестов — нет),
+    и отчёт обязан говорить это вслух, а не оставлять читателя достраивать."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        "#!/usr/bin/env bash\n\n"
+        "<<<<<<< HEAD\n"
+        "alpha() {\n  echo a\n}\n"
+        "=======\n"
+        "beta() {\n  echo b\n}\n"
+        ">>>>>>> branch\n",
+        encoding="utf-8",
+    )
+
+    assert acm.try_resolve(tmp_path, ["tool.sh"]) is not None
+    out = capsys.readouterr().out
+    assert "bash -n" in out and "гарантия слабее" in out, out
+
+
+# ── heredoc: блокирующая находка ai-ревью PR #1392 ───────────────────────────
+#
+# Тело heredoc — ДАННЫЕ, и все три рубежа шелла слепы на нём ОДНОВРЕМЕННО:
+# строка стоит в нулевой колонке (не отступ), не определяет имён (не
+# пересекаются), `bash -n` принимает произвольную прозу внутри heredoc
+# (синтаксис валиден). Правка ОДНОЙ строки текста двумя сторонами выглядела
+# бы как два независимых добавления. И это не теория: heredoc'и несут 25
+# шелловых файлов репозитория (замер `git grep` по `<<` без `<<<`), больше
+# всех — scripts/lib/test/dsh-anthropic-pool.guard.sh (21) и
+# scripts/worker/task.sh (8). Фикстура ниже моделирует ИМЕННО такой файл;
+# имя `issue-create` она носит ради второго свойства — без расширения.
+
+_ISSUE_CREATE_LIKE = (
+    "#!/usr/bin/env bash\n"
+    "set -euo pipefail\n"
+    "\n"
+    "body=$(cat <<'EOF_BODY'\n"
+    "### Цель\n"
+    "<<<<<<< HEAD\n"
+    "Морда обязана отвечать за 200 мс\n"
+    "=======\n"
+    "Морда обязана отвечать за 500 мс\n"
+    ">>>>>>> branch\n"
+    "EOF_BODY\n"
+    ")\n"
+    'echo "$body"\n'
+)
+
+
+def test_shell_conflict_inside_heredoc_is_refused(tmp_path):
+    """Прод-форма живого файла: конфликт ОДНОЙ строки markdown-тела внутри
+    heredoc. До правки try_resolve возвращал успех и клал в файл ОБЕ
+    взаимоисключающие строки — `bash -n` итогового файла при этом rc=0, и
+    результат уехал бы как «сведённый»."""
+    target = tmp_path / "issue-create"
+    target.write_text(_ISSUE_CREATE_LIKE, encoding="utf-8")
+
+    result = acm.try_resolve(tmp_path, ["issue-create"])
+
+    assert result is None, "конфликт внутри heredoc сводить нельзя — это правка данных"
+    text = target.read_text(encoding="utf-8")
+    assert "<<<<<<<" in text, "отказ ДО записи"
+    assert not ("200 мс" in text and "500 мс" in text and "<<<<<<<" not in text)
+
+
+def test_shell_heredoc_refusal_names_the_delimiter(tmp_path):
+    """Отказ обязан называть ограничитель, а не просто «не наш класс» —
+    иначе разбирающий не поймёт, чем этот отказ отличается от прочих."""
+    _, reason = acm.resolve_file_text(_ISSUE_CREATE_LIKE, ".sh")
+    assert "heredoc" in reason and "EOF_BODY" in reason, reason
+
+
+def test_shell_conflict_after_closed_heredoc_still_merges(tmp_path):
+    """Контроль на противоположную ошибку: heredoc ЗАКРЫТ выше по файлу —
+    состояние не должно «залипать», иначе рубеж отверг бы всё после первого
+    же heredoc'а и выключил поддержку шелла целиком, оставаясь зелёным."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        "#!/usr/bin/env bash\n"
+        "cat <<'EOF'\n"
+        "просто текст\n"
+        "EOF\n"
+        "\n"
+        "<<<<<<< HEAD\n"
+        "alpha() {\n  echo a\n}\n"
+        "=======\n"
+        "beta() {\n  echo b\n}\n"
+        ">>>>>>> branch\n",
+        encoding="utf-8",
+    )
+
+    assert acm.try_resolve(tmp_path, ["tool.sh"]) is not None
+    merged = target.read_text(encoding="utf-8")
+    assert "alpha()" in merged and "beta()" in merged
+
+
+def test_shell_herestring_is_not_mistaken_for_heredoc(tmp_path):
+    """`<<<` — herestring, не heredoc. Спутать значит отвергать безобидные
+    файлы навсегда (состояние «heredoc открыт» никогда не закроется)."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        "#!/usr/bin/env bash\n"
+        'grep x <<< "$VAR"\n'
+        "\n"
+        "<<<<<<< HEAD\n"
+        "alpha() {\n  echo a\n}\n"
+        "=======\n"
+        "beta() {\n  echo b\n}\n"
+        ">>>>>>> branch\n",
+        encoding="utf-8",
+    )
+
+    assert acm.try_resolve(tmp_path, ["tool.sh"]) is not None
+
+
+def test_shell_names_cover_alias_and_declare_without_flag():
+    """Неполный список форм определения имени означал бы «имена не
+    пересеклись» там, где они пересекаются (находка ai-ревью PR #1392)."""
+    for ours, theirs, expected in (
+        ("alias ll='ls -l'\n", "alias ll='ls -la'\n", "ll"),
+        ("declare COUNT=1\n", "declare COUNT=2\n", "COUNT"),
+        ("typeset NAME=a\n", "typeset NAME=b\n", "NAME"),
+    ):
+        reason = acm._hunk_unsafe_reason(ours, theirs, ".sh")
+        assert reason is not None and expected in reason, (ours, reason)
+
+
+def test_notice_does_not_claim_ast_parse_when_no_python_in_batch(tmp_path, capsys):
+    """Без .py говорить «только ast.parse итоговых файлов» — неправда:
+    ast.parse тут не звался вовсе."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        "#!/usr/bin/env bash\n\n"
+        "<<<<<<< HEAD\n"
+        "alpha() {\n  echo a\n}\n"
+        "=======\n"
+        "beta() {\n  echo b\n}\n"
+        ">>>>>>> branch\n",
+        encoding="utf-8",
+    )
+
+    assert acm.try_resolve(tmp_path, ["tool.sh"]) is not None
+    out = capsys.readouterr().out
+    assert "только ast.parse итоговых файлов" not in out, out
+    assert "питоновских файлов в пачке нет" in out, out
+
+
+def test_shell_two_safe_hunks_merge_despite_earlier_conflict_marker(tmp_path):
+    """Второй хунк не должен считаться «внутри heredoc» из-за строки маркера
+    ПЕРВОГО хунка.
+
+    Дыра была настоящей: регексп с одним только lookahead видел в
+    `<<<<<<< HEAD` heredoc с ограничителем «HEAD», и любой второй хунк файла
+    отвергался. Прежние тесты на это молчали — они ждали отказа и по другой
+    причине (дубликат имени), то есть зеленели не на том."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        "#!/usr/bin/env bash\n\n"
+        "<<<<<<< HEAD\n"
+        "alpha() {\n  echo a\n}\n"
+        "=======\n"
+        "beta() {\n  echo b\n}\n"
+        ">>>>>>> branch\n"
+        "echo middle\n"
+        "<<<<<<< HEAD\n"
+        "gamma() {\n  echo g\n}\n"
+        "=======\n"
+        "delta() {\n  echo d\n}\n"
+        ">>>>>>> branch\n",
+        encoding="utf-8",
+    )
+
+    assert acm.try_resolve(tmp_path, ["tool.sh"]) is not None, (
+        "оба хунка безопасны — файл обязан свестись")
+    merged = target.read_text(encoding="utf-8")
+    for name in ("alpha()", "beta()", "gamma()", "delta()"):
+        assert name in merged, (name, merged)
+
+
+def test_shell_bare_word_herestring_does_not_open_a_phantom_heredoc(tmp_path):
+    """`<<< HELLO` без кавычек — herestring. Прежний тест брал `<<< "$VAR"`,
+    который не матчился НИ ОДНИМ из регекспов, и потому не различал
+    сломанный от исправного: мутация «убрать границу» оставляла его зелёным."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        "#!/usr/bin/env bash\n"
+        "grep x <<< HELLO\n"
+        "\n"
+        "<<<<<<< HEAD\n"
+        "alpha() {\n  echo a\n}\n"
+        "=======\n"
+        "beta() {\n  echo b\n}\n"
+        ">>>>>>> branch\n",
+        encoding="utf-8",
+    )
+
+    assert acm.try_resolve(tmp_path, ["tool.sh"]) is not None
+
+
+def test_shell_side_that_opens_heredoc_is_refused(tmp_path):
+    """Сцена ai-ревью PR #1392 (второй заход), воспроизведённая дословно:
+    ours открывает heredoc и не закрывает, theirs определяет функцию.
+
+    До правки проходили ВСЕ рубежи: строки до хунка чисты, отступа нет, имена
+    не пересекаются, а `bash -n` на незакрытом heredoc возвращает НОЛЬ
+    (печатает warning). В записанном файле `beta()` и весь хвост становились
+    телом heredoc'а «A» — то есть правка одной конструкции, которую дифф
+    считает двумя независимыми вставками."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        "#!/usr/bin/env bash\n\n"
+        "<<<<<<< HEAD\n"
+        "cat <<A\n"
+        "BODY\n"
+        "=======\n"
+        "beta() {\n  echo b\n}\n"
+        ">>>>>>> branch\n"
+        "echo tail\n",
+        encoding="utf-8",
+    )
+
+    result = acm.try_resolve(tmp_path, ["tool.sh"])
+
+    assert result is None, "сторона, открывшая heredoc, — не самостоятельная вставка"
+    assert "<<<<<<<" in target.read_text(encoding="utf-8"), "отказ ДО записи"
+
+
+def test_shell_side_heredoc_refusal_names_the_delimiter():
+    reason = acm._hunk_unsafe_reason("cat <<A\nBODY\n", "beta() {\n  echo b\n}\n", ".sh")
+    assert reason is not None and "<<A" in reason, reason
+
+
+def test_shell_side_with_closed_heredoc_is_still_additive():
+    """Контроль на противоположную ошибку: сторона, которая открыла И
+    закрыла heredoc, самостоятельна — отвергать её нельзя, иначе рубеж
+    запретил бы любую вставку с текстовым телом."""
+    ours = "alpha() {\n  cat <<'EOF'\ntext\nEOF\n}\n"
+    theirs = "beta() {\n  echo b\n}\n"
+    assert acm._hunk_unsafe_reason(ours, theirs, ".sh") is None
+
+
+def test_shell_arithmetic_left_shift_is_not_a_heredoc():
+    """`$(( x << SHIFT ))` — сдвиг влево, не heredoc. Спутать значит
+    отвергать файл навсегда с ложной причиной (находка ai-ревью PR #1392)."""
+    text = (
+        "#!/usr/bin/env bash\n"
+        "mask=$(( 1 << SHIFT ))\n"
+        "(( y = z << BITS ))\n"
+        "\n"
+        "<<<<<<< HEAD\n"
+        "alpha() {\n  echo a\n}\n"
+        "=======\n"
+        "beta() {\n  echo b\n}\n"
+        ">>>>>>> branch\n"
+    )
+    resolved, reason = acm.resolve_file_text(text, ".sh")
+    assert resolved is not None, reason
+    assert "alpha()" in resolved and "beta()" in resolved
+
+
+def test_shell_refuses_when_resolved_file_leaves_heredoc_open_at_eof(tmp_path):
+    """Зеркальный рубеж на ИТОГОВОМ файле — случай, которого перехунковая
+    проверка не видит по построению: heredoc открывает ХВОСТ файла, ниже
+    хунка.
+
+    Обе стороны самостоятельны, строки до хунка чисты — все перехунковые
+    проверки зелёные. Но собранный файл остаётся с незакрытым heredoc'ом, и
+    `bash -n` такое принимает (warning, rc=0, проверено исполнением). Файл в
+    таком состоянии пришёл уже испорченным, и это ровно «любое сомнение —
+    полный отказ» из контракта модуля: где именно кончаются данные, мы не
+    знаем, а значит не знаем и того, не легла ли вставка внутрь них."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        "#!/usr/bin/env bash\n\n"
+        "<<<<<<< HEAD\n"
+        "alpha() {\n  echo a\n}\n"
+        "=======\n"
+        "beta() {\n  echo b\n}\n"
+        ">>>>>>> branch\n"
+        "cat <<TAIL\n"
+        "данные без ограничителя\n",
+        encoding="utf-8",
+    )
+
+    result = acm.try_resolve(tmp_path, ["tool.sh"])
+
+    assert result is None, "итог с незакрытым heredoc сводить нельзя"
+    assert "<<<<<<<" in target.read_text(encoding="utf-8"), "отказ ДО записи"
+
+
+# ── закрытие heredoc по правилам настоящего bash ────────────────────────────
+#
+# Рубеж общий для всех трёх проверок heredoc (хунк внутри, сторона-открыватель,
+# хвост итогового файла): правило `line.strip() == delim` закрывало heredoc
+# строками, которые bash терминаторами НЕ считает. Оба негативных правила
+# проверены прогоном НАСТОЯЩЕГО bash:
+#   `cat <<'EOF'` … `EOF ` (хвостовой пробел) → тело продолжается, bash
+#     предупреждает «here-document delimited by end-of-file»;
+#   `cat <<-EOF` … `    EOF` (пробельный отступ) → то же: `<<-` снимает
+#     только ТАБУЛЯЦИИ (таб-отступ закрывает — проверено тем же прогоном:
+#     исполнение продолжается после терминатора).
+# Оба случая воспроизведены end-to-end на голове до правки: try_resolve
+# возвращал успех, и ОБЕ взаимоисключающие строки становились мёртвым телом
+# heredoc'а итогового файла (bash -n зелёный).
+
+
+def _conflict_after_false_terminator(open_line: str, bad_terminator: str) -> str:
+    return (
+        "#!/usr/bin/env bash\n"
+        f"{open_line}\n"
+        "prefix\n"
+        f"{bad_terminator}\n"
+        "<<<<<<< HEAD\n"
+        "ours() {\n  echo ours\n}\n"
+        "=======\n"
+        "theirs() {\n  echo theirs\n}\n"
+        ">>>>>>> branch\n"
+        "EOF\n"
+    )
+
+
+def test_shell_heredoc_trailing_space_terminator_does_not_close(tmp_path):
+    """`EOF ` с хвостовым пробелом — НЕ терминатор bash, конфликт после него
+    всё ещё внутри ДАННЫХ и не сводится."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        _conflict_after_false_terminator("cat <<'EOF'", "EOF "), encoding="utf-8")
+
+    assert acm.try_resolve(tmp_path, ["tool.sh"]) is None, (
+        "heredoc не закрыт — конфликт внутри тела сводить нельзя")
+    _, reason = acm.resolve_file_text(target.read_text(encoding="utf-8"), ".sh")
+    assert "heredoc" in reason and "EOF" in reason, reason
+
+
+def test_shell_dash_heredoc_space_indented_terminator_does_not_close(tmp_path):
+    """`<<-` снимает с терминатора только табуляции: `    EOF` с пробелами
+    её НЕ закрывает, конфликт после неё — данные."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        _conflict_after_false_terminator("cat <<-EOF", "    EOF"), encoding="utf-8")
+
+    assert acm.try_resolve(tmp_path, ["tool.sh"]) is None
+
+
+def test_shell_dash_heredoc_tab_indented_terminator_closes(tmp_path):
+    """Контроль против перегиба: `<<-` с ТАБУЛЯЦИЕЙ — настоящий терминатор.
+    Конфликт ПОСЛЕ него — обычный код и обязан свестись, иначе рубеж
+    «залипал» бы и выключал поддержку шелла целиком."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        "#!/usr/bin/env bash\n"
+        "cat <<-EOF\n"
+        "\tbody\n"
+        "\tEOF\n"
+        "<<<<<<< HEAD\n"
+        "alpha() {\n  echo a\n}\n"
+        "=======\n"
+        "beta() {\n  echo b\n}\n"
+        ">>>>>>> branch\n",
+        encoding="utf-8")
+
+    assert acm.try_resolve(tmp_path, ["tool.sh"]) is not None
+    merged = target.read_text(encoding="utf-8")
+    assert "alpha()" in merged and "beta()" in merged, merged
+
+
+def test_shell_heredoc_open_before_requires_exact_terminator():
+    """Юнит на само правило: хвостовой пробел терминатора оставляет heredoc
+    открытым; точное равенство закрывает."""
+    opened = ["cat <<'EOF'", "prefix", "EOF ", "more"]
+    assert acm._shell_heredoc_open_before(opened, 4).delim == "EOF"
+    closed = ["cat <<'EOF'", "prefix", "EOF", "more"]
+    assert acm._shell_heredoc_open_before(closed, 4) is None
+
+
+def test_shell_heredoc_delimiter_may_start_with_digit():
+    """`cat <<2` — легальный bash (прогон: тело печатается, строка «2»
+    закрывает); пропуск открытия — отказ в опасную сторону. Широкий класс не
+    открывает дверь маркерам: строка `<<<<<<< HEAD` не матчится и с ним."""
+    assert acm._shell_heredoc_open_before(["cat <<2", "body"], 2).delim == "2"
+    assert acm._shell_heredoc_open_before(
+        ["<<<<<<< HEAD", "text", "=======", "text", ">>>>>>> branch"], 5) is None
+
+
+# ── Раунд 4 ревью: форма открытия heredoc'а, а не только его закрытие ────
+#
+# Все bash-семантики ниже проверены прогоном НАСТОЯЩЕГО bash, не выведены
+# из документации; дословные выводы — в теле PR #1392.
+
+
+def _shell_conflict_inside(prologue: str, epilogue: str = "") -> str:
+    """Файл, где конфликт стоит РОВНО там, куда целится сцена: сразу после
+    `prologue`. Маркеры литеральные — это синтаксис самого git."""
+    return (prologue
+            + "<<<<<<< HEAD\nстрока владельца\n=======\n"
+              "строка ветки\n>>>>>>> branch\n"
+            + epilogue)
+
+
+def test_shell_escaped_delimiter_opens_a_heredoc_and_is_not_missed():
+    """`cat <<\\EOF` — легальный bash (прогон: тело печатается без подстановок,
+    `EOF` закрывает). Прежний регексп не матчился вовсе, и конфликт в ТЕЛЕ
+    сводился как код: все четыре рубежа шелла зеленели разом, потому что
+    промах мимо открытия делает их слепыми одновременно."""
+    text = _shell_conflict_inside("cat <<\\EOF\n", "EOF\n")
+
+    resolved, reason = acm.resolve_file_text(text, ".sh")
+
+    assert resolved is None, "конфликт в теле heredoc'а не имеет права сводиться"
+    assert "heredoc" in reason and "EOF" in reason
+
+
+def test_shell_heredoc_delimiter_is_read_as_a_whole_word():
+    """`cat <<EOF-1`: настоящий bash держит данные до `EOF-1`, а строка `EOF`
+    остаётся ТЕЛОМ (прогон). Прежний регексп брал ограничителем «EOF» — и
+    хунк за этой строкой сводился как код, хотя он внутри данных."""
+    assert acm._shell_heredoc_open_before(["cat <<EOF-1", "body"], 2).delim == "EOF-1"
+
+    text = _shell_conflict_inside("cat <<EOF-1\nпролог тела\n", "EOF\nхвост\nEOF-1\n")
+    resolved, reason = acm.resolve_file_text(text, ".sh")
+
+    assert resolved is None
+    assert "EOF-1" in reason
+
+
+def test_shell_heredoc_delimiter_quotes_are_removed_like_bash_does():
+    """Три написания одного ограничителя `EOF` — прогон настоящего bash
+    подтвердил, что закрывает их все строка `EOF`, включая склейку
+    `<<"EO"F`."""
+    for opener in ("cat <<'EOF'", 'cat <<"EOF"', 'cat <<"EO"F', "cat <<E\\OF"):
+        state = acm._shell_heredoc_open_before([opener, "body"], 2)
+        assert state is not None and state.delim == "EOF", opener
+        assert acm._shell_heredoc_open_before([opener, "body", "EOF"], 3) is None, opener
+
+
+def test_shell_heredoc_word_stops_on_bash_metacharacters():
+    """`cat <<EOF >out` и `cat <<EOF;echo TAIL` — ограничитель «EOF» (прогон:
+    тело уходит в файл / хвост команды исполняется). Контроль против
+    перегиба: рубеж не должен съедать хвост строки в ограничитель, иначе
+    закрытый heredoc выглядел бы открытым и файл отказывался бы навсегда."""
+    for opener in ("cat <<EOF >out.txt", "cat <<EOF;echo TAIL", "cat <<EOF | wc -l"):
+        assert acm._shell_heredoc_open_before([opener, "body", "EOF"], 3) is None, opener
+
+
+def test_shell_heredoc_hash_does_not_end_the_delimiter_word():
+    """`cat <<EOF#x` — ограничитель «EOF#x» ЦЕЛИКОМ, строка `EOF` остаётся
+    телом (прогон настоящего bash). `#` начинает комментарий только в начале
+    слова, поэтому в список метасимволов он не входит."""
+    state = acm._shell_heredoc_open_before(["cat <<EOF#x", "body", "EOF"], 3)
+
+    assert state is not None and state.delim == "EOF#x"
+
+
+def test_shell_unparsable_heredoc_form_refuses_loudly_and_says_why():
+    """Контракт модуля — «любое сомнение — отказ», но сомнение обязано
+    назвать СЕБЯ: «форму не разобрал» и «heredoc открыт» лечатся по-разному
+    (AGENTS.md, «fail loud, не silent-wrong»)."""
+    state = acm._shell_heredoc_open_before(["cat <<'EOF", "body"], 2)
+
+    assert state is not None and state.delim is None
+    assert "не опознана" in state.describe()
+
+    resolved, reason = acm.resolve_file_text(
+        _shell_conflict_inside("cat <<'EOF\nпролог\n"), ".sh")
+
+    assert resolved is None
+    assert "не опознана" in reason and "cat <<'EOF" in reason
+
+
+def test_shell_closed_heredoc_still_lets_a_later_conflict_merge():
+    """Контроль против перегиба всей пачки выше: правильно опознанный и
+    ЗАКРЫТЫЙ heredoc не должен запирать файл — иначе новый разбор вылечил бы
+    промах ценой отказа всем шелловым файлам с heredoc'ами."""
+    text = _shell_conflict_inside("cat <<\\EOF\nтело\nEOF\n")
+    text = text.replace("строка владельца", "alpha() { :; }")
+    text = text.replace("строка ветки", "beta() { :; }")
+
+    resolved, reason = acm.resolve_file_text(text, ".sh")
+
+    assert resolved is not None, reason
+    assert "alpha()" in resolved and "beta()" in resolved
+
+
+# ── Сцены раунда доводки воркера, перенесённые на разбор слова ────────────
+#
+# Воркер транспорта закрывал те же две находки другим способом (широкий класс
+# `[\w-]` + отдельный сканер «неопознанной формы»). Его СЦЕНЫ переносятся
+# сюда целиком — они ценны и проверяют вход end-to-end через try_resolve; его
+# МЕХАНИЗМ не переносится, и почему — в теле PR.
+
+
+def test_shell_escaped_delimiter_refuses_end_to_end_through_try_resolve(tmp_path):
+    """`cat <<\\EOF` разбирается в ограничитель «EOF» (прогон bash), конфликт
+    стоит в ТЕЛЕ — отказ всей пачки, файл на диске не тронут."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        "#!/usr/bin/env bash\n"
+        "cat <<\\EOF\n"
+        "<<<<<<< HEAD\n"
+        "ours() {\n  echo o\n}\n"
+        "=======\n"
+        "theirs() {\n  echo t\n}\n"
+        ">>>>>>> branch\n"
+        "EOF\n",
+        encoding="utf-8")
+
+    assert acm.try_resolve(tmp_path, ["tool.sh"]) is None
+    _, reason = acm.resolve_file_text(target.read_text(encoding="utf-8"), ".sh")
+    assert "heredoc (<<EOF)" in reason, reason
+
+
+def test_shell_side_closing_its_own_escaped_heredoc_is_a_safe_insertion():
+    """Контроль против перегиба: сторона, открывшая `<<\\A` и ЗАКРЫВШАЯ его
+    своей же строкой `A`, самостоятельна — данные не утекают ниже, и вставка
+    имеет право свестись. Пессимистичный отказ здесь выключил бы шелловые
+    функции с heredoc'ами внутри."""
+    resolved, reason = acm.resolve_file_text(
+        "#!/usr/bin/env bash\n"
+        "<<<<<<< HEAD\n"
+        "emit() {\n  cat <<\\A\nbody\nA\n}\n"
+        "=======\n"
+        "beta() {\n  echo b\n}\n"
+        ">>>>>>> branch\n",
+        ".sh")
+
+    assert resolved is not None, reason
+    assert "emit()" in resolved and "beta()" in resolved
+
+
+def test_shell_side_with_unparsable_heredoc_form_is_refused():
+    """А форма, которую разобрать НЕЛЬЗЯ, делает сторону несамостоятельной:
+    где кончаются её данные — неизвестно.
+
+    Сцена выбрана так, чтобы краснел ИМЕННО этот рубеж, а не соседний
+    (класс #891/#893 — зеленеть/краснеть не на том). `cat <<\\` с переносом
+    строки — ЛЕГАЛЬНЫЙ bash: слэш склеивает строки, ограничителем становится
+    `A` со следующей, `bash -n` возвращает 0 и тело реально печатается
+    (прогон). То есть все прочие рубежи тут зелёные, и отказ может дать
+    только неразобранная форма. Незакрытая кавычка на эту роль не годится:
+    её первым ловит `bash -n`."""
+    _, reason = acm.resolve_file_text(
+        "#!/usr/bin/env bash\n"
+        "<<<<<<< HEAD\n"
+        "emit() {\n  cat <<\\\nA\nbody\nA\n}\n"
+        "=======\n"
+        "beta() {\n  echo b\n}\n"
+        ">>>>>>> branch\n",
+        ".sh")
+
+    assert reason is not None and "не опознана" in reason, reason
+
+
+def test_shell_hyphenated_delimiter_body_eof_does_not_close(tmp_path):
+    """`cat <<EOF-1`: ограничитель — ПОЛНОЕ слово «EOF-1». Строка «EOF» в
+    теле его НЕ закрывает (прогон bash), конфликт после неё — данные."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        "#!/usr/bin/env bash\n"
+        "cat <<EOF-1\n"
+        "EOF\n"
+        "<<<<<<< HEAD\n"
+        "ours() {\n  echo o\n}\n"
+        "=======\n"
+        "theirs() {\n  echo t\n}\n"
+        ">>>>>>> branch\n"
+        "EOF-1\n",
+        encoding="utf-8")
+
+    assert acm.try_resolve(tmp_path, ["tool.sh"]) is None
+    _, reason = acm.resolve_file_text(target.read_text(encoding="utf-8"), ".sh")
+    assert "heredoc (<<EOF-1)" in reason, reason
+
+
+def test_shell_hyphenated_delimiter_real_terminator_merges(tmp_path):
+    """Контроль против перегиба: настоящий терминатор «EOF-1» закрывает, и
+    конфликт после него сводится как обычный код."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        "#!/usr/bin/env bash\n"
+        "cat <<EOF-1\n"
+        "body\n"
+        "EOF-1\n"
+        "<<<<<<< HEAD\n"
+        "alpha() {\n  echo a\n}\n"
+        "=======\n"
+        "beta() {\n  echo b\n}\n"
+        ">>>>>>> branch\n",
+        encoding="utf-8")
+
+    assert acm.try_resolve(tmp_path, ["tool.sh"]) is not None
+    merged = target.read_text(encoding="utf-8")
+    assert "alpha()" in merged and "beta()" in merged, merged
+
+
+def test_shell_herestring_and_conflict_markers_do_not_open_anything():
+    """`<<<` и маркеры конфликта — не открытие heredoc'а и не «неопознанная
+    форма»: обе границы регекспа отбрасывают все позиции внутри них.
+    Арифметика вырезается до поиска. Ложный сигнал здесь выключил бы шелл
+    целиком."""
+    assert acm._shell_heredoc_open_before(
+        ["grep x <<< HELLO", "<<<<<<< HEAD"], 2) is None
+    assert acm._shell_heredoc_open_before(["x=$((a << b))"], 1) is None
+    assert acm._shell_heredoc_open_before(
+        ["<<<<<<< HEAD", "t", "=======", "t", ">>>>>>> branch"], 5) is None
+
+
+# ── раунд 5: полные строки ключевых слов; пин сцены склейки ограничителя ────
+#
+# Multi-assign — ложное «безопасно»: неполный список имён пропускал
+# столкновение второго имени в `export A=1 B=2`, конкатенация молча оставляла
+# живым последнее присваивание (класс #883). Пин сцены `<<'E'O` — по одному
+# месту: разбор слова bash закрывает её (раунд 4), сцена должна ОСТАВАТЬСЯ
+# отказом при любом будущем рефакторинге сканера.
+
+
+def test_shell_multi_name_keyword_line_collision_is_caught():
+    """`export A=1 B=2` определяет ОБА имени: форма, ловившая только первое,
+    давала ложное «имена не пересеклись» там, где обе стороны правят второй
+    (класс #883 — конкатенация молча оставляет живым последнее)."""
+    for ours, theirs, expected in (
+        ("export A=1 B=2\n", "export B=9 C=3\n", "B"),
+        ("readonly E1=x E2=y\n", "E2=z\n", "E2"),
+        ("alias ll='ls -l' lsl='ls -la'\n", "lsl=/bin/lsl\n", "lsl"),
+    ):
+        reason = acm._hunk_unsafe_reason(ours, theirs, ".sh")
+        assert reason is not None and expected in reason, (ours, theirs, reason)
+
+
+def test_shell_multi_name_keyword_line_without_collision_is_additive():
+    ours = "export A=1 B=2\n"
+    theirs = "export C=3 D=4\n"
+    assert acm._hunk_unsafe_reason(ours, theirs, ".sh") is None
+
+
+def test_shell_duplicate_count_does_not_double_count_keyword_lines():
+    """Строка `export A=1 B=2` обязана посчитать `A` РОВНО один раз: две
+    формы разбора на одной строке дали бы «дубликат из одной строки» и
+    отвергали бы годовый файл."""
+    assert acm._duplicate_shell_top_level_names("export A=1 B=2\n") == []
+    assert acm._duplicate_shell_top_level_names("readonly E1=x E1=y\n") == ["E1"]
+
+
+def test_shell_quoted_value_with_equals_is_not_a_name():
+    """`--color=auto` внутри значения alias — ДАННЫЕ, не определение имени:
+    фантом создал бы ложные пересечения (отказ без нужды). Флаги и кавычки
+    перед `=` исключают имя; `color=red` второй стороны остаётся честным
+    верхнеуровневым именем и ни с чем не сталкивается."""
+    ours = "alias grep='grep --color=auto'\n"
+    theirs = "color=red\n"
+    assert acm._hunk_unsafe_reason(ours, theirs, ".sh") is None
+
+
+def test_shell_quoted_delim_concatenation_scene_stays_refused(tmp_path):
+    """Пин исполненной сцены пробы (раунд 5 PR #1392): ours открывает
+    `<<'E'O` — ограничитель EO (кавычка и слово склеиваются, прогон
+    настоящего bash), в теле есть строка «E». Регексп раундов 1-3 брал
+    ограничителем усечённое «E» и закрывал на ней heredoc: merge проходил,
+    а при ИСПОЛНЕНИИ сведённого файла `beta()` не определялась вовсе
+    (bash -n rc=0). Разбор слова bash раунда 4 закрывает сцену — она обязана
+    оставаться отказом, отказ обязан называть ПОЛНОЕ имя, не усечённое."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        "#!/usr/bin/env bash\n\n"
+        "<<<<<<< HEAD\n"
+        "cat <<'E'O\n"
+        "body\n"
+        "E\n"
+        "tail-code\n"
+        "=======\n"
+        "beta() {\n  echo b\n}\n"
+        ">>>>>>> branch\n",
+        encoding="utf-8",
+    )
+
+    result = acm.try_resolve(tmp_path, ["tool.sh"])
+
+    assert result is None, "склейка ограничителя — не самостоятельная вставка"
+    _, reason = acm.resolve_file_text(target.read_text(encoding="utf-8"), ".sh")
+    assert reason is not None and "EO" in reason and "<<E'" not in reason, reason
+
+
+def test_shell_phantom_opening_refuses_never_merges_silently():
+    """Честная граница сканера, запиненная НАПРАВЛЕНИЕМ, а не списком сцен
+    (некритичная находка ai-ревью PR #1392, раунд 5).
+
+    Кавыченный текст и комментарий сканер от кода не отличает, поэтому
+    открывает фантомы там, где bash heredoc'а не видит (все четыре строки
+    ниже настоящий bash исполняет без единой жалобы, rc=0). Цена — лишний
+    уход файла в агентский путь. Чего НЕ бывает: тихого сведения. Очередь
+    `pending` от лишнего открытия только растёт и снимается строго с головы,
+    поэтому фантом не может закрыть настоящий heredoc раньше срока — тест
+    проверяет именно это, а не конкретные формулировки отказа."""
+    phantoms = [
+        'echo "usage: tool <<option>> value"',
+        "echo 'sed s/<<>/X/'",
+        'let "mask = 1 << 4"',
+        "# пример: cat <<EOF",
+    ]
+    for line in phantoms:
+        assert acm._shell_heredoc_open_before([line, "код"], 2) is not None, line
+
+    # Фантом ПОСЛЕ настоящего открытия в той же строке: настоящий закрывается
+    # своим терминатором, фантом остаётся — файл отказан, а не сведён.
+    tail_open = acm._shell_heredoc_open_before(
+        ["cat <<EOF # пример: cat <<PHANTOM", "тело", "EOF", "код"], 4)
+    assert tail_open is not None and tail_open.delim == "PHANTOM"
+
+    # Контроль: чистая строка кода фантома не порождает — пессимизм не
+    # разлился на весь шелл.
+    assert acm._shell_heredoc_open_before(["alpha() { echo a; }", "код"], 2) is None
+    assert acm._shell_heredoc_open_before(["x=$((a << b))", "код"], 2) is None
+
+
+def test_shell_heredoc_queue_closes_strictly_from_the_head():
+    """`cmd <<A <<B` — очередь снимается СТРОГО с головы, и это правило
+    настоящего bash, а не удобство реализации.
+
+    Прогон (скрипт `cat <<A <<B` / `тело A` / `B` / `ещё тело A` / `A` /
+    `тело B` / `B` / `echo AFTER`): bash печатает «тело B» и «AFTER», rc=0 —
+    то есть строка `B` ВНУТРИ тела A осталась ДАННЫМИ, тело A кончилось на
+    `A`, и только следующая `B` закрыла второй heredoc.
+
+    Снятие не с головы (закрыть любой совпавший ограничитель) объявило бы
+    файл чистым на строке «тело B» — а она ещё ДАННЫЕ. Это тихое сведение,
+    то есть опасная сторона, поэтому правило и закреплено тестом."""
+    lines = ["cat <<A <<B", "тело A", "B", "ещё тело A", "A", "тело B", "B", "код"]
+
+    # Строка 3 (`B`) — данные тела A: heredoc всё ещё A, а не закрыт.
+    assert acm._shell_heredoc_open_before(lines, 4).delim == "A"
+    # После настоящего терминатора A открытым остаётся B.
+    assert acm._shell_heredoc_open_before(lines, 6).delim == "B"
+    # И только вторая `B` закрывает очередь целиком.
+    assert acm._shell_heredoc_open_before(lines, 8) is None
+
+
+def test_shell_plain_assignment_line_defines_every_name_on_it():
+    """Блокирующая находка ai-ревью PR #1392, раунд 6: полный разбор строки
+    применялся ТОЛЬКО к строкам ключевых слов, а обычная `MODE=fast QUIET=1`
+    отдавала лишь ПЕРВОЕ имя.
+
+    Сцена ревьюера воспроизведена дословно и сводилась end-to-end: имена не
+    пересекались (`{MODE}` против `{QUIET}`), дубликатов не было, `bash -n`
+    зелёный — а в итоговом файле `QUIET=0` молча побеждал, значение ours
+    терялось без единого сигнала. Это класс #883, ради которого критерий
+    непересечения и существует."""
+    assert acm._shell_top_level_names("MODE=fast QUIET=1") == {"MODE", "QUIET"}
+
+    resolved, reason = acm.resolve_file_text(
+        "#!/usr/bin/env bash\n"
+        "<<<<<<< HEAD\n"
+        "MODE=fast QUIET=1\n"
+        "=======\n"
+        "QUIET=0\n"
+        ">>>>>>> branch\n",
+        ".sh")
+
+    assert resolved is None, "правка одного имени двумя сторонами не имеет права сводиться"
+    assert "QUIET" in reason, reason
+
+
+def test_shell_name_parsing_has_a_single_source_of_truth():
+    """Две копии цикла разбора имён УЖЕ разошлись по направлению ошибки
+    (раунд 6), поэтому обе функции обязаны читать один разбор.
+
+    Тест поведенческий, а не структурный (класс #891/#893 — «наличие имени
+    функции» ничего не доказывает): дубликат ВТОРОГО имени обычной строки
+    виден подсчёту дубликатов ровно так же, как критерию непересечения.
+    Копия, отставшая в одной из двух функций, красит именно это."""
+    assert acm._duplicate_shell_top_level_names("MODE=fast QUIET=1\nQUIET=0") == ["QUIET"]
+    # Контроль против перегиба: одна строка с двумя РАЗНЫМИ именами — не дубль.
+    assert acm._duplicate_shell_top_level_names("MODE=fast QUIET=1") == []
+    assert acm._duplicate_shell_top_level_names("export A=1 B=2") == []
+
+
+def test_shell_value_data_is_not_mistaken_for_a_defined_name():
+    """Контроль против перегиба полного разбора: `=` внутри ЗНАЧЕНИЯ именем
+    не становится, иначе безобидные строки давали бы ложные отказы."""
+    assert acm._shell_top_level_names("alias grep='grep --color=auto'") == {"grep"}
+    assert acm._shell_top_level_names('export FOO="a=b"') == {"FOO"}
+    # Строка, которая ничего не определяет, имён не даёт вовсе.
+    assert acm._shell_top_level_names("echo hi") == set()
+    assert acm._shell_top_level_names("# MODE=fast") == set()
+    # Отступ по-прежнему значит «внутри чего-то».
+    assert acm._shell_top_level_names("    local tmp=1") == set()
+
+
+def test_shell_function_name_may_carry_dashes_and_dots():
+    """Блокирующая находка ai-ревью PR #1392, раунд 7: класс имени функции
+    был идентификатором в стиле C, а bash принимает почти любое слово.
+
+    Прогоном проверено и работает (rc=0, функция вызывается): `my-func`,
+    `foo.bar`, `foo:bar`, `foo@bar`, `foo+bar`, `a/b`, `foo%bar`, `foo,bar`,
+    `foo^bar`, `foo!bar`, `foo[1]`. Отказывает только `foo=bar` (rc=2) —
+    `=` в имени функции bash не принимает, поэтому он и исключён из класса."""
+    for name in ("my-func", "foo.bar", "foo:bar", "foo@bar", "foo+bar", "a/b"):
+        assert acm._shell_top_level_names(f"{name}() {{ :; }}") == {name}, name
+    # Форма с ключевым словом резала имя по первому «недопустимому» символу:
+    # `function my-func {` отдавала ФАНТОМНОЕ `my`.
+    assert acm._shell_top_level_names("function my-func {\n  :\n}") == {"my-func"}
+
+
+def test_shell_same_dashed_function_from_both_sides_is_refused():
+    """Сцена ревьюера end-to-end. До правки: множества имён ПУСТЫЕ,
+    непересечения нет, `bash -n` зелёный, рубежи heredoc'а чисты — пачка
+    сводилась, и в файле молча жило последнее определение (класс #883,
+    «молчаливая порча», которую контракт модуля запрещает)."""
+    resolved, reason = acm.resolve_file_text(
+        "#!/usr/bin/env bash\n"
+        "<<<<<<< HEAD\n"
+        "my-func() {\n  echo ours\n}\n"
+        "=======\n"
+        "my-func() {\n  echo theirs\n}\n"
+        ">>>>>>> branch\n",
+        ".sh")
+
+    assert resolved is None, "две версии одной функции не имеют права сводиться"
+    assert "my-func" in reason, reason
+
+
+def test_shell_wide_name_class_does_not_invent_definitions():
+    """Контроль против перегиба широкого класса: строки, которые НИЧЕГО не
+    определяют, имён не дают. Иначе широкий класс выключил бы шелл целиком —
+    цена замерена на живом корпусе: на 153 файлах `.sh` он добавляет РОВНО
+    одно новое имя (строка `httpd.serve_forever()` питоновского тела heredoc
+    в `scripts/plugins/test/status-scripts.smoke.sh`), и то в безопасную
+    сторону — лишнее имя ведёт к ОТКАЗУ, не к пропуску."""
+    for line in ("(cd x && y)", "*) echo x;;", "esac", "if [ x ]; then",
+                 "case \"$x\" in", "  indented() { :; }"):
+        assert acm._shell_top_level_names(line) == set(), line
+    # Присваивание — не функция: `x=$(foo)` даёт переменную, не `x()`.
+    assert acm._shell_top_level_names("x=$(foo)") == {"x"}
+    assert acm._shell_top_level_names("arr=(1 2)") == {"arr"}
+
+
+def test_unsupported_suffix_message_is_built_from_the_supported_list():
+    """Некритичная находка ai-ревью PR #1392, раунд 7: список типов жил в
+    трёх местах — константе и двух литералах в строках отказа. Четвёртый тип
+    устарил бы обе строки молча.
+
+    Тест поведенческий: подсказка обязана НАЗЫВАТЬ каждый поддержанный тип,
+    а обе точки отказа — нести её целиком. Литерал, отставший от константы,
+    красит это."""
+    for suffix in acm.SUPPORTED_SUFFIXES:
+        assert suffix in acm.UNSUPPORTED_SUFFIX_HINT, suffix
+
+    reason = acm._hunk_unsafe_reason("a", "b", ".txt")
+    assert acm.UNSUPPORTED_SUFFIX_HINT in reason, reason
+
+
+def test_try_resolve_unsupported_type_message_comes_from_the_same_place(tmp_path, capsys):
+    """Вторая точка отказа по типу файла — в `try_resolve`, и её литерал
+    расходился с константой ровно так же незаметно. Сцена проходит ЧЕРЕЗ
+    неё, а не через перехунковую проверку: иначе тест зеленел бы на
+    отставшем литерале (класс #891/#893)."""
+    target = tmp_path / "config.toml"
+    target.write_text(
+        "<<<<<<< HEAD\nkey = 1\n=======\nkey = 2\n>>>>>>> branch\n",
+        encoding="utf-8")
+
+    assert acm.try_resolve(tmp_path, ["config.toml"]) is None
+    printed = capsys.readouterr().out
+    assert acm.UNSUPPORTED_SUFFIX_HINT in printed, printed
+
+
+def test_shell_hash_inside_function_name_is_seen():
+    """Блокирующая находка ai-ревью PR #1392 (раунд 8): `#` был исключён из
+    класса имени «от противного», хотя настоящий bash имена с `#` внутри
+    слова принимает — `#` начинает комментарий только словом с НАЧАЛА
+    строки. Прогон: `lint#all() { echo hi; }; lint#all` печатает `hi`,
+    rc=0. На таких именах класс отдавал ПУСТОЕ множество — направление
+    ошибки опасное, и спека при этом обещала «не принимается только `=`»."""
+    assert acm._shell_top_level_names("lint#all() {\n  echo ours\n}\n") == {"lint#all"}
+    assert acm._shell_top_level_names("foo#bar() { :; }") == {"foo#bar"}
+
+
+def test_shell_hash_function_collision_refuses_end_to_end(tmp_path):
+    """Сцена ревьюера раунда 8 end-to-end: обе стороны правят один `lint#all`
+    разными телами — пачка отказывает, причина называет имя; до правки
+    проходила все рубежи с пустыми множествами имён и сводилась, молча
+    оставляя живым последнее определение (класс #883)."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        "#!/usr/bin/env bash\n"
+        "<<<<<<< HEAD\n"
+        "lint#all() {\n  echo ours\n}\n"
+        "=======\n"
+        "lint#all() {\n  echo theirs\n}\n"
+        ">>>>>>> branch\n",
+        encoding="utf-8")
+
+    assert acm.try_resolve(tmp_path, ["tool.sh"]) is None
+    _, reason = acm.resolve_file_text(target.read_text(encoding="utf-8"), ".sh")
+    assert "lint#all" in reason, reason
+
+
+def test_shell_commented_out_function_is_a_phantom_in_the_safe_direction():
+    """Пин границы после включения `#`: закомментированное определение
+    `#имя() {` в нулевой колонке даёт фантом `#имя` — отказ, не пропуск
+    (модуль везде выбирает ложный отказ вместо тихого сведения). Контроль
+    против перегиба: фантом `#имя` отличен от настоящего `имя`, поэтому
+    реальная функция рядом с собственной закомментированной копией дубликата
+    НЕ создаёт и отказом пачку не валит."""
+    assert acm._shell_top_level_names("#my-func() {") == {"#my-func"}
+    assert acm._duplicate_shell_top_level_names(
+        "my-func() { :; }\n#my-func() {") == []
+
+
+def test_language_reads_shebang_when_conflict_starts_at_first_line(tmp_path):
+    """Некритичная находка ai-ревью PR #1392 (раунд 8): файл без расширения,
+    чей конфликт стоит в САМОЙ ПЕРВОЙ строке, шебангом нулевой строки не
+    обладает — она занята маркером, а шебанг лежит в стороне хунка, и
+    итоговый файл после слияния начнётся именно с неё. До правки такой файл
+    отказывал как «тип не поддержан» — по положению маркера, не по
+    существу."""
+    target = tmp_path / "tool"
+    target.write_text(
+        "<<<<<<< HEAD\n"
+        "#!/usr/bin/env bash\n"
+        "OURS=1\n"
+        "=======\n"
+        "#!/bin/sh\n"
+        "THEIRS=1\n"
+        ">>>>>>> branch\n",
+        encoding="utf-8")
+    text = target.read_text(encoding="utf-8")
+    assert acm.language_of(target, text) == ".sh"
+
+    # Контроль: пустая сторона ours — итог начинается со стороны theirs.
+    theirs_only = "<<<<<<< HEAD\n=======\n#!/bin/sh\nTHEIRS=1\n>>>>>>> branch\n"
+    assert acm.language_of(target, theirs_only) == ".sh"
+
+    # Контроль против перегиба: питоновский шебанг опознаётся так же.
+    python_top = "<<<<<<< HEAD\n#!/usr/bin/env python3\nX = 1\n=======\nX = 2\n>>>>>>> branch\n"
+    assert acm.language_of(target, python_top) == ".py"
+
+    # Контроль против перегиба: ни одна сторона не несёт шебанга — прежний
+    # честный отказ «тип не поддержан» остаётся.
+    no_shebang = "<<<<<<< HEAD\nalpha\n=======\nbeta\n>>>>>>> branch\n"
+    assert acm.language_of(target, no_shebang) is None
+
+
+# Символы-кандидаты для имени функции: всё, что реально встречается в именах
+# шелловых команд, плюс все метасимволы bash — чтобы гвардия ниже проверяла
+# обе стороны границы, а не только удобную.
+_SH_NAME_CANDIDATES = list("-._:@+/%,^!#{}[]~?*=|&;()<> '\"$`\\") + ["хв"]
+
+
+def test_shell_function_name_class_does_not_lag_behind_real_bash():
+    """Класс имени функции не подбирается по одному символу за раунд ревью —
+    он сверяется с НАСТОЯЩИМ bash.
+
+    История, ради которой гвардия и написана: раунд 7 расширил класс с
+    `[A-Za-z_]\\w*` (дефисные имена сводились молча), раунд 8 добавил `#`
+    (`lint#all` — та же дыра на символ в сторону), раунд 9 — `{}`
+    (`foo{a}`, `bar}x{`; `declare -F` показывает функцию ровно с этим
+    именем). Три раунда — один класс дефекта, и каждый раз направление
+    ошибки было ОПАСНЫМ: пустое множество имён, непересечения «нет», пачка
+    сводится, в файле живут оба определения.
+
+    Инвариант: bash принял имя -> сканер обязан его видеть. Обратное
+    расхождение (сканер видит то, чего bash не принимает) — фантом, то есть
+    ОТКАЗ, и оно разрешено явным списком: сегодня там один символ.
+
+    Тест поведенческий (класс #891/#893): имя не «выглядит допустимым» по
+    регекспу, а реально регистрируется — проверяется `declare -F`."""
+    scanner_only_allowed = {"["}  # `foo[bar` — незакрытая скобка подстроки массива
+
+    for char in _SH_NAME_CANDIDATES:
+        name = f"foo{char}bar"
+        probe = subprocess.run(
+            ["bash", "-c", f"{name}() {{ echo ok; }}\n"
+                           'declare -F -- "$N" >/dev/null && echo REGISTERED'],
+            capture_output=True, text=True, encoding="utf-8",
+            env={"N": name, "PATH": "/usr/bin:/bin"})
+        bash_registers = "REGISTERED" in probe.stdout
+        scanner_sees = acm._shell_top_level_names(f"{name}() {{ :; }}") == {name}
+
+        if bash_registers:
+            assert scanner_sees, (
+                f"bash регистрирует функцию {name!r} (declare -F), а сканер её "
+                f"НЕ видит: две версии такого определения свелись бы молча — "
+                f"добавь {char!r} в _SH_NAME_CHARS")
+        elif scanner_sees:
+            assert char in scanner_only_allowed, (
+                f"сканер читает {name!r} как имя, а bash такую функцию не "
+                f"регистрирует: это фантом (направление безопасное, отказ), но "
+                f"он обязан быть НАЗВАН — добавь {char!r} в scanner_only_allowed "
+                f"с причиной")
+
+
+def test_shell_braced_function_name_from_both_sides_is_refused():
+    """Сцена раунда 9 end-to-end: до правки множества имён были ПУСТЫМИ, все
+    рубежи зелёные, пачка сводилась, и в файле оставались оба определения."""
+    resolved, reason = acm.resolve_file_text(
+        "#!/usr/bin/env bash\n"
+        "<<<<<<< HEAD\n"
+        "foo{a}() {\n  echo ours\n}\n"
+        "=======\n"
+        "foo{a}() {\n  echo theirs\n}\n"
+        ">>>>>>> branch\n",
+        ".sh")
+
+    assert resolved is None, "две версии одной функции не имеют права сводиться"
+    assert "foo{a}" in reason, reason
+    # Контроль против перегиба: сам блок `{ … }` именем не становится.
+    assert acm._shell_top_level_names("{ echo x; }") == set()
+
+
+# Формы присваивания-кандидаты: и те, что сканер обязан видеть, и заведомо
+# не-присваивания — чтобы гвардия ниже проверяла обе стороны границы.
+_SH_ASSIGN_FORMS = [
+    ("plain=1", "plain"),
+    ("arr[0]=1", "arr"),
+    ("arr[idx]=1", "arr"),
+    ("P+=/a", "P"),
+    ("cnt+=1", "cnt"),
+    ("export E=1", "E"),
+    ("readonly R=1", "R"),
+    ("declare -i D=1", "D"),
+    ("declare -A m", "m"),
+    ("export PATH_Y", "PATH_Y"),
+    ("A=1 B=2", "B"),
+    # Сцепленные формы — определение НЕ обязано стоять в начале строки
+    # (блокирующая находка ai-ревью PR #1392, раунд 11).
+    ('[ -z "" ] && slot=1', "slot"),
+    ("true; chained=1", "chained"),
+    ("false || fallback=1", "fallback"),
+    ("true && arr2[0]=1", "arr2"),
+    ("echo hi", "hi"),
+    ("[[ a == b ]]", "a"),
+]
+
+
+def test_shell_assignment_forms_do_not_lag_behind_real_bash():
+    """Та же гвардия, что для имён функций, но для ФОРМ присваивания —
+    блокирующая находка ai-ревью PR #1392, раунд 10.
+
+    Разбор видел только `имя=…`, а `arr[0]=…` и `P+=…` — легальный bash и
+    для сканера невидимы. Прогоном подтверждено: `arr[0]=1` против
+    `arr[0]=2` даёт `2` (значение ours потеряно молча), `P+=/a` против
+    `P+=/b` даёт `/a/b` (одна правка применяется ДВАЖДЫ — для счётчика
+    `x+=1` это тихо неверный итог). Обе формы регистрируют переменную:
+    `declare -p` её находит.
+
+    Это третий раз, когда та же семья дефектов приходит другой формой
+    (раунды 6-9 — имена функций и строки ключевых слов), поэтому проверка
+    поведенческая и спрашивает сам bash, а не сверяет регекспы глазами.
+
+    Инвариант: bash зарегистрировал переменную -> сканер видит имя."""
+    for line, name in _SH_ASSIGN_FORMS:
+        probe = subprocess.run(
+            ["bash", "-c", f"{line}\n"
+                           'declare -p -- "$N" >/dev/null 2>&1 && echo REGISTERED'],
+            capture_output=True, text=True, encoding="utf-8",
+            env={"N": name, "PATH": "/usr/bin:/bin"})
+        bash_registers = "REGISTERED" in probe.stdout
+        scanner_sees = name in acm._shell_top_level_names(line)
+
+        if bash_registers:
+            assert scanner_sees, (
+                f"bash регистрирует переменную {name!r} строкой {line!r}, а "
+                f"сканер имени не видит: две стороны, правящие её, свелись бы "
+                f"молча (класс #883)")
+        else:
+            assert not scanner_sees, (
+                f"сканер считает {name!r} определённым строкой {line!r}, но "
+                f"bash переменную не регистрирует — фантом обязан быть назван")
+
+
+def test_shell_indexed_assignment_from_both_sides_is_refused():
+    """Сцена ревьюера end-to-end: до правки множества имён были ПУСТЫМИ,
+    пачка сводилась, и прогон сведённого файла давал значение theirs."""
+    resolved, reason = acm.resolve_file_text(
+        "#!/usr/bin/env bash\n"
+        "<<<<<<< HEAD\n"
+        "arr[0]=ours-value\n"
+        "=======\n"
+        "arr[0]=theirs-value\n"
+        ">>>>>>> branch\n",
+        ".sh")
+
+    assert resolved is None, "правка одного элемента массива с двух сторон не сводится"
+    assert "arr" in reason, reason
+
+
+def test_shell_append_assignment_from_both_sides_is_refused():
+    """`P+=…` с двух сторон опаснее, чем выглядит: обе строки ИСПОЛНЯЮТСЯ
+    (прогон даёт `/a/b`), то есть одна правка применяется дважды — для
+    счётчика это тихо неверный итог, а не «последний победил»."""
+    resolved, reason = acm.resolve_file_text(
+        "#!/usr/bin/env bash\n"
+        "<<<<<<< HEAD\n"
+        "PATH_X+=/a\n"
+        "=======\n"
+        "PATH_X+=/b\n"
+        ">>>>>>> branch\n",
+        ".sh")
+
+    assert resolved is None
+    assert "PATH_X" in reason, reason
+
+
+def test_missing_bash_is_a_refusal_with_a_reason_not_a_crash(monkeypatch):
+    """Некритичная находка ai-ревью PR #1392, раунд 10: `_bash_syntax_error`
+    звал `subprocess.run(["bash", …])` без обработки `FileNotFoundError`, и
+    на машине без bash проход падал исключением — очередь получала
+    инфраструктурный сбой вместо строки отказа. Контракт модуля («любое
+    сомнение — отказ С ПРИЧИНОЙ») нарушался собственной рукой.
+
+    Тест поведенческий: bash реально «исчезает» (подменён `subprocess.run`,
+    бросающий `FileNotFoundError`), и проверяется весь путь до причины
+    отказа, а не наличие `try` в исходнике (класс #891/#893)."""
+    def no_bash(cmd, *args, **kwargs):
+        if cmd and cmd[0] == "bash":
+            raise FileNotFoundError(2, "No such file or directory: 'bash'")
+        raise AssertionError(f"неожиданный вызов {cmd!r}")
+
+    monkeypatch.setattr(acm.subprocess, "run", no_bash)
+
+    # Прямой вызов не бросает, а называет причину.
+    assert acm._bash_syntax_error("alpha() { :; }") == acm.BASH_UNAVAILABLE_REASON
+    assert "bash недоступен" in acm.BASH_UNAVAILABLE_REASON
+
+    # И весь путь до отказа: причина доезжает до текста, .sh не сводится.
+    resolved, reason = acm.resolve_file_text(
+        "#!/usr/bin/env bash\n"
+        "<<<<<<< HEAD\n"
+        "alpha() { :; }\n"
+        "=======\n"
+        "beta() { :; }\n"
+        ">>>>>>> branch\n",
+        ".sh")
+
+    assert resolved is None
+    assert "bash недоступен" in reason, reason
+
+
+def test_shell_chained_assignment_from_both_sides_is_refused():
+    """Блокирующая находка ai-ревью PR #1392, раунд 11: разбор был привязан
+    к НАЧАЛУ строки, а bash исполняет `a && b` как две команды.
+
+    Эта дыра опаснее уже названных границ, и разница в том, чем именно: при
+    кавычках в имени слитый файл падает ГРОМКО на строке определения, а
+    здесь он полностью рабочий — потеря стороны невидима. Прогон
+    подтверждает регистрацию: `bash -c '[ -z "" ] && slot=1; declare -p slot'`
+    находит переменную."""
+    resolved, reason = acm.resolve_file_text(
+        "#!/usr/bin/env bash\n"
+        "<<<<<<< HEAD\n"
+        '[ -z "$slot" ] && slot=ours\n'
+        "=======\n"
+        '[ -n "$other" ] && slot=theirs\n'
+        ">>>>>>> branch\n",
+        ".sh")
+
+    assert resolved is None, "правка одного имени в сцепленной форме не сводится"
+    assert "slot" in reason, reason
+
+
+def test_shell_chained_function_definition_is_seen():
+    """`setup_env;drain() { :; }` определяет ЖИВУЮ функцию `drain` (прогон:
+    вызов работает, `declare -F drain` её находит)."""
+    assert "drain" in acm._shell_top_level_names("setup_env;drain() { :; }")
+
+    resolved, reason = acm.resolve_file_text(
+        "#!/usr/bin/env bash\n"
+        "<<<<<<< HEAD\n"
+        "setup_env;drain() {\n  echo ours\n}\n"
+        "=======\n"
+        "drain() {\n  echo theirs\n}\n"
+        ">>>>>>> branch\n",
+        ".sh")
+
+    assert resolved is None
+    assert "drain" in reason, reason
+
+
+def test_shell_indent_is_checked_on_the_line_not_the_segment():
+    """Контроль против перегиба сегментного разбора: `  [ -z "$x" ] && y=1`
+    ВНУТРИ функции остаётся «внутри чего-то». Если проверять отступ у
+    сегмента, а не у строки, локальные переменные двух разных функций
+    столкнулись бы и давали ложный отказ."""
+    assert acm._shell_top_level_names('  [ -z "$x" ] && y=1') == set()
+    assert acm._shell_top_level_names("\tsetup; local tmp=1") == set()
+    # А та же форма в нулевой колонке — видна.
+    assert acm._shell_top_level_names('[ -z "$x" ] && y=1') == {"y"}
