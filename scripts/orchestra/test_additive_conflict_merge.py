@@ -1315,3 +1315,78 @@ def test_shell_herestring_and_conflict_markers_do_not_open_anything():
     assert acm._shell_heredoc_open_before(["x=$((a << b))"], 1) is None
     assert acm._shell_heredoc_open_before(
         ["<<<<<<< HEAD", "t", "=======", "t", ">>>>>>> branch"], 5) is None
+
+
+# ── раунд 5: полные строки ключевых слов; пин сцены склейки ограничителя ────
+#
+# Multi-assign — ложное «безопасно»: неполный список имён пропускал
+# столкновение второго имени в `export A=1 B=2`, конкатенация молча оставляла
+# живым последнее присваивание (класс #883). Пин сцены `<<'E'O` — по одному
+# месту: разбор слова bash закрывает её (раунд 4), сцена должна ОСТАВАТЬСЯ
+# отказом при любом будущем рефакторинге сканера.
+
+
+def test_shell_multi_name_keyword_line_collision_is_caught():
+    """`export A=1 B=2` определяет ОБА имени: форма, ловившая только первое,
+    давала ложное «имена не пересеклись» там, где обе стороны правят второй
+    (класс #883 — конкатенация молча оставляет живым последнее)."""
+    for ours, theirs, expected in (
+        ("export A=1 B=2\n", "export B=9 C=3\n", "B"),
+        ("readonly E1=x E2=y\n", "E2=z\n", "E2"),
+        ("alias ll='ls -l' lsl='ls -la'\n", "lsl=/bin/lsl\n", "lsl"),
+    ):
+        reason = acm._hunk_unsafe_reason(ours, theirs, ".sh")
+        assert reason is not None and expected in reason, (ours, theirs, reason)
+
+
+def test_shell_multi_name_keyword_line_without_collision_is_additive():
+    ours = "export A=1 B=2\n"
+    theirs = "export C=3 D=4\n"
+    assert acm._hunk_unsafe_reason(ours, theirs, ".sh") is None
+
+
+def test_shell_duplicate_count_does_not_double_count_keyword_lines():
+    """Строка `export A=1 B=2` обязана посчитать `A` РОВНО один раз: две
+    формы разбора на одной строке дали бы «дубликат из одной строки» и
+    отвергали бы годовый файл."""
+    assert acm._duplicate_shell_top_level_names("export A=1 B=2\n") == []
+    assert acm._duplicate_shell_top_level_names("readonly E1=x E1=y\n") == ["E1"]
+
+
+def test_shell_quoted_value_with_equals_is_not_a_name():
+    """`--color=auto` внутри значения alias — ДАННЫЕ, не определение имени:
+    фантом создал бы ложные пересечения (отказ без нужды). Флаги и кавычки
+    перед `=` исключают имя; `color=red` второй стороны остаётся честным
+    верхнеуровневым именем и ни с чем не сталкивается."""
+    ours = "alias grep='grep --color=auto'\n"
+    theirs = "color=red\n"
+    assert acm._hunk_unsafe_reason(ours, theirs, ".sh") is None
+
+
+def test_shell_quoted_delim_concatenation_scene_stays_refused(tmp_path):
+    """Пин исполненной сцены пробы (раунд 5 PR #1392): ours открывает
+    `<<'E'O` — ограничитель EO (кавычка и слово склеиваются, прогон
+    настоящего bash), в теле есть строка «E». Регексп раундов 1-3 брал
+    ограничителем усечённое «E» и закрывал на ней heredoc: merge проходил,
+    а при ИСПОЛНЕНИИ сведённого файла `beta()` не определялась вовсе
+    (bash -n rc=0). Разбор слова bash раунда 4 закрывает сцену — она обязана
+    оставаться отказом, отказ обязан называть ПОЛНОЕ имя, не усечённое."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        "#!/usr/bin/env bash\n\n"
+        "<<<<<<< HEAD\n"
+        "cat <<'E'O\n"
+        "body\n"
+        "E\n"
+        "tail-code\n"
+        "=======\n"
+        "beta() {\n  echo b\n}\n"
+        ">>>>>>> branch\n",
+        encoding="utf-8",
+    )
+
+    result = acm.try_resolve(tmp_path, ["tool.sh"])
+
+    assert result is None, "склейка ограничителя — не самостоятельная вставка"
+    _, reason = acm.resolve_file_text(target.read_text(encoding="utf-8"), ".sh")
+    assert reason is not None and "EO" in reason and "<<E'" not in reason, reason

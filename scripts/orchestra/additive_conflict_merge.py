@@ -56,7 +56,10 @@ LABELS.md`, класс «обе стороны дописывают РАЗНУЮ
 расширения, чей шебанг называет шелл (в репозитории так живут десятки
 исполняемых `scripts/gh/*`, `scripts/git/*`). Критерий симметричен
 питоновскому: `bash -n` каждой стороны вместо `ast.parse` плюс непересечение
-верхнеуровневых имён (функции и присваивания в НУЛЕВОЙ колонке). Отдельный,
+верхнеуровневых имён (функции и присваивания в НУЛЕВОЙ колонке; строка
+ключевого слова несёт СКОЛЬКО УГОДНО присваиваний — `export A=1 B=2`
+определяет оба имени, иначе стороны, правящие второй, сходились бы с
+молчаливой победой последнего, класс #883). Отдельный,
 несимметричный рубеж — heredoc, и он тройной, потому что тело heredoc'а —
 ДАННЫЕ, а все три обычные проверки на данных слепы одновременно (находки
 ai-ревью PR #1392, обе воспроизведены исполнением):
@@ -76,7 +79,7 @@ ai-ревью PR #1392, обе воспроизведены исполнение
 пробелом, `    EOF` с пробельным отступом) иначе закрывал бы heredoc молча во
 ВСЕХ трёх проверках сразу (докстринг сканера, оба случая воспроизведены).
 Ограничитель читается КАК СЛОВО bash, а не регекспом словесных символов: со
-снятием кавычек и экранирования, до неэкранированного метасимвола — `<<\EOF`,
+снятием кавычек и экранирования, до неэкранированного метасимвола — `<<\\EOF`,
 `<<"EO"F`, `<<EOF-1`, `<<EOF#x` дают четыре РАЗНЫХ ограничителя, и все четыре
 проверены прогоном (раунд 4 ревью: регексп молча промахивался мимо первых
 двух, а промах мимо ОТКРЫТИЯ глушит все рубежи разом).
@@ -159,6 +162,16 @@ _SH_ASSIGN_RE = re.compile(
     r"^(?:export\s+|readonly\s+|local\s+|alias\s+"
     r"|(?:declare|typeset)\s+(?:-\S+\s+)?)?"
     r"([A-Za-z_][A-Za-z0-9_]*)=", re.MULTILINE)
+# Строка ключевого слова может нести НЕСКОЛЬКО присваиваний (`export A=1 B=2`,
+# `readonly E1=x E2=y`): форма выше ловит только ПЕРВОЕ имя, и обе стороны,
+# правящие второй, сходились бы с молчаливой победой последнего (класс #883).
+# Имя ищется по всей строке, но НЕ считается именем, если перед ним стоит
+# слово-символ, кавычка или `-`: это данные значения (`--color=auto` внутри
+# `alias grep='grep --color=auto'`, `a=b` внутри кавычек), не определение;
+# остаточные фантомы направлены в ОТКАЗ (лишнее имя в множестве), не в пропуск.
+_SH_MULTI_ASSIGN_PREFIX_RE = re.compile(
+    r"^(?:export|readonly|local|alias|declare|typeset)\b")
+_SH_NAME_EQ_RE = re.compile("(?<![A-Za-z0-9_'\"-])([A-Za-z_][A-Za-z0-9_]*)=")
 _SHEBANG_SHELL_RE = re.compile(r"^#!.*\b(?:ba|z|k)?sh\b")
 
 # `<<` или `<<-`, но НЕ `<<<` (herestring — не heredoc) и НЕ строка маркера
@@ -334,12 +347,21 @@ def _shell_top_level_names(text: str) -> set[str]:
     """Имена, которые текст ОПРЕДЕЛЯЕТ на верхнем уровне: функции и
     присваивания в НУЛЕВОЙ колонке. Отступ значит «внутри чего-то» — такие
     строки в множество не попадают, иначе локальная переменная внутри функции
-    сталкивалась бы с чужой глобальной и давала ложный отказ."""
+    сталкивалась бы с чужой глобальной и давала ложный отказ. Строки
+    ключевых слов разбираются ПОЛНОСТЬЮ (`export A=1 B=2` — два имени), все
+    прочие — одной формой присваивания; двойного счёта нет по построению
+    (ветка `continue`)."""
     names: set[str] = set()
     for match in _SH_FUNCTION_RE.finditer(text):
         names.add(match.group(1) or match.group(2))
-    for match in _SH_ASSIGN_RE.finditer(text):
-        names.add(match.group(1))
+    for line in text.split("\n"):
+        if _SH_MULTI_ASSIGN_PREFIX_RE.match(line):
+            for match in _SH_NAME_EQ_RE.finditer(line):
+                names.add(match.group(1))
+            continue
+        match = _SH_ASSIGN_RE.match(line)
+        if match:
+            names.add(match.group(1))
     return names
 
 
@@ -379,13 +401,24 @@ def _shell_hunk_unsafe_reason(ours: str, theirs: str) -> str | None:
 def _duplicate_shell_top_level_names(text: str) -> list[str]:
     """Тот же класс, что _duplicate_top_level_names у .py: одно имя,
     определённое дважды РАЗНЫМИ хунками одного файла, перехунковый критерий
-    не видит, а слепая конкатенация оставляет живым только последнее."""
+    не видит, а слепая конкатенация оставляет живым только последнее.
+    Разбор имён — тот же, что _shell_top_level_names (полные строки
+    ключевых слов, ветка `continue` исключает двойной счёт: строка
+    `export A=1 B=2` иначе посчитала бы `A` дважды и отвергла бы годовый
+    файл «дубликатом» из одной строки)."""
     counts: dict[str, int] = {}
     for match in _SH_FUNCTION_RE.finditer(text):
         name = match.group(1) or match.group(2)
         counts[name] = counts.get(name, 0) + 1
-    for match in _SH_ASSIGN_RE.finditer(text):
-        counts[match.group(1)] = counts.get(match.group(1), 0) + 1
+    for line in text.split("\n"):
+        if _SH_MULTI_ASSIGN_PREFIX_RE.match(line):
+            for match in _SH_NAME_EQ_RE.finditer(line):
+                name = match.group(1)
+                counts[name] = counts.get(name, 0) + 1
+            continue
+        match = _SH_ASSIGN_RE.match(line)
+        if match:
+            counts[match.group(1)] = counts.get(match.group(1), 0) + 1
     return sorted(name for name, n in counts.items() if n > 1)
 
 
