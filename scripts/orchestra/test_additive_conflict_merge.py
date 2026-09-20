@@ -596,3 +596,139 @@ def test_try_resolve_end_to_end_on_a_real_git_rebase_conflict(tmp_path):
         env={**subprocess.os.environ, "GIT_EDITOR": "true"},
     )
     assert continue_result.returncode == 0, continue_result.stderr
+
+
+# ── Shell (#1383): самый частый отказ по типу файла ──────────────────────────
+#
+# Почему именно .sh, а не «файлы без расширения» из постановки: замер живого
+# прогона conflict-mechanical-rebase 35491299405 (2026-09-20T05:17Z) —
+# `.sh` ×3, `.yml` ×2, `.json` ×1, без расширения ×1. Направление выбрано по
+# замеру, а не по порядку перечисления в тексте задачи.
+
+def test_shell_hunk_safe_when_both_sides_add_disjoint_functions():
+    ours = 'alpha() {\n  echo a\n}\n'
+    theirs = 'beta() {\n  echo b\n}\n'
+    assert acm._hunk_unsafe_reason(ours, theirs, ".sh") is None
+
+
+def test_shell_hunk_unsafe_when_both_sides_define_the_same_function():
+    """Тот же класс, что #883 у питона: обе стороны правят ОДНО имя, и слепая
+    конкатенация оставит живым только последнее определение."""
+    ours = 'drain() {\n  echo ours\n}\n'
+    theirs = 'drain() {\n  echo theirs\n}\n'
+    reason = acm._hunk_unsafe_reason(ours, theirs, ".sh")
+    assert reason is not None and "drain" in reason
+
+
+def test_shell_hunk_unsafe_when_both_sides_assign_the_same_variable():
+    ours = 'TIMEOUT=30\n'
+    theirs = 'TIMEOUT=99\n'
+    reason = acm._hunk_unsafe_reason(ours, theirs, ".sh")
+    assert reason is not None and "TIMEOUT" in reason
+
+
+def test_shell_hunk_unsafe_when_a_side_is_an_unfinished_function():
+    """Оборванная половина конструкции обязана отказывать: склеивать
+    половинки в аддитивном слиянии нельзя. Ловит это `bash -n`, а не
+    самодельный разбор."""
+    ours = 'alpha() {\n  echo a\n'
+    theirs = 'beta() {\n  echo b\n}\n'
+    reason = acm._hunk_unsafe_reason(ours, theirs, ".sh")
+    assert reason is not None and "bash -n" in reason
+
+
+def test_shell_hunk_unsafe_when_a_side_starts_with_indentation():
+    ours = '  echo inside\n'
+    theirs = 'beta() {\n  echo b\n}\n'
+    reason = acm._hunk_unsafe_reason(ours, theirs, ".sh")
+    assert reason is not None and "отступа" in reason
+
+
+def test_shell_local_variable_inside_function_is_not_a_top_level_name():
+    """Контроль на ложный отказ: `local x=` внутри функции стоит с отступом и
+    в множество верхнеуровневых имён попадать не должен — иначе две
+    независимые функции с одноимённой локальной переменной давали бы отказ."""
+    ours = 'alpha() {\n  local tmp=1\n  echo $tmp\n}\n'
+    theirs = 'beta() {\n  local tmp=2\n  echo $tmp\n}\n'
+    assert acm._hunk_unsafe_reason(ours, theirs, ".sh") is None
+
+
+def test_language_of_reads_shebang_for_extensionless_file(tmp_path):
+    """Живой отказ прогона 35491299405 дословно: `scripts/gh/issue-create:
+    тип файла (без расширения) не поддержан`. Файл исполняемый и шелловый —
+    отказывать ему по отсутствию суффикса значит судить по орфографии имени."""
+    path = tmp_path / "issue-create"
+    text = "#!/usr/bin/env bash\nset -euo pipefail\n"
+    assert acm.language_of(path, text) == ".sh"
+    assert acm.language_of(tmp_path / "tool", "#!/usr/bin/env python3\nx = 1\n") == ".py"
+    assert acm.language_of(tmp_path / "data", "просто текст\n") is None
+    assert acm.language_of(tmp_path / "config.yml", "a: 1\n") is None
+
+
+def test_try_resolve_merges_extensionless_shell_script(tmp_path):
+    """Сквозной путь того самого отказа: файл без расширения, шелл, две
+    независимые функции — обязан слиться."""
+    target = tmp_path / "issue-create"
+    target.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n\n"
+        "<<<<<<< HEAD\n"
+        "alpha() {\n  echo a\n}\n"
+        "=======\n"
+        "beta() {\n  echo b\n}\n"
+        ">>>>>>> branch\n",
+        encoding="utf-8",
+    )
+
+    result = acm.try_resolve(tmp_path, ["issue-create"])
+
+    assert result is not None, "шелл без расширения обязан сводиться (#1383)"
+    merged = target.read_text(encoding="utf-8")
+    assert "alpha()" in merged and "beta()" in merged
+    assert "<<<<<<<" not in merged
+
+
+def test_try_resolve_refuses_shell_duplicate_names_across_two_hunks(tmp_path):
+    """Тот же класс «двумя РАЗНЫМИ хунками», что закрыт для .py в круге 3
+    ревью PR #1033: перехунковый критерий его не видит, bash -n зелёный,
+    молча живёт последнее определение."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        "#!/usr/bin/env bash\n\n"
+        "<<<<<<< HEAD\n"
+        "TIMEOUT=30\n"
+        "=======\n"
+        "OTHER_A=1\n"
+        ">>>>>>> branch\n"
+        "echo middle\n"
+        "<<<<<<< HEAD\n"
+        "OTHER_B=2\n"
+        "=======\n"
+        "TIMEOUT=99\n"
+        ">>>>>>> branch\n",
+        encoding="utf-8",
+    )
+
+    result = acm.try_resolve(tmp_path, ["tool.sh"])
+
+    assert result is None
+    assert "<<<<<<<" in target.read_text(encoding="utf-8"), "отказ ДО записи"
+
+
+def test_try_resolve_notice_names_weaker_guarantee_for_shell(tmp_path, capsys):
+    """Гарантия для шелла слабее питоновской (третьего рубежа — тестов — нет),
+    и отчёт обязан говорить это вслух, а не оставлять читателя достраивать."""
+    target = tmp_path / "tool.sh"
+    target.write_text(
+        "#!/usr/bin/env bash\n\n"
+        "<<<<<<< HEAD\n"
+        "alpha() {\n  echo a\n}\n"
+        "=======\n"
+        "beta() {\n  echo b\n}\n"
+        ">>>>>>> branch\n",
+        encoding="utf-8",
+    )
+
+    assert acm.try_resolve(tmp_path, ["tool.sh"]) is not None
+    out = capsys.readouterr().out
+    assert "bash -n" in out and "гарантия слабее" in out, out

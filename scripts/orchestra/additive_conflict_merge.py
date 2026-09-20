@@ -94,9 +94,111 @@ import re
 import subprocess
 import sys
 
-SUPPORTED_SUFFIXES = (".py", ".md")
+SUPPORTED_SUFFIXES = (".py", ".md", ".sh")
 
 _TABLE_ROW_RE = re.compile(r"^\s*\|")
+
+# ── Shell (#1383) ────────────────────────────────────────────────────────────
+#
+# Почему .sh добавлен ВТОРЫМ после .py/.md, а не «заодно»: замер живого
+# прогона conflict-mechanical-rebase 35491299405 (2026-09-20T05:17Z) —
+# отказы по типу файла распределены как `.sh` ×3, `.yml` ×2, `.json` ×1,
+# без расширения ×1. То есть шелл — самый частый отказ, а «файлы без
+# расширения», названные в постановке #1383 дешёвым направлением, дают один
+# отказ из семи. Порядок выбран по замеру, не по порядку в тексте задачи.
+#
+# Критерий симметричен питоновскому, а не придуман заново:
+#   .py  — `ast.parse` стороны + непересечение верхнеуровневых ИМЁН;
+#   .sh  — `bash -n` стороны + непересечение верхнеуровневых ИМЁН
+#          (функции и присваивания в нулевой колонке).
+# Честная разница, названная вслух: у .py есть третий рубеж — pytest соседнего
+# test_<имя>.py. У шелла соглашения «сосед-тест» в этом репозитории нет
+# (тесты лежат как scripts/*/test/<имя>.{test,smoke}.sh с разными хвостами),
+# поэтому третьего рубежа у .sh НЕТ, и отчёт обязан это печатать, а не
+# умалчивать: гарантия для шелла слабее, чем для питона.
+_SH_FUNCTION_RE = re.compile(
+    r"^(?:function\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(\s*\))?"
+    r"|([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\))\s*\{?", re.MULTILINE)
+_SH_ASSIGN_RE = re.compile(
+    r"^(?:export\s+|readonly\s+|declare\s+-\S+\s+|local\s+)?"
+    r"([A-Za-z_][A-Za-z0-9_]*)=", re.MULTILINE)
+_SHEBANG_SHELL_RE = re.compile(r"^#!.*\b(?:ba|z|k)?sh\b")
+_SHEBANG_PYTHON_RE = re.compile(r"^#!.*\bpython[0-9.]*\b")
+
+
+def _bash_syntax_error(text: str) -> str | None:
+    """None — `bash -n` принял текст; иначе первая строка его жалобы.
+
+    Фрагмент, оборванный посередине конструкции (половина функции, середина
+    case), `bash -n` не принимает — и это ровно тот отказ, который нужен:
+    склеивать половинки в аддитивном слиянии нельзя."""
+    result = subprocess.run(["bash", "-n"], input=text, capture_output=True,
+                            text=True, encoding="utf-8")
+    if result.returncode == 0:
+        return None
+    return (result.stderr or "").strip().split("\n")[0] or "bash -n отказал без текста"
+
+
+def _shell_top_level_names(text: str) -> set[str]:
+    """Имена, которые текст ОПРЕДЕЛЯЕТ на верхнем уровне: функции и
+    присваивания в НУЛЕВОЙ колонке. Отступ значит «внутри чего-то» — такие
+    строки в множество не попадают, иначе локальная переменная внутри функции
+    сталкивалась бы с чужой глобальной и давала ложный отказ."""
+    names: set[str] = set()
+    for match in _SH_FUNCTION_RE.finditer(text):
+        names.add(match.group(1) or match.group(2))
+    for match in _SH_ASSIGN_RE.finditer(text):
+        names.add(match.group(1))
+    return names
+
+
+def _shell_hunk_unsafe_reason(ours: str, theirs: str) -> str | None:
+    for label, side in (("ours", ours), ("theirs", theirs)):
+        first_line = next((ln for ln in side.split("\n") if ln.strip()), "")
+        if first_line and first_line[0] in (" ", "\t"):
+            return (f"сторона {label} начинается с отступа ({first_line.strip()!r}) — "
+                    "похоже на правку ВНУТРИ существующего блока, не добавление на "
+                    "верхнем уровне")
+        error = _bash_syntax_error(side)
+        if error is not None:
+            return (f"сторона {label} не разбирается как самостоятельный "
+                    f"shell-фрагмент (bash -n): {error}")
+    collision = _shell_top_level_names(ours) & _shell_top_level_names(theirs)
+    if collision:
+        return f"обе стороны определяют одно и то же имя верхнего уровня: {sorted(collision)}"
+    return None
+
+
+def _duplicate_shell_top_level_names(text: str) -> list[str]:
+    """Тот же класс, что _duplicate_top_level_names у .py: одно имя,
+    определённое дважды РАЗНЫМИ хунками одного файла, перехунковый критерий
+    не видит, а слепая конкатенация оставляет живым только последнее."""
+    counts: dict[str, int] = {}
+    for match in _SH_FUNCTION_RE.finditer(text):
+        name = match.group(1) or match.group(2)
+        counts[name] = counts.get(name, 0) + 1
+    for match in _SH_ASSIGN_RE.finditer(text):
+        counts[match.group(1)] = counts.get(match.group(1), 0) + 1
+    return sorted(name for name, n in counts.items() if n > 1)
+
+
+def language_of(path, text: str) -> str | None:
+    """Язык файла для критерия безопасности: расширение, а при его отсутствии —
+    шебанг. Файлов без расширения в репозитории десятки (`scripts/gh/*`,
+    `scripts/git/*`), и все они исполняемые — отказывать им по одному только
+    отсутствию суффикса значит отказывать по орфографии имени, а не по
+    существу (постановка #1383). `None` — тип не поддержан."""
+    suffix = path.suffix
+    if suffix in SUPPORTED_SUFFIXES:
+        return suffix
+    if suffix:
+        return None
+    first_line = text.split("\n", 1)[0]
+    if _SHEBANG_SHELL_RE.match(first_line):
+        return ".sh"
+    if _SHEBANG_PYTHON_RE.match(first_line):
+        return ".py"
+    return None
 
 
 def parse_conflict_hunks(text: str) -> list[tuple[int, int, str, str]]:
@@ -266,7 +368,10 @@ def _hunk_unsafe_reason(ours: str, theirs: str, suffix: str) -> str | None:
         return _python_hunk_unsafe_reason(ours, theirs)
     if suffix == ".md":
         return _markdown_hunk_unsafe_reason(ours, theirs)
-    return f"тип файла {suffix or '(без расширения)'} не поддержан (только .py/.md)"
+    if suffix == ".sh":
+        return _shell_hunk_unsafe_reason(ours, theirs)
+    return (f"тип файла {suffix or '(без расширения)'} не поддержан "
+            "(только .py/.md/.sh; файл без расширения опознаётся по шебангу)")
 
 
 def resolve_file_text(text: str, suffix: str) -> tuple[str | None, str]:
@@ -368,12 +473,9 @@ def try_resolve(repo_dir, unmerged_paths: list[str]) -> list[str] | None:
     читать диск между `try_resolve → None` и `--abort` без учёта этого
     нельзя."""
     plans: dict = {}
+    languages: dict = {}
     for rel in unmerged_paths:
         path = repo_dir / rel
-        suffix = path.suffix
-        if suffix not in SUPPORTED_SUFFIXES:
-            return _refuse(f"{rel}: тип файла {suffix or '(без расширения)'} "
-                           "не поддержан (только .py/.md)")
         try:
             text = path.read_text(encoding="utf-8")
         except OSError:
@@ -390,6 +492,15 @@ def try_resolve(repo_dir, unmerged_paths: list[str]) -> list[str] | None:
             return _refuse(f"{rel}: файл не читается как UTF-8 "
                            f"(бинарный или чужая кодировка: {error.reason}, "
                            f"байт {error.start}) — не наш класс")
+        # Язык — после чтения: у файла без расширения он живёт в шебанге,
+        # то есть В ТЕКСТЕ, а до #1383 решение принималось по одному только
+        # имени и роняло целую семью исполняемых скриптов репозитория.
+        suffix = language_of(path, text)
+        if suffix is None:
+            return _refuse(f"{rel}: тип файла {path.suffix or '(без расширения)'} "
+                           "не поддержан (только .py/.md/.sh; файл без "
+                           "расширения опознаётся по шебангу)")
+        languages[path] = suffix
         try:
             resolved, reason = resolve_file_text(text, suffix)
         except ValueError as error:
@@ -406,7 +517,7 @@ def try_resolve(repo_dir, unmerged_paths: list[str]) -> list[str] | None:
     # «проверяться ДО пуша, и при любом сомнении — отказ, а не молчаливая
     # порча»).
     for path, resolved in plans.items():
-        if path.suffix == ".py":
+        if languages[path] == ".py":
             try:
                 resolved_tree = ast.parse(resolved)
             except SyntaxError as error:
@@ -423,7 +534,18 @@ def try_resolve(repo_dir, unmerged_paths: list[str]) -> list[str] | None:
                                f"верхнеуровневое имя более одного раза "
                                f"(слепая конкатенация оставила бы живым только "
                                f"последнее определение): {duplicates}")
-        elif path.suffix == ".md":
+        elif languages[path] == ".sh":
+            error = _bash_syntax_error(resolved)
+            if error is not None:
+                return _refuse(f"{path.name}: итоговый файл не принимается "
+                               f"bash -n целиком: {error}")
+            duplicates = _duplicate_shell_top_level_names(resolved)
+            if duplicates:
+                return _refuse(f"{path.name}: итоговый файл определяет "
+                               f"верхнеуровневое имя более одного раза "
+                               f"(слепая конкатенация оставила бы живым только "
+                               f"последнее определение): {duplicates}")
+        elif languages[path] == ".md":
             # Тот же класс для таблиц (находка ai-review PR #1033): один ключ
             # строки от ours одного хунка и theirs другого — правка одной
             # записи, не два независимых добавления.
@@ -437,7 +559,8 @@ def try_resolve(repo_dir, unmerged_paths: list[str]) -> list[str] | None:
     for path, resolved in plans.items():
         path.write_text(resolved, encoding="utf-8")
 
-    resolved_py_paths = [path for path in plans if path.suffix == ".py"]
+    resolved_py_paths = [path for path in plans if languages[path] == ".py"]
+    resolved_sh_paths = [path for path in plans if languages[path] == ".sh"]
     test_targets = _test_targets_for(repo_dir, resolved_py_paths)
     # Факт верификации восстановим из лога, а не домысливается по исходу
     # (находка ai-review PR #1033, круг 5: строка отчёта заявляла
@@ -451,6 +574,15 @@ def try_resolve(repo_dir, unmerged_paths: list[str]) -> list[str] | None:
         print("::notice::additive_conflict_merge: верификация ДО пуша — "
               "только ast.parse итоговых файлов: соседних test_*.py у "
               "затронутых модулей нет, pytest не запускался")
+    if resolved_sh_paths:
+        # Честная граница, а не умолчание (#1383): у шелла нет соглашения
+        # «сосед-тест», поэтому третьего рубежа нет и гарантия слабее, чем
+        # у .py. Читатель лога обязан видеть это, а не достраивать сам.
+        print("::notice::additive_conflict_merge: shell-файлы "
+              f"({', '.join(path.name for path in resolved_sh_paths)}) "
+              "проверены bash -n и непересечением верхнеуровневых имён; "
+              "тестов у них не запускалось — соглашения «сосед-тест» для .sh "
+              "в репозитории нет, гарантия слабее питоновской")
     if test_targets:
         result = subprocess.run(
             [sys.executable, "-m", "pytest", *test_targets, "-q"],
