@@ -2617,6 +2617,16 @@ def _morde_ingest(opener: urllib.request.OpenerDirector, session_id: str, events
 # архивированной сессии безвреден (идемпотентно), потерянная сессия — нет.
 SESSION_ARCHIVE_PENDING_LABEL = "session:archive-pending"
 
+# Сколько записи позволено провисеть в очереди, прежде чем это перестаёт быть
+# «уборка не удалась, повторим» и становится «сломана причина, а не уборка»
+# (#1422). Ровно эту политику обещает текст алерта после #1417 — до #1422 код
+# обещания не исполнял и кричал на КАЖДОМ проходе, включая первый.
+#
+# Два часа — это ~8 проходов пульса подряд (такт пульса: медиана 20.2 мин,
+# замер #1184). Порог объявлен здесь один раз и читается отсюда же алертом —
+# «одно место правды», не число в двух текстах.
+SESSION_ARCHIVE_QUEUE_STALE_HOURS = 2
+
 
 def _set_archive_pending(repo: str, number: int) -> None:
     gh("-X", "POST", f"repos/{repo}/issues/{number}/labels",
@@ -2649,6 +2659,64 @@ def pending_session_archive_issues(repo: str) -> list[dict]:
         gh))
 
 
+def archive_pending_age_hours(repo: str, number: int, now: datetime) -> float | None:
+    """Сколько часов запись висит в очереди — по событию `labeled` этой метки.
+
+    Состояние очереди целиком в метке (#1417), памяти о прошлом прогоне нет —
+    значит и возраст обязан читаться из самого GitHub, а не из счётчика в
+    коде. Берётся ПОСЛЕДНЕЕ событие `labeled` с нашей меткой: запись могли
+    снять и поставить заново (успешная уборка с последующим новым мержем), и
+    возраст считается от последней постановки, а не от первой в истории.
+
+    Обход страниц обязателен (класс #308): у старой задачи событий больше
+    сотни, и единственная страница отдала бы самые свежие, среди которых
+    нашего `labeled` может не быть вовсе.
+
+    None — возраст установить не удалось (события не отдались или события
+    `labeled` с этой меткой в истории нет). Вызывающий обязан трактовать это
+    как «просрочено», а не как «свежее»: fail-safe в сторону громкого, тот же
+    выбор, что у `active_run_kind` в scripts/gh/wake_orchestra.sh (#1408).
+    Обратное умолчание пряталo бы застрявшую очередь при любом сбое API."""
+    try:
+        events = review_labels.list_pages(
+            f"repos/{repo}/issues/{number}/events?per_page=100", gh)
+    except (RuntimeError, OSError, ValueError):
+        return None
+    stamps = [event.get("created_at") for event in events
+              if event.get("event") == "labeled"
+              and (event.get("label") or {}).get("name") == SESSION_ARCHIVE_PENDING_LABEL
+              and event.get("created_at")]
+    if not stamps:
+        return None
+    latest = max(stamps)
+    return (now - parse_time(latest)).total_seconds() / 3600.0
+
+
+def archive_queue_is_stale(repo: str, numbers: list[int], now: datetime) -> tuple[bool, list[str]]:
+    """Очередь «не тает»: хоть одна запись старше SESSION_ARCHIVE_QUEUE_STALE_HOURS.
+
+    Различение, ради которого написана #1422: пока запись свежая, неудачная
+    уборка — это штатная работа очереди (следующий проход повторит сам), и
+    красить ею весь прогон оркестратора нельзя — красный прогон orchestra
+    читается пульсом как «конвейер мёртв» и уводит владельцу ложный сигнал
+    (живой случай 2026-09-21: четыре сообщения за полчаса про одну причину,
+    при полностью работающем конвейере). Просроченная запись — это уже
+    сломанная ПРИЧИНА, а не уборка, и она обязана быть громкой."""
+    stale_lines = []
+    for number in numbers:
+        age = archive_pending_age_hours(repo, number, now)
+        if age is None:
+            stale_lines.append(
+                f"🚨 #{number}: возраст записи в очереди {SESSION_ARCHIVE_PENDING_LABEL} "
+                "установить не удалось — считаю просроченной (fail-safe в сторону громкого)")
+        elif age > SESSION_ARCHIVE_QUEUE_STALE_HOURS:
+            stale_lines.append(
+                f"🚨 #{number}: висит в очереди {SESSION_ARCHIVE_PENDING_LABEL} "
+                f"{age:.1f} ч (порог {SESSION_ARCHIVE_QUEUE_STALE_HOURS} ч) — "
+                "сломана причина, а не уборка")
+    return (bool(stale_lines), stale_lines)
+
+
 def archive_runner_sessions(repo: str, task_numbers: list[int]) -> tuple[list[str], bool]:
     """#119: архив сессий раннера; #1417: с durable-очередью на метке.
 
@@ -2671,30 +2739,43 @@ def archive_runner_sessions(repo: str, task_numbers: list[int]) -> tuple[list[st
     lines = []
     # Метка ставится ДО логина в морду: недоступная морда — ровно тот случай,
     # ради которого очередь и заведена, и запись о работе обязана пережить его.
+    hard_failure = False
     for number in task_numbers:
         try:
             _set_archive_pending(repo, number)
         except RuntimeError as error:
-            # Без метки повторить будет нечему — это громко, а не «ну ладно».
+            # Единственный по-настоящему жёсткий сбой этой функции (#1422):
+            # без метки повторять будет нечему, факт работы потерян, и лечится
+            # это только руками. Всё остальное здесь — штатная работа очереди.
             lines.append(f"🚨 #{number}: метка {SESSION_ARCHIVE_PENDING_LABEL} НЕ поставлена "
                          f"({error}) — сессия может остаться неубранной незаметно")
+            hard_failure = True
     try:
         opener = _morde_opener()
         _morde_login(opener)
     except (RuntimeError, OSError, urllib.error.URLError, ValueError) as error:
-        lines.append(f"🚨 морда dsh-edge недоступна для архива сессий (возможность сломана, "
-                     f"не отсутствует): {error} — очередь по метке "
+        # Недоступная морда — ровно тот случай, ради которого очередь заведена:
+        # запись поставлена выше, повтор случится сам. Прогон не красим, иначе
+        # пульс прочитает это как «конвейер мёртв» (#1422).
+        lines.append(f"⚠️ морда dsh-edge недоступна для архива сессий: {error} — очередь по метке "
                      f"{SESSION_ARCHIVE_PENDING_LABEL} сохранена, повтор на следующем проходе")
-        return (lines, True)
-    archived, hard_failure = _archive_with_opener(repo, opener, task_numbers)
+        return (lines, hard_failure)
+    archived, _still_queued = _archive_with_opener(repo, opener, task_numbers)
+    # Возраст только что поставленной записи заведомо меньше порога — свежесть
+    # очереди проверяет догоняющий проход, который видит её целиком.
     return (lines + archived, hard_failure)
 
 
-def _archive_with_opener(repo: str, opener, task_numbers: list[int]) -> tuple[list[str], bool]:
+def _archive_with_opener(repo: str, opener, task_numbers: list[int]) -> tuple[list[str], list[int]]:
     """Общее тело для первой попытки (после мержа) и для повтора по очереди —
-    одно место правды, а не две копии одного цикла."""
+    одно место правды, а не две копии одного цикла.
+
+    Возвращает (строки, номера, оставшиеся в очереди). Номера, а не флаг
+    «жёсткий сбой» (#1422): неудачная уборка сама по себе больше не красит
+    прогон — запись лежит в очереди и повторится. Красит её ВОЗРАСТ, а
+    возраст умеет считать только вызывающий, который видит очередь целиком."""
     lines = []
-    hard_failure = False
+    still_queued: list[int] = []
     for number in task_numbers:
         session_id = f"harness-{number}"
         try:
@@ -2707,15 +2788,16 @@ def _archive_with_opener(repo: str, opener, task_numbers: list[int]) -> tuple[li
                 # вечный хвост.
                 done = f"🗄️ #{number}: сессии раннера в морде нет — архивировать нечего"
             else:
-                lines.append(f"🚨 #{number}: сессия {session_id} не заархивирована "
-                             f"(возможность сломана): {error} — остаётся в очереди "
-                             f"{SESSION_ARCHIVE_PENDING_LABEL}")
-                hard_failure = True
+                lines.append(f"⚠️ #{number}: сессия {session_id} не заархивирована "
+                             f"({error}) — остаётся в очереди "
+                             f"{SESSION_ARCHIVE_PENDING_LABEL}, повтор на следующем проходе")
+                still_queued.append(number)
                 continue
         except (OSError, ValueError) as error:
-            lines.append(f"🚨 #{number}: архив сессии не удался (возможность сломана): {error} "
-                         f"— остаётся в очереди {SESSION_ARCHIVE_PENDING_LABEL}")
-            hard_failure = True
+            lines.append(f"⚠️ #{number}: архив сессии не удался ({error}) "
+                         f"— остаётся в очереди {SESSION_ARCHIVE_PENDING_LABEL}, "
+                         "повтор на следующем проходе")
+            still_queued.append(number)
             continue
         try:
             _clear_archive_pending(repo, number)
@@ -2725,34 +2807,44 @@ def _archive_with_opener(repo: str, opener, task_numbers: list[int]) -> tuple[li
             # идемпотентный RPC) и честнее, чем потерять запись.
             lines.append(f"{done}; метка {SESSION_ARCHIVE_PENDING_LABEL} не снята ({error}) — "
                          "повтор безвреден, запись останется до успешного снятия")
+            still_queued.append(number)
             continue
         lines.append(done)
-    return lines, hard_failure
+    return lines, still_queued
 
 
-def retry_pending_session_archives(repo: str) -> tuple[list[str], bool]:
+def retry_pending_session_archives(repo: str, now: datetime) -> tuple[list[str], bool]:
     """Догоняющий проход по очереди (#1417): всё, что не убралось раньше.
 
     Вызывается на КАЖДОМ пульсе и ничего не помнит о прошлом прогоне —
     состояние целиком в метке. Поэтому после починки любой причины отказа
     (сегодня HTTP 500 морды, вчера квота DO, завтра окно деплоя) хвост
     добирается сам, без ручного разбора и без того, чтобы кто-то помнил
-    номера."""
+    номера.
+
+    Красит прогон (#1422) НЕ сам факт неудачной уборки, а ВОЗРАСТ записи:
+    свежая запись — это работающая очередь, просроченная — сломанная причина.
+    Порог один на весь код и на текст алерта: SESSION_ARCHIVE_QUEUE_STALE_HOURS."""
     if not DSH_EDGE_URL or not DSH_EDGE_ACCESS_KEY:
         return ([], False)  # конфигурации нет — очередь не наша забота, канал просто пуст
     pending = [issue["number"] for issue in pending_session_archive_issues(repo)
                if "pull_request" not in issue]
     if not pending:
         return ([], False)
+    header = [f"🔁 очередь архива сессий: повторяю {len(pending)} — "
+              + ", ".join(f"#{n}" for n in pending)]
     try:
         opener = _morde_opener()
         _morde_login(opener)
     except (RuntimeError, OSError, urllib.error.URLError, ValueError) as error:
-        return ([f"🚨 очередь архива сессий ({len(pending)}): морда недоступна, повтор отложен "
-                 f"до следующего прохода: {error}"], True)
-    lines, hard_failure = _archive_with_opener(repo, opener, pending)
-    return ([f"🔁 очередь архива сессий: повторяю {len(pending)} — {', '.join(f'#{n}' for n in pending)}"]
-            + lines, hard_failure)
+        stale, stale_lines = archive_queue_is_stale(repo, pending, now)
+        return (header
+                + [f"⚠️ очередь архива сессий ({len(pending)}): морда недоступна, повтор отложен "
+                   f"до следующего прохода: {error}"]
+                + stale_lines, stale)
+    lines, still_queued = _archive_with_opener(repo, opener, pending)
+    stale, stale_lines = archive_queue_is_stale(repo, still_queued, now)
+    return (header + lines + stale_lines, stale)
 
 
 # ── Заметки-итоги в сессии раннера (#480) ─────────────────────────────────────────
@@ -6478,7 +6570,7 @@ def main() -> int:
     # исход. Состояния между прогонами функция не помнит вовсе: оно целиком
     # в метке, и именно поэтому хвост добирается сам после починки любой
     # причины отказа.
-    archive_retry_lines, archive_retry_hard = retry_pending_session_archives(repo)
+    archive_retry_lines, archive_retry_hard = retry_pending_session_archives(repo, now)
     merge_observations, merge_actions, archive_hard_failure, pulls = merge_loop(repo, pulls)
     archive_hard_failure = archive_hard_failure or archive_retry_hard
     # #196, поведение 1: PR с review:ok без вердикта AI (или ai:failed)
@@ -6635,19 +6727,19 @@ def main() -> int:
         broken = []
         if archive_hard_failure:
             broken.append(
-                "Архивация сессии раннера в морде dsh-edge не удалась (возможность "
-                "есть, но сломана — см. отчёт этого прогона orchestra выше). Мерж не "
-                "откатывается, попытка не теряется: незавершённое остаётся в очереди "
-                f"`{SESSION_ARCHIVE_PENDING_LABEL}`, и следующий проход оркестратора "
-                "повторяет её сам, без участия человека. Что осталось убрать — видно "
-                "одним запросом:\n"
+                "Очередь архива сессий раннера НЕ тает: хоть одна запись с меткой "
+                f"`{SESSION_ARCHIVE_PENDING_LABEL}` висит дольше "
+                f"{SESSION_ARCHIVE_QUEUE_STALE_HOURS} ч (номера и возраст — в отчёте этого "
+                "прогона orchestra выше). Это уже не «уборка не удалась, повторим»: сломана "
+                "ПРИЧИНА, и сама по себе она не рассосётся.\n"
+                "Мержи при этом идут, конвейер жив — прогон окрашен красным именно из-за "
+                "очереди, а не из-за остановки конвейера.\n"
+                "Что осталось убрать — видно одним запросом:\n"
                 f"https://github.com/{repo}/issues?q=is%3Aissue+label%3A"
                 f"{SESSION_ARCHIVE_PENDING_LABEL.replace(':', '%3A')}\n"
                 "Если в отчёте выше есть строка «метка НЕ поставлена» — этого номера "
-                "в очереди нет: сама постановка метки упёрлась в ту же поломку, и "
-                "факт об этом прогоне виден только той строкой отчёта.\n"
-                "Ручной разбор нужен, только если очередь не тает несколько проходов "
-                "подряд — тогда сломана причина, а не уборка."
+                "в очереди нет вовсе: сама постановка метки упёрлась в поломку, и "
+                "факт об этом прогоне виден только той строкой отчёта."
             )
         if stall_hard_failure:
             broken.append(
@@ -6658,9 +6750,9 @@ def main() -> int:
         escalation = escalate(
             repo, WATCHDOG_ISSUE,
             "🚨 edge-harness: [статус: " + (
-                "архив сессии раннера сломан" if archive_hard_failure and not stall_hard_failure else
+                "очередь архива сессий не тает" if archive_hard_failure and not stall_hard_failure else
                 "детектор простоя сломан" if stall_hard_failure and not archive_hard_failure else
-                "архив сессии раннера и детектор простоя сломаны"
+                "очередь архива сессий не тает и детектор простоя сломан"
             ) + "]\n" + "\n".join(broken),
         )
         lines.append(f"🚨 прогон окрашен красным ({escalation})")

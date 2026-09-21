@@ -211,22 +211,48 @@ def test_archive_no_config_is_not_hard_failure(monkeypatch):
     assert any("не заданы" in line for line in lines)
 
 
-def test_archive_login_failure_is_hard_failure(monkeypatch):
+def test_archive_login_failure_is_not_hard_failure_because_the_queue_holds_it(monkeypatch):
+    """#1422: недоступная морда — ровно тот случай, ради которого очередь и
+    заведена. Метка поставлена, повтор случится сам; красить этим весь прогон
+    orchestra нельзя — пульс читает красный прогон как «конвейер мёртв» и
+    уводит владельцу ложный сигнал при живых мержах."""
     monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
     monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_set_archive_pending", lambda repo, number: None)
 
     def broken_login(opener):
         raise RuntimeError("логин в морду не удался: HTTP 403")
 
     monkeypatch.setattr(sch, "_morde_login", broken_login)
     lines, hard = sch.archive_runner_sessions("o/r", [5])
+    assert hard is False
+    assert any("повтор на следующем проходе" in line for line in lines)
+
+
+def test_archive_label_not_set_is_the_hard_failure(monkeypatch):
+    """Единственный по-настоящему жёсткий сбой этой функции (#1422): без метки
+    повторять будет НЕЧЕМУ — факт работы потерян, лечится только руками. До
+    #1422 всё было наоборот: безобидная неудачная уборка красила прогон, а
+    вот эта, настоящая потеря, проходила тихой строкой."""
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(
+        sch, "_set_archive_pending",
+        lambda repo, number: (_ for _ in ()).throw(RuntimeError("HTTP 500: метка не поставлена")),
+    )
+    monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
+    monkeypatch.setattr(sch, "_morde_rpc", lambda opener, method, payload: None)
+    monkeypatch.setattr(sch, "_clear_archive_pending", lambda repo, number: None)
+    lines, hard = sch.archive_runner_sessions("o/r", [5])
     assert hard is True
-    assert any("сломана" in line for line in lines)
+    assert any("НЕ поставлена" in line for line in lines)
 
 
 def test_archive_session_not_found_is_not_hard_failure(monkeypatch):
     monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
     monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_set_archive_pending", lambda repo, number: None)
+    monkeypatch.setattr(sch, "_clear_archive_pending", lambda repo, number: None)
     monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
     monkeypatch.setattr(
         sch, "_morde_rpc",
@@ -237,17 +263,21 @@ def test_archive_session_not_found_is_not_hard_failure(monkeypatch):
     assert any("архивировать нечего" in line for line in lines)
 
 
-def test_archive_rpc_failure_is_hard_failure(monkeypatch):
+def test_archive_rpc_failure_is_not_hard_failure_but_stays_queued(monkeypatch):
+    """#1422: неудачная уборка — штатная работа очереди, не поломка конвейера.
+    Красит прогон ВОЗРАСТ записи, и считает его догоняющий проход, который
+    видит очередь целиком."""
     monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
     monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_set_archive_pending", lambda repo, number: None)
     monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
     monkeypatch.setattr(
         sch, "_morde_rpc",
         lambda opener, method, payload: (_ for _ in ()).throw(RuntimeError("internal: что-то сломалось")),
     )
     lines, hard = sch.archive_runner_sessions("o/r", [5])
-    assert hard is True
-    assert any("сломана" in line for line in lines)
+    assert hard is False
+    assert any("остаётся в очереди" in line for line in lines)
 
 
 # ── append_session_notes (#480): заметки-итоги в сессии harness-<N> ──────────────
@@ -10151,6 +10181,20 @@ def test_create_task_replacement_body_passes_declared_dependency_gate(monkeypatc
 # — повторять было некому и нечего.
 
 
+# Фиксированное «сейчас» для возрастных проверок очереди (#1422): возраст
+# записи считается от события `labeled`, и обе стороны сравнения обязаны быть
+# детерминированными, иначе тест зависит от часов раннера.
+_NOW = datetime(2026, 9, 21, 18, 0, tzinfo=timezone.utc)
+
+
+def _labeled_route(number: int, at: str) -> tuple[str, list]:
+    """Прод-форма ответа `GET /repos/{repo}/issues/{n}/events` — снята с живого
+    API: событие постановки метки несёт `event`, `label.name` и `created_at`."""
+    return (f"issues/{number}/events",
+            [{"event": "labeled", "label": {"name": sch.SESSION_ARCHIVE_PENDING_LABEL},
+              "created_at": at}])
+
+
 def _archive_stand(monkeypatch, *, rpc, routes=None):
     monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
     monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
@@ -10170,7 +10214,7 @@ def test_archive_failure_leaves_the_work_in_the_queue(monkeypatch):
 
     lines, hard = sch.archive_runner_sessions("o/r", [5])
 
-    assert hard is True
+    assert hard is False, "#1422: запись в очереди — работающий механизм, не поломка конвейера"
     posted = [c for c in fake.calls if c.startswith("-X POST") and "labels" in c]
     deleted = [c for c in fake.calls if c.startswith("-X DELETE") and "labels" in c]
     assert len(posted) == 1, f"метка обязана ставиться ДО попытки: {fake.calls}"
@@ -10206,7 +10250,11 @@ def test_archive_session_not_found_also_clears_the_queue(monkeypatch):
 
 def test_queue_survives_unreachable_morde(monkeypatch):
     """Недоступная морда — ровно тот случай, ради которого очередь заведена:
-    метка ставится ДО логина, поэтому падение на логине не теряет запись."""
+    метка ставится ДО логина, поэтому падение на логине не теряет запись.
+
+    #1422: и именно поэтому прогон при этом НЕ красный — запись цела, повтор
+    случится сам. Красный прогон orchestra читается пульсом как «конвейер
+    мёртв», и тратить этот сигнал на работающую очередь нельзя."""
     monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
     monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
     monkeypatch.setattr(sch, "_morde_opener", lambda: object())
@@ -10217,7 +10265,7 @@ def test_queue_survives_unreachable_morde(monkeypatch):
 
     lines, hard = sch.archive_runner_sessions("o/r", [5])
 
-    assert hard is True
+    assert hard is False, "#1422: запись цела — красить прогон нечем"
     assert [c for c in fake.calls if c.startswith("-X POST") and "labels" in c], fake.calls
     assert any("повтор на следующем проходе" in line for line in lines), lines
 
@@ -10242,7 +10290,7 @@ def test_retry_pass_drains_the_queue_without_remembering_anything(monkeypatch):
     })
     monkeypatch.setattr(sch, "gh", fake)
 
-    lines, hard = sch.retry_pending_session_archives("o/r")
+    lines, hard = sch.retry_pending_session_archives("o/r", _NOW)
 
     assert hard is False
     assert archived == ["harness-7", "harness-9"], archived
@@ -10264,7 +10312,7 @@ def test_retry_pass_is_quiet_when_the_queue_is_empty(monkeypatch):
     })
     monkeypatch.setattr(sch, "gh", fake)
 
-    lines, hard = sch.retry_pending_session_archives("o/r")
+    lines, hard = sch.retry_pending_session_archives("o/r", _NOW)
 
     assert (lines, hard) == ([], False)
 
@@ -10377,6 +10425,102 @@ def test_after_merge_without_branch_task_does_not_touch_the_archive_at_all(monke
     assert archive_calls == [], archive_calls
 
 
+def _stale_queue_stand(monkeypatch, *, labeled_at, numbers=(7,)):
+    """Стенд догоняющего прохода: очередь непуста, уборка падает, возраст
+    записи задаётся событием `labeled`."""
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_morde_opener", lambda: object())
+    monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
+    monkeypatch.setattr(sch, "_morde_rpc", lambda opener, method, payload: (_ for _ in ()).throw(
+        RuntimeError("internal: HTTP 500")))
+    routes = {
+        f"issues?state=all&labels={sch.SESSION_ARCHIVE_PENDING_LABEL.replace(':', '%3A')}":
+            [{"number": n} for n in numbers],
+    }
+    for n in numbers:
+        routes[f"issues/{n}/labels"] = None
+        if labeled_at is not None:
+            routes.update([_labeled_route(n, labeled_at)])
+        else:
+            # Прод-форма отказа: gh() поднимает RuntimeError с текстом ответа
+            # API — возраст в этот момент установить физически нечем.
+            routes[f"issues/{n}/events"] = RuntimeError("gh api .../events: HTTP 502")
+    fake = FakeGh(routes)
+    monkeypatch.setattr(sch, "gh", fake)
+    return fake
+
+
+def test_fresh_queue_entry_does_not_redden_the_pulse(monkeypatch):
+    """Главная сцена #1422. Живой случай 2026-09-21: квота rows_read DO
+    исчерпана (#1411), уборка падала на каждом проходе, прогон orchestra
+    краснел, и pulse_guard уводил владельцу «пульсы orchestra пропадали» —
+    при полностью живом конвейере, который в те же минуты слил четыре PR.
+    Свежая запись в очереди — это работающий механизм, а не мёртвый конвейер."""
+    fresh = (_NOW - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _stale_queue_stand(monkeypatch, labeled_at=fresh)
+
+    lines, hard = sch.retry_pending_session_archives("o/r", _NOW)
+
+    assert hard is False, lines
+    assert not any("НЕ тает" in line or "сломана причина" in line for line in lines), lines
+
+
+def test_queue_older_than_the_threshold_reddens_the_pulse(monkeypatch):
+    """Вторая половина того же различения: просроченная запись — это уже
+    сломанная ПРИЧИНА, а не уборка, и молчать о ней нельзя. Ровно эту политику
+    текст алерта обещал с #1417, а исполнять её код начал только здесь."""
+    old = (_NOW - timedelta(hours=sch.SESSION_ARCHIVE_QUEUE_STALE_HOURS + 1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _stale_queue_stand(monkeypatch, labeled_at=old)
+
+    lines, hard = sch.retry_pending_session_archives("o/r", _NOW)
+
+    assert hard is True, lines
+    assert any("сломана причина, а не уборка" in line for line in lines), lines
+
+
+def test_unknown_queue_age_counts_as_stale_not_as_fresh(monkeypatch):
+    """Возраст установить не удалось — fail-safe в сторону громкого, тот же
+    выбор, что у active_run_kind в wake_orchestra.sh (#1408). Обратное
+    умолчание («событий нет — значит свежая») прятало бы застрявшую очередь
+    на любом сбое API."""
+    _stale_queue_stand(monkeypatch, labeled_at=None)
+
+    lines, hard = sch.retry_pending_session_archives("o/r", _NOW)
+
+    assert hard is True, lines
+    assert any("установить не удалось" in line for line in lines), lines
+
+
+def test_queue_age_is_read_from_the_latest_labeling_not_the_first(monkeypatch):
+    """Запись могли снять и поставить заново (успешная уборка, потом новый
+    мерж той же задачи). Возраст обязан считаться от ПОСЛЕДНЕЙ постановки —
+    иначе давняя история красит прогон за работу, начатую минуту назад."""
+    monkeypatch.setattr(sch, "gh", FakeGh({"issues/7/events": [
+        {"event": "labeled", "label": {"name": sch.SESSION_ARCHIVE_PENDING_LABEL},
+         "created_at": "2026-09-01T00:00:00Z"},
+        {"event": "unlabeled", "label": {"name": sch.SESSION_ARCHIVE_PENDING_LABEL},
+         "created_at": "2026-09-01T01:00:00Z"},
+        {"event": "labeled", "label": {"name": sch.SESSION_ARCHIVE_PENDING_LABEL},
+         "created_at": (_NOW - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")},
+    ]}))
+
+    age = sch.archive_pending_age_hours("o/r", 7, _NOW)
+
+    assert age is not None and age < 1, age
+
+
+def test_queue_age_ignores_other_labels(monkeypatch):
+    """Событий `labeled` у задачи много (task, area:*, review:*). Считать
+    возраст по чужой метке значило бы мерить не то: наша запись могла лечь
+    минуту назад, а метка `task` — месяц."""
+    monkeypatch.setattr(sch, "gh", FakeGh({"issues/7/events": [
+        {"event": "labeled", "label": {"name": "task"}, "created_at": "2026-09-01T00:00:00Z"},
+    ]}))
+
+    assert sch.archive_pending_age_hours("o/r", 7, _NOW) is None
+
+
 def test_main_runs_the_catch_up_pass_every_pulse(monkeypatch):
     """Проводка, без которой механизм — украшение: очередь обязана разбираться
     САМА на каждом пульсе, иначе метка просто копится и «не потеряно» остаётся
@@ -10407,7 +10551,7 @@ def test_main_runs_the_catch_up_pass_every_pulse(monkeypatch):
     monkeypatch.setattr(sch, "summary", lambda lines: lines_seen.extend(lines))
     monkeypatch.setattr(
         sch, "retry_pending_session_archives",
-        lambda repo: called.append(repo) or (["🔁 очередь архива сессий: повторяю 1 — #7"], False))
+        lambda repo, now: called.append(repo) or (["🔁 очередь архива сессий: повторяю 1 — #7"], False))
 
     assert sch.main() == 0
     assert called == ["o/r"], "догоняющий проход не вызван из пульса"
@@ -10444,10 +10588,10 @@ def test_main_reddens_when_the_catch_up_pass_itself_is_broken(monkeypatch):
     monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool, *, wip_allowed, pulls: ([], []))
     monkeypatch.setattr(sch, "groom_auto_tasks", lambda repo, now, lines: [])
     monkeypatch.setattr(sch, "retry_pending_session_archives",
-                        lambda repo: (["🚨 очередь архива сессий: морда недоступна"], True))
+                        lambda repo, now: (["🚨 очередь архива сессий: морда недоступна"], True))
     escalated = []
     monkeypatch.setattr(sch, "escalate",
                         lambda repo, issue, text: escalated.append(text) or "ок")
 
     assert sch.main() == 1
-    assert escalated and "архив сессии раннера" in escalated[0], escalated
+    assert escalated and "Очередь архива сессий раннера НЕ тает" in escalated[0], escalated
