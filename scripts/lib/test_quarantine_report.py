@@ -179,5 +179,39 @@ def test_json_without_the_field_is_a_read_failure_not_an_empty_quarantine(server
     assert "НЕ прочитан" in out, out
 
 
+@needs_tools
+def test_field_of_the_wrong_type_is_a_read_failure_too(server, tmp_path):
+    """Отдельная от «поля нет» ветка: поле ЕСТЬ, но это не массив (так
+    выглядит ответ прокси-обёртки или сменившийся контракт морды). `length` в
+    jq молча посчитал бы длину строки или числа ключей объекта и выдал бы
+    число — то есть непрочитанный состав снова стал бы похож на прочитанный.
+    Проверка типа обязана поймать и этот случай, не только отсутствие поля."""
+    result = run_report(server('{"ok":true,"quarantined":"нет доступа"}'), tmp_path)
+    out = result.stdout + result.stderr
+
+    assert result.returncode != 0, out
+    assert "карантин пуст" not in out, out
+    assert "НЕ прочитан" in out, out
+
+
+@needs_tools
+def test_non_empty_quarantine_is_a_warning_not_an_error_annotation(server, tmp_path):
+    """Уровень аннотации — это и есть различение «штатное состояние» против
+    «отказ». Непустой карантин обязан быть `::warning::`: `::error::` на нём
+    красил бы деплой и вернул бы ровно тот исход, против которого делался
+    #1376 (одна старая запись валит весь релиз). Проверка отдельная от кода
+    возврата: опечатка в уровне не меняет rc, а читателя лога обманывает."""
+    result = run_report(server(
+        '{"ok":true,"quarantined":[{"id":"sess-a","storedVersion":2,'
+        '"reason":"no migration path to v3","observedAt":1}]}'), tmp_path)
+    out = result.stdout + result.stderr
+
+    assert result.returncode == 0, out
+    assert "::warning::" in out, out
+    assert "::error::" not in out, (
+        "непустой карантин — штатное состояние, а не отказ: "
+        f"error-аннотации быть не должно: {out}")
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

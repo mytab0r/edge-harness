@@ -24,18 +24,19 @@
 #      Лечение: фраза убрана из отказов вовсе.
 #
 # Доказано мутациями — ИСПОЛНЕНО, не пересказано (AGENTS.md, «рецепт мутации —
-# исполни, не вспоминай»). База до мутаций и после отката — «5 passed».
+# исполни, не вспоминай»). База до мутаций и после отката — «7 passed».
 #   1) вернуть в quarantine_report.sh длину вместо типа:
 #      `jq 'if (.quarantined | type) == "array" then (.quarantined | length)
-#      else "нет-массива" end'` → `jq '.quarantined | length'` — «1 failed,
-#      4 passed», краснеет
-#      test_json_without_the_field_is_a_read_failure_not_an_empty_quarantine,
-#      и в stdout мутанта стоит дословно «✅ карантин пуст: ни одна сессия не
-#      осталась непереведённой» на ответе `{"ok":true}` — тот самый
-#      silent-wrong;
+#      else "нет-массива" end'` → `jq '.quarantined | length'` — «2 failed,
+#      5 passed», краснеют
+#      test_json_without_the_field_is_a_read_failure_not_an_empty_quarantine и
+#      test_field_of_the_wrong_type_is_a_read_failure_too (две РАЗНЫЕ двери
+#      одного класса: поля нет вовсе — и поле есть, но не массив), и в stdout
+#      мутанта стоит дословно «✅ карантин пуст: ни одна сессия не осталась
+#      непереведённой» на ответе `{"ok":true}` — тот самый silent-wrong;
 #   2) считать неотвеченный маршрут пустым карантином (ветку отказа
 #      `canary_http` заменить на `|| body='{"ok":true,"quarantined":[]}'`) —
-#      «1 failed, 4 passed», краснеет
+#      «1 failed, 6 passed», краснеет
 #      test_unreachable_route_is_a_read_failure_not_an_empty_quarantine, то
 #      есть главная сцена задачи.
 #
