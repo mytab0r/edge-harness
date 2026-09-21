@@ -59,7 +59,9 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
+import tempfile
 from typing import Callable
 
 GhFn = Callable[..., dict | list | None]
@@ -263,12 +265,30 @@ def write_registry(gh_func: GhFn, repo: str, registry: dict, sha: str | None,
     if sha is None:
         _ensure_branch(gh_func, repo)
     encoded = base64.b64encode(dump_registry(registry).encode("utf-8")).decode("ascii")
-    args = ["-X", "PUT", f"repos/{repo}/contents/{REGISTRY_PATH}",
-            "-f", f"message={message}",
-            "-f", f"content={encoded}", "-f", f"branch={REGISTRY_BRANCH}"]
+    payload = {"message": message, "content": encoded, "branch": REGISTRY_BRANCH}
     if sha:
-        args += ["-f", f"sha={sha}"]
-    gh_func(*args)
+        payload["sha"] = sha
+    # Тело уходит ФАЙЛОМ (`gh api --input`), а не аргументом командной строки
+    # (issue #1406, живой инцидент — прогон orchestra 35585768697). Реестр
+    # растёт монотонно, и его base64 упёрся в MAX_ARG_STRLEN: потолок ОДНОГО
+    # аргумента в Linux — 131 072 байта (32 страницы), а `findings.json` на
+    # момент падения весил 97 771 байт, то есть ≈130 364 символа base64.
+    # `ARG_MAX` (2 МБ суммарно) тут ни при чём — ломается лимит одного
+    # аргумента, поэтому «аргументов мало» не спасает, и порог необратим:
+    # каждый следующий проход падал бы надёжнее предыдущего.
+    #
+    # Цена ошибки измерена: проход оркестратора падал ПОСЛЕ первого слияния,
+    # обрывая цикл слияний (#297) и крася прогон — а серия красных кормит
+    # предохранитель диспатча (#226). Слияния простояли 2 часа 13 минут при
+    # двух зелёных mergeable PR.
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
+                                     encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False)
+        body_path = handle.name
+    try:
+        gh_func("-X", "PUT", f"repos/{repo}/contents/{REGISTRY_PATH}", "--input", body_path)
+    finally:
+        os.unlink(body_path)
 
 
 def sync_after_merge(gh_func: GhFn, repo: str, pr_number: int,
