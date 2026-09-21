@@ -5,8 +5,9 @@
 //
 // Словарь событий — SessionEventMap (@deepseek-ai/dsh-session 0.1.1-rc.2,
 // lib/types/types.d.ts); конверт {type, seq, time, data} переносится дословно,
-// кроме полей, попавших под caps: усечение заявлено (truncated: true + исходный
-// размер), не замаскировано.
+// кроме полей, попавших под caps: усечение ЗАЯВЛЕНО, не замаскировано — но
+// заявлено ВНУТРИ усечённого текста, а не лишними членами data (issue #1404,
+// см. projectEventData).
 
 /** Версия формы спула; при несовместимой смене формы растёт. */
 export const SPOOL_VERSION = 1;
@@ -50,8 +51,33 @@ export const CAPS = Object.freeze({
  */
 export const MAX_EVENTS_PER_SESSION = 5_000;
 
+/**
+ * Текст пометки усечения (#1404). Живёт ВНУТРИ усечённого текста, потому что
+ * схема v0 у `data` закрытая: любой лишний член — отказ миграции целиком
+ * (`assertReleasedEventPayload` → `data has unexpected member`). Пометка
+ * добавляет к усечённому блоку константу порядка 50 символов СВЕРХ потолка —
+ * сознательно: потолок нужен, чтобы ограничить рост спула, и полсотни байт
+ * на событие его не ломают, а молчаливое усечение ломает журнал.
+ */
+export function truncationNotice(originalSize) {
+  return `\n…[обрезано харнесом: было ${originalSize} символов]`;
+}
+
 function cutText(text, budget) {
   return typeof text === 'string' && text.length > budget ? text.slice(0, budget) : text;
+}
+
+/** Дописывает пометку в ПОСЛЕДНИЙ блок с текстом — тот, на котором бюджет
+ * кончился. Блоков без текста не касается. */
+function appendNoticeToBlocks(blocks, originalSize) {
+  if (!Array.isArray(blocks)) return;
+  for (let i = blocks.length - 1; i >= 0; i -= 1) {
+    const block = blocks[i];
+    if (block !== null && typeof block === 'object' && typeof block.text === 'string') {
+      block.text += truncationNotice(originalSize);
+      return;
+    }
+  }
 }
 
 /**
@@ -89,10 +115,25 @@ function capContentBlocks(blocks, budget) {
 /**
  * Caps одного события. Событие из Session.append — deep-frozen, поэтому data
  * сначала клонируется (structuredClone), мутируется только клон; форма data
- * остаётся формой DSH — добавляются только объявляющие усечение поля
- * truncated/original_size (коллизий со словарём SessionEventMap нет: там нет
- * ни truncated, ни original_size). Поля появляются только при фактической
- * обрезке: неурезанное событие уходит в спул без них.
+ * остаётся формой DSH ДОСЛОВНО — ни одного лишнего члена.
+ *
+ * Класс, оплаченный проданным инцидентом (issue #1404, измерено механизмом
+ * #1379): прежняя редакция дописывала в `data` поля `truncated`/`original_size`
+ * и проверяла коллизии со словарём SessionEventMap — но не с ВАЛИДАТОРОМ
+ * формата. Схема v0 у `data` закрытая: `assertReleasedEventPayload`
+ * (@deepseek-ai/dsh-session-format-v0-to-v1) знает для tool/result ровно
+ * {turn, step, message} + опциональные {error, meta}, для tool/call —
+ * {turn, step, callId, name, arguments} БЕЗ опциональных, для
+ * assistant/message — {turn, step, message} + {usage, interrupted}. Любой
+ * лишний член → `data has unexpected member` → вся сессия не мигрирует.
+ * Цена, увиденная в первом же прогоне #1379: 127 карантинных сессий прода из
+ * 165 — то есть 77% карантина породили эти две строки.
+ *
+ * Факт усечения при этом НЕ теряется (fail loud остаётся fail loud): он
+ * уходит В САМ усечённый текст пометкой `truncationNotice`, а возвращаемые
+ * `{truncated, originalSize}` по-прежнему питают статистику index.js. Поля
+ * появляются только при фактической обрезке: неурезанное событие уходит в
+ * спул дословно.
  */
 export function projectEventData(type, data) {
   if (data === null || typeof data !== 'object') return { data, truncated: false, originalSize: 0 };
@@ -119,8 +160,17 @@ export function projectEventData(type, data) {
     }
   }
   if (cut) {
-    out.truncated = true;
-    out.original_size = originalSize;
+    if (type === 'assistant/message') {
+      appendNoticeToBlocks(out.message?.content, originalSize);
+    } else if (type === 'tool/call') {
+      // arguments — JSON-строка, и обрезка её уже сломала: дописать пометку
+      // хуже не делает, а причину называет. Молча отдать обрубок JSON —
+      // ровно silent-wrong.
+      out.arguments += truncationNotice(originalSize);
+    } else if (type === 'tool/result') {
+      const block = Array.isArray(out.message?.content) ? out.message.content[0] : undefined;
+      if (block !== null && typeof block === 'object') appendNoticeToBlocks(block.content, originalSize);
+    }
   }
   return { data: out, truncated: cut, originalSize };
 }

@@ -14,7 +14,7 @@ import { before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { apply } from '../lib/index.js';
-import { ALLOWED_EVENT_TYPES, CAPS, MAX_EVENTS_PER_SESSION, parseSpool, projectEventData } from '../lib/core.js';
+import { ALLOWED_EVENT_TYPES, CAPS, MAX_EVENTS_PER_SESSION, parseSpool, projectEventData, truncationNotice } from '../lib/core.js';
 
 // Пин фикстуры: dist.integrity из metadata реестра; сверяется с фактически
 // скачанным tarball'ом — тот же supply-chain паттерн, что в dsh_task.sh.
@@ -226,7 +226,7 @@ describe('allowlist и форма спула', () => {
 });
 
 describe('caps payload', () => {
-  it('assistant/message: текст усечён до 48000, truncated + исходный размер', () => {
+  it('assistant/message: текст усечён до 48000, пометка ВНУТРИ текста, а не членом data', () => {
     const dir = mkdtempSync(join(tmpdir(), 'hands-streamer-'));
     const spool = join(dir, 'spool.ndjson');
     const { listeners } = captureCtx({ HANDS_SPOOL: spool });
@@ -237,9 +237,12 @@ describe('caps payload', () => {
     const { records } = readSpool(spool);
     assert.equal(records.length, 1);
     const data = records[0].data;
-    assert.equal(data.truncated, true);
-    assert.equal(data.original_size, CAPS.assistantText + 500);
-    assert.equal(data.message.content[0].text.length, CAPS.assistantText);
+    // Класс #1404: лишний член в data — отказ апстримной миграции целиком.
+    assert.equal(data.truncated, undefined, 'truncated не имеет права быть членом data');
+    assert.equal(data.original_size, undefined, 'original_size не имеет права быть членом data');
+    const text = data.message.content[0].text;
+    assert.ok(text.startsWith('ж'.repeat(CAPS.assistantText)), 'сам текст усечён ровно по потолку');
+    assert.equal(text, 'ж'.repeat(CAPS.assistantText) + truncationNotice(CAPS.assistantText + 500));
   });
 
   it('tool/call: arguments усечены до 16000; короткие не трогаются', () => {
@@ -253,9 +256,11 @@ describe('caps payload', () => {
     onEvent(session, appendToolCall(session, 'ls', '{}', 1, 2));
 
     const { records } = readSpool(spool);
-    assert.equal(records[0].data.arguments.length, CAPS.toolArguments);
-    assert.equal(records[0].data.truncated, true);
-    assert.equal(records[0].data.original_size, big.length);
+    assert.ok(records[0].data.arguments.startsWith(big.slice(0, CAPS.toolArguments)));
+    assert.equal(records[0].data.arguments,
+      big.slice(0, CAPS.toolArguments) + truncationNotice(big.length));
+    assert.equal(records[0].data.truncated, undefined, 'truncated не имеет права быть членом data');
+    assert.equal(records[0].data.original_size, undefined);
     assert.equal(records[1].data.arguments, '{}');
     assert.equal(records[1].data.truncated, undefined);
   });
@@ -270,9 +275,9 @@ describe('caps payload', () => {
 
     const { records } = readSpool(spool);
     const text = records[0].data.message.content[0].content[0].text;
-    assert.equal(text.length, CAPS.toolResultText);
-    assert.equal(records[0].data.truncated, true);
-    assert.equal(records[0].data.original_size, CAPS.toolResultText + 10);
+    assert.equal(text, 'y'.repeat(CAPS.toolResultText) + truncationNotice(CAPS.toolResultText + 10));
+    assert.equal(records[0].data.truncated, undefined, 'truncated не имеет права быть членом data');
+    assert.equal(records[0].data.original_size, undefined);
   });
 
   it('короткие assistant/message и tool/result не помечаются усечёнными', () => {
