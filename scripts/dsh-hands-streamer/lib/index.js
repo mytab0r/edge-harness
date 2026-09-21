@@ -102,10 +102,18 @@ function apply(ctx) {
         noteDrop(event.type);
         return;
       }
-      const { data } = projectEventData(event.type, event.data);
+      const { data, truncated } = projectEventData(event.type, event.data);
       appendFileSync(spoolPath, serializeSpoolLine(toSpoolLine(session.id, event, data)));
       written.set(session.id, count + 1);
       stats.accepted += 1;
+      // Счётчик усечений существовал в объекте stats с рождения (строка выше),
+      // но не инкрементился НИКЕМ и всегда был нулевым — то есть stream_note
+      // молча утверждал «усечений не было» на каждом прогоне (находка ai-ревью
+      // PR #1405). С #1404 это перестало быть косметикой: члены truncated/
+      // original_size ушли из data (закрытая схема апстрима их отвергает), и
+      // без этой строки машинно читаемого носителя факта усечения не осталось
+      // бы вовсе — только пометка внутри текста, для человека.
+      if (truncated) stats.truncated += 1;
     } catch (error) {
       warn(ctx, `событие ${event?.type} не записано: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
