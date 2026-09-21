@@ -78,6 +78,23 @@ jobs:
           # тем же приёмом, что GH_TOKEN не подставляется в argv.
           SIGNATURE: ${{ github.event.client_payload.signature }}
           TELEGRAM_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
+          # Ответ ТОМУ, кто нажал, тем же каналом, которым пришёл вопрос
+          # (#1398). До этой правки отвергнутое нажатие оставляло ровно один
+          # след — красный прогон, у которого читателя нет: владелец видел
+          # нажатую кнопку и считал решение принятым, а задача сутки стояла
+          # с waiting:owner (живой случай #1379).
+          #
+          # Цена названа явно, а не умолчана: job получает ДВА новых секрета
+          # и вместе с ними право писать в чат владельца. Оба уже читают
+          # соседние job'ы того же конвейера (orchestra.yml, worker.yml,
+          # deploy-worker.yml и др.), новых секретов не заводится, и
+          # отправитель один на репозиторий — pulse_guard.send_telegram.
+          # Альтернатива «пусть уведомляет отдельный job по workflow_run»
+          # отвергнута: между отказом и уведомлением появился бы второй
+          # прогон, способный не состояться, — то есть тот же класс
+          # «сигнал теряется молча», только этажом выше.
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python3 scripts/orchestra/apply_owner_decision.py \
             --repo "$REPO" \

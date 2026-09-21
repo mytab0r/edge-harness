@@ -3,12 +3,14 @@
 (#254). Запускается workflow'ом .github/workflows/owner-decision.yml по
 repository_dispatch (event_type owner-decision), который морда шлёт узким
 GH_DISPATCH_TOKEN (ADR 0008, Contents+Actions, без Issues). Этот job читает
-ОДИН секрет репозитория — TELEGRAM_WEBHOOK_SECRET (проверка подписи ниже;
+ТРИ секрета репозитория — TELEGRAM_WEBHOOK_SECRET (проверка подписи ниже;
 до правки #1251 секретов не читал вовсе, прежняя формулировка этого
 докстринга «никакого нового секрета» описывала то прежнее поведение и
 противоречила новому тексту ниже — модуль противоречил сам себе,
-исправлено ревью PR #1254), — плюс issues:write из
-permissions workflow'а (github.token).
+исправлено ревью PR #1254) плюс TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID
+(ответ владельцу на ОТВЕРГНУТОЕ нажатие, #1398 — раздел «Отказ не пропадает
+молча» ниже), — плюс issues:write из permissions workflow'а (github.token).
+Новых секретов не заведено: все три уже читают соседние job'ы конвейера.
 
 Пишет РОВНО ТОТ ЖЕ артефакт, что и ручной ответ владельца комментарием
 (#470/#471, PROTOCOL.md «Решение владельца как артефакт») — первая строка
@@ -40,7 +42,10 @@ Telegram через setWebhook, — и компрометация роли ве�
 «РЕШЕНИЕ: N» (принятый риск #1251) — назначение подписи: происхождение
 артефакта («Источник: нажатие инлайн-кнопки») не врёт и цена подделки
 артефакта-кнопки выше, чем у комментария. `verify_signature` даёт
-ТРИ РАЗНЫХ отказа, ни один не пишет комментарий (класс #1096, носитель
+ТРИ РАЗНЫХ отказа, ни один не пишет комментарий РЕШЕНИЯ (след отказа —
+другой текст и другой класс, см. «Отказ не пропадает молча» ниже; что он
+не может нести маркер решения, проверяет `assert_no_decision_marker` тем
+же регулярным выражением, которое читает гвардия) (класс #1096, носитель
 третьего состояния scripts/lib/check_result.py — здесь применена та же
 дисциплина «не схлопывать разные причины в одно НЕТ», без прямого импорта
 модуля: тот заточен под проверки инвариантов репозитория, эта — под
@@ -72,10 +77,30 @@ Telegram через setWebhook, — и компрометация роли ве�
 версии (не подписывает), существует РОВНО длительность прогона
 `deploy-worker.yml` (минуты) и закрывается САМ, без ручного шага: как
 только деплой заканчивается, воркер уже шлёт подпись всегда. Внутри этого
-окна нажатие кнопки красит job (SignatureMissing) — это видимый, громкий,
-самостоятельно устраняющийся сбой, не тихая дыра: постоянного «мягкого»
+окна нажатие кнопки красит job (SignatureMissing): постоянного «мягкого»
 режима, принимающего пустую подпись бессрочно, здесь нет и не будет —
 именно бессрочный обход и был дырой issue #1251.
+
+Прежняя редакция этого абзаца называла такой сбой «самостоятельно
+устраняющимся» и «видимым» — оба слова оказались неверны, и цену назвал
+живой случай #1379 (разбор — #1398). Видимым он не был: единственным следом
+был красный прогон `owner-decision.yml`, у которого нет ни одного читателя,
+и владелец, нажавший кнопку, не узнал НИЧЕГО. Самоустраняющимся — только
+если пустая подпись пришла от воркера в окне деплоя; если секрета в воркере
+просто нет, не устранится никогда, а отсюда эти два случая неразличимы.
+Поэтому текст отказа больше не выбирает между ними (AGENTS.md, «алерт не
+гадает»), а уведомление о нём — обязательный шаг, см. ниже.
+
+Отказ не пропадает молча (issue #1398). Любой отказ — `DecisionRefused` с
+машинным кодом причины и с ГАЗОМ (что именно возвращает движение; отказ без
+газа запрещён AGENTS.md, а до #1398 весь этот путь был ровно таким). После
+отказа `__main__` зовёт `notify_refusal`, и у отказа появляются два
+адресата: владелец — сообщением в Telegram тем же каналом, которым пришёл
+вопрос; следующий агент — комментарием в самой задаче (след дедуплицируется
+по паре причина+вариант, класс #1100). Job при этом остаётся КРАСНЫМ:
+уведомление добавлено к громкому отказу, а не вместо него. Доставка
+best-effort по каждому каналу, но её провал называется вслух — «сигнал
+ушёл» и «сигнал не ушёл» лечатся по-разному.
 
 Проверка «задача всё ещё ждёт» (находка ревью PR #486, четвёртый заход):
 клавиатуры прошлых эскалаций ничем не удаляются (кнопки снимает только
@@ -123,8 +148,8 @@ import hmac
 import os
 import sys
 
-from pulse_guard import DECISION_COMMENT_PREFIX, gh, post_issue_comment
-from waiting_owner_guard import WAITING_OWNER_LABEL
+from pulse_guard import DECISION_COMMENT_PREFIX, gh, post_issue_comment, send_telegram
+from waiting_owner_guard import DECISION_MARKER_RE, WAITING_OWNER_LABEL
 
 # Имя переменной окружения, несущей секрет подписи (#1251) — ОДНО место
 # правды и здесь, и в .github/workflows/owner-decision.yml (env: с тем же
@@ -151,6 +176,38 @@ def compute_signature(secret: str, issue_number: int, option: int) -> str:
     return hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
 
 
+class DecisionRefused(RuntimeError):
+    """Отказ применить нажатие — с МАШИННЫМ кодом причины и с газом (#1398).
+
+    RuntimeError остаётся базой сознательно: `__main__` и уже написанные тесты
+    ловят её, поведение существующих вызовов не меняется. Новое — два поля:
+
+    - `reason` — код причины, по которому дедуплицируется след в задаче
+      (класс #1100: повторное нажатие той же кнопки не плодит копии);
+    - `gas` — что именно возвращает движение. Отказ без газа запрещён
+      правилами репозитория (AGENTS.md, «Тормоз без газа не принимается»), а
+      до #1398 весь этот путь был ровно таким: нажатие отвергнуто, и дальше
+      не происходило НИЧЕГО.
+    """
+
+    def __init__(self, reason: str, message: str, gas: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.gas = gas
+        # Контекст нажатия навешивает `main` (`with_context`), а читает его
+        # `__main__` при уведомлении. Через исключение, а не через env: репо,
+        # задача и вариант уже пришли аргументами, и вторая их копия в
+        # переменных окружения была бы вторым местом правды — расходится
+        # молча, лечится дважды.
+        self.repo: str | None = None
+        self.issue_number: int | None = None
+        self.option: int | None = None
+
+    def with_context(self, repo: str, issue_number: int, option: int) -> "DecisionRefused":
+        self.repo, self.issue_number, self.option = repo, issue_number, option
+        return self
+
+
 def verify_signature(secret: str | None, issue_number: int, option: int, signature: str | None) -> None:
     """Три РАЗНЫХ отказа (issue #1251, класс #1096 — не схлопывать причины в
     одно НЕТ), ни один не должен привести к post_issue_comment: секрет не
@@ -159,16 +216,28 @@ def verify_signature(secret: str | None, issue_number: int, option: int, signatu
     сравнение байтовое). См. докстринг модуля, раздел «Подпись
     client_payload», за объяснением каждой причины и переходного режима."""
     if not secret:
-        raise RuntimeError(
+        raise DecisionRefused(
+            "github_secret_missing",
             f"секрет {SIGNATURE_SECRET_ENV_VAR} не настроен в этом job'е (GitHub Actions "
-            "repository secret) — подпись НЕЧЕМ проверить, решение НЕ записано"
+            "repository secret) — подпись НЕЧЕМ проверить, решение НЕ записано",
+            f"добавить {SIGNATURE_SECRET_ENV_VAR} в GitHub Actions repository secrets и "
+            "нажать кнопку ещё раз; пока секрета нет, кнопочный путь не работает вовсе",
         )
     if not signature:
-        raise RuntimeError(
-            "client_payload не несёт подписи (signature пусто) — dispatch либо от "
-            "воркера без TELEGRAM_WEBHOOK_SECRET/старее правки #1251 (переходное окно "
-            "деплоя, самоустраняется), либо вызван напрямую в обход кнопки Telegram; "
-            "решение НЕ записано"
+        raise DecisionRefused(
+            "signature_missing",
+            # Факт, и только факт. Прежняя редакция называла здесь две гипотезы
+            # («переходное окно деплоя, самоустраняется» ЛИБО прямой вызов) —
+            # это гадание, запрещённое AGENTS.md («алерт не гадает»), и одна из
+            # гипотез успокаивающая: если секрета в воркере просто нет,
+            # «самоустранится» не произойдёт никогда, а читатель уже успокоен.
+            "client_payload пришёл с пустой подписью (signature пусто) — решение НЕ "
+            "записано. Причину отсюда установить НЕЛЬЗЯ: этот job не читает ни "
+            "секреты Cloudflare, ни версию задеплоенного воркера",
+            "установить причину одним из двух: `wrangler secret list` у воркера "
+            f"(есть ли {SIGNATURE_SECRET_ENV_VAR}) и версия воркера против даты правки "
+            "#1251; пока причина не устранена, решение применяется комментарием-маркером "
+            "в самой задаче (PROTOCOL.md, «Решение владельца как артефакт»)",
         )
     expected = compute_signature(secret, issue_number, option).encode("utf-8")
     # Сравнение БАЙТАМИ, не строками (находка ревью PR #1254): строковый
@@ -179,11 +248,113 @@ def verify_signature(secret: str | None, issue_number: int, option: int, signatu
     # никогда, байтовый compare_digest даёт обычный mismatch выше.
     supplied = signature.encode("utf-8")
     if not hmac.compare_digest(expected, supplied):
-        raise RuntimeError(
+        raise DecisionRefused(
+            "signature_mismatch",
             f"#{issue_number}: подпись client_payload не совпадает с ожидаемой для "
             f"варианта {option} — подделка, испорченный payload или подпись от другой "
-            "пары issue/option; решение НЕ записано"
+            "пары issue/option; решение НЕ записано",
+            "если кнопку нажимал владелец — повторить нажатие на СВЕЖЕМ сообщении "
+            "эскалации (подпись привязана к паре задача+вариант); если нет — этот "
+            "отказ и есть штатная работа заслона #1251, делать ничего не нужно",
         )
+
+
+# Маркер следа отказа в задаче (#1398). Форма — скобочная строка, как
+# WAITING_OWNER_ESCALATE_MARKER и прочие маркеры гвардий: в прозе так не пишут,
+# а машина находит подстрокой. Дедуп по ПАРЕ причина+вариант: повторное нажатие
+# той же кнопки при той же неисправности не плодит копии следа (класс #1100 —
+# 114 дублей одного маркера), а нажатие ДРУГОГО варианта или отказ по ДРУГОЙ
+# причине — другое событие, и след у него свой.
+REFUSAL_MARKER_PREFIX = "[нажатие владельца отвергнуто: "
+
+
+def refusal_marker(reason: str, issue_number: int, option: int) -> str:
+    return f"{REFUSAL_MARKER_PREFIX}{reason}:{issue_number}:{option}]"
+
+
+def refusal_comment(refusal: "DecisionRefused", issue_number: int, option: int) -> str:
+    """След отказа в самой задаче — чтобы причина осталась для СЛЕДУЮЩЕГО
+    агента, а не только в чужом чате и в логе прогона, которого у этого
+    события нет читателя (#1398).
+
+    Текст обязан НЕ нести маркер решения ни одной строкой: комментарий,
+    начинающийся с «<маркер>: N», снял бы `waiting:owner` и записал бы то
+    самое решение, в применении которого мы сейчас отказываем — silent-wrong
+    ровно наоборот. Проверяется не глазами, а `assert_no_decision_marker`."""
+    return (
+        f"{refusal_marker(refusal.reason, issue_number, option)}\n"
+        f"⛔ Нажатие кнопки по этой задаче (вариант {option}) НЕ применено.\n\n"
+        f"**Причина** ({refusal.reason}): {refusal}\n\n"
+        f"**Что возвращает движение:** {refusal.gas}\n\n"
+        f"Задача остаётся с меткой `{WAITING_OWNER_LABEL}` — решение по ней не записано. "
+        "Разбор класса «нажатие пропадает молча» — #1398."
+    )
+
+
+def refusal_telegram_text(repo: str, issue_number: int, option: int,
+                          refusal: "DecisionRefused") -> str:
+    """Ответ ТОМУ, кто нажал, тем же каналом, которым пришёл вопрос. Без него
+    владелец видит нажатую кнопку и считает решение принятым: «применено» и
+    «выброшено» он не различает ничем (живой случай #1379 — сутки простоя)."""
+    return (
+        f"⛔ Нажатие по #{issue_number} (вариант {option}) не применено.\n\n"
+        f"Причина: {refusal}\n\n"
+        f"Что делать: {refusal.gas}\n\n"
+        f"https://github.com/{repo}/issues/{issue_number}"
+    )
+
+
+def assert_no_decision_marker(text: str) -> None:
+    """Страховка против худшего исхода этого файла: текст ОТКАЗА, случайно
+    несущий маркер решения, применил бы решение, в котором отказано —
+    `waiting_owner_guard` читает маркер в любом комментарии от кого угодно и
+    автора не смотрит вовсе (AGENTS.md, #1251). Поэтому проверка машинная тем
+    же регулярным выражением, что читает гвардия, а не «я посмотрел глазами»."""
+    if DECISION_MARKER_RE.search(text):
+        raise RuntimeError(
+            "текст отказа несёт маркер решения — публикация применила бы решение, "
+            "в котором отказано; комментарий НЕ отправлен"
+        )
+
+
+def refusal_already_reported(repo: str, issue_number: int, marker: str) -> bool:
+    """True — след с этим маркером в задаче уже есть (то же нажатие при той же
+    неисправности повторили). Ошибка чтения комментариев НЕ выдаётся за «следа
+    нет»: она пробрасывается наверх, иначе дедуп молча выключался бы при любом
+    сбое API и плодил копии — тот же класс, что «дедуп issue-create молча
+    выключается без repo» (#1395)."""
+    comments = gh(f"repos/{repo}/issues/{issue_number}/comments?per_page=100") or []
+    return any(marker in (comment.get("body") or "") for comment in comments)
+
+
+def notify_refusal(repo: str, issue_number: int, option: int,
+                   refusal: "DecisionRefused") -> None:
+    """Два адресата отказа, и ни один не обязателен для второго (#1398).
+
+    Доставка best-effort ПО КАЖДОМУ каналу, но провал канала называется
+    вслух: «сигнал ушёл» и «сигнал не ушёл» лечатся по-разному, а job и так
+    красный — глушить здесь нечего. Сам отказ применить решение от результата
+    доставки не зависит: он уже принят выше по стеку."""
+    marker = refusal_marker(refusal.reason, issue_number, option)
+    comment = refusal_comment(refusal, issue_number, option)
+    assert_no_decision_marker(comment)
+
+    try:
+        if refusal_already_reported(repo, issue_number, marker):
+            print(f"apply_owner_decision: след отказа {refusal.reason} по #{issue_number} "
+                  f"(вариант {option}) в задаче уже есть — второй не пишу")
+        else:
+            post_issue_comment(repo, issue_number, comment)
+            print(f"apply_owner_decision: причина отказа записана комментарием в #{issue_number}")
+    except (RuntimeError, OSError) as error:
+        print(f"::warning::apply_owner_decision: след отказа в #{issue_number} НЕ записан "
+              f"({error}) — причина осталась только в этом логе", file=sys.stderr)
+
+    if send_telegram(refusal_telegram_text(repo, issue_number, option, refusal)):
+        print("apply_owner_decision: владельцу отправлено уведомление об отказе")
+    else:
+        print("::warning::apply_owner_decision: уведомление владельцу НЕ отправлено — "
+              "нажатие осталось без ответа в том канале, где было сделано", file=sys.stderr)
 
 
 def issue_still_waiting(repo: str, issue_number: int) -> bool:
@@ -211,23 +382,50 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    verify_signature(os.environ.get(SIGNATURE_SECRET_ENV_VAR), args.issue, args.option, args.signature or None)
-
-    if not issue_still_waiting(args.repo, args.issue):
-        raise RuntimeError(
-            f"#{args.issue}: задача не в состоянии waiting:owner (закрыта либо метка "
-            "снята/сменился раунд) — решение НЕ записано, нажата протухшая кнопка "
-            "прошлой эскалации"
-        )
+    # Отказ несёт контекст нажатия, но НЕ уведомляет сам: `main` остаётся
+    # чистым решением («записать или отказать»), и его контракт «при отказе не
+    # написано ни строчки решения» проверяется тестами без сети. Уведомление —
+    # шаг `__main__`, у него и адресаты, и best-effort доставка.
+    try:
+        verify_signature(os.environ.get(SIGNATURE_SECRET_ENV_VAR), args.issue, args.option,
+                         args.signature or None)
+        _check_issue_still_waiting(args.repo, args.issue)
+    except DecisionRefused as refusal:
+        raise refusal.with_context(args.repo, args.issue, args.option) from None
 
     post_issue_comment(args.repo, args.issue, decision_comment(args.option))
-    print(f"apply_owner_decision: #{args.issue} — РЕШЕНИЕ: {args.option} записано комментарием")
+    print(f"apply_owner_decision: #{args.issue} — решение (вариант {args.option}) записано комментарием")
     return 0
+
+
+def _check_issue_still_waiting(repo: str, issue_number: int) -> None:
+    if not issue_still_waiting(repo, issue_number):
+        raise DecisionRefused(
+            "not_waiting",
+            f"#{issue_number}: задача не в состоянии waiting:owner (закрыта либо метка "
+            "снята/сменился раунд) — решение НЕ записано, нажата протухшая кнопка "
+            "прошлой эскалации",
+            "решение по этой задаче уже применено или задача закрыта — делать ничего "
+            "не нужно; клавиатуры прошлых эскалаций остаются нажимаемыми, нажимать "
+            "нужно кнопки САМОГО СВЕЖЕГО сообщения",
+        )
 
 
 if __name__ == "__main__":
     try:
         sys.exit(main())
+    except DecisionRefused as refusal:
+        # Отказ остаётся ГРОМКИМ (::error:: + exit 1) — job красный, как и был.
+        # Новое — у отказа появились адресаты: до #1398 красный прогон был
+        # ЕДИНСТВЕННЫМ следом, а читателя у этого события нет ни одного.
+        print(f"::error::apply_owner_decision: {refusal}", file=sys.stderr)
+        print(f"::error::apply_owner_decision: газ — {refusal.gas}", file=sys.stderr)
+        if refusal.repo and refusal.issue_number is not None and refusal.option is not None:
+            notify_refusal(refusal.repo, refusal.issue_number, refusal.option, refusal)
+        else:
+            print("::warning::apply_owner_decision: у отказа нет контекста нажатия — "
+                  "уведомить некого, причина осталась только в этом логе", file=sys.stderr)
+        sys.exit(1)
     except RuntimeError as error:
         print(f"::error::apply_owner_decision: {error}", file=sys.stderr)
         sys.exit(1)
