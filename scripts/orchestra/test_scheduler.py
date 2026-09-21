@@ -712,6 +712,16 @@ def test_main_exits_nonzero_and_escalates_on_archive_hard_failure(monkeypatch):
     code = sch.main()
     assert code == 1  # прогон окрашен красным — мерж уже состоялся, но поломка не молчит
     assert escalated and escalated[0][0] == "o/r" and escalated[0][1] == sch.WATCHDOG_ISSUE
+    # Честность эскалации (замечание ревью PR #1418, чеклист тела): текст не
+    # имеет права утверждать «задача помечена» — на ветке «саму постановку
+    # метки не удалось сделать» (отдельная 🚨-строка отчёта этого же прогона)
+    # помеченной задачи нет, и «НИЧЕГО не потеряно» противоречило бы отчёту.
+    # Эскалация обещает только то, что механизм всегда выполняет: очередь
+    # повторяется сама, а что осталось убрать — видно запросом по метке.
+    text = escalated[0][2]
+    assert "помечена" not in text, f"эскалация утверждает факт о метке: {text}"
+    assert sch.SESSION_ARCHIVE_PENDING_LABEL in text, text
+    assert "issues?q=is%3Aissue+label%3Asession%3Aarchive-pending" in text, text
 
 
 def test_main_exits_nonzero_and_escalates_on_stall_hard_failure(monkeypatch):
@@ -10298,6 +10308,73 @@ def test_after_merge_archives_only_the_branch_task_not_mentions(monkeypatch):
 
     assert archived == [1398], f"в архив ушла чужая живая сессия: {archived}"
     assert sorted(noted) == [1251, 1398, 1402], noted
+
+
+def test_after_merge_archives_the_branch_task_even_without_body_mentions(monkeypatch):
+    """Первая половина гейта архива (находка ai-review PR #1418): слитый PR с
+    телом БЕЗ упоминаний открытых задач пула всё равно архивирует сессию
+    задачи ВЕТКИ. Путь санкционированный — контракт берёт номер из ветки,
+    тело не читает вовсе, а `pr-create` запрещает только Closes/Fixes/Resolves.
+    Прежняя редакция гейтила вызов архива на task_numbers (список упоминаний
+    тела): ни попытки, ни метки session:archive-pending, ни строки отчёта —
+    сессия harness-<N> молча оставалась активной навсегда, то есть потеря
+    информации, которую #1417 снимает. Мутация «вернуть вызов под
+    `if task_numbers:`» красит именно этот тест."""
+    merged = pull(9, pr_body="Тело без упоминания задач.", ref="agent/7-fix-thing")
+    archived, noted = [], []
+
+    def fake_gh(*args):
+        joined = " ".join(args)
+        if joined.startswith("repos/o/r/pulls/9/files"):
+            return []
+        raise AssertionError(f"нет маршрута для: {joined}")
+
+    monkeypatch.setattr(sch, "gh", fake_gh)
+    monkeypatch.setattr(sch, "recent_runs", lambda *a, **k: [])
+    monkeypatch.setattr(sch, "append_session_notes",
+                        lambda notes: noted.extend(n for n, _ in notes) or ([], False))
+    monkeypatch.setattr(sch, "archive_runner_sessions",
+                        lambda repo, numbers: archived.extend(numbers) or ([], False))
+
+    sch.after_merge("o/r", merged, [])
+
+    assert archived == [7], f"сессия задачи ветки не ушла в архив без упоминаний: {archived}"
+    assert noted == [], noted
+
+
+def test_after_merge_without_branch_task_does_not_touch_the_archive_at_all(monkeypatch):
+    """Вторая половина того же гейта (находка ai-review PR #1418): PR без
+    agent-ветки (own_task is None — dependabot, orchestra:skip) не ходит в
+    морду вовсе. Прежняя редакция звала archive_runner_sessions(repo, []) на
+    любом слитом PR с упоминаниями в теле: холостой логин, а при лежащей
+    морде — hard_failure, красный пульс и эскалация про очередь
+    session:archive-pending, которой не было (нечего ни помечать, ни
+    повторять). Мутация «убрать гейт, звать всегда» красит именно этот тест."""
+    merged = pull(9, pr_body="related #5", ref=None)  # head без ref — own_task None
+    archive_calls = []
+
+    def fake_gh(*args):
+        joined = " ".join(args)
+        if joined.startswith("repos/o/r/pulls/9/files"):
+            return []
+        if joined.startswith("-X POST repos/o/r/issues/"):
+            return None  # напоминание про упомянутую задачу — не предмет этого теста
+        if joined.startswith("repos/o/r/issues/"):
+            return {"state": "open", "labels": [{"name": "task"}], "title": "т"}
+        raise AssertionError(f"нет маршрута для: {joined}")
+
+    monkeypatch.setattr(sch, "gh", fake_gh)
+    monkeypatch.setattr(sch, "recent_runs", lambda *a, **k: [])
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    monkeypatch.setattr(sch, "append_session_notes", lambda notes: ([], False))
+    monkeypatch.setattr(
+        sch, "archive_runner_sessions",
+        lambda repo, numbers: archive_calls.append(numbers)
+        or pytest.fail(f"архив без задачи ветки не должен вызываться: {numbers}"))
+
+    sch.after_merge("o/r", merged, [])
+
+    assert archive_calls == [], archive_calls
 
 
 def test_main_runs_the_catch_up_pass_every_pulse(monkeypatch):
