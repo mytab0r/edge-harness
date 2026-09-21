@@ -1,5 +1,5 @@
 diff --git a/apps/dsh-edge/src/do-session-persistence.ts b/apps/dsh-edge/src/do-session-persistence.ts
-index 6443b33..0e82b04 100644
+index 6443b33..bf342b7 100644
 --- a/apps/dsh-edge/src/do-session-persistence.ts
 +++ b/apps/dsh-edge/src/do-session-persistence.ts
 @@ -1121,6 +1121,36 @@ export class DurableObjectSessionPersistence extends SessionPersistence {
@@ -39,11 +39,16 @@ index 6443b33..0e82b04 100644
    private isEventTableRebuildCheaper(legacy: number): boolean {
      // INSERT includes the primary-key index; allow 32 catalog writes for a swap.
      // One set-based probe caps event reads and SQL calls independently of the
-@@ -1390,6 +1420,14 @@ export class DurableObjectSessionPersistence extends SessionPersistence {
- type EventTable = 'dsh_session_events' | 'dsh_session_events_migrating'
+@@ -1396,6 +1426,19 @@ interface QuarantinedSession {
+   readonly reason: string
+ }
  
- /** HARNESS (#1376): one session this build refused to migrate, and why. */
-+/** Строка таблицы карантина, как её отдаёт quarantinedSessions() (#1379). */
++/**
++ * HARNESS (#1379): строка ТАБЛИЦЫ карантина, как её отдаёт
++ * quarantinedSessions(). Отличается от QuarantinedSession выше не случайно:
++ * там — то, что построил текущий старт (без времени, оно ещё не записано),
++ * здесь — то, что лежит в таблице, вместе с observed_at.
++ */
 +export interface QuarantinedSessionRecord {
 +  id: string
 +  storedVersion: number
@@ -51,9 +56,9 @@ index 6443b33..0e82b04 100644
 +  observedAt: number
 +}
 +
- interface QuarantinedSession {
-   readonly id: string
-   readonly storedVersion: number
+ function revisionOf(storeIdentity: string, row: HeaderRow): PersistenceRevision {
+   return SessionPersistenceRevision(
+     `${storeIdentity}:incarnation:${row.incarnation}:revision:${row.revision}`,
 diff --git a/apps/dsh-edge/src/instance.ts b/apps/dsh-edge/src/instance.ts
 index aa0eaf2..1b12561 100644
 --- a/apps/dsh-edge/src/instance.ts
