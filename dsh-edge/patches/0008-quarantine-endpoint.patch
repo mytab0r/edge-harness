@@ -1,0 +1,126 @@
+diff --git a/apps/dsh-edge/src/do-session-persistence.ts b/apps/dsh-edge/src/do-session-persistence.ts
+index 6443b33..bf342b7 100644
+--- a/apps/dsh-edge/src/do-session-persistence.ts
++++ b/apps/dsh-edge/src/do-session-persistence.ts
+@@ -1121,6 +1121,36 @@ export class DurableObjectSessionPersistence extends SessionPersistence {
+     }
+   }
+ 
++  /**
++   * HARNESS (#1379): состав карантина наружу, читаемый деплоем.
++   *
++   * Писатель этой таблицы — recordQuarantinedSessions выше (#1376). У списка
++   * было два читателя, и оба недоступны прогону деплоя: console.error уходит
++   * в Workers-логи (Logpush не подключён), а таблица живёт внутри Durable
++   * Object. То есть карантин работал, но узнать его состав можно было только
++   * руками. Метод — единственный способ прочитать состав снаружи DO.
++   *
++   * Таблицы может не быть вовсе: её создаёт recordQuarantinedSessions, а он
++   * зовётся только при миграции. Инстанс, который ни разу не мигрировал,
++   * карантина не имеет — это честный ПУСТОЙ список, а не отказ, поэтому
++   * отсутствие таблицы возвращает [], и различать «таблицы нет» и «карантин
++   * пуст» на этом уровне нечего: оба значат «ничего не изолировано».
++   * Обратное — ошибка чтения при СУЩЕСТВУЮЩЕЙ таблице — проглатываться не
++   * имеет права и уходит наверх исключением: «пусто» и «посмотреть не
++   * смогли» лечатся по-разному.
++   */
++  quarantinedSessions(): readonly QuarantinedSessionRecord[] {
++    const tableExists = this.storage.sql.exec<{ count: number }>(
++      `SELECT count(*) AS count FROM sqlite_master
++       WHERE type = 'table' AND name = 'dsh_edge_quarantined_sessions'`,
++    ).toArray()[0]?.count ?? 0
++    if (tableExists === 0) return []
++    return this.storage.sql.exec<QuarantinedSessionRecord>(
++      `SELECT id, stored_version AS storedVersion, reason, observed_at AS observedAt
++       FROM dsh_edge_quarantined_sessions ORDER BY id`,
++    ).toArray()
++  }
++
+   private isEventTableRebuildCheaper(legacy: number): boolean {
+     // INSERT includes the primary-key index; allow 32 catalog writes for a swap.
+     // One set-based probe caps event reads and SQL calls independently of the
+@@ -1396,6 +1426,19 @@ interface QuarantinedSession {
+   readonly reason: string
+ }
+ 
++/**
++ * HARNESS (#1379): строка ТАБЛИЦЫ карантина, как её отдаёт
++ * quarantinedSessions(). Отличается от QuarantinedSession выше не случайно:
++ * там — то, что построил текущий старт (без времени, оно ещё не записано),
++ * здесь — то, что лежит в таблице, вместе с observed_at.
++ */
++export interface QuarantinedSessionRecord {
++  id: string
++  storedVersion: number
++  reason: string
++  observedAt: number
++}
++
+ function revisionOf(storeIdentity: string, row: HeaderRow): PersistenceRevision {
+   return SessionPersistenceRevision(
+     `${storeIdentity}:incarnation:${row.incarnation}:revision:${row.revision}`,
+diff --git a/apps/dsh-edge/src/instance.ts b/apps/dsh-edge/src/instance.ts
+index aa0eaf2..1b12561 100644
+--- a/apps/dsh-edge/src/instance.ts
++++ b/apps/dsh-edge/src/instance.ts
+@@ -381,6 +381,24 @@ export class DshEdgeInstance extends DshEdgeWorkspace {
+       if (url.pathname === '/api/remote.mux') {
+         return this.openRemoteMux(request)
+       }
++      // HARNESS (#1379, PATCHES.md 0008-quarantine-endpoint): состав карантина
++      // наружу. Писатель таблицы — патч 0007 (#1376); до этого маршрута у
++      // списка было два читателя, и оба недоступны прогону деплоя —
++      // console.error уходит в Workers-логи (Logpush не подключён), таблица
++      // живёт внутри DO. Канарейка деплоя читает этот маршрут и печатает
++      // состав либо честное «карантин пуст», чтобы владелец не ходил за ним
++      // руками.
++      //
++      // Форма ответа — всегда СПИСОК, даже пустой, и отдельного признака
++      // «пусто» в теле нет: пустой массив и есть пусто. Различать надо не
++      // «пусто против непусто», а «ответ получен против не получен» — это
++      // делает код HTTP на стороне канарейки, а не поле в JSON.
++      //
++      // Причина карантина (reason) — текст ошибки миграции формата сессии,
++      // не содержимое сессии: событий, кредов и полезной нагрузки тут нет.
++      if (url.pathname === '/api/quarantine' && request.method === 'GET') {
++        return jsonResponse({ ok: true, quarantined: await this.sessions.quarantinedSessions() })
++      }
+       if (url.pathname === '/api/skills') {
+         return await this.handleSkillsCrud(request)
+       }
+diff --git a/apps/dsh-edge/src/session-store.ts b/apps/dsh-edge/src/session-store.ts
+index d88f66b..bb518e6 100644
+--- a/apps/dsh-edge/src/session-store.ts
++++ b/apps/dsh-edge/src/session-store.ts
+@@ -108,6 +108,7 @@ import EdgeCredentialProvider from './edge-credentials.ts'
+ import DurableObjectSessionPersistence, {
+   EDGE_HISTORY_PAGE_LIMITS,
+   type EdgeEventPage,
++  type QuarantinedSessionRecord,
+ } from './do-session-persistence.ts'
+ import EdgeModelSelectionBridge from './model-selection-bridge.ts'
+ import EdgeSessionQuery from './edge-session-query.ts'
+@@ -800,6 +801,23 @@ export class EdgeSessionStore {
+     return info.inputModalities === undefined || info.inputModalities.includes('image')
+   }
+ 
++  /**
++   * HARNESS (#1379): состав карантина наружу — для канарейки деплоя.
++   *
++   * Шов тот же, что у referencedImage ниже: доступ к таблицам DO есть только
++   * у DurableObjectSessionPersistence, и отсутствие этого бэкенда — ОТКАЗ, а
++   * не пустой список. Разница принципиальная: пустой список значит «ничего не
++   * изолировано», отказ значит «посмотреть не смогли», и путать их нельзя —
++   * ровно ради этого различения задача #1379 и заведена.
++   */
++  async quarantinedSessions(): Promise<readonly QuarantinedSessionRecord[]> {
++    const { persistence } = await this.services()
++    if (!(persistence instanceof DurableObjectSessionPersistence)) {
++      throw new EdgeSessionStoreError('INVALID_DATA', 'Edge persistence backend is unavailable.')
++    }
++    return persistence.quarantinedSessions()
++  }
++
+   /** Authorize one opaque attachment id against canonical session events. */
+   async referencedImage(
+     id: SessionId,
