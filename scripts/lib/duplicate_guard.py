@@ -151,11 +151,15 @@ def fetch_open_task_candidates(repo: str) -> list[Candidate]:
     размером пула (~110 задач, #310).
 
     Тестовый шов: `DUPLICATE_GUARD_FIXTURE=<путь>` подменяет реальный вызов
-    чтением готового JSON-файла — ТОЛЬКО для тестов bash-обёртки
-    (scripts/gh/test/issue-create-duplicate-guard.test.sh). Причина шва
-    именно здесь, а не monkeypatch subprocess (как test_claim_task.py):
-    этот путь вызывается ИЗ bash (scripts/gh/issue-create) новым процессом
-    python3, а не из pytest, где monkeypatch недоступен физически."""
+    чтением готового JSON-файла — ТОЛЬКО для тестов, гоняющих bash-обёртку
+    (scripts/gh/test/issue-create-duplicate-guard.test.sh и
+    scripts/lib/test_issue_create_repo_resolution.py — второй запускает ту же
+    обёртку процессом из pytest, #1395). Причина шва именно здесь, а не
+    monkeypatch subprocess (как test_claim_task.py): этот путь вызывается ИЗ
+    bash (scripts/gh/issue-create) новым процессом python3, куда monkeypatch
+    вызывающего не достаёт. СНЯТИЕ переменной — тоже шов, и намеренный: без
+    неё вызов идёт в настоящий `gh issue list`, и его отказ воспроизводит
+    настоящий сбой выборки пула (класс #1395, ветка FETCH_FAILED_RC)."""
     fixture = os.environ.get("DUPLICATE_GUARD_FIXTURE")
     if fixture:
         return json.loads(Path(fixture).read_text(encoding="utf-8"))
@@ -170,15 +174,31 @@ def fetch_open_task_candidates(repo: str) -> list[Candidate]:
     return json.loads(result.stdout or "[]")
 
 
+# Код возврата «открытый пул прочитать не удалось» (#1395, находка ai-ревью
+# PR #1403). Отдельный и от 0 («прочитан, результат в stdout»), и от 2 («не та
+# форма вызова»): прежняя редакция возвращала 0 и на этом исходе, печатая WARN
+# и пустой stdout, — для вызывающего «не смог посмотреть» выглядело ровно как
+# «дублей нет». Это тот же класс, ради которого заведена #1395, только этажом
+# ниже. Одно место правды на обе стороны шва — читает scripts/gh/issue-create.
+FETCH_FAILED_RC = 3
+
+
 def main(argv: list[str]) -> int:
     """`check <repo> <title>` печатает совпадения (TSV: score\\tnumber\\ttitle\\turl,
-    одна строка на кандидата, пусто — совпадений нет) в stdout и ВСЕГДА
-    возвращает 0 — решение «блокировать/пропустить» принимает вызывающий
-    (`scripts/gh/issue-create`) по содержимому stdout, не по коду возврата
-    (симметрично task-branch: сбой ЭТОЙ, необязательной проверки — не повод
-    ронять создание issue). Сбой сети/gh — предупреждение в stderr, пустой
-    stdout (как будто совпадений нет): недоступность инструмента дедупликации
-    не должна блокировать реальную работу агента."""
+    одна строка на кандидата, пусто — совпадений нет) в stdout. Коды возврата
+    РАЗЛИЧАЮТ три исхода, а не два (#1395): 0 — пул прочитан, результат в
+    stdout (пусто = совпадений нет, это ФАКТ); 2 — не та форма вызова;
+    FETCH_FAILED_RC — пул прочитать НЕ удалось, совпадений не «ноль», их
+    просто никто не считал. Решение «блокировать/пропустить» принимает
+    вызывающий (`scripts/gh/issue-create`) ДВУХСТОРОННЕ (находка ревью
+    PR #1403, чеклист): при состоявшейся сверке (0) — по содержимому stdout;
+    при несостоявшейся (FETCH_FAILED_RC) — отказ/--dedup-skip-ack ровно ПО
+    КОДУ возврата, поэтому «сбой ЭТОЙ необязательной проверки — не повод
+    ронять создание issue» здесь больше не читается: отказ при нечитаемом
+    пуле — и есть смысл рубежа (#1395, как у гвардии пуша #1096). До #1403
+    сбой сети/gh давал 0 и пустой stdout, и issue-create доходил до
+    `gh issue create` с одной WARN-строкой в логе (исполнено ревью на
+    подменённом `gh`, не выведено из чтения)."""
     if len(argv) != 4 or argv[1] != "check":
         print("использование: duplicate_guard.py check <repo> <title>", file=sys.stderr)
         return 2
@@ -187,8 +207,8 @@ def main(argv: list[str]) -> int:
         candidates = fetch_open_task_candidates(repo)
     except Exception as error:  # noqa: BLE001 — сбой инструмента, не повод блокировать
         print(f"WARN: duplicate_guard не смог получить открытый пул ({error}) — "
-              f"проверка похожести пропущена.", file=sys.stderr)
-        return 0
+              f"сверка на дубли НЕ выполнена (это не «дублей нет»).", file=sys.stderr)
+        return FETCH_FAILED_RC
     for match in find_similar_open_tasks(title, candidates):
         print(f"{match['score']:.2f}\t{match['number']}\t{match['title']}\t{match['url']}")
     return 0
