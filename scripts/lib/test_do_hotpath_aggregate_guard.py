@@ -92,6 +92,40 @@ def test_group_by_appears_only_in_allowed_getters():
     )
 
 
+# Агрегат по НЕиндексированной колонке — та же цена, что полный GROUP BY, но
+# regex выше его не видит: `GROUP BY` в запросе нет (#1411, вторая дверь,
+# найденная ai-review PR #1425). Живой случай: `#emitSystemEvent` брал
+# следующий отрицательный seq через
+# `SELECT COUNT(*) … FROM events WHERE task_id = ? AND source = 'system'` —
+# `source` ни в одном индексе не ведёт, значит читались ВСЕ события задачи, и
+# цена системного события росла вместе с длиной сессии. Замер на 100 000
+# событий одной задачи: 14.25 мс → 0.003 мс после замены на
+# `SELECT MIN(seq) … WHERE task_id = ?` (один seek по префиксу
+# UNIQUE(task_id, seq), без нового индекса).
+#
+# Гвардия структурная сознательно, и это названо вслух: утверждение здесь —
+# «во всём harness.ts нет ни одного агрегата по events, фильтрованного по
+# source», то есть про ОТСУТСТВИЕ формы, а не про поведение одного вызова.
+# Поведенческая половина живёт отдельно (cf-worker/test/journal-rows-read.spec.ts
+# меряет rowsRead настоящего SqlStorage); прецедент той же формы —
+# scripts/lib/test_pagination_guard.py.
+AGGREGATE_BY_SOURCE_RE = re.compile(
+    r'["\'`][^"\'`]*(?:COUNT|SUM|MIN|MAX)\s*\([^)]*\)[^"\'`]*FROM\s+events[^"\'`]*source\s*=',
+)
+
+
+def test_no_aggregate_over_events_filtered_by_source():
+    """Агрегат по events с фильтром по `source` читает все события задачи —
+    цена растёт вместе с сессией, как до #1411. Нужен счёт системных событий —
+    бери его из того, что индекс уже упорядочил (`MIN(seq)` по префиксу
+    task_id), а не пересчитывай таблицу."""
+    offenders = AGGREGATE_BY_SOURCE_RE.findall(harness_text())
+    assert offenders == [], (
+        "агрегат по events, фильтрованный по неиндексированному source "
+        f"(цена растёт с длиной сессии, #1411): {offenders}"
+    )
+
+
 def test_status_body_has_no_inline_group_by():
     """#status() — сам горячий путь — не имеет права звать GROUP BY напрямую.
 
