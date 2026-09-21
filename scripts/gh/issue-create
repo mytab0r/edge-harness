@@ -25,6 +25,17 @@
 # газ — явный `--confirm-not-duplicate "<почему не дубль>"`, причина попадает
 # в тело issue (не тонет в одном терминале). Совпадений нет — флаг не нужен.
 #
+# Сам этот тормоз не имеет права выключиться молча (#1395): репозиторий пула
+# определяется ТРЕМЯ источниками (gh repo view → GITHUB_REPOSITORY → git
+# remote origin), выбранный печатается вслух; создание ОТКЛОНЯЕТСЯ в обоих
+# случаях несостоявшейся сверки — не сработал ни один источник ЛИБО сам пул
+# прочитать не удалось (duplicate_guard.FETCH_FAILED_RC). Газ —
+# `--dedup-skip-ack "<причина>"`, и она уходит в тело issue вместе с тем,
+# ЧТО именно не удалось. Прежняя редакция знала один источник и на его отказе печатала
+# `::warning::`, продолжая создание — «не смог посмотреть» засчитывалось как
+# «прошло» (живой случай: #1385/#1386, байт-в-байт одинаковые задачи с
+# разницей в 7 секунд).
+#
 # Третий тормоз (#695): решение о приоритете (`area:process`,
 # `scripts/lib/free_task.py::META_LABEL`) обязано быть явным — умолчание
 # «просто не поставил» запрещено. Живой случай 2026-09-07: #684/#685/#689
@@ -70,6 +81,7 @@ args=()
 no_task_ack=""
 confirm_not_duplicate=""
 not_process_ack=""
+dedup_skip_ack=""
 title=""
 body=""
 # body_slot_kind/body_slot_index — где в args лежит тело, чтобы позже (если
@@ -127,6 +139,13 @@ while [ "$i" -le "$n" ]; do
       ;;
     --not-process-ack=*)
       not_process_ack="${arg#--not-process-ack=}"
+      ;;
+    --dedup-skip-ack)
+      i=$((i + 1))
+      dedup_skip_ack="${!i}"
+      ;;
+    --dedup-skip-ack=*)
+      dedup_skip_ack="${arg#--dedup-skip-ack=}"
       ;;
     --title)
       i=$((i + 1))
@@ -221,12 +240,88 @@ if [ "$has_task" -eq 1 ]; then
   fi
 fi
 
-# repo — нужен и приоритетной проверке ниже, и дедупу (#566): один вызов
-# gh repo view, не два (has_task=1 — единственный случай, где обе секции
+# repo — нужен и приоритетной проверке ниже, и дедупу (#566): определяется
+# ОДИН раз, не дважды (has_task=1 — единственный случай, где обе секции
 # вообще смотрят в сеть; --no-task-ack уже объявил «это не пул»).
+#
+# Три источника, а не один (issue #1395). Прежняя редакция знала только
+# `gh repo view` — а он ходит в GraphQL, и в агентских каналах штатно
+# отвечает 403; дедуп при этом молча выключался и печатал `::warning::`.
+# Цена измерена: #1385/#1386 — байт-в-байт одинаковые задачи, созданные с
+# разницей в 7 секунд, обе висели в пуле открытыми.
+#
+# Источник печатается ВСЛУХ: `git remote origin` форка или чужой клон дал бы
+# чужой пул для сверки, и молчаливая подстановка была бы хуже отказа.
+resolve_repo() {
+  local value=""
+  value="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
+  if [ -n "$value" ]; then
+    printf '%s\t%s' "$value" "gh repo view"
+    return 0
+  fi
+  if [ -n "${GITHUB_REPOSITORY:-}" ]; then
+    printf '%s\t%s' "$GITHUB_REPOSITORY" "переменная GITHUB_REPOSITORY"
+    return 0
+  fi
+  local origin
+  origin="$(git remote get-url origin 2>/dev/null || true)"
+  value="$(printf '%s' "$origin" | sed -n 's#^.*github\.com[:/]\([^/]\{1,\}\)/\([^/]\{1,\}\)$#\1/\2#p' | sed 's/\.git$//')"
+  if [ -n "$value" ]; then
+    printf '%s\t%s' "$value" "git remote get-url origin"
+    return 0
+  fi
+  return 1
+}
+
+# Приписка к телу issue — ОДНО место правды на всех расписывающихся (#1395).
+# Через pool_issue.py append-note (#720, находка ревью PR #804): инлайн-форма
+# «БЛОКИРУЕТСЯ: …» живёт ПОСЛЕДНЕЙ непустой строкой, голый конкат
+# body+footer оставлял футер после неё — созданная issue объявление уже не
+# несла, хотя гейт его только что потребовал. append-note переносит
+# объявление в конец ЗА футером (тот же предикат, третьего парсера нет).
+#
+# Вторая копия этого блока появилась бы у --dedup-skip-ack и разошлась бы с
+# первой молча (AGENTS.md, «одно место правды»), поэтому блок вынесен, а не
+# скопирован.
+append_body_note() {
+  local note=$1 new_body
+  tmp_note_file="$(mktemp)"
+  printf '%s' "$note" >"$tmp_note_file"
+  new_body="$(printf '%s' "$body" | python3 "$SCRIPT_DIR/../lib/pool_issue.py" append-note "$tmp_note_file")"
+  case "$body_slot_kind" in
+    value)
+      args[$body_slot_index]="$new_body"
+      ;;
+    value_inline)
+      args[$body_slot_index]="--body=$new_body"
+      ;;
+    file)
+      tmp_footer_file="$(mktemp)"
+      printf '%s' "$new_body" >"$tmp_footer_file"
+      args[$body_slot_index]="$tmp_footer_file"
+      ;;
+    file_inline)
+      tmp_footer_file="$(mktemp)"
+      printf '%s' "$new_body" >"$tmp_footer_file"
+      args[$body_slot_index]="--body-file=$tmp_footer_file"
+      ;;
+    *)
+      echo "::warning::issue-create: расписка дана, но тело (--body/--body-file) не передано — причина не записана в issue, видна только в этом логе." >&2
+      ;;
+  esac
+  # Тело изменено — держим локальную копию в согласии с тем, что уйдёт в gh:
+  # вторая приписка в одном прогоне иначе затёрла бы первую.
+  body="$new_body"
+}
+
 repo=""
+repo_source=""
 if [ "$has_task" -eq 1 ]; then
-  repo="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
+  if resolved="$(resolve_repo)"; then
+    repo="${resolved%%$'\t'*}"
+    repo_source="${resolved#*$'\t'}"
+    echo "issue-create: репозиторий пула — $repo (источник: $repo_source)" >&2
+  fi
 fi
 
 # Третий тормоз (#695): решение о приоритете обязано быть явным — метка
@@ -260,7 +355,12 @@ if [ "$has_task" -eq 1 ]; then
   # сравнивает слова заголовка и может не совпасть при разных формулировках
   # одного и того же дефекта (см. duplicate_guard.py, честный потолок метода).
   if [ -z "$repo" ]; then
-    echo "::warning::issue-create: не смог определить repo (gh repo view) — верх группы приоритета не показан." >&2
+    # Источников теперь три (#1395) — называть здесь один было бы ложной
+    # подсказкой: читатель пошёл бы чинить `gh repo view`, хотя не сработало
+    # ВСЁ. Сама печать верха приоритета остаётся предупреждением, а не
+    # отказом: её отсутствие ослабляет сверку глазами, но ниже по тексту
+    # сверка на дубли по этой же причине УЖЕ откажет создавать issue.
+    echo "::warning::issue-create: репозиторий пула не определился ни одним из трёх источников (gh repo view, GITHUB_REPOSITORY, git remote origin) — верх группы приоритета не показан." >&2
   else
     echo "issue-create: текущий верх группы приоритета ($meta_label) — сверься глазами, нет ли уже той же проблемы другими словами:" >&2
     top_err_file="$(mktemp)"
@@ -286,13 +386,46 @@ fi
 # чем сравнивать по смыслу) и только если заголовок вообще известен (пустой
 # --title — забота самого gh issue create, здесь просто нечего сравнивать).
 if [ "$has_task" -eq 1 ] && [ -n "$title" ]; then
+  # Сверка либо СОСТОЯЛАСЬ (dedup_failure пуст, matches — факт), либо не
+  # состоялась, и тогда dedup_failure называет ПОЧЕМУ. Две причины несостояния
+  # ведут в ОДНУ ветку отказа (issue #1395, блокирующая находка ai-ревью
+  # PR #1403): снятие класса только на стадии определения repo оставляло
+  # вторую ветку того же тормоза с прежним поведением — пул недоступен,
+  # matches пуст, скрипт доходит до `gh issue create` с одной WARN-строкой.
+  # Гарантия «тормоз не выключается молча» обязана держаться для обеих
+  # веток, иначе она шире механизма.
+  matches=""
+  dedup_failure=""
   if [ -z "$repo" ]; then
-    echo "::warning::issue-create: не смог определить repo (gh repo view) — проверка похожести пропущена." >&2
+    dedup_failure="репозиторий пула не определён ни одним из трёх источников (gh repo view, GITHUB_REPOSITORY, git remote origin)"
   else
     dg_err_file="$(mktemp)"
-    matches="$(python3 "$SCRIPT_DIR/../lib/duplicate_guard.py" check "$repo" "$title" 2>"$dg_err_file" || true)"
+    matches="$(python3 "$SCRIPT_DIR/../lib/duplicate_guard.py" check "$repo" "$title" 2>"$dg_err_file")" && dg_rc=0 || dg_rc=$?
     dg_err="$(cat "$dg_err_file" 2>/dev/null || true)"; rm -f "$dg_err_file"
     [ -z "$dg_err" ] || echo "$dg_err" >&2
+    if [ "$dg_rc" -ne 0 ]; then
+      # Пустой stdout при ненулевом коде — не «совпадений нет», а «никто не
+      # считал»: обнуляем явно, чтобы ниже он не выглядел фактом.
+      matches=""
+      dedup_failure="открытый пул задач прочитать не удалось (duplicate_guard.py rc=$dg_rc, причина — строкой выше)"
+    fi
+  fi
+
+  if [ -n "$dedup_failure" ]; then
+    # Тот же третий рубеж, что у гвардии пуша (#1096): отказ + осознанная
+    # расписка. Тормоз с газом, и газ дешёвый — три источника выше закрывают
+    # штатные пути, так что сюда доходит только среда, где посмотреть нечем.
+    if [ -z "$dedup_skip_ack" ]; then
+      echo "::error::issue-create: сверку на дубли выполнить НЕЧЕМ — $dedup_failure. Это не «дублей нет», это «посмотреть не смогли» (класс #1395, живой случай #1385/#1386 — две байт-в-байт одинаковые задачи в пуле). Газ: задай GITHUB_REPOSITORY=owner/repo и/или почини доступ к API, либо распишись --dedup-skip-ack \"<почему сверка невозможна и что сделано вместо неё>\" — причина попадёт в тело issue." >&2
+      echo "issue НЕ создана, ничего не отправлено в GitHub." >&2
+      exit 1
+    fi
+    echo "issue-create: сверка на дубли НЕ выполнена, осознанно (--dedup-skip-ack): $dedup_skip_ack" >&2
+    append_body_note "
+
+---
+Сверка на дубли перед заведением НЕ выполнялась (--dedup-skip-ack, #1395). Почему не удалась: $dedup_failure. Расписка автора: $dedup_skip_ack"
+  else
     if [ -n "$matches" ]; then
       if [ -n "$confirm_not_duplicate" ]; then
         listed=$(printf '%s\n' "$matches" | awk -F'\t' '{printf "- #%s (score %.2f): %s — %s\n", $2, $1, $3, $4}')
@@ -304,36 +437,7 @@ if [ "$has_task" -eq 1 ] && [ -n "$title" ]; then
 Проверено на дубли перед заведением (--confirm-not-duplicate, #566). Похожие открытые задачи:
 $listed
 Не дубль, потому что: $confirm_not_duplicate"
-        # Приписка — через pool_issue.py append-note (#720, находка ревью
-        # PR #804): инлайн-форма «БЛОКИРУЕТСЯ: …» живёт ПОСЛЕДНЕЙ непустой
-        # строкой, голый конкат body+footer оставлял футер после неё —
-        # созданная issue объявление уже не несла, хотя гейт его только что
-        # потребовал. append-note переносит объявление в конец ЗА футером
-        # (тот же предикат, третьего парсера нет).
-        tmp_note_file="$(mktemp)"
-        printf '%s' "$footer" >"$tmp_note_file"
-        new_body="$(printf '%s' "$body" | python3 "$SCRIPT_DIR/../lib/pool_issue.py" append-note "$tmp_note_file")"
-        case "$body_slot_kind" in
-          value)
-            args[$body_slot_index]="$new_body"
-            ;;
-          value_inline)
-            args[$body_slot_index]="--body=$new_body"
-            ;;
-          file)
-            tmp_footer_file="$(mktemp)"
-            printf '%s' "$new_body" >"$tmp_footer_file"
-            args[$body_slot_index]="$tmp_footer_file"
-            ;;
-          file_inline)
-            tmp_footer_file="$(mktemp)"
-            printf '%s' "$new_body" >"$tmp_footer_file"
-            args[$body_slot_index]="--body-file=$tmp_footer_file"
-            ;;
-          *)
-            echo "::warning::issue-create: --confirm-not-duplicate дан, но тело (--body/--body-file) не передано — причина не записана в issue, видна только в этом логе." >&2
-            ;;
-        esac
+        append_body_note "$footer"
       else
         echo "::error::issue-create: похожие ОТКРЫТЫЕ задачи пула уже есть — вероятно, дефект уже диагностируется (класс #566, живой случай #518/#547/#564):" >&2
         printf '%s\n' "$matches" | awk -F'\t' '{printf "  #%s (score %.2f): %s — %s\n", $2, $1, $3, $4}' >&2
