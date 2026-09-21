@@ -206,7 +206,7 @@ def test_no_redirect_handler_does_not_follow_303():
 def test_archive_no_config_is_not_hard_failure(monkeypatch):
     monkeypatch.setattr(sch, "DSH_EDGE_URL", "")
     monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "")
-    lines, hard = sch.archive_runner_sessions([5])
+    lines, hard = sch.archive_runner_sessions("o/r", [5])
     assert hard is False
     assert any("не заданы" in line for line in lines)
 
@@ -219,7 +219,7 @@ def test_archive_login_failure_is_hard_failure(monkeypatch):
         raise RuntimeError("логин в морду не удался: HTTP 403")
 
     monkeypatch.setattr(sch, "_morde_login", broken_login)
-    lines, hard = sch.archive_runner_sessions([5])
+    lines, hard = sch.archive_runner_sessions("o/r", [5])
     assert hard is True
     assert any("сломана" in line for line in lines)
 
@@ -232,7 +232,7 @@ def test_archive_session_not_found_is_not_hard_failure(monkeypatch):
         sch, "_morde_rpc",
         lambda opener, method, payload: (_ for _ in ()).throw(RuntimeError("session-not-found: нет такой сессии")),
     )
-    lines, hard = sch.archive_runner_sessions([5])
+    lines, hard = sch.archive_runner_sessions("o/r", [5])
     assert hard is False
     assert any("архивировать нечего" in line for line in lines)
 
@@ -245,7 +245,7 @@ def test_archive_rpc_failure_is_hard_failure(monkeypatch):
         sch, "_morde_rpc",
         lambda opener, method, payload: (_ for _ in ()).throw(RuntimeError("internal: что-то сломалось")),
     )
-    lines, hard = sch.archive_runner_sessions([5])
+    lines, hard = sch.archive_runner_sessions("o/r", [5])
     assert hard is True
     assert any("сломана" in line for line in lines)
 
@@ -525,7 +525,7 @@ def test_after_merge_appends_session_note_for_each_declared_task(monkeypatch):
     monkeypatch.setattr(sch, "gh", fake_gh)
     monkeypatch.setattr(sch, "recent_runs", lambda *a, **k: [])
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
-    monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
+    monkeypatch.setattr(sch, "archive_runner_sessions", lambda repo, numbers: ([], False))
     monkeypatch.setattr(
         sch, "append_session_notes",
         lambda notes: (captured.setdefault("notes", notes) and []) or ([], False),
@@ -562,7 +562,7 @@ def test_after_merge_appends_session_note_before_archiving(monkeypatch):
     )
     monkeypatch.setattr(
         sch, "archive_runner_sessions",
-        lambda numbers: (order.append("archive") and []) or ([], False),
+        lambda repo, numbers: (order.append("archive") and []) or ([], False),
     )
     sch.after_merge("o/r", merged, [])
     assert order == ["note", "archive"]
@@ -5274,7 +5274,7 @@ def test_after_merge_promises_auto_close_only_for_own_branch_task(monkeypatch):
     monkeypatch.setattr(sch, "gh", fake_gh)
     monkeypatch.setattr(sch, "recent_runs", lambda *a, **k: [])  # серии нет — возобновление #220 не событие
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
-    monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
+    monkeypatch.setattr(sch, "archive_runner_sessions", lambda repo, numbers: ([], False))
 
     sch.after_merge("o/r", merged, [])
 
@@ -5311,7 +5311,7 @@ def test_after_merge_notifies_telegram_about_merge_once(monkeypatch):
     monkeypatch.setattr(sch, "gh", fake_gh)
     monkeypatch.setattr(sch, "recent_runs", lambda *a, **k: [])  # серии нет — возобновление #220 не событие
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
-    monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
+    monkeypatch.setattr(sch, "archive_runner_sessions", lambda repo, numbers: ([], False))
     monkeypatch.setattr(
         sch, "send_telegram",
         lambda text, as_html=False: sent.append((text, as_html)) or True)
@@ -5356,7 +5356,7 @@ def test_after_merge_announces_only_own_branch_task_not_prose_mentions(monkeypat
 
     monkeypatch.setattr(sch, "gh", fake_gh)
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
-    monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
+    monkeypatch.setattr(sch, "archive_runner_sessions", lambda repo, numbers: ([], False))
     monkeypatch.setattr(
         sch, "send_telegram",
         lambda text, as_html=False: sent.append((text, as_html)) or True)
@@ -5393,7 +5393,7 @@ def test_after_merge_without_own_branch_task_sends_nothing(monkeypatch):
     monkeypatch.setattr(sch, "gh", fake_gh)
     monkeypatch.setattr(sch, "recent_runs", lambda *a, **k: [])  # серии нет — возобновление #220 не событие
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
-    monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
+    monkeypatch.setattr(sch, "archive_runner_sessions", lambda repo, numbers: ([], False))
     monkeypatch.setattr(
         sch, "send_telegram",
         lambda text, as_html=False: sent.append(text) or True)
@@ -5424,7 +5424,7 @@ def test_after_merge_telegram_miss_is_loud_but_not_fatal(monkeypatch):
 
     monkeypatch.setattr(sch, "gh", fake_gh)
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
-    monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
+    monkeypatch.setattr(sch, "archive_runner_sessions", lambda repo, numbers: ([], False))
     monkeypatch.setattr(sch, "send_telegram", lambda text, as_html=False: False)
     monkeypatch.setattr(sch, "update_remaining_pulls", lambda repo, merged_number, others: ([], []))
 
@@ -5897,7 +5897,7 @@ def test_after_merge_resume_series_by_merge_posts_marker(monkeypatch):
     monkeypatch.setattr(pg, "send_telegram", lambda text: True)  # канал escalate
     monkeypatch.setattr(sch, "send_telegram", lambda text, as_html=False: True)
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
-    monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
+    monkeypatch.setattr(sch, "archive_runner_sessions", lambda repo, numbers: ([], False))
 
     observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
 
@@ -5927,7 +5927,7 @@ def test_after_merge_resume_skips_when_merge_predates_red_run(monkeypatch):
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("мерж старше красного прогона — сброса быть не должно"))
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
-    monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
+    monkeypatch.setattr(sch, "archive_runner_sessions", lambda repo, numbers: ([], False))
 
     observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
 
@@ -5955,7 +5955,7 @@ def test_after_merge_resume_skips_when_series_closed(monkeypatch):
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("серия закрыта зелёным — сброса быть не должно"))
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
-    monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
+    monkeypatch.setattr(sch, "archive_runner_sessions", lambda repo, numbers: ([], False))
 
     observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
 
@@ -5983,7 +5983,7 @@ def test_after_merge_resume_skips_without_claim_trace(monkeypatch):
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("следа аренды нет — сброса быть не должно"))
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
-    monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
+    monkeypatch.setattr(sch, "archive_runner_sessions", lambda repo, numbers: ([], False))
 
     observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
 
@@ -6012,7 +6012,7 @@ def test_after_merge_resume_dedupes_by_pr_marker(monkeypatch):
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("сброс этим мержем уже сигналился"))
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
-    monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
+    monkeypatch.setattr(sch, "archive_runner_sessions", lambda repo, numbers: ([], False))
 
     observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
 
@@ -6077,7 +6077,7 @@ def test_after_merge_resume_ignores_fake_dedup_marker_without_job_token(monkeypa
     monkeypatch.setattr(pg, "send_telegram", lambda text: True)
     monkeypatch.setattr(sch, "send_telegram", lambda text, as_html=False: True)
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
-    monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
+    monkeypatch.setattr(sch, "archive_runner_sessions", lambda repo, numbers: ([], False))
 
     observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
 
@@ -6111,7 +6111,7 @@ def test_after_merge_resume_does_not_claim_reset_when_marker_not_posted(monkeypa
     monkeypatch.setattr(pg, "send_telegram", lambda text: True)  # канал escalate
     monkeypatch.setattr(sch, "send_telegram", lambda text, as_html=False: True)
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
-    monkeypatch.setattr(sch, "archive_runner_sessions", lambda numbers: ([], False))
+    monkeypatch.setattr(sch, "archive_runner_sessions", lambda repo, numbers: ([], False))
 
     observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
 
@@ -10131,3 +10131,246 @@ def test_create_task_replacement_body_passes_declared_dependency_gate(monkeypatc
     assert len(calls) == 1, "реальный гейт пропустил тело — объявление связи на месте"
     body_arg = next(a for a in calls[0] if a.startswith("body="))
     assert body_arg.rstrip().endswith("БЛОКИРУЕТСЯ: ничем")
+
+
+# ── Очередь архива сессии на метке (#1417) ──────────────────────────────────
+#
+# Класс, названный владельцем дословно: «мы потом починим, но мы никогда не
+# узнаем, какую сессию нужно было заархивировать». До #1417 факт «убрать не
+# удалось» жил только в логе прогона, и слитая задача второй раз не сливается
+# — повторять было некому и нечего.
+
+
+def _archive_stand(monkeypatch, *, rpc, routes=None):
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_morde_opener", lambda: object())
+    monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
+    monkeypatch.setattr(sch, "_morde_rpc", rpc)
+    fake = FakeGh({**(routes or {}), "issues/5/labels": None})
+    monkeypatch.setattr(sch, "gh", fake)
+    return fake
+
+
+def test_archive_failure_leaves_the_work_in_the_queue(monkeypatch):
+    """Главная сцена #1417: сбой оставляет РАБОТУ, а не пустоту. Метка стоит —
+    значит следующий проход знает, что убирать, без чьей-либо памяти."""
+    fake = _archive_stand(monkeypatch, rpc=lambda opener, method, payload: (_ for _ in ()).throw(
+        RuntimeError("internal: HTTP 500")))
+
+    lines, hard = sch.archive_runner_sessions("o/r", [5])
+
+    assert hard is True
+    posted = [c for c in fake.calls if c.startswith("-X POST") and "labels" in c]
+    deleted = [c for c in fake.calls if c.startswith("-X DELETE") and "labels" in c]
+    assert len(posted) == 1, f"метка обязана ставиться ДО попытки: {fake.calls}"
+    assert deleted == [], "на сбое метка снимается — работа потеряна"
+    assert any(sch.SESSION_ARCHIVE_PENDING_LABEL in line for line in lines), lines
+
+
+def test_archive_success_takes_the_work_out_of_the_queue(monkeypatch):
+    """Симметрия: успех обязан снимать метку, иначе очередь не тает никогда и
+    повтор идёт вечно."""
+    fake = _archive_stand(monkeypatch, rpc=lambda opener, method, payload: {})
+
+    lines, hard = sch.archive_runner_sessions("o/r", [5])
+
+    assert hard is False
+    assert [c for c in fake.calls if c.startswith("-X DELETE") and "labels" in c], fake.calls
+    assert any("заархивирована" in line for line in lines), lines
+
+
+def test_archive_session_not_found_also_clears_the_queue(monkeypatch):
+    """«Сессии нет» — терминальный исход, а не сбой: убирать нечего и никогда
+    не будет. Держать такую запись в очереди значило бы копить вечный хвост,
+    который никогда не растает."""
+    fake = _archive_stand(monkeypatch, rpc=lambda opener, method, payload: (_ for _ in ()).throw(
+        RuntimeError("session-not-found: нет такой сессии")))
+
+    lines, hard = sch.archive_runner_sessions("o/r", [5])
+
+    assert hard is False
+    assert [c for c in fake.calls if c.startswith("-X DELETE") and "labels" in c], fake.calls
+    assert any("архивировать нечего" in line for line in lines), lines
+
+
+def test_queue_survives_unreachable_morde(monkeypatch):
+    """Недоступная морда — ровно тот случай, ради которого очередь заведена:
+    метка ставится ДО логина, поэтому падение на логине не теряет запись."""
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_morde_opener", lambda: object())
+    monkeypatch.setattr(sch, "_morde_login", lambda opener: (_ for _ in ()).throw(
+        RuntimeError("логин в морду не удался: HTTP 403")))
+    fake = FakeGh({"issues/5/labels": None})
+    monkeypatch.setattr(sch, "gh", fake)
+
+    lines, hard = sch.archive_runner_sessions("o/r", [5])
+
+    assert hard is True
+    assert [c for c in fake.calls if c.startswith("-X POST") and "labels" in c], fake.calls
+    assert any("повтор на следующем проходе" in line for line in lines), lines
+
+
+def test_retry_pass_drains_the_queue_without_remembering_anything(monkeypatch):
+    """Догоняющий проход ничего не помнит о прошлом прогоне — состояние
+    целиком в метке. Именно поэтому хвост добирается сам после починки любой
+    причины отказа, а не после того, как кто-то вспомнил номера."""
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_morde_opener", lambda: object())
+    monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
+    archived = []
+    monkeypatch.setattr(sch, "_morde_rpc",
+                        lambda opener, method, payload: archived.append(payload["sessionId"]) or {})
+    fake = FakeGh({
+        f"issues?state=all&labels={sch.SESSION_ARCHIVE_PENDING_LABEL.replace(':', '%3A')}": [
+            {"number": 7}, {"number": 9},
+        ],
+        "issues/7/labels": None,
+        "issues/9/labels": None,
+    })
+    monkeypatch.setattr(sch, "gh", fake)
+
+    lines, hard = sch.retry_pending_session_archives("o/r")
+
+    assert hard is False
+    assert archived == ["harness-7", "harness-9"], archived
+    deleted = [c for c in fake.calls if c.startswith("-X DELETE") and "labels" in c]
+    assert len(deleted) == 2, f"успех обязан снимать метку с каждой: {fake.calls}"
+    assert any("повторяю 2" in line for line in lines), lines
+
+
+def test_retry_pass_is_quiet_when_the_queue_is_empty(monkeypatch):
+    """Холостой ход: пустая очередь не ходит в морду вовсе — ни логина, ни
+    RPC. Иначе догоняющий проход стоил бы сетевого вызова на каждом пульсе
+    ради ничего."""
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_morde_login", lambda opener: (_ for _ in ()).throw(
+        AssertionError("логин на пустой очереди — холостой сетевой вызов")))
+    fake = FakeGh({
+        f"issues?state=all&labels={sch.SESSION_ARCHIVE_PENDING_LABEL.replace(':', '%3A')}": [],
+    })
+    monkeypatch.setattr(sch, "gh", fake)
+
+    lines, hard = sch.retry_pending_session_archives("o/r")
+
+    assert (lines, hard) == ([], False)
+
+
+def test_after_merge_archives_only_the_branch_task_not_mentions(monkeypatch):
+    """Вторая половина #1417 (перекрывает #1415): архивируется сессия задачи
+    ВЕТКИ, а не всех задач, упомянутых в теле прозой.
+
+    Живой случай — прогон 35610435199: слит PR #1401 (ветка
+    `agent/1398-owner-press-never-silent`, задача ветки #1398), а архив
+    пытались сделать ещё и для #925, #1251, #1402 — ОТКРЫТЫХ задач пула,
+    упомянутых как related. Спасал ровно отказ морды: HTTP 500 не дал ни одной
+    чужой живой сессии уехать в архив. Фильтр «метка task» от этого не
+    защищает — чужая живая задача её как раз несёт.
+
+    Заметки-итогов остаются на прежнем списке сознательно: польза «PR слит» в
+    related-задаче — отдельный вопрос, и решать его этой правкой значило бы
+    протащить чужое решение под видом фикса."""
+    merged = pull(9, pr_body="#1398 и related #1251, #1402", ref="agent/1398-owner-press")
+    archived, noted = [], []
+
+    def fake_gh(*args):
+        joined = " ".join(args)
+        if joined.startswith("repos/o/r/pulls/9/files"):
+            return []
+        if joined.startswith("-X POST repos/o/r/issues/"):
+            return None  # напоминание про упомянутые задачи — не предмет этого теста
+        if joined.startswith("repos/o/r/issues/"):
+            return {"state": "open", "labels": [{"name": "task"}], "title": "т"}
+        raise AssertionError(f"нет маршрута для: {joined}")
+
+    monkeypatch.setattr(sch, "gh", fake_gh)
+    monkeypatch.setattr(sch, "recent_runs", lambda *a, **k: [])
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
+    monkeypatch.setattr(sch, "append_session_notes",
+                        lambda notes: noted.extend(n for n, _ in notes) or ([], False))
+    monkeypatch.setattr(sch, "archive_runner_sessions",
+                        lambda repo, numbers: archived.extend(numbers) or ([], False))
+
+    sch.after_merge("o/r", merged, [])
+
+    assert archived == [1398], f"в архив ушла чужая живая сессия: {archived}"
+    assert sorted(noted) == [1251, 1398, 1402], noted
+
+
+def test_main_runs_the_catch_up_pass_every_pulse(monkeypatch):
+    """Проводка, без которой механизм — украшение: очередь обязана разбираться
+    САМА на каждом пульсе, иначе метка просто копится и «не потеряно» остаётся
+    словом. Мутация «снять вызов из main» красит именно этот тест — остальные
+    проверяют функцию в отрыве и её отсутствие в пульсе не замечают."""
+    called, lines_seen = [], []
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "independent_pulse_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
+    monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
+    monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
+    monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls, merged=None, *, pool=None: [])
+    monkeypatch.setattr(sch, "reap_stalled_worker_run", lambda repo, now, pool, pulls: ([], []))
+    monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
+    monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
+    monkeypatch.setattr(sch, "unhealthy_pulls", lambda repo, now, pulls, *, pool=None: [])
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, pulls))
+    monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
+    monkeypatch.setattr(sch, "accept_merged_tasks",
+                        lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False))
+    monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], True))
+    monkeypatch.setattr(sch, "wip_gate", lambda repo, now, pulls, pool, dispatch_allowed: ([], [], True))
+    monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool, *, wip_allowed, pulls: ([], []))
+    monkeypatch.setattr(sch, "detect_and_act", lambda repo, now, lines, run_url=None: [])
+    monkeypatch.setattr(sch, "escalate_stale_auto_tasks", lambda repo, now: [])
+    monkeypatch.setattr(sch, "groom_auto_tasks", lambda repo, now, lines: [])
+    monkeypatch.setattr(sch, "summary", lambda lines: lines_seen.extend(lines))
+    monkeypatch.setattr(
+        sch, "retry_pending_session_archives",
+        lambda repo: called.append(repo) or (["🔁 очередь архива сессий: повторяю 1 — #7"], False))
+
+    assert sch.main() == 0
+    assert called == ["o/r"], "догоняющий проход не вызван из пульса"
+    assert any("очередь архива сессий" in line for line in lines_seen), lines_seen
+
+
+def test_main_reddens_when_the_catch_up_pass_itself_is_broken(monkeypatch):
+    """Жёсткий сбой догоняющего прохода — такая же поломанная возможность, как
+    и сбой при мерже: очередь не разбирается, и прогон обязан покраснеть, а не
+    молча копить метки."""
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    for name, value in (
+        ("heartbeat_check", lambda repo, now: []),
+        ("independent_pulse_check", lambda repo, now: []),
+        ("upstream_drift_lines", lambda repo: []),
+        ("open_pulls", lambda repo: []),
+        ("all_merged_pulls", lambda repo: []),
+        ("open_task_issues", lambda repo: []),
+        ("mark_conflicts", lambda repo, pulls: []),
+        ("detect_and_act", lambda repo, now, lines, run_url=None: []),
+        ("escalate_stale_auto_tasks", lambda repo, now: []),
+        ("summary", lambda lines: None),
+    ):
+        monkeypatch.setattr(sch, name, value)
+    monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls, merged=None, *, pool=None: [])
+    monkeypatch.setattr(sch, "reap_stalled_worker_run", lambda repo, now, pool, pulls: ([], []))
+    monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
+    monkeypatch.setattr(sch, "unhealthy_pulls", lambda repo, now, pulls, *, pool=None: [])
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, pulls))
+    monkeypatch.setattr(sch, "accept_merged_tasks",
+                        lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False))
+    monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], True))
+    monkeypatch.setattr(sch, "wip_gate", lambda repo, now, pulls, pool, dispatch_allowed: ([], [], True))
+    monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool, *, wip_allowed, pulls: ([], []))
+    monkeypatch.setattr(sch, "groom_auto_tasks", lambda repo, now, lines: [])
+    monkeypatch.setattr(sch, "retry_pending_session_archives",
+                        lambda repo: (["🚨 очередь архива сессий: морда недоступна"], True))
+    escalated = []
+    monkeypatch.setattr(sch, "escalate",
+                        lambda repo, issue, text: escalated.append(text) or "ок")
+
+    assert sch.main() == 1
+    assert escalated and "архив сессии раннера" in escalated[0], escalated

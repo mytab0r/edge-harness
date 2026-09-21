@@ -2604,8 +2604,53 @@ def _morde_ingest(opener: urllib.request.OpenerDirector, session_id: str, events
         raise RuntimeError(f"HTTP {error.code}: {detail}") from error
 
 
-def archive_runner_sessions(task_numbers: list[int]) -> tuple[list[str], bool]:
-    """#119: архив сессий раннера по каждому номеру задачи из тела слитого PR.
+# Очередь незавершённого архива сессии (issue #1417). Метка на ЗАДАЧЕ — то
+# самое durable-свойство, которого не хватало: до неё факт «сессию убрать не
+# удалось» жил только в логе прогона, и первый же сбой терял информацию о том,
+# ЧТО убирать. Слитая задача второй раз не сливается — повторять было некому и
+# нечего, а газ, который называл алерт («следующий успешный мерж той же
+# задачи»), для слитой задачи не наступает никогда.
+#
+# Порядок операций выбран так, чтобы падение в любой точке оставляло РАБОТУ, а
+# не пустоту: метка ставится ДО попытки и снимается ТОЛЬКО после успеха или
+# терминального «сессии нет». At-least-once: лишний повтор архивации уже
+# архивированной сессии безвреден (идемпотентно), потерянная сессия — нет.
+SESSION_ARCHIVE_PENDING_LABEL = "session:archive-pending"
+
+
+def _set_archive_pending(repo: str, number: int) -> None:
+    gh("-X", "POST", f"repos/{repo}/issues/{number}/labels",
+       "-f", f"labels[]={SESSION_ARCHIVE_PENDING_LABEL}")
+
+
+def _clear_archive_pending(repo: str, number: int) -> None:
+    # Сегмент метки в ПУТИ кодируется тем же местом правды, что и query
+    # (review_labels.label_query_value): у метки есть двоеточие, а `gh api`
+    # разворачивает `:owner`/`:repo` в пути как СВОИ плейсхолдеры — сырая
+    # форма молча даёт 404 (живой класс, закрытый на waiting:owner, #1012).
+    gh("-X", "DELETE",
+       f"repos/{repo}/issues/{number}/labels/"
+       f"{review_labels.label_query_value(SESSION_ARCHIVE_PENDING_LABEL)}")
+
+
+def pending_session_archive_issues(repo: str) -> list[dict]:
+    """Задачи, чью сессию ещё предстоит убрать — ОДИН запрос по метке.
+
+    `state=all`: приёмка закрывает задачу в том же прогоне, что и мерж, а
+    метка переживает закрытие — очередь не имеет права терять запись только
+    потому, что задача закрылась раньше, чем архив удался.
+
+    Обход страниц обязателен (класс #308): очередь не ограничена сверху
+    ничем, кроме числа несостоявшихся уборок."""
+    return list(review_labels.list_pages(
+        f"repos/{repo}/issues?state=all"
+        f"&labels={review_labels.label_query_value(SESSION_ARCHIVE_PENDING_LABEL)}"
+        "&per_page=100",
+        gh))
+
+
+def archive_runner_sessions(repo: str, task_numbers: list[int]) -> tuple[list[str], bool]:
+    """#119: архив сессий раннера; #1417: с durable-очередью на метке.
 
     Возвращает (строки отчёта, был_ли_жёсткий_сбой). «Жёсткий сбой» —
     инфраструктурная поломка (логин в морду не прошёл, сеть, RPC вернул НЕ
@@ -2613,33 +2658,101 @@ def archive_runner_sessions(task_numbers: list[int]) -> tuple[list[str], bool]:
     правилу fail loud такой сбой не может быть неотличим от «сессии нет» или
     «конфигурации нет» (оба — норма, не поломка). Мерж уже состоялся и не
     откатывается: жёсткий сбой не прерывает обход остальных номеров, только
-    помечает результат — эскалацию и красный код делает вызывающий main()."""
+    помечает результат — эскалацию и красный код делает вызывающий main().
+
+    Информация при этом больше НЕ теряется: каждый номер помечается
+    `SESSION_ARCHIVE_PENDING_LABEL` до попытки, и метка снимается только на
+    успехе либо на терминальном «сессии нет». Что осталось убрать, видно
+    одним запросом по метке, а `retry_pending_session_archives` повторяет это
+    на каждом проходе — без участия человека и без памяти о прошлом прогоне."""
     if not DSH_EDGE_URL or not DSH_EDGE_ACCESS_KEY:
         return (["⚠️ DSH_EDGE_URL/DSH_EDGE_ACCESS_KEY не заданы — архив сессий раннеров пропущен (#119)"],
                 False)
+    lines = []
+    # Метка ставится ДО логина в морду: недоступная морда — ровно тот случай,
+    # ради которого очередь и заведена, и запись о работе обязана пережить его.
+    for number in task_numbers:
+        try:
+            _set_archive_pending(repo, number)
+        except RuntimeError as error:
+            # Без метки повторить будет нечему — это громко, а не «ну ладно».
+            lines.append(f"🚨 #{number}: метка {SESSION_ARCHIVE_PENDING_LABEL} НЕ поставлена "
+                         f"({error}) — сессия может остаться неубранной незаметно")
     try:
         opener = _morde_opener()
         _morde_login(opener)
     except (RuntimeError, OSError, urllib.error.URLError, ValueError) as error:
-        return ([f"🚨 морда dsh-edge недоступна для архива сессий (возможность сломана, не отсутствует): {error}"],
-                True)
+        lines.append(f"🚨 морда dsh-edge недоступна для архива сессий (возможность сломана, "
+                     f"не отсутствует): {error} — очередь по метке "
+                     f"{SESSION_ARCHIVE_PENDING_LABEL} сохранена, повтор на следующем проходе")
+        return (lines, True)
+    archived, hard_failure = _archive_with_opener(repo, opener, task_numbers)
+    return (lines + archived, hard_failure)
+
+
+def _archive_with_opener(repo: str, opener, task_numbers: list[int]) -> tuple[list[str], bool]:
+    """Общее тело для первой попытки (после мержа) и для повтора по очереди —
+    одно место правды, а не две копии одного цикла."""
     lines = []
     hard_failure = False
     for number in task_numbers:
         session_id = f"harness-{number}"
         try:
             _morde_rpc(opener, "workspace.archiveSession", {"sessionId": session_id})
-            lines.append(f"🗄️ #{number}: сессия {session_id} заархивирована в морде")
+            done = f"🗄️ #{number}: сессия {session_id} заархивирована в морде"
         except RuntimeError as error:
             if "session-not-found" in str(error):
-                lines.append(f"🗄️ #{number}: сессии раннера в морде нет — архивировать нечего")
+                # Терминальный исход, а не сбой: убирать нечего и никогда не
+                # будет — держать такую запись в очереди значило бы копить
+                # вечный хвост.
+                done = f"🗄️ #{number}: сессии раннера в морде нет — архивировать нечего"
             else:
-                lines.append(f"🚨 #{number}: сессия {session_id} не заархивирована (возможность сломана): {error}")
+                lines.append(f"🚨 #{number}: сессия {session_id} не заархивирована "
+                             f"(возможность сломана): {error} — остаётся в очереди "
+                             f"{SESSION_ARCHIVE_PENDING_LABEL}")
                 hard_failure = True
+                continue
         except (OSError, ValueError) as error:
-            lines.append(f"🚨 #{number}: архив сессии не удался (возможность сломана): {error}")
+            lines.append(f"🚨 #{number}: архив сессии не удался (возможность сломана): {error} "
+                         f"— остаётся в очереди {SESSION_ARCHIVE_PENDING_LABEL}")
             hard_failure = True
+            continue
+        try:
+            _clear_archive_pending(repo, number)
+        except RuntimeError as error:
+            # Сессия убрана, а метка осталась — следующий проход повторит
+            # архивацию уже архивированной сессии. Это безвредно (тот же
+            # идемпотентный RPC) и честнее, чем потерять запись.
+            lines.append(f"{done}; метка {SESSION_ARCHIVE_PENDING_LABEL} не снята ({error}) — "
+                         "повтор безвреден, запись останется до успешного снятия")
+            continue
+        lines.append(done)
     return lines, hard_failure
+
+
+def retry_pending_session_archives(repo: str) -> tuple[list[str], bool]:
+    """Догоняющий проход по очереди (#1417): всё, что не убралось раньше.
+
+    Вызывается на КАЖДОМ пульсе и ничего не помнит о прошлом прогоне —
+    состояние целиком в метке. Поэтому после починки любой причины отказа
+    (сегодня HTTP 500 морды, вчера квота DO, завтра окно деплоя) хвост
+    добирается сам, без ручного разбора и без того, чтобы кто-то помнил
+    номера."""
+    if not DSH_EDGE_URL or not DSH_EDGE_ACCESS_KEY:
+        return ([], False)  # конфигурации нет — очередь не наша забота, канал просто пуст
+    pending = [issue["number"] for issue in pending_session_archive_issues(repo)
+               if "pull_request" not in issue]
+    if not pending:
+        return ([], False)
+    try:
+        opener = _morde_opener()
+        _morde_login(opener)
+    except (RuntimeError, OSError, urllib.error.URLError, ValueError) as error:
+        return ([f"🚨 очередь архива сессий ({len(pending)}): морда недоступна, повтор отложен "
+                 f"до следующего прохода: {error}"], True)
+    lines, hard_failure = _archive_with_opener(repo, opener, pending)
+    return ([f"🔁 очередь архива сессий: повторяю {len(pending)} — {', '.join(f'#{n}' for n in pending)}"]
+            + lines, hard_failure)
 
 
 # ── Заметки-итоги в сессии раннера (#480) ─────────────────────────────────────────
@@ -3126,9 +3239,24 @@ def after_merge(
             actions.append(f"⚠️ авто-возобновление предохранителя не сработало: {error}")
         if resume_line:
             actions.append(resume_line)
-    # Архив сессий раннеров (#119) — только для ЗАДАЧ пула (метка task): номер из
-    # тела PR может оказаться чужой активной задачей/PR без сессии, архивировать
-    # его нельзя — утащим чужую живую сессию в архив.
+    # Архив сессии раннера (#119) — ТОЛЬКО по задаче ВЕТКИ этого PR (#1417).
+    # Прежняя редакция брала весь task_numbers, то есть каждую открытую задачу
+    # пула, упомянутую в теле прозой, — и комментарий здесь же формулировал
+    # запрет, которого код не выполнял («утащим чужую живую сессию в архив»).
+    # Фильтр «метка task» от этого не защищал: чужая ЖИВАЯ задача её как раз
+    # несёт. Живой случай — прогон 35610435199: слит PR #1401 (задача ветки
+    # #1398), архив пытались сделать для #925, #1251, #1402 тоже. Спасал ровно
+    # отказ морды: HTTP 500 не дал ни одной чужой сессии уехать в архив.
+    #
+    # Тот же класс уже закрывали для приёмки (#259/#394): упоминание в прозе не
+    # делает задачу задачей этого PR. `own_task` вычислен выше и до #1417 нигде
+    # для архива не использовался.
+    #
+    # Заметки-итогов (append_session_notes) СОЗНАТЕЛЬНО оставлены на прежнем
+    # списке: «PR слит в main» в related-задаче — отдельный вопрос о пользе, и
+    # решать его этой правкой значило бы протащить чужое решение под видом
+    # фикса (#1417, раздел «Не подтверждено»).
+    archive_targets = [own_task] if own_task is not None else []
     if task_numbers:
         # Заметка-итог в сессии раннера (#480): «PR слит в main» — факт,
         # который эта функция и так обнаружила (мерж), без нового опроса.
@@ -3138,7 +3266,7 @@ def after_merge(
         note_lines, note_hard_failure = append_session_notes(
             [(n, f"🔀 PR #{number} слит в main.") for n in task_numbers])
         actions += note_lines
-        archive_lines, hard_failure = archive_runner_sessions(task_numbers)
+        archive_lines, hard_failure = archive_runner_sessions(repo, archive_targets)
         actions += archive_lines
         hard_failure = hard_failure or note_hard_failure
     # Реестр незакрытых находок ревью, ключ файл (#1262, объединяет #1217):
@@ -6328,7 +6456,16 @@ def main() -> int:
     # слияния — освобождённая задача должна попасть в тот же отчёт, а
     # merge_queue ниже не зависит от пула задач.
     unhealthy_lines = unhealthy_pulls(repo, now, pulls, pool=pool)
+    # Догоняющий проход по очереди архива сессий (#1417) — ДО merge_loop
+    # намеренно: обрабатывается хвост ПРОШЛЫХ проходов, а неудачи этого
+    # прогона ждут следующего пульса. Повторять то, что только что упало по
+    # той же причине, тем же прогоном — трата вызовов без шанса на другой
+    # исход. Состояния между прогонами функция не помнит вовсе: оно целиком
+    # в метке, и именно поэтому хвост добирается сам после починки любой
+    # причины отказа.
+    archive_retry_lines, archive_retry_hard = retry_pending_session_archives(repo)
     merge_observations, merge_actions, archive_hard_failure, pulls = merge_loop(repo, pulls)
+    archive_hard_failure = archive_hard_failure or archive_retry_hard
     # #196, поведение 1: PR с review:ok без вердикта AI (или ai:failed)
     # дольше порога — оркестратор сам запускает ai-review.yml. merge_loop уже
     # вернул актуальный список открытых PR (#443): если он что-то слил или
@@ -6428,6 +6565,7 @@ def main() -> int:
     )
     actions = (
         stale_lines + replacement_lines + lease_actions + conflict_lines + unhealthy_lines
+        + archive_retry_lines
         + merge_actions + ai_actions + stuck_large_ok_actions + stale_ready_lines + reopen_lines
         + accept_actions
         + stale_unclaimed_lines + conveyor_actions + conflict_rework_actions
@@ -6482,10 +6620,15 @@ def main() -> int:
         broken = []
         if archive_hard_failure:
             broken.append(
-                "После мержа PR архивация сессии раннера в морде dsh-edge не удалась "
-                "(возможность есть, но сломана — см. отчёт этого прогона orchestra выше). "
-                "Мерж не откатывается; сессия останется в списке активных до ручного "
-                "разбора или следующего успешного мержа той же задачи."
+                "Архивация сессии раннера в морде dsh-edge не удалась (возможность "
+                "есть, но сломана — см. отчёт этого прогона orchestra выше). Мерж не "
+                "откатывается, и НИЧЕГО не потеряно: задача помечена "
+                f"`{SESSION_ARCHIVE_PENDING_LABEL}`, следующий проход оркестратора "
+                "повторит попытку сам. Что осталось убрать — видно одним запросом:\n"
+                f"https://github.com/{repo}/issues?q=is%3Aissue+label%3A"
+                f"{SESSION_ARCHIVE_PENDING_LABEL.replace(':', '%3A')}\n"
+                "Ручной разбор нужен, только если очередь не тает несколько проходов "
+                "подряд — тогда сломана причина, а не уборка."
             )
         if stall_hard_failure:
             broken.append(
