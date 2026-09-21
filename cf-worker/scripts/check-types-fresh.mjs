@@ -22,9 +22,11 @@
 // Имена секретов wrangler types читает из .dev.vars (важны КЛЮЧИ, не
 // значения) — без этого файла генерат молча теряет секретные биндинги из
 // интерфейса Env, и гвардия падает ложно, показывая удаление HANDS_TOKEN и
-// соседей. Поэтому .dev.vars создаётся из .dev.vars.example, если его нет.
+// соседей. Поэтому .dev.vars создаётся из .dev.vars.example, если его нет,
+// и удаляется после генерации, если создан здесь (окружение шага остаётся
+// как найдено).
 
-import { copyFileSync, existsSync } from "node:fs";
+import { copyFileSync, existsSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -34,19 +36,36 @@ const GENERATED = "worker-configuration.d.ts";
 
 // Отличия, которые НЕ означают устаревания (см. шапку). Паттерны применяются к
 // строкам diff'а, поэтому учитывают ведущие -/+.
+//
+// hash-фильтр — форма ШАПКИ генерата `(hash: ...)`, не любой `hash:`:
+// в теле генерата живут одноимённые члены интерфейсов (`hash:
+// CryptoKeyKeyAlgorithm`, `hash: URLPatternComponentResult`), и широкий
+// `.*hash: ` проглотил бы содержательную правку вида `+ hash: string;` молча
+// (находка ai-ревью PR #1420, чеклист).
 const BENIGN = [
-  /^[-+].*hash: /,
+  /^[-+].*\(hash: /,
   /^[-+].*Secrets \(HANDS_TOKEN/,
   /^[-+].*they are set via/,
   /^--- /,
   /^\+\+\+ /,
 ];
 
-if (!existsSync(join(root, ".dev.vars"))) {
-  copyFileSync(join(root, ".dev.vars.example"), join(root, ".dev.vars"));
+// Имена секретов wrangler types читает из .dev.vars (важны КЛЮЧИ, не значения).
+// Файл заводится здесь ТОЛЬКО если его не было, и удаляется после генерации:
+// шаг не должен менять окружение соседних шагов job'а (находка ai-ревью
+// PR #1420, чеклист — непустой .dev.vars красил vitest-тесты на исправном коде).
+const devVars = join(root, ".dev.vars");
+let createdDevVars = false;
+if (!existsSync(devVars)) {
+  copyFileSync(join(root, ".dev.vars.example"), devVars);
+  createdDevVars = true;
 }
 
-execFileSync("npx", ["wrangler", "types"], { cwd: root, stdio: "inherit" });
+try {
+  execFileSync("npx", ["wrangler", "types"], { cwd: root, stdio: "inherit" });
+} finally {
+  if (createdDevVars) rmSync(devVars);
+}
 
 const diff = execFileSync("git", ["diff", "--", GENERATED], { cwd: root, encoding: "utf8" });
 const meaningful = diff
