@@ -41,7 +41,31 @@ const SCHEMA = [
      data    TEXT,
      UNIQUE(task_id, seq)
    )`,
-  `CREATE INDEX IF NOT EXISTS events_by_id ON events(id)`,
+  // #1411: events_by_id был ИЗБЫТОЧЕН — `id INTEGER PRIMARY KEY` и есть rowid,
+  // отдельный индекс по нему не даёт ни одного плана, которого нет у самой
+  // таблицы (проверено EXPLAIN QUERY PLAN: `SELECT COALESCE(MAX(id),0)` и
+  // подзапрос ретеншна `id IN (…)` без него читают rowid напрямую, замер
+  // 0.012 → 0.007 мс на 200 000 строк). Снимается явно: `CREATE INDEX IF NOT
+  // EXISTS` идемпотентен, а вот УБРАТЬ уже созданный на проде индекс может
+  // только DROP — иначе он переживёт деплой и продолжит стоить запись на
+  // каждую вставку.
+  `DROP INDEX IF EXISTS events_by_id`,
+  // #1411, горячий путь: GET /api/events?task_id=…&after=… (клиенты —
+  // scripts/hands/dsh_task.sh и scripts/lib/journal_status.sh, опрос в цикле
+  // пока идёт job) читает `WHERE task_id = ? AND id > ? ORDER BY id LIMIT ?`.
+  // Индекса, ведущего (task_id, id), не было, и UNIQUE(task_id, seq) даёт
+  // порядок по seq, а не по id — SQLite читал ВСЕ события задачи и сортировал
+  // их во временном B-дереве, после чего применял LIMIT. То есть курсор
+  // `after` не ограничивал скан вовсе: каждый опрос стоил столько, сколько у
+  // задачи событий всего.
+  //
+  // Замер, оплативший этот индекс (2026-09-21, #1411): 12 436 246 rows_read
+  // за ОДИН час — 93.2% суточного расхода при лимите 5 000 000/сутки, в тот
+  // же час 34 632 rows_written (то есть ~359 прочитанных строк на каждую
+  // записанную). Морда отвечала HTTP 500 на любой SELECT, и из-за этого
+  // молча не архивировались сессии раннера и не дописывались логи итогов.
+  // План до/после на 200 000 строк: 31.8 мс → 0.311 мс на запрос.
+  `CREATE INDEX IF NOT EXISTS events_task_id_id ON events(task_id, id)`,
   // Ретеншн (#306/#305): без индекса по ts пачечное удаление старых событий
   // (RETENTION_TABLES ниже) само превратилось бы в полный скан на каждый тик.
   `CREATE INDEX IF NOT EXISTS events_by_ts ON events(ts)`,
@@ -2086,10 +2110,26 @@ export class Harness extends DurableObject<Env> {
    */
   #emitSystemEvent(taskId: string, kind: string, data: unknown): void {
     const now = Date.now();
-    const previous = Number(
-      this.#rows(this.#sql.exec("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND source = 'system'", taskId))[0].n,
-    );
-    const seq = -(previous + 1);
+    // #1411, вторая дверь того же класса (находка ai-review PR #1425): прежде
+    // здесь стоял `SELECT COUNT(*) … WHERE task_id = ? AND source = 'system'` —
+    // `source` ни в одном индексе не ведёт, поэтому COUNT читал ВСЕ события
+    // задачи, и цена системного события росла вместе с длиной сессии. Замер на
+    // 100 000 событий одной задачи: 14.25 мс → 0.003 мс.
+    //
+    // MIN(seq) по префиксу UNIQUE(task_id, seq) — один seek по покрывающему
+    // индексу, без нового индекса (важно: rows_written тоже лимитирован).
+    // Системные seq отрицательные, job'овые положительные, поэтому минимум по
+    // задаче и есть «самый последний системный», а `Math.min(0, …)` держит
+    // случай «системных ещё не было» (минимум положительный или строк нет).
+    //
+    // Заодно снят латентный дефект счётчика: ретеншн удаляет старые события, и
+    // COUNT после удаления давал УЖЕ ЗАНЯТЫЙ seq — INSERT падал на
+    // UNIQUE(task_id, seq), `rowsWritten === 0`, и событие тихо не появлялось.
+    // MIN такого не допускает: он смотрит на то, что осталось.
+    const lowest = this.#rows(
+      this.#sql.exec("SELECT MIN(seq) AS m FROM events WHERE task_id = ?", taskId),
+    )[0].m;
+    const seq = Math.min(0, lowest === null || lowest === undefined ? 0 : Number(lowest)) - 1;
     const cursor = this.#sql.exec(
       "INSERT INTO events (task_id, seq, ts, source, kind, data) VALUES (?, ?, ?, 'system', ?, ?)",
       taskId,
