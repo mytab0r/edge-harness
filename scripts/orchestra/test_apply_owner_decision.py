@@ -419,3 +419,38 @@ def test_notify_refusal_posts_nothing_if_the_text_would_apply_the_decision(monke
     with pytest.raises(RuntimeError, match="маркер решения"):
         aod.notify_refusal("o/r", 471, 2, _refusal())
     assert posted == []
+
+
+def test_refusal_comment_does_not_claim_a_label_that_is_gone():
+    """Находка ai-ревью PR #1401: единый текст «задача остаётся с меткой
+    waiting:owner» ложен ровно для причины `not_waiting` — там метки как раз
+    НЕТ (снята или задача закрыта), и это и есть причина отказа. След,
+    утверждающий обратное, обманывает следующего агента именно в том случае,
+    ради которого проверка `issue_still_waiting` написана."""
+    gone = aod.refusal_comment(_refusal("not_waiting"), 471, 2)
+    assert "нет (снята или задача закрыта)" in gone, gone
+    assert "остаётся с меткой" not in gone, gone
+
+    still = aod.refusal_comment(_refusal("signature_missing"), 471, 2)
+    assert "остаётся с меткой" in still, still
+
+
+def test_refusal_trace_lookup_reads_the_whole_history_not_one_page(monkeypatch):
+    """Класс #308/#276: эндпоинт комментариев отдаёт СТАРЕЙШИЕ вперёд и
+    `sort`/`direction` молча игнорирует, поэтому на задаче длиннее ста
+    комментариев первая страница свежего маркера не содержит вовсе — дедуп
+    перестал бы находить собственный след и плодил бы копии при каждом
+    повторном нажатии (класс #1100). Мутация «вернуть однократный gh с
+    per_page=100» красит и этот тест, и механическую гвардию
+    scripts/lib/test_pagination_guard.py."""
+    marker = aod.refusal_marker("signature_missing", 471, 2)
+    pages = {"calls": 0}
+
+    def whole_history(repo, issue_number, max_pages=None):
+        pages["calls"] += 1
+        # Маркер лежит в ХВОСТЕ истории — там, где его и оставит свежий отказ.
+        return [{"body": f"шум {i}"} for i in range(150)] + [{"body": marker}]
+
+    monkeypatch.setattr(aod, "all_issue_comments", whole_history)
+    assert aod.refusal_already_reported("o/r", 471, marker) is True
+    assert pages["calls"] == 1
