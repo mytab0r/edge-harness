@@ -244,3 +244,20 @@ def test_unreadable_pool_ack_records_which_failure_it_covers(stand):
 
     assert "пул задач прочитать не удалось" in body, body
     assert "API недоступен, сверил по локальной выписке" in body, body
+
+
+@needs_bash
+def test_explicit_ack_does_not_bypass_a_found_duplicate(stand):
+    """Рамка газа (находка ревью чеклиста fcba42c): --dedup-skip-ack действует
+    ТОЛЬКО на ветку несостоявшейся сверки (dedup_failure). Этот тест краснеет,
+    если рефакторинг поднимет проверку ack выше — и расписка начнёт обходить
+    отказ на НАЙДЕННОМ дубле: тот же байт-в-байт #1385/#1386 вернулся бы уже
+    с распиской в теле. Здесь repo определился, пул прочитан, совпадение
+    найдено, ack ДАН — создание обязано быть отклонено."""
+    result = stand.run("--dedup-skip-ack", "расписка не отменяет найденный дубль",
+                       repo_env="o/r")
+    out = result.stdout + result.stderr
+
+    assert result.returncode != 0, out
+    assert not stand.gh_create_called, (
+        "--dedup-skip-ack провёл найденный дубль сквозь отказ: " + out)
