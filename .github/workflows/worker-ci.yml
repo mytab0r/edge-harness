@@ -50,6 +50,16 @@ jobs:
         run: npm run check
         working-directory: cf-worker
 
+      - name: Типы сгенерированы из текущего wrangler?
+        # Ворота на PR (#1419): worker-configuration.d.ts — генерат, и его
+        # свежесть проверялась ТОЛЬКО в deploy-worker.yml, то есть после
+        # слияния. Bump wrangler от Dependabot (#1357) приехал без
+        # перегенерации, PR слился зелёным, а деплой морды падал на этой самой
+        # проверке девять суток. Тело проверки — тот же файл, что зовёт
+        # deploy-worker.yml, не вторая копия условия.
+        run: npm run types:check
+        working-directory: cf-worker
+
       - name: Typecheck
         run: npm run typecheck
         working-directory: cf-worker

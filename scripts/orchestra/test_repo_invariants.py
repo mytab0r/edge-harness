@@ -227,7 +227,7 @@ class FakeGh:
         "contents/docs/research/data/worktree-cleanup.jsonl": RuntimeError(
             "gh api repos/o/r/contents/...: HTTP 404: Not Found"),
         "issues/120/comments": [],
-        # Запасной маршрут для инварианта 17 (морда dsh-edge, #1041): здоровый
+        # Запасной маршрут для инварианта 17 (морда, #1041): здоровый
         # дефолт — последний прогон deploy-dsh-edge.yml зелёный и уже стоит на
         # main_sha "deadbeef", совпадающем с commits/main — decide_frontend_
         # deploy_stale молчит без единого доп. вызова compare/. Без этого
@@ -238,11 +238,29 @@ class FakeGh:
             {"conclusion": "success", "head_sha": "deadbeef",
              "created_at": "2026-09-01T00:00:00Z", "html_url": "https://example/runs/1"},
         ]},
+        # Тот же здоровый дефолт для ВТОРОГО деплоя морды (#1419, обобщение
+        # #1041): инвариант 17 теперь опрашивает оба workflow, и тест, которому
+        # deploy-worker.yml безразличен, не обязан знать о его существовании.
+        "workflows/deploy-worker.yml/runs": {"workflow_runs": [
+            {"conclusion": "success", "head_sha": "deadbeef",
+             "created_at": "2026-09-01T00:00:00Z", "html_url": "https://example/runs/2"},
+        ]},
         "commits/main": {"sha": "deadbeef"},
     }
 
     def __init__(self, routes):
-        self.routes = {**self._DEFAULT_ROUTES, **routes}
+        # Пользовательские маршруты перебираются ПЕРВЫМИ: дефолт — «запасной
+        # маршрут» по докстрингу класса, а не приоритетный. Прежний порядок
+        # ({**defaults, **routes}) работал, пока дефолтные фрагменты не
+        # пересекались ПОДСТРОКОЙ с пользовательскими: одинаковый ключ
+        # переопределялся значением routes, но частичное пересечение
+        # («workflows/deploy-worker.yml/runs» дефолта против
+        # «…runs?head_sha=…» пользователя) отдавало ответ дефолта, минуя
+        # подставленный (обобщение #1419 добавило второй дефолтный
+        # deploy-маршрут и вскрыло это на тестах merge-reactions).
+        self.routes = dict(routes)
+        for fragment, result in self._DEFAULT_ROUTES.items():
+            self.routes.setdefault(fragment, result)
         self.calls = []
 
     def __call__(self, *args):
@@ -3645,16 +3663,25 @@ def test_frontend_deploy_watched_paths_reads_real_workflow():
     # Одно место правды (AGENTS.md): читает РЕАЛЬНЫЙ deploy-dsh-edge.yml,
     # не пересказ списком-литералом — список путей мог измениться в workflow
     # без синхронной правки инварианта, тест ловит именно это расхождение.
-    paths = ri._frontend_deploy_watched_paths()
+    paths = ri._frontend_deploy_watched_paths("deploy-dsh-edge.yml")
     assert "dsh-edge/**" in paths
     assert ".github/workflows/deploy-dsh-edge.yml" in paths
+
+
+def test_frontend_deploy_watched_paths_reads_real_worker_workflow():
+    # Обобщение #1419: второй деплой морды читает СВОИ пути из СВОЕГО файла —
+    # не наследует dsh-edge/** чужого деплоя.
+    paths = ri._frontend_deploy_watched_paths("deploy-worker.yml")
+    assert "cf-worker/**" in paths
+    assert ".github/workflows/deploy-worker.yml" in paths
+    assert not any(p.startswith("dsh-edge/") for p in paths)
 
 
 def test_frontend_deploy_watched_paths_fail_loud_when_missing(tmp_path):
     workflow = tmp_path / "deploy-dsh-edge.yml"
     workflow.write_text("on:\n  push:\n    branches: [main]\n", encoding="utf-8")
     with pytest.raises(RuntimeError, match="on.push.paths"):
-        ri._frontend_deploy_watched_paths(workflow)
+        ri._frontend_deploy_watched_paths("deploy-dsh-edge.yml", workflow)
 
 
 def test_frontend_deploy_watched_paths_fail_loud_on_unrecognized_glob_form(tmp_path):
@@ -3671,7 +3698,7 @@ def test_frontend_deploy_watched_paths_fail_loud_on_unrecognized_glob_form(tmp_p
         encoding="utf-8",
     )
     with pytest.raises(RuntimeError, match=re.escape("cf-worker/src/*.cjs")):
-        ri._frontend_deploy_watched_paths(workflow)
+        ri._frontend_deploy_watched_paths("deploy-dsh-edge.yml", workflow)
 
 
 def test_frontend_deploy_watched_paths_accepts_exclusion_glob(tmp_path):
@@ -3684,7 +3711,7 @@ def test_frontend_deploy_watched_paths_accepts_exclusion_glob(tmp_path):
         "      - dsh-edge/**\n      - '!dsh-edge/**.md'\n",
         encoding="utf-8",
     )
-    paths = ri._frontend_deploy_watched_paths(workflow)
+    paths = ri._frontend_deploy_watched_paths("deploy-dsh-edge.yml", workflow)
     assert paths == ["dsh-edge/**", "!dsh-edge/**.md"]
 
 
@@ -3698,7 +3725,7 @@ def test_frontend_deploy_watched_paths_missing_pyyaml_is_runtime_error_not_impor
     workflow.write_text("on:\n  push:\n    paths: ['dsh-edge/**']\n", encoding="utf-8")
     monkeypatch.setitem(sys.modules, "yaml", None)  # следующий `import yaml` -> ImportError
     with pytest.raises(RuntimeError, match="PyYAML недоступна"):
-        ri._frontend_deploy_watched_paths(workflow)
+        ri._frontend_deploy_watched_paths("deploy-dsh-edge.yml", workflow)
 
 
 def test_frontend_deploy_watched_paths_missing_workflow_file_is_runtime_error(tmp_path):
@@ -3708,7 +3735,7 @@ def test_frontend_deploy_watched_paths_missing_workflow_file_is_runtime_error(tm
     # continue-on-error пропускал все гвардии после него. Радиус отказа
     # обязан остаться внутри инварианта: «недоступна», не крах модуля.
     with pytest.raises(RuntimeError, match="не найден"):
-        ri._frontend_deploy_watched_paths(tmp_path / "deploy-dsh-edge.yml")
+        ri._frontend_deploy_watched_paths("deploy-dsh-edge.yml", tmp_path / "deploy-dsh-edge.yml")
 
 
 def test_frontend_deploy_watched_paths_broken_yaml_is_runtime_error(tmp_path):
@@ -3717,7 +3744,7 @@ def test_frontend_deploy_watched_paths_broken_yaml_is_runtime_error(tmp_path):
     workflow = tmp_path / "deploy-dsh-edge.yml"
     workflow.write_text("on:\n  push:\n    paths: [dsh-edge/**\n", encoding="utf-8")
     with pytest.raises(RuntimeError, match="YAML не разбирается"):
-        ri._frontend_deploy_watched_paths(workflow)
+        ri._frontend_deploy_watched_paths("deploy-dsh-edge.yml", workflow)
 
 
 def test_decide_frontend_deploy_stale_no_completed_runs_is_unconfirmed_not_healthy():
@@ -3838,10 +3865,64 @@ def test_check_frontend_deploy_stale_healthy_default(monkeypatch):
     fake = FakeGh({})  # дефолт FakeGh уже здоров: last_good_sha == main_sha
     patch_gh(monkeypatch, fake)
     result = ri.check_frontend_deploy_stale(REPO)
-    assert result["status"] == "healthy"
+    # Оба деплоя морды проверены (#1419), оба здоровы.
+    assert result["deploy-dsh-edge.yml"]["status"] == "healthy"
+    assert result["deploy-worker.yml"]["status"] == "healthy"
+    assert result["deploy-worker.yml"]["workflow"] == "deploy-worker.yml"
     # Дешёвый путь: last_good_sha уже совпал с main_sha — ни on.push.paths,
     # ни compare/ не читаются.
     assert not any("compare/" in c for c in fake.calls)
+
+
+def test_check_frontend_deploy_stale_flags_worker_incident_1419(monkeypatch):
+    # Живой случай #1419: deploy-dsh-edge.yml здоров, deploy-worker.yml на
+    # каждом прогоне красен (устаревший генерат) — дифф должен быть виден
+    # ПО КАЖДОМУ деплою отдельно, а не тонуть в общем 💚 другого.
+    fake = FakeGh({
+        # dsh-edge-деплой зелёный на main — не участник этого сценария.
+        "workflows/deploy-dsh-edge.yml/runs": {"workflow_runs": [
+            deploy_run("d848f998", conclusion="success"),
+        ]},
+        "workflows/deploy-worker.yml/runs": {"workflow_runs": [
+            deploy_run("d848f998", conclusion="failure",
+                       created_at="2026-09-13T17:51:33Z", html_url="https://example/runs/1419a"),
+            deploy_run("53135c4e", conclusion="success",
+                       created_at="2026-09-12T00:17:25Z", html_url="https://example/runs/1419b"),
+        ]},
+        "commits/main": {"sha": "d848f998"},
+        "compare/53135c4e...d848f998": {"files": [
+            {"filename": "cf-worker/src/index.ts"},
+        ]},
+    })
+    patch_gh(monkeypatch, fake)
+    result = ri.check_frontend_deploy_stale(REPO)
+    assert result["deploy-dsh-edge.yml"]["status"] == "healthy"  # дефолт FakeGh
+    worker = result["deploy-worker.yml"]
+    assert worker["status"] == "stale"
+    assert worker["workflow"] == "deploy-worker.yml"
+    assert worker["main_deploy_state"] == "failed"
+    assert worker["stale_paths"] == ["cf-worker/src/index.ts"]
+
+
+def test_check_frontend_deploy_stale_compare_shared_between_workflows(monkeypatch):
+    # Оба деплоя стоят на одном последнем зелёном — compare/ делается ОДИН
+    # раз (кэш), а не по копии на workflow.
+    fake = FakeGh({
+        "workflows/deploy-dsh-edge.yml/runs": {"workflow_runs": [
+            deploy_run("oldsha", conclusion="success"),
+        ]},
+        "workflows/deploy-worker.yml/runs": {"workflow_runs": [
+            deploy_run("oldsha", conclusion="success", html_url="https://example/runs/2"),
+        ]},
+        "commits/main": {"sha": "newmain"},
+        "compare/oldsha...newmain": {"files": [{"filename": "docs/INDEX.md"}]},
+    })
+    patch_gh(monkeypatch, fake)
+    result = ri.check_frontend_deploy_stale(REPO)
+    # дрейф вне watched у обоих → оба здоровы
+    assert result["deploy-dsh-edge.yml"]["status"] == "healthy"
+    assert result["deploy-worker.yml"]["status"] == "healthy"
+    assert sum(1 for c in fake.calls if "compare/" in c) == 1
 
 
 def test_check_frontend_deploy_stale_flags_live_incident_via_gh(monkeypatch):
@@ -3852,6 +3933,12 @@ def test_check_frontend_deploy_stale_flags_live_incident_via_gh(monkeypatch):
             deploy_run("dddd94c1", conclusion="success",
                        created_at="2026-09-12T12:21:25Z", html_url="https://example/runs/34693446228"),
         ]},
+        # deploy-worker.yml — дефолтный здоровый маршрут FakeGh стоит на
+        # deadbeef; здесь main = ecf646da, ставим его зелёный на main, чтобы
+        # предмет теста (dsh-edge-инцидент #1041) остался единственным сигналом.
+        "workflows/deploy-worker.yml/runs": {"workflow_runs": [
+            deploy_run("ecf646da", conclusion="success", html_url="https://example/runs/2"),
+        ]},
         "commits/main": {"sha": "ecf646da"},
         "compare/dddd94c1...ecf646da": {"files": [
             {"filename": "dsh-edge/e2e-smoke/browser-walk.mjs"},
@@ -3860,10 +3947,11 @@ def test_check_frontend_deploy_stale_flags_live_incident_via_gh(monkeypatch):
     })
     patch_gh(monkeypatch, fake)
     result = ri.check_frontend_deploy_stale(REPO)
-    assert result["status"] == "stale"
-    assert result["last_deployed_sha"] == "dddd94c1"
-    assert result["stale_paths"] == ["dsh-edge/e2e-smoke/browser-walk.mjs"]
-    assert result["main_deploy_state"] == "failed"
+    assert result["deploy-dsh-edge.yml"]["status"] == "stale"
+    assert result["deploy-dsh-edge.yml"]["last_deployed_sha"] == "dddd94c1"
+    assert result["deploy-dsh-edge.yml"]["stale_paths"] == ["dsh-edge/e2e-smoke/browser-walk.mjs"]
+    assert result["deploy-dsh-edge.yml"]["main_deploy_state"] == "failed"
+    assert result["deploy-worker.yml"]["status"] == "healthy"
 
 
 def test_check_frontend_deploy_stale_compare_ceiling_is_runtime_error_not_false_healthy(monkeypatch):
@@ -3899,6 +3987,11 @@ def test_build_report_flags_frontend_deploy_stale(monkeypatch):
             deploy_run("ecf646da", conclusion="failure"),
             deploy_run("dddd94c1", conclusion="success"),
         ]},
+        # deploy-worker.yml зелёный на main — его 💚 не обязан существовать,
+        # но и мешать чужому тесту не должен.
+        "workflows/deploy-worker.yml/runs": {"workflow_runs": [
+            deploy_run("ecf646da", conclusion="success"),
+        ]},
         "commits/main": {"sha": "ecf646da"},
         "compare/dddd94c1...ecf646da": {"files": [
             {"filename": "dsh-edge/e2e-smoke/browser-walk.mjs"},
@@ -3908,7 +4001,40 @@ def test_build_report_flags_frontend_deploy_stale(monkeypatch):
     monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
     lines, findings = ri.build_report(REPO, now)
     assert findings[17][0]["last_deployed_sha"] == "dddd94c1"
+    assert findings[17][0]["workflow"] == "deploy-dsh-edge.yml"
     assert any("🚨" in line and "[17]" in line and "устарела" in line for line in lines)
+
+
+def test_build_report_flags_deploy_worker_stale_1419(monkeypatch):
+    # Живой случай #1419 — инвариант называет красный deploy-worker.yml:
+    # dsh-edge-деплой здоров, worker-деплой девять суток красен. До
+    # обобщения этот сценарий печатал общий 💚 «морда стоит на main».
+    now = utc(2026, 9, 21, 12, 0)
+    fake = FakeGh({
+        f"issues?state=open&labels={ri.TASK_LABEL}": [],
+        "pulls?state=closed": [],
+        "pulls?state=open": [],
+        "graphql": graphql_pool_page(),
+        "search/issues": {"items": []},
+        f"workflows/{ri.RECURRING_FAILURE_WORKFLOW}/runs": {"workflow_runs": []},
+        "workflows/deploy-dsh-edge.yml/runs": {"workflow_runs": [
+            deploy_run("d848f998", conclusion="success"),
+        ]},
+        "workflows/deploy-worker.yml/runs": {"workflow_runs": [
+            deploy_run("d848f998", conclusion="failure"),
+            deploy_run("53135c4e", conclusion="success"),
+        ]},
+        "commits/main": {"sha": "d848f998"},
+        "compare/53135c4e...d848f998": {"files": [
+            {"filename": "cf-worker/src/index.ts"},
+        ]},
+    })
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(ri, "OPENSPEC_CHANGES", Path("/nonexistent-openspec-changes"))
+    lines, findings = ri.build_report(REPO, now)
+    assert len(findings[17]) == 1
+    assert findings[17][0]["workflow"] == "deploy-worker.yml"
+    assert any("🚨" in line and "[17]" in line and "deploy-worker.yml" in line for line in lines)
 
 
 def test_build_report_frontend_deploy_stale_reports_unavailable_not_healthy(monkeypatch):
@@ -3946,6 +4072,7 @@ def test_run_escalations_posts_frontend_deploy_stale_once(monkeypatch):
     patch_gh(monkeypatch, fake)
     findings = {17: [{
         "status": "stale",
+        "workflow": "deploy-dsh-edge.yml",
         "last_deployed_sha": "dddd94c1", "last_success_at": "2026-09-12T12:21:25Z",
         "last_success_url": "https://example/runs/1", "main_sha": "ecf646da",
         "stale_paths": ["dsh-edge/e2e-smoke/browser-walk.mjs"],
@@ -3961,6 +4088,27 @@ def test_run_escalations_posts_frontend_deploy_stale_once(monkeypatch):
     assert "УПАЛ" in posts[0]
 
 
+def test_run_escalations_each_deploy_workflow_escalates_separately(monkeypatch):
+    # Обобщение #1419: больны ОБА деплоя — два поста, каждый называет СВОЙ
+    # workflow; ключ дедупа несёт имя, чтобы снятие алерта одного деплоя
+    # не заглушило алерт другого.
+    fake = FakeGh({"issues/120/comments": []})
+    patch_gh(monkeypatch, fake)
+    stale = lambda wf: {
+        "status": "stale", "workflow": wf,
+        "last_deployed_sha": "dddd94c1", "last_success_at": "2026-09-12T12:21:25Z",
+        "last_success_url": "https://example/runs/1", "main_sha": "ecf646da",
+        "stale_paths": ["docs/x.md"],
+        "latest_run_url": "https://example/runs/9", "latest_conclusion": "failure",
+        "main_deploy_state": "failed", "main_run_url": "https://example/runs/9",
+    }
+    ri.run_escalations(REPO, {17: [stale("deploy-dsh-edge.yml"), stale("deploy-worker.yml")]})
+    posts = fake.mutating_calls()
+    assert len(posts) == 2
+    assert "deploy-dsh-edge.yml" in posts[0]
+    assert "deploy-worker.yml" in posts[1]
+
+
 def test_run_escalations_frontend_deploy_stale_not_attempted_advises_dispatch(monkeypatch):
     # Ревью PR #1076 (третий проход, блокирующая 2): stale достижим и БЕЗ
     # упавшего прогона на main (деплой не запускался вовсе). Текст обязан
@@ -3970,9 +4118,10 @@ def test_run_escalations_frontend_deploy_stale_not_attempted_advises_dispatch(mo
     patch_gh(monkeypatch, fake)
     findings = {17: [{
         "status": "stale",
+        "workflow": "deploy-worker.yml",
         "last_deployed_sha": "dddd94c1", "last_success_at": "2026-09-12T12:21:25Z",
         "last_success_url": "https://example/runs/1", "main_sha": "ecf646da",
-        "stale_paths": ["dsh-edge/e2e-smoke/browser-walk.mjs"],
+        "stale_paths": ["cf-worker/src/index.ts"],
         "latest_run_url": None, "latest_conclusion": None,
         "main_deploy_state": "not-attempted", "main_run_url": None,
     }]}
@@ -3981,6 +4130,7 @@ def test_run_escalations_frontend_deploy_stale_not_attempted_advises_dispatch(mo
     assert len(posts) == 1
     assert "НЕ ЗАПУСКАЛСЯ" in posts[0]
     assert "workflow_dispatch" in posts[0]
+    assert "deploy-worker.yml" in posts[0]
     # Ложный совет «проверь причину падения» (падения не было) отсутствует —
     # фраза «править причину падения нечего» допустима, а вот императива
     # «проверь причину» быть не должно.
@@ -3994,6 +4144,7 @@ def test_run_escalations_no_success_runs_states_window_fact(monkeypatch):
     patch_gh(monkeypatch, fake)
     findings = {17: [{
         "status": "unconfirmed",
+        "workflow": "deploy-dsh-edge.yml",
         "last_deployed_sha": None, "last_success_at": None, "last_success_url": None,
         "main_sha": "ecf646da", "stale_paths": [],
         "latest_run_url": None, "latest_conclusion": None,
@@ -4024,6 +4175,10 @@ def test_build_report_in_flight_deploy_is_warning_not_false_healthy(monkeypatch)
             deploy_run("oldsha", conclusion="success",
                        created_at="2026-09-12T12:21:25Z", html_url="https://example/runs/1"),
         ]},
+        # Второй деплой морды зелёный на main — не участник сценария (#1419).
+        "workflows/deploy-worker.yml/runs": {"workflow_runs": [
+            deploy_run("newmain", conclusion="success", html_url="https://example/runs/2"),
+        ]},
         "commits/main": {"sha": "newmain"},
         "compare/oldsha...newmain": {"files": [
             {"filename": "dsh-edge/e2e-smoke/browser-walk.mjs"},
@@ -4034,7 +4189,10 @@ def test_build_report_in_flight_deploy_is_warning_not_false_healthy(monkeypatch)
     lines, findings = ri.build_report(REPO, now)
     assert findings[17] == []
     assert any("⚠️" in line and "[17]" in line and "в полёте" in line for line in lines)
-    assert not any("💚 [17]" in line for line in lines)
+    # in-flight НЕ печатается 💚: «деплой ещё идёт» — это «не проверено»,
+    # не «свежо» (AGENTS.md, «Проверяй видимый результат, а не шаг»).
+    # 💚 ВТОРОГО (здорового) деплоя корректен и делу не мешает.
+    assert not any("💚 [17] deploy-dsh-edge.yml" in line for line in lines)
 
 
 # Инвариант 18 (#1101): маркер статуса конвейера в #120 не от токена job'а

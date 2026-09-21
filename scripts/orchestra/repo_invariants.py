@@ -253,11 +253,18 @@ gh() (общий с pulse_guard/scheduler, тот же субпроцесс-ко
       разу за сутки, и единственным видимым признаком была красная вкладка
       Actions: ни issue #1041, ни отчёт этого файла не называли факт «прод-
       морда не соответствует main» явно. Сравнивает head_sha последнего
-      ЗЕЛЁНОГО прогона FRONTEND_DEPLOY_WORKFLOW с текущим main ПО ПУТЯМ,
+      ЗЕЛЁНОГО прогона КАЖДОГО workflow из FRONTEND_DEPLOY_WORKFLOWS с текущим
+      main ПО ПУТЯМ,
       которые тот же workflow объявляет своими (`on.push.paths`, читается из
       файла — одно место правды, не задублирован литералом); нарушение —
       только если main реально ушёл дальше по watched_paths (AGENTS.md,
-      «Алерт не гадает» — дрейф вне них деплою безразличен). Незавершённый
+      «Алерт не гадает» — дрейф вне них деплою безразличен). Обобщение #1419
+      (2026-09-13..21, второй живой случай ТОГО ЖЕ класса в другом workflow):
+      deploy-worker.yml падал на каждом прогоне девять суток (устаревший
+      worker-configuration.d.ts), а инвариант знал только deploy-dsh-edge.yml —
+      с тех пор проверяется каждый деплойный workflow из
+      FRONTEND_DEPLOY_WORKFLOWS, отчёт и эскалация несут имя workflow, ключ
+      дедупа не даёт здоровому деплою заглушить алерт больного. Незавершённый
       прогон текущего main не эскалируется как «устарела» (находка ревью
       PR #1076) — деплой уже в полёте, следующий пульс либо застанет success,
       либо ту же устарелость, если прогон упадёт. Наблюдательный, не в
@@ -2649,12 +2656,18 @@ def fetch_wip_gate_markers(repo: str) -> list[tuple[datetime, str]]:
 # не называли этот факт как «морда молча устарела» — они называли только
 # «прогон упал», что не то же самое (AGENTS.md: «Проверяй видимый результат,
 # а не шаг»). check_frontend_deploy_stale переводит это в явный факт:
-# последний ЗЕЛЁНЫЙ прогон FRONTEND_DEPLOY_WORKFLOW стоит на коммите X, main
+# последний ЗЕЛЁНЫЙ прогон КАЖДОГО деплойного workflow (FRONTEND_DEPLOY_
+# WORKFLOWS) стоит на коммите X, main
 # уехал дальше по путям, которые тот же workflow объявляет своими
 # (`on.push.paths`) — значит отданная прод-морда не соответствует main, и
 # это не наблюдение задним числом, а прямое сравнение sha/файлов.
 
-FRONTEND_DEPLOY_WORKFLOW = "deploy-dsh-edge.yml"
+# Оба деплойных workflow морды (#1419, обобщение #1041): deploy-dsh-edge.yml
+# собирает морду из апстрима dsh-edge, deploy-worker.yml деплоит cf-worker —
+# инцидент #1419 показал, что красный деплой ВТОРОГО из них девять суток не
+# виден никому, потому что инвариант 17 знал только первый. Список, не
+# скаляр: третий деплойный workflow добавляется одной строкой здесь.
+FRONTEND_DEPLOY_WORKFLOWS = ("deploy-dsh-edge.yml", "deploy-worker.yml")
 # Симметрично RECURRING_FAILURE_RUNS_TO_SCAN (инвариант 10) — не нашли
 # успешного прогона даже в этом окне, отчёт обязан сказать именно это
 # («не подтверждено»), а не молчать за меньшим окном.
@@ -2667,13 +2680,16 @@ COMPARE_FILES_CEILING = 300
 
 
 def _frontend_deploy_watched_paths(
+    workflow: str,
     workflow_path: Path | None = None,
 ) -> list[str]:
-    """`on.push.paths` из самого `deploy-dsh-edge.yml` — не задублированы
-    литералом здесь (AGENTS.md, «Одно место правды»): список путей,
-    реально триггерящих деплой, мог измениться в workflow без синхронной
+    """`on.push.paths` из самого файла названного деплойного workflow — не
+    задублированы литералом здесь (AGENTS.md, «Одно место правды»): список
+    путей, реально триггерящих деплой, мог измениться в workflow без синхронной
     правки этого файла, и тогда сравнение сверяло бы не то, что деплой
-    действительно слушает.
+    действительно слушает. `workflow` — имя файла в .github/workflows/
+    (элемент FRONTEND_DEPLOY_WORKFLOWS): каждый деплой читает СВОИ пути,
+    один workflow не наследует пути чужого.
 
     YAML 1.1: незакавыченный ключ `on:` парсится PyYAML как булево `True`,
     не строка `'on'` — тот же гоч, что уже описан и обойдён в
@@ -2712,8 +2728,8 @@ def _frontend_deploy_watched_paths(
     try:
         import yaml
     except ImportError as error:
-        raise RuntimeError(f"PyYAML недоступна: {error} — инвариант 17 не может прочитать {FRONTEND_DEPLOY_WORKFLOW}") from error
-    path = workflow_path or (REPO_ROOT / ".github" / "workflows" / FRONTEND_DEPLOY_WORKFLOW)
+        raise RuntimeError(f"PyYAML недоступна: {error} — инвариант 17 не может прочитать {workflow}") from error
+    path = workflow_path or (REPO_ROOT / ".github" / "workflows" / workflow)
     if not path.exists():
         raise RuntimeError(
             f"{path}: файл не найден — workflow переименован или удалён; инвариант 17 не может "
@@ -2774,7 +2790,8 @@ def decide_frontend_deploy_stale(
     changed_paths: list[str] | None,
     watched_paths: list[str],
 ) -> dict:
-    """Чистая функция (без сети). `runs` — прогоны FRONTEND_DEPLOY_WORKFLOW,
+    """Чистая функция (без сети). `runs` — прогоны ОДНОГО деплойного workflow
+    из FRONTEND_DEPLOY_WORKFLOWS,
     ОТСОРТИРОВАНЫ от новых к старым (контракт вызывающего кода, как и в
     check_recurring_worker_failure). `main_sha` — текущий HEAD main.
     `changed_paths` — список файлов, изменившихся между head_sha последнего
@@ -2904,50 +2921,74 @@ def decide_frontend_deploy_stale(
     }
 
 
+def _compare_changed_paths(repo: str, base_sha: str, main_sha: str) -> list[str]:
+    """Файлы между последним зелёным деплоем и текущим main. Единое место
+    для обоих деплойных workflow (compare между одной парой sha в прогоне
+    делается ОДИН раз, кэш у вызывающего — check_frontend_deploy_stale).
+
+    Находка ревью PR #1076 (чеклист, «страница GitHub API без обхода»,
+    класс #308/#309): compare/ режет массив files на жёстком потолке БЕЗ
+    флага в ответе (по докам REST — до 300; число из документации API,
+    живым прогоном ответа с >300 файлами не подтверждено). Ровно потолочное
+    число файлов = сравнение неполно: окно между последним зелёным деплоем
+    и текущим main копит ВСЕ файлы (включая docs/), а деплойные пути
+    сортируются после — обрезка выбрасывает именно их, и инвариант напечатал
+    бы 💚 при реальном дрейфе. RuntimeError → честное «недоступна»,
+    НЕ «здорово»."""
+    compare = gh(f"repos/{repo}/compare/{base_sha}...{main_sha}")
+    files = (compare or {}).get("files") or []
+    if len(files) >= COMPARE_FILES_CEILING:
+        raise RuntimeError(
+            f"repos/{repo}/compare вернул {len(files)} файлов (>= потолка {COMPARE_FILES_CEILING}) — "
+            "сравнение обрезано API, дрейф по watched-путям не может быть проверен честно"
+        )
+    return [f["filename"] for f in files]
+
+
 def check_frontend_deploy_stale(repo: str) -> dict:
-    """IO-обвязка инварианта 17: последний ЗЕЛЁНЫЙ прогон
-    FRONTEND_DEPLOY_WORKFLOW против текущего main + on.push.paths того же
-    workflow (одно место правды, см. _frontend_deploy_watched_paths). Возвращает
-    decide-словарь ЦЕЛИКОМ (все пять status, не только нарушения) — build_report
-    обязан различить «морда свежая», «деплой main в полёте — не проверено» и
-    нарушение. Сеть недоступна/квота/неполное сравнение — RuntimeError наверх:
-    build_report обязан отличить «не проверено» от «здорово» (тот же приём, что
-    инварианты 12/15)."""
-    runs = pulse_guard.recent_runs(repo, FRONTEND_DEPLOY_WORKFLOW, per_page=FRONTEND_DEPLOY_RUNS_TO_SCAN)
-    runs = sorted(runs, key=lambda r: r.get("created_at") or "", reverse=True)
+    """IO-обвязка инварианта 17: для КАЖДОГО деплойного workflow из
+    FRONTEND_DEPLOY_WORKFLOWS — последний ЗЕЛЁНЫЙ прогон против текущего main
+    + on.push.paths из файла того же workflow (одно место правды, см.
+    _frontend_deploy_watched_paths; #1419: инвариант, знавший только
+    deploy-dsh-edge.yml, девять суток не видел красного deploy-worker.yml).
+    Возвращает dict {workflow: decide-словарь ЦЕЛИКОМ + поле "workflow"} (все
+    пять status, не только нарушения) — build_report обязан различить «морда
+    свежая», «деплой main в полёте — не проверено» и нарушение по каждому
+    деплою отдельно. Сеть недоступна/квота/неполное сравнение — RuntimeError
+    наверх: build_report обязан отличить «не проверено» от «здорово» (тот же
+    приём, что инварианты 12/15)."""
     main_commit = gh(f"repos/{repo}/commits/main") or {}
     main_sha = main_commit.get("sha")
     if not main_sha:
         raise RuntimeError(f"repos/{repo}/commits/main не вернул sha")
 
-    completed = [r for r in runs if r.get("conclusion")]
-    last_good = next((r for r in completed if r.get("conclusion") == "success"), None)
-    changed_paths: list[str] | None = None
-    watched_paths: list[str] = []
-    # Дешёвый путь в здоровом состоянии (тот же принцип, что
-    # check_recurring_worker_failure): last_good_sha уже совпал с main_sha —
-    # ни on.push.paths, ни compare/ не нужны вовсе.
-    if last_good is not None and last_good.get("head_sha") != main_sha:
-        watched_paths = _frontend_deploy_watched_paths()
-        compare = gh(f"repos/{repo}/compare/{last_good['head_sha']}...{main_sha}")
-        files = (compare or {}).get("files") or []
-        # Находка ревью PR #1076 (чеклист, «страница GitHub API без обхода»,
-        # класс #308/#309): compare/ режет массив files на жёстком потолке БЕЗ
-        # флага в ответе (по докам REST — до 300; число из документации API,
-        # живым прогоном ответа с >300 файлами не подтверждено). Ровно
-        # потолочное число файлов = сравнение неполно: окно между последним
-        # зелёным деплоем и текущим main копит ВСЕ файлы (включая docs/),
-        # а dsh-edge/** сортируется после — обрезка выбрасывает именно
-        # деплойные пути, и инвариант напечатал бы 💚 при реальном дрейфе.
-        # RuntimeError → честное «недоступна», НЕ «здорово».
-        if len(files) >= COMPARE_FILES_CEILING:
-            raise RuntimeError(
-                f"repos/{repo}/compare вернул {len(files)} файлов (>= потолка {COMPARE_FILES_CEILING}) — "
-                "сравнение обрезано API, дрейф по watched-путям не может быть проверен честно"
-            )
-        changed_paths = [f["filename"] for f in files]
+    # Кэш compare: у обоих деплоев последний зелёный нередко стоит на одном и
+    # том же коммите main — второму compare/ не нужен, ответ идентичен.
+    compares: dict[tuple[str, str], list[str]] = {}
+    results: dict[str, dict] = {}
+    for workflow in FRONTEND_DEPLOY_WORKFLOWS:
+        runs = pulse_guard.recent_runs(repo, workflow, per_page=FRONTEND_DEPLOY_RUNS_TO_SCAN)
+        runs = sorted(runs, key=lambda r: r.get("created_at") or "", reverse=True)
 
-    return decide_frontend_deploy_stale(runs, main_sha, changed_paths, watched_paths)
+        completed = [r for r in runs if r.get("conclusion")]
+        last_good = next((r for r in completed if r.get("conclusion") == "success"), None)
+        changed_paths: list[str] | None = None
+        watched_paths: list[str] = []
+        # Дешёвый путь в здоровом состоянии (тот же принцип, что
+        # check_recurring_worker_failure): last_good_sha уже совпал с main_sha —
+        # ни on.push.paths, ни compare/ не нужны вовсе.
+        if last_good is not None and last_good.get("head_sha") != main_sha:
+            watched_paths = _frontend_deploy_watched_paths(workflow)
+            pair = (last_good["head_sha"], main_sha)
+            if pair not in compares:
+                compares[pair] = _compare_changed_paths(repo, *pair)
+            changed_paths = compares[pair]
+
+        results[workflow] = {
+            **decide_frontend_deploy_stale(runs, main_sha, changed_paths, watched_paths),
+            "workflow": workflow,
+        }
+    return results
 # Инвариант 18 (#1101, доводка #1074/PR #1077): маркер статуса конвейера в
 # #120 оставлен НЕ токеном job'а — нарушение по автору, не по числу
 # ══════════════════════════════════════════════════════════════════════════
@@ -3550,61 +3591,66 @@ def build_report(repo: str, now: datetime,
         lines.append("💚 [16] заявленное и пересчитанное число PR, ждущих доработки, согласованы")
 
     try:
-        v17 = check_frontend_deploy_stale(repo)
+        v17_all = check_frontend_deploy_stale(repo)
     except RuntimeError as error:
         findings[17] = []
-        lines.append(f"🚨 [17] проверка свежести морды dsh-edge недоступна: {error} — "
+        lines.append(f"🚨 [17] проверка свежести деплоев морды недоступна: {error} — "
                       "инвариант пропущен на этом прогоне (это НЕ «морда свежая»)")
     else:
+        # Обобщение #1419: отчёт печатается ПО КАЖДОМУ деплойному workflow —
+        # красный deploy-worker.yml обязан называться так же громко, как
+        # красный deploy-dsh-edge.yml, а не тонуть в общем 💚 другого деплоя.
+        findings[17] = []
         # Пять различимых состояний decide (ревью PR #1076, третий проход):
         # «здорово», «в полёте — не проверено» и нарушение печатаются
         # РАЗНЫМИ строками — раньше in-flight и дрейф вне watched коллапсировали
         # в общий 💚 «морда стоит на main», т.е. непроверенное печаталось как
         # проверенное (AGENTS.md, «Проверяй видимый результат, а не шаг»).
-        status17 = v17.get("status")
-        if status17 == "stale":
-            findings[17] = [v17]
-            state17 = v17.get("main_deploy_state")
-            where17 = (
-                f"деплой текущего main УПАЛ ({v17.get('main_run_url')})"
-                if state17 == "failed"
-                else "прогонов на текущем main в сканируемом окне нет — деплой не запускался"
-            )
-            lines.append(
-                f"🚨 [17] морда dsh-edge устарела относительно main (#1041): последний "
-                f"зелёный {FRONTEND_DEPLOY_WORKFLOW} — {v17['last_deployed_sha'][:8]} "
-                f"({v17['last_success_at']}), main ушёл дальше по "
-                f"{len(v17['stale_paths'])} затронутым путям деплоя: "
-                f"{', '.join(v17['stale_paths'][:5])}"
-                f"{' …' if len(v17['stale_paths']) > 5 else ''}; {where17} — снимается "
-                f"следующим зелёным прогоном {FRONTEND_DEPLOY_WORKFLOW} на текущем (или более новом) main"
-            )
-        elif status17 in ("unconfirmed", "never-succeeded"):
-            findings[17] = [v17]
-            if v17.get("latest_conclusion"):
+        for v17 in v17_all.values():
+            workflow17 = v17["workflow"]
+            status17 = v17.get("status")
+            if status17 == "stale":
+                findings[17].append(v17)
+                state17 = v17.get("main_deploy_state")
+                where17 = (
+                    f"деплой текущего main УПАЛ ({v17.get('main_run_url')})"
+                    if state17 == "failed"
+                    else "прогонов на текущем main в сканируемом окне нет — деплой не запускался"
+                )
                 lines.append(
-                    f"🚨 [17] {FRONTEND_DEPLOY_WORKFLOW}: ни одного успешного прогона в "
-                    f"последних {FRONTEND_DEPLOY_RUNS_TO_SCAN} — до какого коммита реально "
-                    f"дошла живая морда, неизвестно (последний прогон: "
-                    f"{v17['latest_conclusion']}, {v17['latest_run_url']}) — снимается "
-                    f"следующим зелёным прогоном"
+                    f"🚨 [17] морда устарела относительно main ({workflow17}, "
+                    f"#1041/#1419): последний зелёный — {v17['last_deployed_sha'][:8]} "
+                    f"({v17['last_success_at']}), main ушёл дальше по "
+                    f"{len(v17['stale_paths'])} затронутым путям деплоя: "
+                    f"{', '.join(v17['stale_paths'][:5])}"
+                    f"{' …' if len(v17['stale_paths']) > 5 else ''}; {where17} — снимается "
+                    f"следующим зелёным прогоном {workflow17} на текущем (или более новом) main"
+                )
+            elif status17 in ("unconfirmed", "never-succeeded"):
+                findings[17].append(v17)
+                if v17.get("latest_conclusion"):
+                    lines.append(
+                        f"🚨 [17] {workflow17}: ни одного успешного прогона в "
+                        f"последних {FRONTEND_DEPLOY_RUNS_TO_SCAN} — до какого коммита реально "
+                        f"дошла живая морда, неизвестно (последний прогон: "
+                        f"{v17['latest_conclusion']}, {v17['latest_run_url']}) — снимается "
+                        f"следующим зелёным прогоном"
+                    )
+                else:
+                    lines.append(
+                        f"🚨 [17] {workflow17}: завершённых прогонов в последних "
+                        f"{FRONTEND_DEPLOY_RUNS_TO_SCAN} нет вовсе — до какого коммита реально "
+                        "дошла живая морда, неизвестно — снимается следующим зелёным прогоном"
+                    )
+            elif status17 == "in-flight":
+                lines.append(
+                    f"⚠️ [17] {workflow17}: деплой текущего main ещё в полёте "
+                    f"({v17.get('latest_run_url')}) — свежесть на этом пульсе НЕ проверена; "
+                    "следующий пульс пересчитает"
                 )
             else:
-                lines.append(
-                    f"🚨 [17] {FRONTEND_DEPLOY_WORKFLOW}: завершённых прогонов в последних "
-                    f"{FRONTEND_DEPLOY_RUNS_TO_SCAN} нет вовсе — до какого коммита реально "
-                    "дошла живая морда, неизвестно — снимается следующим зелёным прогоном"
-                )
-        elif status17 == "in-flight":
-            findings[17] = []
-            lines.append(
-                f"⚠️ [17] деплой текущего main ещё в полёте ({v17.get('latest_run_url')}) — "
-                "свежесть витрины на этом пульсе НЕ проверена; следующий пульс пересчитает"
-            )
-        else:
-            findings[17] = []
-            lines.append(f"💚 [17] живая морда dsh-edge стоит на текущем main "
-                          f"(или main не менял пути {FRONTEND_DEPLOY_WORKFLOW})")
+                lines.append(f"💚 [17] {workflow17}: живая морда стоит на текущем main "
+                              f"(или main не менял пути этого деплоя)")
     # Отдельный запрос на всю историю комментариев #120 (не переиспользует
     # wip_markers выше): fetch_wip_gate_markers отдаёт только (время, тело)
     # ДВУХ конкретных маркеров WIP-гейта — инварианту 18 нужны СЫРЫЕ поля
@@ -3961,8 +4007,11 @@ def run_escalations(repo: str, findings: dict[int, list]) -> list[str]:
         result = escalate_if_new(repo, 16, key, text)
         if result:
             lines.append(f"📣 инвариант 16 эскалирован: {result}")
-    if findings.get(17):
-        item = findings[17][0]
+    for item in findings.get(17, []):
+        # Обобщение #1419: нарушений может быть до одного на КАЖДЫЙ деплойный
+        # workflow — эскалируется каждый, ключ несёт имя workflow, чтобы дедуп
+        # одного деплоя не глушил алерт другого.
+        workflow17 = item.get("workflow", "неизвестный workflow")
         # Ревью PR #1076 (третий проход, блокирующая 2): данные (runs)
         # различают «деплой текущего main упал» и «деплой на main не
         # запускался вовсе» — текст эскалации обязан назвать ФАКТ, а не
@@ -3976,7 +4025,7 @@ def run_escalations(repo: str, findings: dict[int, list]) -> list[str]:
             # ФАКТ (новый упавший прогон — новое реальное событие деплоя),
             # как у 18 (вердикт там закреплён докстрингом
             # pipeline_status_marker_key, здесь — этим комментарием).
-            key = f"no-success:{item['latest_run_url']}"
+            key = f"no-success:{workflow17}:{item['latest_run_url']}"
             if item.get("latest_conclusion"):
                 facts17 = (
                     f"Последний прогон: {item['latest_conclusion']}, "
@@ -3985,28 +4034,28 @@ def run_escalations(repo: str, findings: dict[int, list]) -> list[str]:
             else:
                 facts17 = "Завершённых прогонов в сканируемом окне нет вовсе."
             text = (
-                f"🚨 edge-harness: инвариант 17 (морда dsh-edge, #1041) — ни одного "
-                f"успешного прогона {FRONTEND_DEPLOY_WORKFLOW} в последних "
+                f"🚨 edge-harness: инвариант 17 ({workflow17}, морда, #1041/#1419) — ни одного "
+                f"успешного прогона в последних "
                 f"{FRONTEND_DEPLOY_RUNS_TO_SCAN} — до какого коммита реально дошла "
                 f"живая морда, неизвестно. {facts17} Снимается следующим зелёным прогоном."
             )
         else:
-            key = f"{item['last_deployed_sha']}:{item['main_sha']}"
+            key = f"{workflow17}:{item['last_deployed_sha']}:{item['main_sha']}"
             if item.get("main_deploy_state") == "failed":
                 action17 = (
                     f"Деплой текущего main УПАЛ ({item.get('main_run_url')}) — "
-                    f"проверь причину падения (Actions → {FRONTEND_DEPLOY_WORKFLOW})."
+                    f"проверь причину падения (Actions → {workflow17})."
                 )
             else:
                 action17 = (
                     f"Прогонов на текущем main в последних {FRONTEND_DEPLOY_RUNS_TO_SCAN} "
                     "нет вовсе — деплой НЕ ЗАПУСКАЛСЯ (триггер не дошёл или расписание "
                     "молчит): править причину падения нечего, запусти "
-                    f"{FRONTEND_DEPLOY_WORKFLOW} вручную (workflow_dispatch)."
+                    f"{workflow17} вручную (workflow_dispatch)."
                 )
             text = (
-                "🚨 edge-harness: инвариант 17 (морда dsh-edge устарела относительно main, "
-                f"#1041) — последний зелёный {FRONTEND_DEPLOY_WORKFLOW} стоит на "
+                "🚨 edge-harness: инвариант 17 (морда устарела относительно main, "
+                f"{workflow17}, #1041/#1419) — последний зелёный стоит на "
                 f"{item['last_deployed_sha'][:8]} ({item['last_success_at']}), main "
                 f"({item['main_sha'][:8]}) ушёл дальше по {len(item['stale_paths'])} "
                 f"путям деплоя: {', '.join(item['stale_paths'][:10])}"
@@ -4019,7 +4068,7 @@ def run_escalations(repo: str, findings: dict[int, list]) -> list[str]:
             )
         result = escalate_if_new(repo, 17, key, text)
         if result:
-            lines.append(f"📣 инвариант 17 эскалирован: {result}")
+            lines.append(f"📣 инвариант 17 эскалирован ({workflow17}): {result}")
     if findings.get(18):
         v18 = findings[18]
         latest = v18[-1]  # check_* возвращает список, отсортированный по created_at

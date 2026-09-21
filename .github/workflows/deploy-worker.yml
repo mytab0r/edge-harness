@@ -127,26 +127,15 @@ jobs:
           exit $missing
 
       - name: Типы актуальны?
-        # Имена секретов wrangler types читает из .dev.vars (значения не важны,
-        # важны ключи) — иначе генерат молча теряет их и гвардия ложно падает.
-        # Хеш конфигурации wrangler может отличаться от закоммиченного из-за
-        # окружения CI; комментарий про секреты добавляется вручную после генерации.
-        # Сравниваем только существенные различия: Env-интерфейс и runtime types.
+        # Тело проверки — cf-worker/scripts/check-types-fresh.mjs, ОДИН файл на
+        # оба места запуска (#1419): здесь (после слияния, перед деплоем) и в
+        # worker-ci.yml на КАЖДОМ PR. Инцидент #1419 в том и состоял, что
+        # проверка стояла только здесь: PR с устаревшим генератом сливался
+        # зелёным, а деплой падал девять суток подряд, и никто этого не видел.
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          [ -f .dev.vars ] || cp .dev.vars.example .dev.vars
-          npx wrangler types
-          # Фильтруем известные безвредные отличия: строка хеша, комментарий про секреты
-          # (в новых версиях wrangler его нет), заголовки diff (---/+++).
-          # В diff строки начинаются с -/+; паттерны учитывают это.
-          if ! git diff -- worker-configuration.d.ts | grep -vE '^[-+].*hash: |^[-+].*Secrets \(HANDS_TOKEN|^[-+].*they are set via|^--- |^\+\+\+ ' | grep -q '^[+-]'; then
-            exit 0
-          fi
-          git diff -- worker-configuration.d.ts | head -40
-          echo "::error::worker-configuration.d.ts устарел: запусти 'npm run types' и закоммить."
-          exit 1
+        run: npm run types:check
         working-directory: cf-worker
 
       # Гвардия узости GH_DISPATCH_TOKEN (задача #6): морда — поверхность,
