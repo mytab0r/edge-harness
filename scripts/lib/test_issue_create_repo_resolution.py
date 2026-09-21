@@ -124,10 +124,15 @@ class Stand:
         subprocess.run(["git", "remote", "add", "origin", url], cwd=path, check=True)
         return path
 
-    def run(self, *extra, cwd=None, repo_env=None):
+    def run(self, *extra, cwd=None, repo_env=None, pool_readable=True):
         env = dict(self.env)
         if repo_env is not None:
             env["GITHUB_REPOSITORY"] = repo_env
+        if not pool_readable:
+            # Без фикстуры duplicate_guard идёт в настоящий `gh issue list`, а
+            # подменённый gh отвечает ошибкой — НАСТОЯЩИЙ отказ выборки пула,
+            # а не подменённая функция разбора.
+            env.pop("DUPLICATE_GUARD_FIXTURE", None)
         return subprocess.run(
             ["bash", str(SCRIPT), "--title", TITLE_564, "--body", VALID_BODY,
              "--label", "task", *NOT_PROCESS_ACK, *extra],
@@ -208,3 +213,34 @@ def test_the_note_does_not_push_the_dependency_declaration_out_of_the_tail(stand
     tail = "\n".join(body.splitlines()[-5:])
 
     assert "ничем" in tail, body
+
+
+@needs_bash
+def test_unreadable_pool_refuses_too_even_when_the_repo_is_known(stand):
+    """Блокирующая находка ai-ревью PR #1403: класс #1395 жил в ДВУХ ветках
+    одного тормоза, а снят был в одной. Репозиторий определился (штатный путь
+    после этого PR), но сам пул прочитать не удалось — `duplicate_guard.main`
+    возвращал 0 и пустой stdout, `|| true` это проглатывал, и скрипт доходил
+    до `gh issue create` с единственной WARN-строкой. Это ровно измеренный
+    исход #1385/#1386 в среде без API."""
+    result = stand.run(repo_env="o/r", pool_readable=False)
+    out = result.stdout + result.stderr
+
+    assert result.returncode != 0, out
+    assert not stand.gh_create_called, "issue создана, хотя пул прочитать не удалось"
+    assert "НЕЧЕМ" in out, out
+    assert "dedup-skip-ack" in out, "газ в отказе не назван: " + out
+
+
+@needs_bash
+def test_unreadable_pool_ack_records_which_failure_it_covers(stand):
+    """Расписка обязана называть, ЧТО именно не удалось: «репозиторий не
+    определился» и «пул не прочитан» — разные диагнозы и лечатся по-разному.
+    Единый текст «репозиторий не определился» врал бы ровно здесь."""
+    result = stand.run("--dedup-skip-ack", "API недоступен, сверил по локальной выписке",
+                       repo_env="o/r", pool_readable=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    body = stand.created_body.read_text(encoding="utf-8")
+
+    assert "пул задач прочитать не удалось" in body, body
+    assert "API недоступен, сверил по локальной выписке" in body, body
