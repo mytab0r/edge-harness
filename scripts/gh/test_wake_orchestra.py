@@ -21,6 +21,7 @@ import os
 import shutil
 import stat
 import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 SCRIPT = Path(__file__).with_name("wake_orchestra.sh")
@@ -34,15 +35,28 @@ REPO = "o/r"
 BASH = shutil.which("bash") or "bash"
 
 
-def make_fake_gh(tmp_path: Path, *, active_status: str | None, api_fails: bool = False) -> tuple[Path, Path]:
+def make_fake_gh(tmp_path: Path, *, active_status: str | None, api_fails: bool = False,
+                 age_minutes: float = 1.0, with_created_at: bool = True) -> tuple[Path, Path]:
     """Пишет фейковый `gh` в tmp_path/bin/gh. active_status — "in_progress",
     "queued" или None (нет активных прогонов вовсе). api_fails — симулирует
     сетевой/лимитный сбой самого `gh api` (не пустой ответ, а НЕудачу вызова).
+
+    age_minutes — возраст активного прогона: ответ несёт `created_at` в ТОЙ
+    ЖЕ форме, что и настоящий GitHub (ISO-8601 с Z), потому что решение
+    «зомби или вот-вот стартует» принимается именно по нему (#1408).
+    with_created_at=False — ответ БЕЗ этого поля: отдельный исход, а не
+    «возраст ноль».
+
     Возвращает (bin_dir, dispatch_log)."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     dispatch_log = tmp_path / "dispatch_calls.log"
     fake_gh = bin_dir / "gh"
+    created_at = (datetime.now(timezone.utc)
+                  - timedelta(minutes=age_minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # Одинарные фигурные скобки: строка подставляется В f-string ниже уже
+    # готовой, второй раз её не экранируют.
+    run_json = ('{"id": 1, "created_at": "' + created_at + '"}') if with_created_at else '{"id": 1}'
     fake_gh.write_text(f"""#!/usr/bin/env bash
 set -euo pipefail
 if [ "$1" = "api" ]; then
@@ -53,14 +67,14 @@ if [ "$1" = "api" ]; then
   case "$2" in
     *status=in_progress*)
       if [ "{active_status}" = "in_progress" ]; then
-        echo '{{"workflow_runs": [{{"id": 1}}]}}'
+        echo '{{"workflow_runs": [{run_json}]}}'
       else
         echo '{{"workflow_runs": []}}'
       fi
       ;;
     *status=queued*)
       if [ "{active_status}" = "queued" ]; then
-        echo '{{"workflow_runs": [{{"id": 1}}]}}'
+        echo '{{"workflow_runs": [{run_json}]}}'
       else
         echo '{{"workflow_runs": []}}'
       fi
@@ -82,8 +96,10 @@ exit 1
     return bin_dir, dispatch_log
 
 
-def run_wake(tmp_path: Path, *, active_status: str | None, api_fails: bool = False) -> subprocess.CompletedProcess:
-    bin_dir, dispatch_log = make_fake_gh(tmp_path, active_status=active_status, api_fails=api_fails)
+def run_wake(tmp_path: Path, *, active_status: str | None, api_fails: bool = False,
+             age_minutes: float = 1.0, with_created_at: bool = True) -> subprocess.CompletedProcess:
+    bin_dir, dispatch_log = make_fake_gh(tmp_path, active_status=active_status, api_fails=api_fails,
+                                         age_minutes=age_minutes, with_created_at=with_created_at)
     env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"}
     result = subprocess.run(
         [BASH, str(SCRIPT), REPO],
@@ -135,3 +151,57 @@ def test_workflows_call_shared_script_not_raw_dispatch():
             f"{name}: всё ещё зовёт gh workflow run orchestra.yml напрямую — "
             "экономия диспатча (#456) обойдена"
         )
+
+
+# ── возраст активного прогона: зомби не считается активным (#1408) ───────────
+
+
+def test_stale_queued_run_does_not_disable_the_wake(tmp_path):
+    """Главная сцена #1408. Живой случай: прогон 34748469966 висел в queued
+    восемь суток с нулём job'ов, `cancel` и `force-cancel` отвечали HTTP 409
+    — то есть он неубиваем, а каждый вызов будильника уходил в пропуск.
+    Оркестратор остался с одним живым триггером (schedule), который GitHub
+    задерживает и роняет, и слияния простаивали часами при зелёных PR."""
+    result = run_wake(tmp_path, active_status="queued", age_minutes=8 * 24 * 60)
+
+    assert result.returncode == 0, result.stderr
+    assert len(result.dispatch_calls) == 1, "зависший прогон не имеет права съедать диспатч"
+    assert "завис" in result.stdout, result.stdout
+
+
+def test_fresh_queued_run_still_saves_the_dispatch(tmp_path):
+    """Экономия #456 остаётся: прогон, который вот-вот стартует, по-прежнему
+    отменяет диспатч. Без этой проверки лечение #1408 свелось бы к отмене
+    экономии вовсе."""
+    result = run_wake(tmp_path, active_status="queued", age_minutes=2)
+
+    assert result.dispatch_calls == [], "свежая очередь обязана экономить диспатч"
+    assert "уже queued" in result.stdout
+
+
+def test_stale_in_progress_run_does_not_disable_the_wake_either(tmp_path):
+    """Тот же класс на втором статусе: проход оркестратора укладывается в
+    единицы минут, и прогон, «выполняющийся» часами, завис так же надёжно,
+    как зависший в очереди. Чинить один статус из двух значило бы оставить
+    дверь открытой."""
+    result = run_wake(tmp_path, active_status="in_progress", age_minutes=5 * 60)
+
+    assert len(result.dispatch_calls) == 1, result.stdout
+    assert "завис" in result.stdout
+
+
+def test_fresh_in_progress_run_still_saves_the_dispatch(tmp_path):
+    result = run_wake(tmp_path, active_status="in_progress", age_minutes=3)
+
+    assert result.dispatch_calls == [], "идущий прогон обязан экономить диспатч"
+    assert "уже in_progress" in result.stdout
+
+
+def test_answer_without_created_at_is_treated_as_stale_not_as_fresh(tmp_path):
+    """Возраст неизвестен — fail-safe в ту же сторону, что и сбой проверки
+    (ADR 0012): лишний триггер дешевле отключённого будильника. Обратное
+    умолчание («нет поля — значит свежий») вернуло бы класс #1408 через
+    чёрный ход на любом неожиданном ответе API."""
+    result = run_wake(tmp_path, active_status="queued", with_created_at=False)
+
+    assert len(result.dispatch_calls) == 1, result.stdout
