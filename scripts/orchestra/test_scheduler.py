@@ -10574,6 +10574,55 @@ def test_queue_age_ignores_other_labels(monkeypatch):
     assert sch.archive_pending_age_hours("o/r", 7, _NOW) is None
 
 
+def test_unreachable_morde_in_the_catch_up_pass_still_judges_by_age(monkeypatch):
+    """Замечание ревью PR #1424 (некритичное, но дыра настоящая): ветка «морда
+    недоступна» в догоняющем проходе тестом не была прибита вовсе, а она
+    изменена этой задачей — раньше отдавала безусловный hard, теперь судит по
+    ВОЗРАСТУ, как и успешный проход. Живой сценарий ровно такой: квота DO
+    исчерпана, логин в морду не проходит, очередь стоит."""
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_morde_opener", lambda: object())
+    monkeypatch.setattr(sch, "_morde_login", lambda opener: (_ for _ in ()).throw(
+        RuntimeError("логин в морду не удался: HTTP 500")))
+    fresh = (_NOW - timedelta(minutes=20)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    routes = {
+        f"issues?state=all&labels={sch.SESSION_ARCHIVE_PENDING_LABEL.replace(':', '%3A')}":
+            [{"number": 7}],
+    }
+    routes.update([_labeled_route(7, fresh)])
+    monkeypatch.setattr(sch, "gh", FakeGh(routes))
+
+    lines, (hard, since) = sch.retry_pending_session_archives("o/r", _NOW)
+
+    assert hard is False, f"свежая запись при лежащей морде прогон не красит: {lines}"
+    assert since is None, "просроченных записей нет — сравнивать эпизод не с чем"
+    assert any("морда недоступна" in line for line in lines), lines
+
+
+def test_unreachable_morde_with_a_stale_entry_does_redden(monkeypatch):
+    """Вторая половина той же ветки: просроченная запись при лежащей морде —
+    это и есть «сломана причина, а не уборка», и молчать нельзя."""
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_morde_opener", lambda: object())
+    monkeypatch.setattr(sch, "_morde_login", lambda opener: (_ for _ in ()).throw(
+        RuntimeError("логин в морду не удался: HTTP 500")))
+    old = (_NOW - timedelta(hours=sch.SESSION_ARCHIVE_QUEUE_STALE_HOURS + 1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    routes = {
+        f"issues?state=all&labels={sch.SESSION_ARCHIVE_PENDING_LABEL.replace(':', '%3A')}":
+            [{"number": 7}],
+    }
+    routes.update([_labeled_route(7, old)])
+    monkeypatch.setattr(sch, "gh", FakeGh(routes))
+
+    lines, (hard, since) = sch.retry_pending_session_archives("o/r", _NOW)
+
+    assert hard is True, lines
+    assert since is not None, "эпизод обязан знать, с чем сравнивать время алерта"
+    assert any("сломана причина, а не уборка" in line for line in lines), lines
+
+
 def test_stale_episode_is_new_when_no_alert_was_ever_sent(monkeypatch):
     """Первый эпизод обязан заговорить: маркера нет — сигнал уходит."""
     monkeypatch.setattr(sch, "issue_marker_times", lambda repo, issue, marker: [])
