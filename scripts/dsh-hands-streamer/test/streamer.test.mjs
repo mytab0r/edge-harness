@@ -245,6 +245,28 @@ describe('caps payload', () => {
     assert.equal(text, 'ж'.repeat(CAPS.assistantText) + truncationNotice(CAPS.assistantText + 500));
   });
 
+  it('усечение считается для машины, а не только пишется для человека', () => {
+    // Второй носитель факта усечения (находка ai-ревью PR #1405). Счётчик
+    // stats.truncated существовал в объекте с рождения, но не инкрементился
+    // НИКЕМ и всегда был нулевым — stream_note молча утверждал «усечений не
+    // было» на каждом прогоне. С #1404 это перестало быть косметикой: члены
+    // truncated/original_size ушли из data (закрытая схема апстрима их
+    // отвергает), и без счётчика машинно читаемого носителя не осталось бы
+    // вовсе. Проверка ПОВЕДЕНЧЕСКАЯ: читается настоящий файл статистики,
+    // который bash публикует как stream_note, а не исходник index.js.
+    const dir = mkdtempSync(join(tmpdir(), 'hands-streamer-'));
+    const spool = join(dir, 'spool.ndjson');
+    const { listeners } = captureCtx({ HANDS_SPOOL: spool });
+    const onEvent = listeners.get('session/event')[0];
+    const session = new Session(SessionId('session-caps-stats'));
+    onEvent(session, appendAssistant(session, 'ц'.repeat(CAPS.assistantText + 1)));
+    onEvent(session, appendAssistant(session, 'коротко', 1, 2));
+
+    const stats = readStats(spool);
+    assert.equal(stats.accepted, 2);
+    assert.equal(stats.truncated, 1, 'усечено ровно одно событие из двух');
+  });
+
   it('tool/call: arguments усечены до 16000; короткие не трогаются', () => {
     const dir = mkdtempSync(join(tmpdir(), 'hands-streamer-'));
     const spool = join(dir, 'spool.ndjson');

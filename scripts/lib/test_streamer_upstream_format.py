@@ -36,6 +36,7 @@ _console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_u
 # --- конец console_utf8 bootstrap ---
 
 import json
+import os
 import shutil
 import subprocess
 
@@ -51,18 +52,36 @@ VALIDATOR_PKG = "@deepseek-ai/dsh-session-format-v0-to-v1"
 VALIDATOR_VERSION = "0.1.3-alpha.2"
 CACHE = ROOT / "node_modules"  # .gitignore уже несёт node_modules/
 
-needs_node = pytest.mark.skipif(shutil.which("node") is None or shutil.which("npm") is None,
-                                reason="нужны настоящие node и npm")
+# Отсутствие node/npm — пропуск ТОЛЬКО вне CI (находка ai-ревью PR #1405:
+# гвардия, объявившая «падение, не пропуск», не имеет права тихо пропускаться
+# там, где и проверяет). В GitHub Actions node есть всегда — его исчезновение
+# значит сломанную среду, а не «нечем проверить», и тогда это падение.
+_NO_NODE = shutil.which("node") is None or shutil.which("npm") is None
+needs_node = pytest.mark.skipif(
+    _NO_NODE and not os.environ.get("GITHUB_ACTIONS"),
+    reason="нужны настоящие node и npm (вне CI это пропуск, в CI — падение)")
+
+
+def _installed_version() -> str | None:
+    manifest = CACHE / "@deepseek-ai" / "dsh-session-format-v0-to-v1" / "package.json"
+    if not manifest.exists():
+        return None
+    return json.loads(manifest.read_text(encoding="utf-8")).get("version")
 
 
 @pytest.fixture(scope="session")
 def validator():
-    """Ставит пакет апстрима, если его нет. Провал установки — ПАДЕНИЕ, не
-    пропуск: «не смогли проверить» и «проверили, всё хорошо» лечатся
-    по-разному, и тихий skip здесь вернул бы ровно тот класс, который эта
-    гвардия и держит."""
-    target = CACHE / VALIDATOR_PKG.replace("/", "/")
-    if not (CACHE / "@deepseek-ai" / "dsh-session-format-v0-to-v1" / "package.json").exists():
+    """Ставит пакет апстрима, если его нет или версия не та.
+
+    Провал установки — ПАДЕНИЕ, не пропуск: «не смогли проверить» и
+    «проверили, всё хорошо» лечатся по-разному, и тихий skip здесь вернул бы
+    ровно тот класс, который эта гвардия и держит.
+
+    Версия УЖЕ установленного пакета сверяется с пином (находка ai-ревью
+    PR #1405): без сверки гвардия на чужой машине могла бы проверять чужую
+    схему из ранее установленного node_modules и зеленеть по ней — то есть
+    доказывать совместимость не с тем, что стоит в проде."""
+    if _installed_version() != VALIDATOR_VERSION:
         result = subprocess.run(
             ["npm", "install", "--no-save", "--no-package-lock", "--no-audit", "--no-fund", "--silent",
              f"{VALIDATOR_PKG}@{VALIDATOR_VERSION}"],
@@ -70,9 +89,11 @@ def validator():
         assert result.returncode == 0, (
             f"не удалось поставить {VALIDATOR_PKG}@{VALIDATOR_VERSION} — гвардия НЕ выполнена "
             f"(это не «всё хорошо»): {result.stderr[-2000:]}")
-    assert (CACHE / "@deepseek-ai" / "dsh-session-format-v0-to-v1" / "package.json").exists(), (
-        "пакет апстрима не появился после установки")
-    return str(target)
+    actual = _installed_version()
+    assert actual == VALIDATOR_VERSION, (
+        f"установлен {VALIDATOR_PKG}@{actual}, а пин — {VALIDATOR_VERSION}: гвардия проверяла бы "
+        "не ту схему и зеленела по ней")
+    return actual
 
 
 def validate(event_type: str, data: dict) -> tuple[bool, str]:
@@ -176,3 +197,4 @@ console.log(JSON.stringify({{
     assert answer["originalSize"] == 48_500, answer
     assert answer["extraMembers"] == [], (
         f"в data появились лишние члены — ровно класс #1404: {answer['extraMembers']}")
+
