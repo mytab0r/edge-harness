@@ -129,3 +129,31 @@ def test_temporary_body_file_is_removed_even_when_the_call_fails():
         rf.write_registry(boom, "o/r", oversized_registry(), "blobsha", "test")
 
     assert not Path(captured["path"]).exists(), "временный файл тела остался на диске"
+
+
+def test_no_call_site_puts_file_content_into_an_argument_value():
+    """Класс, а не случай: поведенческий тест выше держит ОДИН вызов, а этот —
+    правило для всех. Форма проверки здесь СОЗНАТЕЛЬНО текстовая, и это не
+    рецидив класса #891/#893: проверяется не «работает ли функция», а
+    «существует ли где-нибудь ещё вызов такой формы» — утверждение о
+    множестве мест, которое поведением одного места не проверить. Тот же
+    приём и по той же причине применяет scripts/lib/test_pagination_guard.py.
+
+    Содержимое файла в значении аргумента (`-f` с полем content) — единственный
+    носитель без верхней границы: тела комментариев и issue ограничены самим
+    GitHub 65 536 символами, вдвое ниже потолка одного аргумента, и
+    структурно недосягаемы."""
+    root = Path(__file__).resolve().parent.parent.parent
+    # Паттерн собирается конкатенацией СОЗНАТЕЛЬНО: написанный литералом, он
+    # нашёл бы сам себя в этом файле, и проверка «ноль совпадений» стала бы
+    # невыполнимой — то же и у заявления «## Класс закрыт» в теле PR, которое
+    # гейт ищет по всему дереву.
+    pattern = 'f' + '"content='
+    found = subprocess.run(["git", "grep", "-nE", pattern],
+                           cwd=root, capture_output=True, text=True, encoding="utf-8")
+    assert found.returncode in (0, 1), found.stderr
+    offenders = [line for line in found.stdout.splitlines() if line.strip()]
+
+    assert offenders == [], (
+        "содержимое файла снова уходит значением аргумента — класс #1406 вернулся:\n"
+        + "\n".join(offenders))
