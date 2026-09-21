@@ -207,9 +207,15 @@ def _apply_plan(monkeypatch, tmp_path, server, plan_items):
     def fake_gh(*args):
         joined = " ".join(args)
         if joined.startswith("-X PUT repos/mytab0r/edge-harness/contents/findings.json"):
-            for arg in args:
-                if arg.startswith("content="):
-                    server["content"] = arg[len("content="):]
+            # Тело PUT приезжает ФАЙЛОМ (`gh api --input`), а не аргументом
+            # (#1406): реестр перерос MAX_ARG_STRLEN, и argv-форма роняла
+            # проход оркестратора через OSError E2BIG. Фейк обязан читать
+            # тело оттуда же, откуда его читает настоящий gh, — иначе он
+            # проверял бы форму, которой больше нет.
+            assert "--input" in args, f"тело PUT снова уехало в argv: {joined}"
+            payload = json.loads(
+                Path(args[args.index("--input") + 1]).read_text(encoding="utf-8"))
+            server["content"] = payload["content"]
             puts.append(joined)
             return {"content": {"sha": "newsha"}}
         return {"content": server["content"], "sha": "blobsha"}
