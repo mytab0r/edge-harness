@@ -271,10 +271,30 @@ def test_waiting_owner_alert_text_has_variants_link_and_threshold():
     assert f"{wog.WAITING_OWNER_REESCALATE_HOURS} ч" in text
 
 
-def test_waiting_owner_alert_text_honest_without_variants_block():
+def test_owner_alert_no_longer_has_a_fallback_for_missing_variants():
+    """Контракт изменён СОЗНАТЕЛЬНО (issue #1413). Прежняя редакция имела
+    ветку «блок не размечен» и всё равно просила у владельца «РЕШЕНИЕ:
+    <номер>» — номер из списка, которого нет. Это был дефект, а не запасной
+    путь: за 2026-09-14…21 по шести задачам владельцу ушло по восемь таких
+    напоминаний, и он ответил, что не понимает, кто у кого что запросил."""
     text = wog.waiting_owner_alert_text(
         REPO, issue(370, ISSUE_370_BODY, labels=("task", "waiting:owner")))
-    assert "не размечены машиночитаемым блоком" in text
+
+    assert "не размечены машиночитаемым блоком" not in text, text
+
+
+def test_missing_variants_note_addresses_the_agent_and_names_both_ways_out():
+    """Пометка адресована АГЕНТУ и несёт газ в обе стороны: сформулировать
+    варианты либо снять метку, если решение владельца не нужно вовсе. Без
+    второго выхода это был бы тормоз без газа, только переехавший с владельца
+    на агента."""
+    text = wog.missing_variants_note_text(
+        REPO, issue(370, ISSUE_370_BODY, labels=("task", "waiting:owner")))
+
+    assert text.startswith("🧭 " + wog.MISSING_VARIANTS_MARKER)
+    assert "Варианты владельца" in text
+    assert "сними метку" in text
+    assert "РЕШЕНИЕ: <номер>" not in text, "у агента не просят ответ владельца"
 
 
 def test_resolved_comment_text_names_option_and_label():
@@ -486,10 +506,13 @@ def test_waiting_owner_check_passes_variant_labels_as_escalate_options(monkeypat
     assert calls == [["Секрет с правами администратора", "Оставить ручной инструмент"]]
 
 
-def test_waiting_owner_check_escalates_without_options_when_variants_not_machine_readable(monkeypatch):
-    """Прод-форма #370 (варианты прозой, без «—») — escalate() получает
-    options пустым, поведение остаётся текстовым алертом, как до кнопок."""
+def test_waiting_owner_check_does_not_ping_the_owner_without_variants(monkeypatch):
+    """Главная сцена #1413 на прод-форме #370 (варианты прозой, без «—»):
+    владельцу НЕ уходит ничего, а в задаче появляется пометка агенту.
+    Прежняя редакция здесь слала текстовый алерт «Нужен твой выбор» без
+    выбора."""
     calls = []
+    notes = []
 
     def fake(*args):
         if args[0] == "-X":
@@ -505,13 +528,54 @@ def test_waiting_owner_check_escalates_without_options_when_variants_not_machine
         raise AssertionError(f"неожиданный вызов gh: {args}")
 
     patch_gh(monkeypatch, fake)
-    monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: None)
+    monkeypatch.setattr(pg, "post_issue_comment",
+                        lambda repo, n, text: notes.append((n, text)))
     monkeypatch.setattr(
         wog, "escalate",
         lambda repo, number, text, options=None: calls.append(options) or "мок",
     )
-    wog.waiting_owner_check(REPO, utc(12, 0))
-    assert calls == [[]]
+    lines = wog.waiting_owner_check(REPO, utc(12, 0))
+
+    assert calls == [], "владельцу не сигналим: вопрос не сформулирован"
+    assert len(notes) == 1 and notes[0][0] == 370
+    assert wog.MISSING_VARIANTS_MARKER in notes[0][1]
+    assert any("вариантов нет" in line for line in lines), lines
+
+
+def test_missing_variants_note_is_left_once_not_every_pulse(monkeypatch):
+    """Пометка одноразовая: дедуп по маркеру. Иначе лечение свелось бы к
+    переносу того же ежесуточного шума с владельца на задачу — класс #1100
+    («114 дублей одного маркера»). Громкая строка в прогоне при этом остаётся
+    на каждом проходе: состояние не исчезло, и отчёт не имеет права о нём
+    молчать."""
+    calls, notes = [], []
+
+    def fake(*args):
+        if args[0] == "-X":
+            return None
+        url = args[0]
+        if url.startswith(f"repos/{REPO}/issues?state=open&labels=task"):
+            return []
+        if url.startswith(f"repos/{REPO}/issues?state=open&labels=waiting%3Aowner"):
+            return [{"number": 370, "labels": [{"name": "task"}, {"name": "waiting:owner"}],
+                     "body": ISSUE_370_BODY, "title": "Нужно решение"}]
+        if url == f"repos/{REPO}/issues/370/comments?per_page=100&page=1":
+            return [{"body": f"🧭 {wog.MISSING_VARIANTS_MARKER}\nуже помечено",
+                     "created_at": "2026-09-20T12:00:00Z"}]
+        raise AssertionError(f"неожиданный вызов gh: {args}")
+
+    patch_gh(monkeypatch, fake)
+    monkeypatch.setattr(pg, "post_issue_comment",
+                        lambda repo, n, text: notes.append((n, text)))
+    monkeypatch.setattr(
+        wog, "escalate",
+        lambda repo, number, text, options=None: calls.append(options) or "мок",
+    )
+    lines = wog.waiting_owner_check(REPO, utc(12, 0))
+
+    assert calls == [], "владельцу по-прежнему не сигналим"
+    assert notes == [], "вторая копия пометки не пишется"
+    assert any("вариантов нет" in line for line in lines), lines
 
 
 def test_waiting_owner_check_silent_channel_when_already_escalated_recently(monkeypatch, offline_telegram):

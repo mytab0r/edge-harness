@@ -268,14 +268,48 @@ def escalation_pending(marker_times: list[datetime], now: datetime,
     return age_minutes >= threshold_hours * 60
 
 
+# Маркер пометки «метка стоит, вопрос не сформулирован» (issue #1413). Форма —
+# скобочная строка, как WAITING_OWNER_ESCALATE_MARKER: в прозе так не пишут.
+MISSING_VARIANTS_MARKER = "[варианты не сформулированы]"
+
+
+def missing_variants_note_text(repo: str, issue: dict) -> str:
+    """Пометка АГЕНТУ, не владельцу (issue #1413): метка стоит, а вопроса нет.
+
+    Живой случай, оплативший это разделение: 2026-09-14…21 по шести задачам
+    (#1151, #1080, #1036, #1009, #768, #668) владельцу ушло по восемь
+    напоминаний «Нужен твой выбор: <заголовок>» с припиской «(варианты не
+    размечены машиночитаемым блоком)» и просьбой ответить «РЕШЕНИЕ: <номер>»
+    — номер из списка, которого нет. Кнопок там не бывает по построению:
+    инлайн-клавиатура строится из того же блока (`variant_option_labels` →
+    `escalate(options=...)`), пустой список даёт текстовый алерт. Владелец
+    сформулировал требование к каналу прямо: если от него что-то нужно —
+    приходит сообщение С КНОПКАМИ. Восемь суток приходило обратное."""
+    return (
+        f"🧭 {MISSING_VARIANTS_MARKER}\n"
+        f"Метка `{WAITING_OWNER_LABEL}` стоит, а машиночитаемого блока «## Варианты "
+        "владельца» в теле нет — значит вопрос владельцу НЕ сформулирован, и "
+        "спрашивать его нечем.\n\n"
+        "Это работа агента, а не владельца: сформулируй варианты с ценой каждого и "
+        "размести их блоком (формат — `docs/agents/PROTOCOL.md`, «Решение владельца "
+        "как артефакт»). После этого эскалация уйдёт владельцу с инлайн-кнопками, и "
+        "ответ будет аутентифицированным.\n\n"
+        f"Если решение владельца по задаче не нужно вовсе — сними метку "
+        f"`{WAITING_OWNER_LABEL}`. Пока она стоит, задача не берётся из пула, а "
+        "владельцу при этом ничего не уходит — по построению (issue #1413)."
+    )
+
+
 def waiting_owner_alert_text(repo: str, issue: dict) -> str:
-    """Текст эскалации: одной фразой — что решить, варианты с последствием
-    (или честная оговорка, если блок вариантов не размечен машиночитаемо),
-    как ответить, ссылка на задачу, порог повтора — план, не голая
-    констатация (правило репозитория «алерт обязан кончаться планом»)."""
+    """Текст эскалации ВЛАДЕЛЬЦУ: одной фразой — что решить, варианты с
+    последствием, как ответить, ссылка на задачу, порог повтора — план, не
+    голая констатация (правило репозитория «алерт обязан кончаться планом»).
+
+    Вызывается ТОЛЬКО когда варианты есть (issue #1413). Прежняя редакция
+    имела ветку «блок не размечен» и всё равно просила у владельца номер из
+    несуществующего списка — это и был дефект, а не запасной путь."""
     variants = variant_lines(issue.get("body") or "")
-    variants_block = "\n".join(variants) if variants else (
-        "(варианты не размечены машиночитаемым блоком — смотри тело задачи по ссылке)")
+    variants_block = "\n".join(variants)
     title = (issue.get("title") or "").strip()
     return (
         f"🧭 {WAITING_OWNER_ESCALATE_MARKER}\n"
@@ -410,17 +444,42 @@ def waiting_owner_check(repo: str, now: datetime) -> list[str]:
             lines.append(f"✅ #{number}: решение получено (вариант {option}), метка снята")
             continue
 
+        # Адресат зависит от того, СФОРМУЛИРОВАН ли вопрос (issue #1413).
+        # Вариантов нет — владельцу не уходит НИЧЕГО: спрашивать его нечем, а
+        # «Нужен твой выбор» без выбора — неправда (AGENTS.md, «алерт не
+        # гадает») и тормоз, который владелец физически не может снять.
+        options = variant_option_labels(issue.get("body") or "")
+        if not options:
+            already_noted = any(
+                MISSING_VARIANTS_MARKER in (comment.get("body") or "") for comment in comments)
+            print(f"::warning::#{number}: метка {WAITING_OWNER_LABEL} стоит, а вариантов в "
+                  "теле нет — владельцу не сигналю, вопрос не сформулирован (#1413)",
+                  file=sys.stderr)
+            if already_noted:
+                lines.append(f"🔇 #{number}: метка стоит, вариантов нет — пометка агенту уже "
+                             "оставлена, владельцу не сигналю (#1413)")
+                continue
+            try:
+                pulse_guard.post_issue_comment(repo, number, missing_variants_note_text(repo, issue))
+            except RuntimeError as error:
+                print(f"::warning::пометка о несформулированных вариантах не оставлена "
+                      f"в #{number}: {error}", file=sys.stderr)
+                lines.append(f"🚨 #{number}: метка стоит, вариантов нет, и пометка агенту "
+                             f"НЕ оставлена: {error}")
+                continue
+            lines.append(f"📝 #{number}: метка стоит, вариантов нет — оставлена пометка агенту "
+                         "сформулировать их; владельцу не сигналю (#1413)")
+            continue
+
         marker_times = [
             pulse_guard.parse_time(comment["created_at"]) for comment in comments
             if WAITING_OWNER_ESCALATE_MARKER in (comment.get("body") or "")
         ]
         if escalation_pending(marker_times, now):
             text = waiting_owner_alert_text(repo, issue)
-            # options (#254, PR #486): непустой список — Telegram-сообщение
-            # уходит с инлайн-кнопками (webhook callback_query теперь принят
-            # мордой, PR #486); блока вариантов нет машиночитаемо — escalate()
-            # честно падает обратно на текстовый алерт (см. её докстринг).
-            options = variant_option_labels(issue.get("body") or "")
+            # options (#254, PR #486) непуст по построению: ветка «вариантов
+            # нет» отработала выше и до сюда не доходит. Telegram-сообщение
+            # уходит с инлайн-кнопками (webhook callback_query принят мордой).
             delivered = escalate(repo, issue["number"], text, options=options)
             lines.append(f"🚨 #{issue['number']}: нужен выбор владельца — сигнал ({delivered})")
         else:
