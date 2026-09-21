@@ -194,12 +194,30 @@ def daily_totals_from_rows(rows: list[dict], sum_has: set[str], dim_has: set[str
     peak_label = None
     if peak is not None:
         peak_label = peak["dimensions"].get("datetimeHour") or peak["dimensions"].get("date")
+    # by_hour (#1411): колонка «пиковый час» показывает ОДНО число и прячет
+    # форму суток. Живой случай 2026-09-20/21: 10 589 030 из 10 972 775 и
+    # 12 420 742 из 13 349 765 rows_read пришлись на ОДИН час — то есть это
+    # не фоновая нагрузка, а всплеск, и отличить одно от другого по пиковому
+    # числу нельзя: те же 12 млн, размазанные по суткам, дали бы такой же
+    # суточный итог и совсем другую причину. Час всплеска нужен, чтобы
+    # сопоставить его с прогонами Actions.
+    by_hour: dict[str, dict[str, int]] = {}
+    if "datetimeHour" in dim_has:
+        for r in rows:
+            label = r["dimensions"].get("datetimeHour")
+            if not label:
+                continue
+            entry = by_hour.setdefault(label, {"rows_read": 0, "rows_written": 0})
+            entry["rows_read"] += r["sum"].get("rowsRead", 0) or 0
+            if has_written:
+                entry["rows_written"] += r["sum"].get("rowsWritten", 0) or 0
     return {
         "rows_read": total_read,
         "rows_written": total_written,
         "peak_label": peak_label,
         "peak_rows_read": (peak["sum"].get("rowsRead", 0) or 0) if peak is not None else 0,
         "by_namespace": by_namespace,
+        "by_hour": by_hour,
     }
 
 
@@ -215,6 +233,35 @@ def format_table(days_summary: list[tuple[date, dict]]) -> str:
             f"{day.isoformat()} | {summary['rows_read']:,} | {pct:.1f}% | {peak} | "
             f"{summary['rows_written']:,}"
         )
+    return "\n".join(lines)
+
+
+def format_hourly_breakdown(days_summary: list[tuple[date, dict]]) -> str:
+    """Почасовая раскладка (#1411) — печатается по флагу `--hours`.
+
+    Зачем отдельно от суточной таблицы: суточный итог отвечает «сколько», а
+    форма суток отвечает «что это было». Всплеск в один час и ровная
+    нагрузка дают одинаковое суточное число и разные причины — первая ищется
+    сопоставлением с прогонами Actions в тот же час, вторая нет.
+
+    Часы с нулевым rows_read опускаются: в сутках их большинство, и они
+    только топят строки, ради которых таблицу и смотрят. Если ненулевых
+    часов нет вовсе, так и сказано — пустая таблица и «данных нет» разные
+    вещи (тот же fail loud, что и везде)."""
+    lines = ["час (UTC) | rows_read | % суток | rows_written", "---|---|---|---"]
+    printed = 0
+    for _day, summary in days_summary:
+        day_read = summary["rows_read"]
+        for label in sorted(summary.get("by_hour", {})):
+            entry = summary["by_hour"][label]
+            if not entry["rows_read"]:
+                continue
+            share = entry["rows_read"] / day_read * 100 if day_read else 0.0
+            lines.append(f"{label} | {entry['rows_read']:,} | {share:.1f}% | {entry['rows_written']:,}")
+            printed += 1
+    if not printed:
+        return ("почасовая раскладка: ни одного часа с ненулевым rows_read за снятые сутки "
+                "(это не «данных нет» — данные пришли, чтения в них нулевые)")
     return "\n".join(lines)
 
 
@@ -432,7 +479,7 @@ def today_rows_read(token: str, account_id: str) -> int:
     return summary["rows_read"]
 
 
-def run(token: str, account_id: str, days: int) -> str:
+def run(token: str, account_id: str, days: int, *, hours: bool = False) -> str:
     info = discover_dataset(token)
     dataset = info["dataset"]
     sum_fields = sorted({"rowsRead", "rowsWritten"} & info["sum_field_names"])
@@ -465,6 +512,8 @@ def run(token: str, account_id: str, days: int) -> str:
         "",
         format_namespace_breakdown(per_day),
     ]
+    if hours:
+        lines += ["", format_hourly_breakdown(per_day)]
     return "\n".join(lines)
 
 
@@ -472,6 +521,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--days", type=int, default=7, help="сколько последних суток UTC снять")
+    parser.add_argument("--hours", action="store_true",
+                        help="добавить почасовую раскладку (#1411): суточный итог отвечает "
+                             "«сколько», форма суток — «что это было»")
     args = parser.parse_args()
     if args.days < 1:
         parser.error(f"--days должен быть >= 1, получено {args.days} — "
@@ -485,7 +537,7 @@ def main() -> int:
         return 1
 
     try:
-        report = run(token, account_id, args.days)
+        report = run(token, account_id, args.days, hours=args.hours)
     except RuntimeError as error:
         msg = str(error)
         low = msg.lower()

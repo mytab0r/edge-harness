@@ -9,6 +9,7 @@
 """
 
 import importlib.util
+import pathlib
 from datetime import date
 from pathlib import Path
 
@@ -283,6 +284,79 @@ def test_format_namespace_breakdown_empty_is_explicit():
 
 
 # ── build_data_query: форма запроса зависит от shape, не от догадки ──────────────────
+
+
+# ── почасовая раскладка (#1411): форма суток, а не только пиковое число ──────────
+
+
+def test_daily_totals_keeps_every_hour_not_just_the_peak():
+    """Колонка «пиковый час» прячет форму суток: всплеск в один час и ровная
+    нагрузка дают одинаковый суточный итог и разные причины. Живой случай
+    2026-09-21: 12 420 742 из 13 349 765 rows_read пришлись на один час."""
+    summary = mod.daily_totals_from_rows(ROWS_ONE_DAY, {"rowsRead", "rowsWritten"},
+                                         {"datetimeHour", "namespaceId"})
+    assert summary["by_hour"] == {
+        "2026-09-01T00:00:00Z": {"rows_read": 100, "rows_written": 10},
+        "2026-09-01T13:00:00Z": {"rows_read": 900000, "rows_written": 20},
+        "2026-09-01T14:00:00Z": {"rows_read": 50, "rows_written": 5},
+    }
+
+
+def test_daily_totals_sums_hours_split_across_namespaces():
+    """Один час приходит НЕСКОЛЬКИМИ строками — по строке на namespaceId.
+    Складывать их обязана раскладка, иначе час покажет долю одного
+    пространства и будет молча меньше правды."""
+    rows = [
+        {"dimensions": {"datetimeHour": "2026-09-01T13:00:00Z", "namespaceId": "ns-a"},
+         "sum": {"rowsRead": 700000, "rowsWritten": 7}},
+        {"dimensions": {"datetimeHour": "2026-09-01T13:00:00Z", "namespaceId": "ns-b"},
+         "sum": {"rowsRead": 200000, "rowsWritten": 3}},
+    ]
+    summary = mod.daily_totals_from_rows(rows, {"rowsRead", "rowsWritten"},
+                                         {"datetimeHour", "namespaceId"})
+    assert summary["by_hour"]["2026-09-01T13:00:00Z"] == {"rows_read": 900000, "rows_written": 10}
+
+
+def test_hourly_breakdown_shows_share_of_the_day():
+    """Доля часа в сутках — то самое число, ради которого раскладка и нужна:
+    «97% суточного расхода в одном часе» читается как всплеск сразу, а
+    абсолютное число само по себе — нет."""
+    summary = mod.daily_totals_from_rows(ROWS_ONE_DAY, {"rowsRead", "rowsWritten"},
+                                         {"datetimeHour", "namespaceId"})
+    out = mod.format_hourly_breakdown([(date(2026, 9, 1), summary)])
+    assert "2026-09-01T13:00:00Z" in out
+    assert "900,000" in out
+    assert "100.0%" in out  # 900000 из 900150 округляется до 100.0
+
+
+def test_hourly_breakdown_omits_zero_hours():
+    """Нулевых часов в сутках большинство, и они топят строки, ради которых
+    таблицу смотрят."""
+    summary = mod.daily_totals_from_rows(
+        [{"dimensions": {"datetimeHour": "2026-09-01T03:00:00Z", "namespaceId": "ns-a"},
+          "sum": {"rowsRead": 0, "rowsWritten": 0}},
+         {"dimensions": {"datetimeHour": "2026-09-01T04:00:00Z", "namespaceId": "ns-a"},
+          "sum": {"rowsRead": 5, "rowsWritten": 1}}],
+        {"rowsRead", "rowsWritten"}, {"datetimeHour", "namespaceId"})
+    out = mod.format_hourly_breakdown([(date(2026, 9, 1), summary)])
+    assert "T04:00:00Z" in out
+    assert "T03:00:00Z" not in out
+
+
+def test_hourly_breakdown_empty_is_explicit_not_a_blank_table():
+    """«Данных нет» и «данные есть, чтения нулевые» лечатся по-разному —
+    пустая таблица не имеет права выглядеть как первое."""
+    out = mod.format_hourly_breakdown([(date(2026, 9, 1), {"rows_read": 0, "by_hour": {}})])
+    assert "ни одного часа" in out
+
+
+def test_hours_flag_is_off_by_default_so_the_deploy_job_output_is_unchanged():
+    """Гвардия обратной совместимости: job `measure-rows-read` в
+    deploy-worker.yml зовёт скрипт БЕЗ флага, и его вывод меняться не должен —
+    иначе правка инструмента молча переписывает прежние замеры в истории."""
+    source = (pathlib.Path(mod.__file__).read_text(encoding="utf-8"))
+    assert 'action="store_true"' in source, "флаг обязан быть опциональным, не позиционным"
+    assert "hours: bool = False" in source, "умолчание обязано быть «не печатать»"
 
 
 def test_build_data_query_range_shape_uses_date_geq_leq():
