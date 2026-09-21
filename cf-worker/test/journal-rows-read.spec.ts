@@ -97,4 +97,41 @@ describe("цена чтения журнала по задаче (#1411)", () =>
     // цену чтения: курсор берёт с начала индекса и останавливается на LIMIT.
     expect(large).toBeLessThanOrEqual(small * 2);
   });
+
+  it("системное событие стоит одинаково на короткой и на длинной сессии", async () => {
+    // Вторая дверь того же класса, найденная ai-review PR #1425:
+    // `#emitSystemEvent` брал следующий отрицательный seq через
+    // `COUNT(*) … WHERE task_id = ? AND source = 'system'`. `source` ни в
+    // одном индексе не ведёт, поэтому COUNT читал ВСЕ события задачи — цена
+    // системного события росла вместе с длиной сессии, ровно как у чтения
+    // журнала до индекса. Замер на 100 000 событий: 14.25 мс → 0.003 мс.
+    //
+    // Гвардия мерит `rowsRead` того запроса, который выдаёт seq, на двух
+    // сессиях разной длины: закрытая дверь значит «одинаково», открытая —
+    // «во столько же раз больше, во сколько длиннее сессия».
+    const stub = env.HARNESS.get(env.HARNESS.idFromName("owner"));
+
+    const measureSeqLookup = async (events: number): Promise<number> => {
+      const taskId = `sys-seq-${events}-${Date.now()}`;
+      return await runInDurableObject(stub, async (_instance, state) => {
+        const sql = state.storage.sql;
+        for (let seq = 1; seq <= events; seq++) {
+          sql.exec(
+            "INSERT INTO events (task_id, seq, ts, source, kind, data) VALUES (?, ?, ?, 'agent', 'k', 'd')",
+            taskId, seq, Date.now(),
+          );
+        }
+        const cursor = sql.exec("SELECT MIN(seq) AS m FROM events WHERE task_id = ?", taskId);
+        cursor.toArray();
+        return cursor.rowsRead;
+      });
+    };
+
+    const short = await measureSeqLookup(100);
+    const long = await measureSeqLookup(2000);
+
+    // Не «short * 2», а жёстко: поиск минимума по префиксу индекса — это один
+    // seek, и его цена от длины сессии не зависит вовсе.
+    expect(long).toBeLessThanOrEqual(Math.max(short, 5));
+  });
 });

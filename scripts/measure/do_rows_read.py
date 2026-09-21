@@ -195,8 +195,12 @@ def daily_totals_from_rows(rows: list[dict], sum_has: set[str], dim_has: set[str
     if peak is not None:
         peak_label = peak["dimensions"].get("datetimeHour") or peak["dimensions"].get("date")
     # by_hour (#1411): колонка «пиковый час» показывает ОДНО число и прячет
-    # форму суток. Живой случай 2026-09-20/21: 10 589 030 из 10 972 775 и
-    # 12 420 742 из 13 349 765 rows_read пришлись на ОДИН час — то есть это
+    # форму суток. Живой случай 2026-09-20/21 (снимок run 35634931785, тот же,
+    # что в docs/research/20-cloudflare-free.md — числа одного замера обязаны
+    # совпадать между кодом и исследованием; расхождение нашло ai-review
+    # PR #1425, и причина была в том, что я взял их из ДВУХ разных прогонов по
+    # ещё накапливающимся суткам): 10 589 688 из 10 972 775 и
+    # 12 436 246 из 13 349 765 rows_read пришлись на ОДИН час — то есть это
     # не фоновая нагрузка, а всплеск, и отличить одно от другого по пиковому
     # числу нельзя: те же 12 млн, размазанные по суткам, дали бы такой же
     # суточный итог и совсем другую причину. Час всплеска нужен, чтобы
@@ -517,13 +521,23 @@ def run(token: str, account_id: str, days: int, *, hours: bool = False) -> str:
     return "\n".join(lines)
 
 
-def main() -> int:
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Парсер вынесен из main() (#1411, находка ai-review PR #1425), чтобы
+    умолчания проверялись ПОВЕДЕНИЕМ, а не чтением литералов в исходнике:
+    прежняя гвардия искала строки `action="store_true"` и `hours: bool = False`
+    и зеленела, противореча собственному диффу. Умолчание — это поведение
+    argparse, и именно его сломает следующая правка."""
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--days", type=int, default=7, help="сколько последних суток UTC снять")
     parser.add_argument("--hours", action="store_true",
                         help="добавить почасовую раскладку (#1411): суточный итог отвечает "
                              "«сколько», форма суток — «что это было»")
+    return parser
+
+
+def main() -> int:
+    parser = build_arg_parser()
     args = parser.parse_args()
     if args.days < 1:
         parser.error(f"--days должен быть >= 1, получено {args.days} — "

@@ -2110,10 +2110,26 @@ export class Harness extends DurableObject<Env> {
    */
   #emitSystemEvent(taskId: string, kind: string, data: unknown): void {
     const now = Date.now();
-    const previous = Number(
-      this.#rows(this.#sql.exec("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND source = 'system'", taskId))[0].n,
-    );
-    const seq = -(previous + 1);
+    // #1411, вторая дверь того же класса (находка ai-review PR #1425): прежде
+    // здесь стоял `SELECT COUNT(*) … WHERE task_id = ? AND source = 'system'` —
+    // `source` ни в одном индексе не ведёт, поэтому COUNT читал ВСЕ события
+    // задачи, и цена системного события росла вместе с длиной сессии. Замер на
+    // 100 000 событий одной задачи: 14.25 мс → 0.003 мс.
+    //
+    // MIN(seq) по префиксу UNIQUE(task_id, seq) — один seek по покрывающему
+    // индексу, без нового индекса (важно: rows_written тоже лимитирован).
+    // Системные seq отрицательные, job'овые положительные, поэтому минимум по
+    // задаче и есть «самый последний системный», а `Math.min(0, …)` держит
+    // случай «системных ещё не было» (минимум положительный или строк нет).
+    //
+    // Заодно снят латентный дефект счётчика: ретеншн удаляет старые события, и
+    // COUNT после удаления давал УЖЕ ЗАНЯТЫЙ seq — INSERT падал на
+    // UNIQUE(task_id, seq), `rowsWritten === 0`, и событие тихо не появлялось.
+    // MIN такого не допускает: он смотрит на то, что осталось.
+    const lowest = this.#rows(
+      this.#sql.exec("SELECT MIN(seq) AS m FROM events WHERE task_id = ?", taskId),
+    )[0].m;
+    const seq = Math.min(0, lowest === null || lowest === undefined ? 0 : Number(lowest)) - 1;
     const cursor = this.#sql.exec(
       "INSERT INTO events (task_id, seq, ts, source, kind, data) VALUES (?, ?, ?, 'system', ?, ?)",
       taskId,

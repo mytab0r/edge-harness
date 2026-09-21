@@ -292,7 +292,7 @@ def test_format_namespace_breakdown_empty_is_explicit():
 def test_daily_totals_keeps_every_hour_not_just_the_peak():
     """Колонка «пиковый час» прячет форму суток: всплеск в один час и ровная
     нагрузка дают одинаковый суточный итог и разные причины. Живой случай
-    2026-09-21: 12 420 742 из 13 349 765 rows_read пришлись на один час."""
+    2026-09-21: 12 436 246 из 13 349 765 rows_read пришлись на один час."""
     summary = mod.daily_totals_from_rows(ROWS_ONE_DAY, {"rowsRead", "rowsWritten"},
                                          {"datetimeHour", "namespaceId"})
     assert summary["by_hour"] == {
@@ -350,13 +350,27 @@ def test_hourly_breakdown_empty_is_explicit_not_a_blank_table():
     assert "ни одного часа" in out
 
 
-def test_hours_flag_is_off_by_default_so_the_deploy_job_output_is_unchanged():
-    """Гвардия обратной совместимости: job `measure-rows-read` в
-    deploy-worker.yml зовёт скрипт БЕЗ флага, и его вывод меняться не должен —
-    иначе правка инструмента молча переписывает прежние замеры в истории."""
-    source = (pathlib.Path(mod.__file__).read_text(encoding="utf-8"))
-    assert 'action="store_true"' in source, "флаг обязан быть опциональным, не позиционным"
-    assert "hours: bool = False" in source, "умолчание обязано быть «не печатать»"
+def test_hours_is_opt_in_so_callers_without_the_flag_keep_the_old_output():
+    """Флаг опционален, а умолчание — «не печатать».
+
+    Прежняя редакция этого теста (найдено ai-review PR #1425) называлась
+    `..._so_the_deploy_job_output_is_unchanged` и утверждала в докстринге, что
+    job `measure-rows-read` зовёт скрипт БЕЗ флага — а тот же PR как раз
+    добавил ему `--hours`. Заявление было шире механизма: гвардилось не
+    поведение job'а и даже не workflow-файл, а два литерала в исходнике, и
+    тест зеленел, противореча собственному диффу.
+
+    Что здесь реально сторожится: опциональность. Вызывающий, который флага не
+    передал, получает тот же вывод, что до #1411 — значит прежние замеры в
+    истории (`docs/research/20-cloudflare-free.md`) остаются сопоставимыми.
+    Что job теперь зовёт с `--hours` — осознанная часть замысла #1411, а не
+    нарушение: разовый диагностический прогон существует ради формы суток.
+
+    Проверяется вызовом парсера, а не чтением исходника: умолчание — это
+    поведение `argparse`, и именно его сломает следующая правка."""
+    parser = mod.build_arg_parser()
+    assert parser.parse_args([]).hours is False, "умолчание обязано быть «не печатать»"
+    assert parser.parse_args(["--hours"]).hours is True, "флаг обязан включать раскладку"
 
 
 def test_build_data_query_range_shape_uses_date_geq_leq():
