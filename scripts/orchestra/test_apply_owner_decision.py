@@ -422,17 +422,29 @@ def test_notify_refusal_posts_nothing_if_the_text_would_apply_the_decision(monke
 
 
 def test_refusal_comment_does_not_claim_a_label_that_is_gone():
-    """Находка ai-ревью PR #1401: единый текст «задача остаётся с меткой
-    waiting:owner» ложен ровно для причины `not_waiting` — там метки как раз
-    НЕТ (снята или задача закрыта), и это и есть причина отказа. След,
-    утверждающий обратное, обманывает следующего агента именно в том случае,
-    ради которого проверка `issue_still_waiting` написана."""
+    """Находки ai-ревью PR #1401 (оба круга): строку про метку `waiting:owner`
+    можно писать ТОЛЬКО причиной `not_waiting` — она единственная отказывает
+    ПОСЛЕ обращения к задаче, там отсутствие метки ПРОВЕРЕНО
+    (`issue_still_waiting` вернул False) и является самой причиной отказа.
+    Для `not_waiting` единый текст «задача остаётся с меткой» был ложен ровно
+    в том случае, ради которого проверка написана (первый круг ревью). Три
+    причины подписи отказывают ДО обращения к API за состоянием (второй круг
+    ревью), а живой случай реален: решение уже записано комментарием
+    «РЕШЕНИЕ: N», гвардия на пульсе сняла метку, владелец нажал кнопку —
+    отказ по подписи приходит на задачу УЖЕ БЕЗ метки, и «остаётся с меткой»
+    было бы утверждением без проверки. Мутация «вернуть безусловную строку в
+    любую из ветвей» красит этот тест."""
     gone = aod.refusal_comment(_refusal("not_waiting"), 471, 2)
     assert "нет (снята или задача закрыта)" in gone, gone
     assert "остаётся с меткой" not in gone, gone
 
-    still = aod.refusal_comment(_refusal("signature_missing"), 471, 2)
-    assert "остаётся с меткой" in still, still
+    for reason in ("github_secret_missing", "signature_missing", "signature_mismatch"):
+        text = aod.refusal_comment(_refusal(reason), 471, 2)
+        assert "остаётся с меткой" not in text, (reason, text)
+        # Job называет ровно то, что знает: эту метку этот отказ не трогал,
+        # а где смотреть актуальное состояние — названо.
+        assert "не снимал и не ставил" in text, (reason, text)
+        assert "актуальное состояние видно в метках задачи" in text, (reason, text)
 
 
 def test_refusal_trace_lookup_reads_the_whole_history_not_one_page(monkeypatch):
