@@ -9,6 +9,7 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "types": "wrangler types",
+    "types:check": "node scripts/check-types-fresh.mjs",
     "check": "node scripts/check-frontend-contract.mjs",
     "docs": "node scripts/generate-api-docs.mjs",
     "canary": "node scripts/canary-ui.mjs"
