@@ -841,6 +841,33 @@ jobs:
           rpc workspace.archiveSession '{"type":"client-request","rpcId":"canary","method":"workspace.archiveSession","payload":{"sessionId":"'"$sid"'"}}' >/dev/null
           echo "✅ ingest-шов #119 жив: сессия $sid создана, наполнена, заархивирована"
 
+      # Состав карантина в лог деплоя (#1379). Патч 0007 (#1376) изолирует
+      # сессию, которую этот билд не может перевести в текущий формат: морда
+      # стартует, а запись остаётся как есть. Но узнать СОСТАВ карантина было
+      # неоткуда: console.error уходит в Workers-логи (Logpush не подключён),
+      # таблица живёт внутри Durable Object. Патч 0008 открывает состав
+      # маршрутом, этот шаг его читает и печатает.
+      #
+      # Шаг НЕ красит деплой: карантин — штатное состояние, а не поломка
+      # (иначе одна старая запись валила бы каждый деплой, ровно тот исход,
+      # против которого #1376 и делался). Красит он только невозможность
+      # ПОСМОТРЕТЬ: непрочитанный маршрут — это «не знаю», а «не знаю» не
+      # имеет права выглядеть как «карантин пуст» (AGENTS.md, fail loud).
+      - name: Состав карантина сессий (#1379)
+        if: success() && steps.route.outputs.plugins != '0'
+        env:
+          DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/scripts/lib/canary_http.sh"
+          source "$GITHUB_WORKSPACE/scripts/lib/quarantine_report.sh"
+          base="https://dsh-edge.mytab0r.workers.dev"
+          jar="$RUNNER_TEMP/dsh-edge-quarantine.cookies"
+          code=$(canary_probe "Логин для чтения карантина #1379" 303 -c "$jar" \
+            -X POST "$base/api/auth/login" --data-urlencode "accessKey=$DSH_EDGE_ACCESS_KEY")
+          [ "$code" = "303" ] || { echo "::error::Логин для чтения карантина не удался (HTTP $code) — состав карантина НЕ прочитан, это не «карантин пуст»"; exit 1; }
+          quarantine_report "$base" "$jar"
+
       # Канарейка реестра провайдеров (#378), только чтение: деплой обязан не
       # просто поднять морду, а смонтировать namespace llm-pi-ai и directory
       # готовых маршрутов — без них кнопки Settings → Models мертвы, и это
