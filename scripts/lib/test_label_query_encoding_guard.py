@@ -81,19 +81,44 @@ def _production_scripts() -> list[Path]:
 # Расширение предусмотрено докстрингом этого файла («третья форма обязана
 # получить собственный признак здесь же, не тихо остаться дырой»): вторая
 # форма пришла с #1432 и получила его.
-_ENCODERS = ("label_query_value", "label_search_value")
+# Кодировщик ПРИВЯЗАН к поверхности, а не «любой из двух» (находка ai-review
+# PR #1435, и это не педантизм). Замер 2026-09-22
+# (docs/research/21-github-actions.md) показал, что формы не просто разные —
+# каждая ЛОМАЕТ чужую поверхность:
+#   `issues?labels=<метка>` — значение query-ПАРАМЕТРА: без `%3A` серверный
+#       фильтр отдаёт пустой список (класс #938);
+#   `search/issues?q=label:<метка>` — часть ВЫРАЖЕНИЯ поиска: `%3A` внутри
+#       значения движок НЕ декодирует, `label:area%3Aprocess` → 0 совпадений
+#       против 343 у сырого двоеточия и кавычек.
+# Пока гвардия принимала «любой из двух» на обеих поверхностях, форма
+# `q=label:{label_query_value(x)}` — та самая, молча пустая — проходила её
+# зелёной, и старая проба этого файла её же канонизировала.
+_ENCODER_BY_SUFFIX = {
+    "&labels=": "label_query_value",
+    "?labels=": "label_query_value",
+    "label:": "label_search_value",
+}
 
 
-def _is_label_query_value_call(expr: ast.expr) -> bool:
-    """True — выражение внутри `{...}` это вызов одного из кодировщиков
-    метки, голый или через атрибут (`review_labels.label_query_value(...)`)."""
+def _required_encoder(constant: str) -> str | None:
+    """Какой кодировщик обязан стоять сразу за этой константой — по её
+    суффиксу. None — константа не является позицией значения метки."""
+    for suffix, encoder in _ENCODER_BY_SUFFIX.items():
+        if constant.endswith(suffix):
+            return encoder
+    return None
+
+
+def _is_encoder_call(expr: ast.expr, expected: str) -> bool:
+    """True — выражение внутри `{...}` это вызов ИМЕННО того кодировщика,
+    которого требует поверхность, голый или через атрибут."""
     if not isinstance(expr, ast.Call):
         return False
     func = expr.func
     if isinstance(func, ast.Attribute):
-        return func.attr in _ENCODERS
+        return func.attr == expected
     if isinstance(func, ast.Name):
-        return func.id in _ENCODERS
+        return func.id == expected
     return False
 
 
@@ -112,8 +137,8 @@ def _unencoded_labels_offenders(path: Path) -> list[str]:
         for i, part in enumerate(values):
             if not (isinstance(part, ast.Constant) and isinstance(part.value, str)):
                 continue
-            if not (part.value.endswith("&labels=") or part.value.endswith("?labels=")
-                    or part.value.endswith("label:")):
+            expected = _required_encoder(part.value)
+            if expected is None:
                 continue
             # 'labels=' / 'label:' — последний кусок f-строки целиком
             # (константа без подстановки следом, например голый литерал
@@ -123,8 +148,9 @@ def _unencoded_labels_offenders(path: Path) -> list[str]:
             nxt = values[i + 1]
             if not isinstance(nxt, ast.FormattedValue):
                 continue
-            if not _is_label_query_value_call(nxt.value):
-                offenders.append(f"{path.relative_to(REPO_ROOT)}:{part.lineno}")
+            if not _is_encoder_call(nxt.value, expected):
+                offenders.append(f"{path.relative_to(REPO_ROOT)}:{part.lineno} "
+                                 f"(нужен {expected})")
     return offenders
 
 
@@ -167,10 +193,19 @@ def test_unencoded_offenders_flags_q_label_colon_form():
         offenders = _unencoded_labels_offenders(probe)
     finally:
         probe.unlink()
-    assert offenders == [f"{probe.relative_to(REPO_ROOT)}:2"]
+    # Сообщение несёт и адрес, и НУЖНЫЙ кодировщик: без второго автор
+    # правит наугад — на этой поверхности их два, и они не заменяют друг друга.
+    assert len(offenders) == 1, offenders
+    assert offenders[0].startswith(f"{probe.relative_to(REPO_ROOT)}:2")
+    assert "label_search_value" in offenders[0], offenders
 
 
-def test_unencoded_offenders_accepts_q_label_colon_form_when_encoded():
+def test_percent_encoder_on_the_search_surface_is_an_offender():
+    """Перевёрнутая проба (находка ai-review PR #1435). Раньше этот тест
+    зеленил форму `q=label:{label_query_value(x)}` — ту самую, которую замер
+    2026-09-22 объявил молча пустой (0 совпадений против 343). Зелёный тест
+    канонизировал дефект: первый же скопированный отсюда вызов ушёл бы в
+    прод с пустым списком и зелёным CI."""
     probe = REPO_ROOT / "scripts" / "lib" / "_probe_q_label_colon_encoded.py"
     probe.write_text(
         'from review_labels import label_query_value\n'
@@ -182,7 +217,24 @@ def test_unencoded_offenders_accepts_q_label_colon_form_when_encoded():
         offenders = _unencoded_labels_offenders(probe)
     finally:
         probe.unlink()
-    assert offenders == []
+    assert offenders and "label_search_value" in offenders[0], offenders
+
+
+def test_search_encoder_on_the_query_parameter_surface_is_an_offender():
+    """Симметрия, без которой привязка половинчатая: кавычки поиска в
+    `labels=` дали бы `%22` в значении и тот же молчаливый пустой список."""
+    probe = REPO_ROOT / "scripts" / "lib" / "_probe_labels_param_search_encoded.py"
+    probe.write_text(
+        'from review_labels import label_search_value\n'
+        'def f(repo, label):\n'
+        '    return f"repos/{repo}/issues?labels={label_search_value(label)}"\n',
+        encoding="utf-8",
+    )
+    try:
+        offenders = _unencoded_labels_offenders(probe)
+    finally:
+        probe.unlink()
+    assert offenders and "label_query_value" in offenders[0], offenders
 
 
 # ── Поведенческий тест на прод-форме значения ────────────────────────────────
@@ -268,4 +320,8 @@ def test_search_qualifier_without_any_encoder_still_reddens():
         offenders = _unencoded_labels_offenders(probe)
     finally:
         probe.unlink()
-    assert offenders == [f"{probe.relative_to(REPO_ROOT)}:2"]
+    # Сообщение несёт и адрес, и НУЖНЫЙ кодировщик: без второго автор
+    # правит наугад — на этой поверхности их два, и они не заменяют друг друга.
+    assert len(offenders) == 1, offenders
+    assert offenders[0].startswith(f"{probe.relative_to(REPO_ROOT)}:2")
+    assert "label_search_value" in offenders[0], offenders

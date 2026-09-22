@@ -10736,13 +10736,23 @@ def test_continuing_stale_episode_neither_alerts_nor_reddens(monkeypatch):
 # механизм не касался по построению.
 
 
-def _sweep_stand(monkeypatch, *, found, label_calls, fail_on=()):
+def _sweep_stand(monkeypatch, *, found, label_calls, fail_on=(), queue_depth=0,
+                 search_error=None, depth_error=None):
+    """Стенд свипа. `queue_depth` — сколько записей УЖЕ лежит в очереди:
+    свип обязан сначала спросить глубину и ставить только до потолка
+    (газ #1435), поэтому маршрут `issues?labels=` здесь обязателен."""
     monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
     monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
 
     def fake_gh(*args):
         joined = " ".join(args)
+        if "issues?state=all" in joined and "labels=" in joined:
+            if depth_error:
+                raise RuntimeError(depth_error)
+            return [{"number": 10_000 + i} for i in range(queue_depth)]
         if joined.startswith("search/issues"):
+            if search_error:
+                raise RuntimeError(search_error)
             return {"items": [{"number": n} for n in found]}
         if joined.startswith("-X POST") and "labels" in joined:
             number = int(joined.split("/issues/")[1].split("/")[0])
@@ -10806,6 +10816,9 @@ def test_sweep_query_excludes_both_labels(monkeypatch):
 
     def fake_gh(*args):
         joined = " ".join(args)
+        # Глубина очереди — первый вызов свипа (газ #1435): пустая очередь.
+        if "issues?state=all" in joined and "labels=" in joined:
+            return []
         if joined.startswith("search/issues"):
             seen["q"] = urllib.parse.unquote(joined)
             return {"items": []}
@@ -11046,3 +11059,63 @@ def test_main_reddens_when_the_catch_up_pass_itself_is_broken(monkeypatch):
 
     assert sch.main() == 1
     assert escalated and "Очередь архива сессий раннера НЕ тает" in escalated[0], escalated
+
+
+# ── Газ поставщика очереди: приток не больше проходимости (находка #1435) ────
+
+def test_sweep_stops_adding_when_the_queue_is_already_full(monkeypatch):
+    """Живой отказ, а не теория: морда лежит сутками (случай 2026-09-21), и
+    свип без газа льёт по 20 меток за пульс автономно — за сутки ~1400
+    записей, а догоняющий проход считает возраст КАЖДОЙ запросом таймлайна.
+    Это тысячи запросов GitHub в час, упор в rate limit, красный оркестратор
+    и вставшие слияния: механизм уборки душил бы конвейер ровно на том
+    отказе, ради которого очередь и заведена."""
+    calls = []
+    _sweep_stand(monkeypatch, found=[901, 902], label_calls=calls,
+                 queue_depth=sch.CLOSED_TASK_SWEEP_LIMIT)
+
+    lines = sch.sweep_closed_task_sessions("o/r")
+
+    assert calls == [], "очередь полна — новых ставить нельзя"
+    assert any("полна" in line for line in lines), lines
+
+
+def test_sweep_fills_only_the_remaining_room(monkeypatch):
+    """Не «всё или ничего»: место есть — ставим ровно столько, сколько
+    влезает, а не потолок целиком поверх уже лежащего."""
+    calls = []
+    room = 3
+    _sweep_stand(monkeypatch, found=list(range(901, 901 + 10)), label_calls=calls,
+                 queue_depth=sch.CLOSED_TASK_SWEEP_LIMIT - room)
+
+    sch.sweep_closed_task_sessions("o/r")
+
+    assert len(calls) == room, calls
+
+
+def test_sweep_search_failure_is_loud_not_an_empty_list(monkeypatch):
+    """Отказ Search API неотличим от «убирать нечего», если вернуть []:
+    пульс зелёный, поставщик мёртв, накопление возобновляется молча. Search
+    у GitHub несёт собственную квоту и падает отдельно от core — случай
+    реальный (находка ai-review PR #1435)."""
+    calls = []
+    _sweep_stand(monkeypatch, found=[], label_calls=calls,
+                 search_error="HTTP 403: search rate limit")
+
+    lines = sch.sweep_closed_task_sessions("o/r")
+
+    assert calls == []
+    assert any("⚠️" in line and "поиск" in line for line in lines), lines
+
+
+def test_sweep_unknown_queue_depth_is_loud_and_adds_nothing(monkeypatch):
+    """Глубину не узнали — ставить вслепую нельзя: это и есть отсутствие
+    газа. Молчаливый пропуск неотличим от «очередь пуста»."""
+    calls = []
+    _sweep_stand(monkeypatch, found=[901], label_calls=calls,
+                 depth_error="HTTP 500: очередь не читается")
+
+    lines = sch.sweep_closed_task_sessions("o/r")
+
+    assert calls == []
+    assert any("глубину не узнать" in line for line in lines), lines
