@@ -304,6 +304,79 @@ def test_the_guard_sees_a_marker_it_has_never_heard_of():
     ]
 
 
+def test_the_guard_sees_equality_comparison():
+    """Форма `==`. Её нашло ai-ревью PR #1434 ИСПОЛНЕНИЕМ: признак разбирал
+    только `in`/`startswith`, и копия проходила молча.
+
+    Тест здесь не дублирует мутацию из шапки гвардии, а страхует её: шапка —
+    текст, и в этом файле она уже дважды расходилась с деревом. Сузь кто-нибудь
+    `_string_comparisons_against_error` обратно — покраснеет этот тест, а не
+    только ручной перегон."""
+    source = (
+        "def _archive_with_opener(repo, opener, task_numbers):\n"
+        "    try:\n"
+        "        pass\n"
+        "    except RuntimeError as error:\n"
+        '        if str(error) == "session-not-found":\n'
+        "            return []\n"
+    )
+    assert _string_comparisons_against_error(source, "_archive_with_opener") == [
+        "session-not-found"
+    ]
+
+
+def test_the_guard_sees_equality_with_the_literal_on_the_left():
+    """Порядок операндов в Python свободен: полагаться на привычку автора
+    значило бы оставить вторую дверь вплотную к первой."""
+    source = (
+        "def _archive_with_opener(repo, opener, task_numbers):\n"
+        "    try:\n"
+        "        pass\n"
+        "    except RuntimeError as error:\n"
+        '        if "session-not-found" != str(error):\n'
+        "            return []\n"
+    )
+    assert _string_comparisons_against_error(source, "_archive_with_opener") == [
+        "session-not-found"
+    ]
+
+
+def test_the_guard_sees_a_regular_expression_over_the_error_text():
+    """Вторая форма того же круга ревью: регулярка по тексту отказа — та же
+    классификация, только записанная дороже."""
+    source = (
+        "def _archive_with_opener(repo, opener, task_numbers):\n"
+        "    try:\n"
+        "        pass\n"
+        "    except RuntimeError as error:\n"
+        '        if re.search(r"session-not-found", str(error)):\n'
+        "            return []\n"
+    )
+    assert _string_comparisons_against_error(source, "_archive_with_opener") == [
+        "session-not-found"
+    ]
+
+
+def test_precompiled_pattern_is_the_declared_blind_spot_not_an_accident():
+    """Честный потолок, закреплённый машиной, а не только прозой.
+
+    Докстринг признака называет непокрытую форму прямо: паттерн, собранный
+    заранее (`re.compile`) и вызванный одним аргументом. Пока потолок только
+    в тексте, он живёт до первой правки; этот тест делает его наблюдаемым
+    состоянием. Покраснеет он в двух случаях, и оба — работа, а не поломка:
+    форму покрыли (тогда потолок из докстринга надо убрать) или признак
+    сломали так, что он стал ловить лишнее."""
+    source = (
+        "def _archive_with_opener(repo, opener, task_numbers):\n"
+        "    try:\n"
+        "        pass\n"
+        "    except RuntimeError as error:\n"
+        "        if _NOT_FOUND_RE.search(str(error)):\n"
+        "            return []\n"
+    )
+    assert _string_comparisons_against_error(source, "_archive_with_opener") == []
+
+
 def test_the_guard_does_not_fire_on_calls_that_are_not_about_the_error():
     """Обратная сторона: узость области — не формальность. Сравнение строки
     с чем-то, что не является текстом отказа, копией правила не является, и
