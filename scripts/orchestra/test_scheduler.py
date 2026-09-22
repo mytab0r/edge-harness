@@ -421,15 +421,18 @@ def test_session_failure_terminal_classified_by_content_not_status_code():
     """Различать эти исходы по коду нельзя — он у них один и тот же. Решает
     содержание тела отказа; незнакомое содержание — по умолчанию сломанная
     возможность (громкий путь)."""
-    assert sch.session_failure_is_terminal(UNMIGRATABLE_SESSION_ERROR) is True
-    assert sch.session_failure_terminal_reason(UNMIGRATABLE_SESSION_ERROR) is not None
-    assert sch.session_failure_is_terminal(QUOTA_EXHAUSTED_ERROR) is False
-    assert sch.session_failure_terminal_reason(QUOTA_EXHAUSTED_ERROR) is None
-    assert sch.session_failure_is_terminal("HTTP 502: bad gateway") is False
-    assert sch.session_failure_is_terminal(RuntimeError("Connection reset by peer")) is False
+    # Классификация с #1433 живёт в общем модуле morde_outcome; имена
+    # session_failure_* из #1444 больше не существуют — таблица переехала
+    # туда целиком, второй копии быть не должно.
+    assert sch.morde_outcome.is_terminal(UNMIGRATABLE_SESSION_ERROR) is True
+    assert sch.morde_outcome.terminal_reason(UNMIGRATABLE_SESSION_ERROR) is not None
+    assert sch.morde_outcome.is_terminal(QUOTA_EXHAUSTED_ERROR) is False
+    assert sch.morde_outcome.terminal_reason(QUOTA_EXHAUSTED_ERROR) is None
+    assert sch.morde_outcome.is_terminal("HTTP 502: bad gateway") is False
+    assert sch.morde_outcome.is_terminal(RuntimeError("Connection reset by peer")) is False
     # Повреждение, а не честный отказ миграции (ADR 0027) — громкий путь.
     corruption = 'HTTP 500: {"detail":"SessionPersistenceCorruptionError: checksum mismatch"}'
-    assert sch.session_failure_is_terminal(corruption) is False
+    assert sch.morde_outcome.is_terminal(corruption) is False
 
 
 def test_append_session_notes_one_login_for_several_notes(monkeypatch):
