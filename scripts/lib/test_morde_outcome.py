@@ -131,7 +131,38 @@ def test_terminal_outcomes_split_into_normal_and_loss():
 # которую начнут глушить.
 
 
-FUNCTIONS_THAT_CALL_THE_MORDE = ("_archive_with_opener", "append_session_notes")
+# Двери морды в scheduler.py — единственные обёртки, через которые файл
+# ходит в dsh-edge. Область гвардии выводится из ИСХОДНИКА (функции с
+# вызовом двери или потреблением `morde_outcome`), а не хардкодится списком
+# имён: хардкод двух имён покрывал два из семи ходоков, и четвёртая копия
+# правила в любом из остальных пяти мест прошла бы молча (находка ai-review
+# PR #1434). Новый вызывающий морды попадает в область сам, без правки
+# гвардии.
+MORDE_DOORS = frozenset({"_morde_opener", "_morde_login", "_morde_rpc", "_morde_ingest"})
+
+
+def _morde_going_function_names(source: str) -> list[str]:
+    """Имена всех функций scheduler.py, которые ходят в морду: вызывают
+    дверь `_morde_*`, потребляют общий классификатор `morde_outcome` или
+    упоминают двери в своём тексте (упоминание — тоже маркер «функция живёт
+    на маршруте морды», как `post_entity_snapshot`, гейтящий сырые записи
+    той же `_guard_raw_subprocess_write`, что `_morde_rpc`)."""
+    tree = ast.parse(source)
+    names: list[str] = []
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        called = {
+            n.func.id
+            for n in ast.walk(node)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        }
+        touched = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+        segment = ast.get_source_segment(source, node) or ""
+        if (called & MORDE_DOORS or "morde_outcome" in touched
+                or "_morde_" in segment):
+            names.append(node.name)
+    return names
 
 
 def _string_comparisons_against_error(source: str, function_name: str) -> list[str]:
@@ -190,7 +221,7 @@ def test_scheduler_has_no_handwritten_outcome_classification():
     (прежняя редакция такую копию пропускала молча)."""
     source = SCHEDULER.read_text(encoding="utf-8")
     offenders = {}
-    for name in FUNCTIONS_THAT_CALL_THE_MORDE:
+    for name in _morde_going_function_names(source):
         literals = _string_comparisons_against_error(source, name)
         if literals:
             offenders[name] = literals

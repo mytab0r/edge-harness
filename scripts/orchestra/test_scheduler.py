@@ -53,6 +53,12 @@ spec.loader.exec_module(sch)  # type: ignore[union-attr]
 
 import upstream_drift as _upstream_drift_mod  # noqa: E402  (после sys.path.insert выше)
 
+_LIB = _DIR.parent / "lib"
+_mo_test_spec = importlib.util.spec_from_file_location(
+    "test_morde_outcome_for_callers", _LIB / "test_morde_outcome.py")
+test_morde_outcome = importlib.util.module_from_spec(_mo_test_spec)
+_mo_test_spec.loader.exec_module(test_morde_outcome)  # type: ignore[union-attr]
+
 
 def _fresh_upstream_tags() -> list[dict]:
     """Фикстура тегов апстрима «пин свеж» — прод-форма `repos/{repo}/tags`,
@@ -332,6 +338,77 @@ def test_append_session_notes_session_not_found_is_not_hard_failure(monkeypatch)
     lines, hard = sch.append_session_notes([(5, "заметка")])
     assert lines == []
     assert hard is False
+
+
+def test_new_terminal_marker_flips_both_morde_callers_at_once(monkeypatch):
+    # Критерий #1433 «проверяется тестом на двух вызывающих сразу»: чужой
+    # маркер, дописанный в общий список TERMINAL_FAILURES, меняет поведение
+    # ОБЕИХ функций — архива и заметок — без правки их кода. Исторический
+    # механизм всех трёх аварий был ровно обратным: новая авария учила одно
+    # место, остальные молчали. У scheduler.py СВОЯ копия модуля (importlib
+    # по пути), поэтому список патчится через sch.morde_outcome.
+    novel = "SomeBrandNewUpstreamRefusal"
+    refusal = f'HTTP 500: {{"ok":false,"detail":"{novel}: подробности"}}'
+
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
+    monkeypatch.setattr(sch, "_clear_archive_pending", lambda repo, number: None)
+    raised: list[str] = [refusal]
+
+    def failing_rpc(opener, method, payload):
+        raise RuntimeError(raised[0])
+
+    def failing_ingest(opener, session_id, events):
+        raise RuntimeError(raised[0])
+
+    monkeypatch.setattr(sch, "_morde_rpc", failing_rpc)
+    monkeypatch.setattr(sch, "_morde_ingest", failing_ingest)
+
+    # До пополнения списка оба вызывающих видят сломанную возможность:
+    # архив держит номер в очереди, заметки красят прогон.
+    queued_lines, still_queued = sch._archive_with_opener("o/r", object(), [7])
+    assert still_queued == [7]
+    assert any("остаётся в очереди" in line for line in queued_lines)
+    broken_lines, broken = sch.append_session_notes([(7, "заметка")])
+    assert broken is True
+    assert any("сломана" in line for line in broken_lines)
+
+    # Одна правка общего списка — оба потребителя трактуют исход одинаково:
+    # терминальный, с общей человекочитаемой причиной из того же места.
+    monkeypatch.setitem(
+        sch.morde_outcome.TERMINAL_FAILURES,
+        novel, ("новый апстримный отказ", sch.morde_outcome.LOSS),
+    )
+
+    terminal_lines, still_queued = sch._archive_with_opener("o/r", object(), [7])
+    assert still_queued == [], "терминальный исход не должен оставаться в очереди"
+    assert any("новый апстримный отказ" in line for line in terminal_lines)
+    # Чужой маркер зарегистрирован как ПОТЕРЯ: сессия в морде есть, и строка
+    # «архивировать нечего» врала бы факту (находка ai-review PR #1434);
+    # формат строки потери — из #1444, у архива и заметок он свой.
+    assert any("повтор не поможет никогда" in line and "снимаю с очереди" in line
+               for line in terminal_lines)
+    assert not any("архивировать нечего" in line for line in terminal_lines)
+    loss_lines, hard = sch.append_session_notes([(7, "заметка")])
+    assert hard is False, "терминальный исход не красит прогон"
+    assert any("не дописан" in line and "повтор не поможет никогда" in line
+               and "новый апстримный отказ" in line for line in loss_lines)
+
+    # Фаза 2 — та же ветка ПОТЕРИ на ПРОД-ФОРМЕ отказа #1430: тот же литерал
+    # UNMIGRATABLE из test_morde_outcome.py (не пересказ), правка списка не
+    # нужна — маркер уже там. Снос ветки is_loss у ЛЮБОГО из вызывающих
+    # краснит этот тест, раньше не краснил никто.
+    raised[0] = test_morde_outcome.UNMIGRATABLE
+    loss_archive, loss_queued = sch._archive_with_opener("o/r", object(), [7])
+    assert loss_queued == [], "немигрируемый формат не должен ждать повтора"
+    assert any("морда отказывается мигрировать формат сессии" in line
+               and "повтор не поможет никогда" in line for line in loss_archive)
+    assert not any("архивировать нечего" in line for line in loss_archive)
+    loss_notes, hard_notes = sch.append_session_notes([(7, "заметка")])
+    assert hard_notes is False, "потеря не красит прогон"
+    assert any("не дописан" in line and "повтор не поможет никогда" in line
+               for line in loss_notes)
 
 
 def test_append_session_notes_ingest_failure_is_hard_failure(monkeypatch):
