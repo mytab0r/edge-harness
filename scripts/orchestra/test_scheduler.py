@@ -347,6 +347,75 @@ def test_append_session_notes_ingest_failure_is_hard_failure(monkeypatch):
     assert any("сломана" in line for line in lines)
 
 
+# Прод-форма отказа, снятая с живого прогона 35647962282 (2026-09-22T00:25Z):
+# морда отвечает HTTP 500 с апстримной ошибкой миграции формата в detail. По
+# КОДУ это неотличимо от «квота исчерпана», поэтому тест кормит именно то, что
+# реально пришло, а не наш пересказ.
+UNMIGRATABLE_SESSION_ERROR = (
+    'HTTP 500: {"ok":false,"error":"Internal runtime error.","code":"internal",'
+    '"detail":"SessionFormatUnsupportedMigrationError: '
+    '@deepseek-ai/dsh-session-format-v0-to-v1 refuses this format v0 Session: '
+    'tool/result 67 data has unexpected member \\"truncated\\""}'
+)
+
+QUOTA_EXHAUSTED_ERROR = (
+    'HTTP 500: {"ok":false,"error":"Internal runtime error.","code":"internal",'
+    '"detail":"Error: Exceeded allowed rows read in Durable Objects free tier."}'
+)
+
+
+def test_unmigratable_session_is_terminal_not_a_broken_capability(monkeypatch):
+    """Главная сцена #1430. Живой случай: поле `truncated` в data записал наш
+    же стример (#1404), фикс #1405 убрал его из НОВЫХ событий — но уже
+    записанные сессии остались такими, какие есть, и апстримная миграция будет
+    отказывать ВСЕГДА. Повтор не поможет ни через час, ни завтра.
+
+    Прогон при этом красился, `pulse_guard` читал красноту как «пульсы
+    orchestra пропадали», и владельцу уходило «конвейер мёртв» при живом
+    конвейере, который в те же минуты сливал PR."""
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
+    monkeypatch.setattr(
+        sch, "_morde_ingest",
+        lambda opener, session_id, events: (_ for _ in ()).throw(
+            RuntimeError(UNMIGRATABLE_SESSION_ERROR)),
+    )
+
+    lines, hard = sch.append_session_notes([(1251, "заметка")])
+
+    assert hard is False, f"терминальный исход не имеет права красить прогон: {lines}"
+    # И не молчим: потеря заметки — факт, он обязан быть назван с номером.
+    assert any("#1251" in line and "никогда" in line for line in lines), lines
+
+
+def test_quota_exhaustion_stays_a_broken_capability(monkeypatch):
+    """Вторая половина различения, и она важнее первой: тот же HTTP 500, но
+    повтор ПОМОЖЕТ (суточная квота DO сбрасывается в 00:00 UTC). Замолчать его
+    значило бы потерять сигнал о реально сломанной морде — ровно та ошибка,
+    в которую легко свалиться, «починив» соседний случай глушилкой по коду."""
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
+    monkeypatch.setattr(
+        sch, "_morde_ingest",
+        lambda opener, session_id, events: (_ for _ in ()).throw(
+            RuntimeError(QUOTA_EXHAUSTED_ERROR)),
+    )
+
+    lines, hard = sch.append_session_notes([(1251, "заметка")])
+
+    assert hard is True, "исчерпанная квота — сломанная возможность, повтор поможет"
+    assert any("сломана" in line for line in lines), lines
+
+
+def test_session_failure_is_terminal_judges_by_content_not_by_status_code():
+    """Различать эти два исхода по коду нельзя — он у них один и тот же."""
+    assert sch.session_failure_is_terminal(UNMIGRATABLE_SESSION_ERROR) is True
+    assert sch.session_failure_is_terminal(QUOTA_EXHAUSTED_ERROR) is False
+    assert sch.session_failure_is_terminal("HTTP 502: bad gateway") is False
+
+
 def test_append_session_notes_one_login_for_several_notes(monkeypatch):
     # Мутация-гвардия: если кто-то перенесёт логин внутрь цикла по заметкам,
     # этот тест покраснеет — login_calls вырастет с 1 до len(notes).

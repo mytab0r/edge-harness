@@ -2980,6 +2980,36 @@ def _session_note_message_id(session_id: str) -> str:
     return f"harness-note:{session_id}:{run_id}:{next(_SESSION_NOTE_SEQ)}"
 
 
+# Отказы морды, которые повтор НЕ вылечит никогда (#1430). Сессия лежит в
+# хранилище в формате, который апстримная миграция v0→v1 отказывается
+# принимать, и формат сам по себе не изменится — ни через час, ни завтра.
+#
+# Живой случай: поле `truncated` в `data` события записал наш же стример
+# (дефект #1404, фикс #1405 `8b46e8d4` убрал его из НОВЫХ событий), но уже
+# записанные сессии остались такими, какие есть. Морда отвечает
+# `HTTP 500 Internal runtime error` с `SessionFormatUnsupportedMigrationError`
+# в detail — по КОДУ это неотличимо от «квота исчерпана», а лечится
+# противоположно: там ждать, здесь ждать бессмысленно.
+#
+# Поэтому исход различается по СОДЕРЖАНИЮ отказа. Список — место правды, а не
+# набор проверок по коду: добавить сюда новый апстримный отказ формата дешевле,
+# чем искать вторую копию условия.
+TERMINAL_SESSION_FAILURE_MARKERS = (
+    "SessionFormatUnsupportedMigrationError",
+    "SessionFormatUnsupported",
+)
+
+
+def session_failure_is_terminal(error: object) -> bool:
+    """Повтор этого отказа не поможет никогда — терминальный исход КОНКРЕТНОЙ
+    сессии, как `HTTP 404` («сессии нет»), а не сломанная возможность.
+
+    Возвращает False на всём остальном, включая `Exceeded allowed rows read`
+    (квота DO), сеть и таймаут: там повтор — ровно то, что нужно, и молчать
+    о таком отказе нельзя."""
+    return any(marker in str(error) for marker in TERMINAL_SESSION_FAILURE_MARKERS)
+
+
 def append_session_notes(notes: list[tuple[int, str]]) -> tuple[list[str], bool]:
     """notes — [(номер задачи, текст заметки), …], собранные вызывающей
     функцией за ОДИН проход (не по одной заметке): один логин в морду на весь
@@ -3026,6 +3056,15 @@ def append_session_notes(notes: list[tuple[int, str]]) -> tuple[list[str], bool]
         except RuntimeError as error:
             if "HTTP 404" in str(error):
                 continue  # сессии раннера в морде нет — писать некуда, это норма
+            if session_failure_is_terminal(error):
+                # Заметка для ЭТОЙ сессии потеряна навсегда — и это названо, а
+                # не проглочено. Но прогон не красим: конвейеру такой исход не
+                # мешает, а красный прогон orchestra пульс читает как «конвейер
+                # мёртв» и уводит владельцу ложный сигнал (#1422, #1430).
+                lines.append(
+                    f"⚠️ #{number}: лог итогов в сессию {session_id} не попадёт никогда — "
+                    f"морда отказывается мигрировать её формат: {error}")
+                continue
             lines.append(f"🚨 #{number}: лог итогов не дописан в сессию {session_id} (возможность сломана): {error}")
             hard_failure = True
         except (OSError, ValueError) as error:
