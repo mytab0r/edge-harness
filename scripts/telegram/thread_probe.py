@@ -26,7 +26,14 @@
                   нужен переключатель, и API называет какой);
   send_broken     тема создалась, но `sendMessage(message_thread_id=…)`
                   отказал → ровно случай #847, темы есть, доставка в них нет;
-  works           тема создана, сообщение в неё доставлено, тема удалена.
+  works           тема создана, сообщение в неё доставлено, тема удалена;
+  undetermined    Telegram не ответил или ответил 429/5xx → про темы этот
+                  ответ не говорит НИЧЕГО, и назвать его «темы не работают»
+                  значило бы соврать (находка ревью PR #1464);
+  no_access       не прошла контрольная отправка → дело не в темах.
+
+Последние два красят прогон (rc 1): замер не состоялся, и зелёный лог на
+несостоявшемся замере — тот же silent-wrong, что и неверный вердикт.
 
 Контрольный шаг (обычный `sendMessage` без темы) стоит ПЕРВЫМ намеренно:
 без него «всё отказало» не отличается от «токен не тот / чат не тот», и
@@ -75,6 +82,24 @@ OUTCOME_WORKS = "works"
 OUTCOME_SEND_BROKEN = "send_broken"
 OUTCOME_THEMES_ABSENT = "themes_absent"
 OUTCOME_NO_ACCESS = "no_access"
+# Пятый исход, добавлен по находке ревью PR #1464. Флаг `transport` заводился
+# ровно для различения «Telegram не ответил» и «Telegram отказал» — и не
+# читался решающей функцией ни разу: обрыв сети на шаге 2 печатал
+# «themes_absent», а 429 на шаге 3 — «send_broken», то есть «#847
+# воспроизвёлся», и это уходило владельцу как факт. Silent-wrong ровно того
+# класса, против которого написан весь остальной файл.
+OUTCOME_UNDETERMINED = "undetermined"
+
+# Коды, которые говорят о нагрузке и доступности, а не о темах. 429 — лимит
+# Bot API, 5xx — сторона Telegram. Ни один из них не позволяет судить, есть
+# темы или нет; 400/401/403 — позволяют, это ответ про сам запрос.
+UNDETERMINED_CODES = frozenset({429, 500, 502, 503, 504})
+
+# Исходы, которые что-то УСТАНОВИЛИ про темы. Остальные два (no_access,
+# undetermined) — про то, что замер не состоялся, и красят прогон: молчаливо
+# зелёный прогон на несостоявшемся замере и есть тот silent-wrong, ради
+# которого заведён пятый исход.
+ESTABLISHED_OUTCOMES = frozenset({OUTCOME_WORKS, OUTCOME_SEND_BROKEN, OUTCOME_THEMES_ABSENT})
 
 # Имя пробной темы. Видно владельцу в чате несколько секунд, поэтому оно
 # говорит, что происходит, а не «test».
@@ -137,6 +162,19 @@ def describe(result: dict) -> str:
     return f"отказ {code}: {result.get('description', '')}"
 
 
+def undetermined_reason(result: dict) -> str | None:
+    """Почему по этому ответу НЕЛЬЗЯ судить о темах, или None — можно.
+
+    Отдельная функция, а не условие на месте: её зовут три шага, и три копии
+    этого условия разошлись бы (AGENTS.md, «Одно место правды»)."""
+    if result.get("transport"):
+        return f"Telegram не ответил вовсе — {result.get('description', '')}"
+    if result.get("error_code") in UNDETERMINED_CODES:
+        return (f"Telegram ответил {result.get('error_code')} — это про нагрузку и "
+                f"доступность, не про темы: {result.get('description', '')}")
+    return None
+
+
 class Probe:
     """Шаги замера. Класс, чтобы протокол (список шагов с их ответами)
     собирался в одном месте и печатался целиком, а не по кускам."""
@@ -181,6 +219,10 @@ def run(token: str, chat_id: str, redact: Redactor, caller=call, out=print) -> d
     control = probe.step("sendMessage без темы", "sendMessage",
                          {"text": "🔬 замер тредов (#1463): контрольное сообщение"})
     if not control.get("ok"):
+        blind = undetermined_reason(control)
+        if blind:
+            return {"outcome": OUTCOME_UNDETERMINED, "topic_id": None,
+                    "why": f"контроль: {blind}"}
         return {"outcome": OUTCOME_NO_ACCESS, "topic_id": None,
                 "why": f"контрольная отправка не прошла — дело не в темах: {describe(control)}"}
 
@@ -188,6 +230,10 @@ def run(token: str, chat_id: str, redact: Redactor, caller=call, out=print) -> d
     created = probe.step("createForumTopic", "createForumTopic", {"name": PROBE_TOPIC_NAME})
     probe.dump("createForumTopic", created)
     if not created.get("ok"):
+        blind = undetermined_reason(created)
+        if blind:
+            return {"outcome": OUTCOME_UNDETERMINED, "topic_id": None,
+                    "why": f"создание темы: {blind}"}
         return {"outcome": OUTCOME_THEMES_ABSENT, "topic_id": None,
                 "why": f"создать тему не дали: {describe(created)}"}
 
@@ -199,19 +245,31 @@ def run(token: str, chat_id: str, redact: Redactor, caller=call, out=print) -> d
         sent = probe.step("sendMessage в тему", "sendMessage",
                           {"text": "🔬 сообщение внутри темы", "message_thread_id": topic_id})
         if not sent.get("ok"):
+            blind = undetermined_reason(sent)
+            if blind:
+                return {"outcome": OUTCOME_UNDETERMINED, "topic_id": topic_id,
+                        "why": f"отправка в тему: {blind}"}
             return {"outcome": OUTCOME_SEND_BROKEN, "topic_id": topic_id,
                     "why": f"тема создана, но доставка в неё отказала: {describe(sent)}"}
 
         out("Шаг 4. Переименование темы (editForumTopic)")
-        probe.step("editForumTopic", "editForumTopic",
-                   {"message_thread_id": topic_id, "name": PROBE_TOPIC_RENAMED})
+        edited = probe.step("editForumTopic", "editForumTopic",
+                            {"message_thread_id": topic_id, "name": PROBE_TOPIC_RENAMED})
 
         out("Шаг 5. Снятие закреплений (unpinAllForumTopicMessages)")
-        probe.step("unpinAllForumTopicMessages", "unpinAllForumTopicMessages",
-                   {"message_thread_id": topic_id})
+        unpinned = probe.step("unpinAllForumTopicMessages", "unpinAllForumTopicMessages",
+                              {"message_thread_id": topic_id})
 
-        return {"outcome": OUTCOME_WORKS, "topic_id": topic_id,
-                "why": "тема создана, сообщение в неё доставлено, правка темы принята"}
+        # Вердикт перечисляет ровно то, что проверено ответом. До находки
+        # ревью PR #1464 здесь стояла константа «правка темы принята» —
+        # утверждение о шаге 4, чей ответ никто не читал: строка была бы той
+        # же самой, откажи editForumTopic.
+        done = ["тема создана", "сообщение в неё доставлено"]
+        done.append("правка темы принята" if edited.get("ok")
+                    else f"правка темы ОТКАЗАНА ({describe(edited)})")
+        done.append("закрепления сняты" if unpinned.get("ok")
+                    else f"снятие закреплений ОТКАЗАНО ({describe(unpinned)})")
+        return {"outcome": OUTCOME_WORKS, "topic_id": topic_id, "why": ", ".join(done)}
     finally:
         out("Шаг 6. Уборка: удаление пробной темы (deleteForumTopic)")
         removed = probe.step("deleteForumTopic", "deleteForumTopic",
@@ -248,7 +306,7 @@ def main() -> int:
     # шаг на честно измеренном «темы не работают» заставил бы следующего
     # агента чинить исправный код. rc 0 на любом установленном исходе,
     # rc 1 — только когда исход установить не удалось.
-    return 0 if verdict["outcome"] != OUTCOME_NO_ACCESS else 1
+    return 0 if verdict["outcome"] in ESTABLISHED_OUTCOMES else 1
 
 
 if __name__ == "__main__":

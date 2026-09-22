@@ -174,6 +174,109 @@ def test_cleanup_runs_even_when_sending_into_the_topic_fails(bot_api):
     assert [m for m, _ in bot_api.seen].count("deleteForumTopic") == 1
 
 
+def _fail_nth_send(bot_api, status, body, nth=2):
+    """Подменяет ответ на N-ю отправку, оставляя вызов НАСТОЯЩИМ."""
+    calls = {"n": 0}
+    real_call = thread_probe.call
+
+    def counting(token, method, payload):
+        if method == "sendMessage":
+            calls["n"] += 1
+            if calls["n"] == nth:
+                bot_api.responses["sendMessage"] = (status, body)
+        return real_call(token, method, payload)
+
+    return counting
+
+
+def test_network_outage_on_create_is_not_called_themes_absent(bot_api):
+    """Находка ревью PR #1464: флаг transport заводился ради различения
+    «не ответил» и «отказал», а решающая функция его не читала — обрыв сети
+    печатал «themes_absent», то есть факт о темах, которого замер не видел."""
+    def dead_network(token, method, payload):
+        if method == "createForumTopic":
+            return {"ok": False, "transport": True, "description": "сеть: timed out"}
+        return thread_probe.call(token, method, payload)
+
+    verdict = thread_probe.run("t", "42", thread_probe.Redactor([]),
+                               caller=dead_network, out=lambda *_a, **_k: None)
+
+    assert verdict["outcome"] == thread_probe.OUTCOME_UNDETERMINED
+    assert "не ответил" in verdict["why"]
+
+
+def test_rate_limit_on_sending_into_topic_is_not_called_send_broken(bot_api):
+    """429 на шаге 3 — это про лимит, а не про #847. Прежний код объявлял
+    «#847 воспроизвёлся» и уходил владельцу как факт."""
+    bot_api.responses["createForumTopic"] = (
+        200, {"ok": True, "result": {"message_thread_id": 3}})
+    caller = _fail_nth_send(bot_api, 429,
+                            {"ok": False, "error_code": 429,
+                             "description": "Too Many Requests: retry after 5"})
+
+    verdict = thread_probe.run("t", "42", thread_probe.Redactor([]),
+                               caller=caller, out=lambda *_a, **_k: None)
+
+    assert verdict["outcome"] == thread_probe.OUTCOME_UNDETERMINED
+    assert "429" in verdict["why"]
+
+
+def test_server_error_on_control_is_not_called_no_access(bot_api):
+    """503 на контроле — Telegram лежит, а не «токен не тот»."""
+    bot_api.responses["sendMessage"] = (
+        503, {"ok": False, "error_code": 503, "description": "Service Unavailable"})
+
+    verdict = _run()
+
+    assert verdict["outcome"] == thread_probe.OUTCOME_UNDETERMINED
+
+
+def test_undetermined_still_cleans_up_the_topic(bot_api):
+    bot_api.responses["createForumTopic"] = (
+        200, {"ok": True, "result": {"message_thread_id": 8}})
+    caller = _fail_nth_send(bot_api, 429, {"ok": False, "error_code": 429, "description": "лимит"})
+
+    thread_probe.run("t", "42", thread_probe.Redactor([]),
+                     caller=caller, out=lambda *_a, **_k: None)
+
+    assert [m for m, _ in bot_api.seen].count("deleteForumTopic") == 1
+
+
+def test_plain_bad_request_still_reads_as_a_fact_about_topics(bot_api):
+    """Обратная сторона: 400 — это ОТВЕТ про запрос, и превращать его в
+    «установить не удалось» значило бы потерять единственный измеренный факт."""
+    bot_api.responses["createForumTopic"] = (
+        400, {"ok": False, "error_code": 400, "description": "Bad Request: the chat is not a forum"})
+
+    assert _run()["outcome"] == thread_probe.OUTCOME_THEMES_ABSENT
+
+
+def test_only_established_outcomes_keep_the_run_green():
+    """rc 0 — только там, где замер что-то установил."""
+    assert thread_probe.ESTABLISHED_OUTCOMES == {
+        thread_probe.OUTCOME_WORKS,
+        thread_probe.OUTCOME_SEND_BROKEN,
+        thread_probe.OUTCOME_THEMES_ABSENT,
+    }
+    assert thread_probe.OUTCOME_UNDETERMINED not in thread_probe.ESTABLISHED_OUTCOMES
+    assert thread_probe.OUTCOME_NO_ACCESS not in thread_probe.ESTABLISHED_OUTCOMES
+
+
+def test_works_verdict_names_a_refused_edit_instead_of_claiming_it(bot_api):
+    """Некритичное замечание ревью PR #1464: строка «правка темы принята»
+    была константой — она печаталась бы и при отказе editForumTopic."""
+    bot_api.responses["createForumTopic"] = (
+        200, {"ok": True, "result": {"message_thread_id": 4}})
+    bot_api.responses["editForumTopic"] = (
+        400, {"ok": False, "error_code": 400, "description": "Bad Request: TOPIC_NOT_MODIFIED"})
+
+    verdict = _run()
+
+    assert verdict["outcome"] == thread_probe.OUTCOME_WORKS
+    assert "правка темы ОТКАЗАНА" in verdict["why"]
+    assert "правка темы принята" not in verdict["why"]
+
+
 def test_network_outage_is_transport_not_a_telegram_refusal(monkeypatch):
     """Недоступность — закрытый порт, а не подставное исключение."""
     probe_socket = socket.socket()
