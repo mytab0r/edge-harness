@@ -218,3 +218,8 @@ def test_unanswered_probes_take_no_verdict_and_go_to_browser():
     assert "DEPLOY-BAD" not in result.stderr, result.stderr
     # Решение не принято — канал ушёл в браузерную часть, а не в вердикт.
     assert "дальше решает браузер" in result.stdout, (result.stdout, result.stderr)
+    # И хвост «бэкенд отвечает» на неответившем зонде не печатается (находка
+    # AI-ревью PR #1441, чеклист круга 4): утверждение об измерении, которого
+    # не было. Краснеет, если условие хвоста снова перестанет смотреть на то,
+    # получен ли статус вовсе.
+    assert "бэкенд отвечает" not in result.stdout, (result.stdout, result.stderr)

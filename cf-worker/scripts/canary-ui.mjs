@@ -6,7 +6,11 @@
 // страница сломана — сервер здоров.
 //
 // Использование:
-//   node scripts/canary-ui.mjs --url http://127.0.0.1:8808 --token dev-token
+//   HANDS_TOKEN=… node scripts/canary-ui.mjs --url http://127.0.0.1:8808
+// Токен читается ТОЛЬКО из env HANDS_TOKEN: флага --token у скрипта нет,
+// такой аргумент был бы молча проигнорирован, а запуск без env выходит
+// кодом 2 — см. таблицу кодов в docs/agents/INFRA-CF.md (находка
+// AI-ревью PR #1441, чеклист круга 4).
 // Без --url проверяется прод (https://edge-harness.mytab0r.workers.dev).
 // Нужен установленный браузер: npx playwright install chromium.
 

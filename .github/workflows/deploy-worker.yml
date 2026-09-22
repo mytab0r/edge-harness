@@ -258,7 +258,10 @@ jobs:
           # Вердикт пишется в output ДО выхода — иначе шаг автооката его не
           # увидит: при ненулевом коде дальнейшие строки не исполняются.
           set +e
-          node scripts/canary-ui.mjs --url "${{ vars.HARNESS_URL }}" --token "$HANDS_TOKEN"
+          # Токен читается только из env HANDS_TOKEN ниже: флага --token у
+          # скрипта нет, мёртвый аргумент учил бы форме, которую скрипт
+          # игнорирует (чеклист AI-ревью PR #1441, круг 4).
+          node scripts/canary-ui.mjs --url "${{ vars.HARNESS_URL }}"
           canary_code=$?
           set -e
           if [ "$canary_code" = "3" ]; then
@@ -346,7 +349,8 @@ jobs:
         run: |
           npm ci
           npx playwright install --with-deps chromium
-          node scripts/canary-ui.mjs --url "${{ vars.HARNESS_URL }}" --token "$HANDS_TOKEN"
+          # Без --token: скрипт читает HANDS_TOKEN из env ниже, флага у него нет.
+          node scripts/canary-ui.mjs --url "${{ vars.HARNESS_URL }}"
         working-directory: cf-worker
         env:
           HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}

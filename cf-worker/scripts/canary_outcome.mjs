@@ -115,6 +115,10 @@ export function probeOutcome(staticStatus, apiStatus, apiBodyText) {
     reason:
       `статика ${staticStatus === 200 ? "200" : "ответа нет"}, ` +
       `/api/ready ${apiStatus === null ? "ответа нет" : apiStatus}` +
-      (apiDown ? "" : ", бэкенд отвечает"),
+      // «бэкенд отвечает» — только при РЕАЛЬНО полученном статусе: при
+      // apiStatus === null зонд ответа не получал вовсе, и хвост был бы
+      // утверждением об измерении, которого не было («Алерт не гадает»;
+      // находка AI-ревью PR #1441, чеклист круга 4).
+      (apiStatus !== null && !apiDown ? ", бэкенд отвечает" : ""),
   };
 }
