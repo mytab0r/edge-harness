@@ -43,6 +43,52 @@ jobs:
     steps:
       - id: deploy
         run: npx wrangler deploy
+      - name: Канарейка
+        id: canary_ui
+        run: |
+          echo "verdict=deploy" >> "$GITHUB_OUTPUT"
+          node scripts/canary-ui.mjs
+      - name: Автооткат
+        id: auto_rollback
+        if: failure() && steps.deploy.outcome == 'success' && steps.canary_ui.outputs.verdict != 'backend-down'
+        run: npx wrangler rollback --yes
+"""
+
+# Копипаст из GUARDED с переименованным id канарейки: `if:` ссылается на
+# canary_ui, а шаг называется canary — подстрочная проверка зелёная, а в
+# Actions output несуществующего шага пуст и откат безусловен (находка
+# AI-ревью PR #1441).
+GUARDED_WITH_RENAMED_CANARY_ID = """name: deploy
+on: [push]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - id: deploy
+        run: npx wrangler deploy
+      - name: Канарейка
+        id: canary
+        run: |
+          echo "verdict=deploy" >> "$GITHUB_OUTPUT"
+          node scripts/canary-ui.mjs
+      - name: Автооткат
+        id: auto_rollback
+        if: failure() && steps.deploy.outcome == 'success' && steps.canary_ui.outputs.verdict != 'backend-down'
+        run: npx wrangler rollback --yes
+"""
+
+# Шаг-издатель существует, но вердикт не пишет: output пуст, откат безусловен.
+VERDICT_PRODUCER_WITHOUT_VERDICT_WRITE = """name: deploy
+on: [push]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - id: deploy
+        run: npx wrangler deploy
+      - name: Канарейка
+        id: canary_ui
+        run: node scripts/canary-ui.mjs
       - name: Автооткат
         id: auto_rollback
         if: failure() && steps.deploy.outcome == 'success' && steps.canary_ui.outputs.verdict != 'backend-down'
@@ -89,6 +135,29 @@ def test_rollback_with_a_verdict_is_silent(tmp_path, monkeypatch):
     workflows = _tree(tmp_path, {"deploy-thing.yml": GUARDED})
     monkeypatch.setattr(guard, "UNGUARDED_ROLLBACK_WORKFLOWS", {})
     assert guard.check_rollback_guarded(workflows) == []
+
+
+def test_rollback_if_referencing_missing_producer_step_reddens(tmp_path, monkeypatch):
+    """Блокирующая находка AI-ревью PR #1441: `if:` спрашивает вердикт у шага
+    с чужим id — подстрочная проверка зелёная, а в Actions output
+    несуществующего шага пуст, `'' != 'backend-down'` истинно, откат
+    безусловен. Гвардия обязана это ловить и называть чужой id."""
+    workflows = _tree(tmp_path, {"deploy-thing.yml": GUARDED_WITH_RENAMED_CANARY_ID})
+    monkeypatch.setattr(guard, "UNGUARDED_ROLLBACK_WORKFLOWS", {})
+    problems = guard.check_rollback_guarded(workflows)
+    assert problems, "копипаст с чужим id прошёл гвардию молча"
+    assert any("canary_ui" in p and "нет" in p for p in problems), problems
+
+
+def test_producer_step_without_verdict_write_reddens(tmp_path, monkeypatch):
+    """Шаг-издатель есть, но `verdict=` в GITHUB_OUTPUT не пишет — вердикт
+    не издаётся, output пуст, откат безусловен. То же молчаливое красное
+    состояние, прибитое поведенчески."""
+    workflows = _tree(tmp_path, {"deploy-thing.yml": VERDICT_PRODUCER_WITHOUT_VERDICT_WRITE})
+    monkeypatch.setattr(guard, "UNGUARDED_ROLLBACK_WORKFLOWS", {})
+    problems = guard.check_rollback_guarded(workflows)
+    assert problems, "шаг без записи вердикта прошёл гвардию молча"
+    assert any("verdict=" in p and "canary_ui" in p for p in problems), problems
 
 
 def test_rollback_only_in_a_comment_is_not_a_rollback(tmp_path, monkeypatch):
@@ -146,7 +215,7 @@ def test_live_repository_really_has_rollback_steps():
     Откаты в дереве есть, и ровно один из них уже спрашивает вердикт."""
     steps = guard.rollback_steps()
     assert steps, "в дереве не найдено ни одного шага с wrangler rollback — признак уехал"
-    guarded = [w for w, _, cond in steps if guard.VERDICT_OUTPUT in cond]
+    guarded = [w for w, _, cond, _ in steps if guard.VERDICT_OUTPUT in cond]
     assert "deploy-worker.yml" in guarded, steps
 
 

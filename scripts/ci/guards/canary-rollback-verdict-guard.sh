@@ -19,7 +19,7 @@
 # не отдаётся = «деплой плохой», откат остаётся.
 #
 # Доказано мутациями — ИСПОЛНЕНО, не пересказано.
-# База: 46 passed (канарейка 5 + гвардия отката 10 + алерт 31).
+# База: 49 passed (канарейка 6 + гвардия отката 12 + алерт 31).
 #   1) сузить «бэкенд лежит» до отказов, чью причину назвало тело (узкое
 #      правило прежней редакции этого PR) — «1 failed, 45 passed», краснеет
 #      test_unrecognized_5xx_is_still_backend_down: голый 5xx без причины в
@@ -44,7 +44,13 @@
 #   5) снять условие вердикта с шага автооката deploy-worker.yml — «3 failed,
 #      38 passed», краснеют test_live_repository_is_consistent,
 #      test_live_repository_really_has_rollback_steps и
-#      test_rollback_gates_only_on_post_deploy_failures.
+#      test_rollback_gates_only_on_post_deploy_failures;
+#   6) снять проверку издателя вердикта (блокирующая находка AI-ревью
+#      PR #1441: копипаст `if:` с чужим id канарейки зелён подстроку, а в
+#      Actions пустой output делает откат безусловным) — «2 failed,
+#      10 passed», краснеют test_rollback_if_referencing_missing_producer_
+#      step_reddens и test_producer_step_without_verdict_write_reddens.
+#      База для этой мутации: 12 passed (набор гвардии отката).
 #
 # Регистрируется каталогом (#749), не рукописным шагом repo-ci.yml.
 set -euo pipefail

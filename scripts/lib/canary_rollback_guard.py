@@ -17,6 +17,12 @@
 шаг обязан либо спрашивать вердикт канарейки в своём `if:`, либо стоять в
 `UNGUARDED_ROLLBACK_WORKFLOWS` с НАЗВАННОЙ причиной и номером задачи.
 
+Спрашивать — мало: `if:` обязан ссылаться на шаг, который СУЩЕСТВУЕТ в том
+же job и реально пишет `verdict=` в `GITHUB_OUTPUT` (находка AI-ревью
+PR #1441). Копипаст с чужим id зелён подстрочную проверку, а в Actions
+несуществующий шаг даёт пустой output: `'' != 'backend-down'` истинно —
+откат безусловен, тот же класс, молча.
+
 Запуск:
   python scripts/lib/canary_rollback_guard.py
   python -m pytest scripts/lib/test_canary_rollback_guard.py -q
@@ -46,6 +52,8 @@ _ROLLBACK_RE = re.compile(r"wrangler(?:@[^\s]+)?\s+rollback\b")
 # именем. Имя выхода — контракт между канарейкой и шагом, и он один на все
 # workflow: второй синоним означал бы вторую версию того же правила.
 VERDICT_OUTPUT = "outputs.verdict"
+# Кто издаёт вердикт: `steps.<id>.outputs.verdict` в `if:` шага отката.
+_VERDICT_PRODUCER_RE = re.compile(r"steps\.([A-Za-z0-9_-]+)\.outputs\.verdict")
 
 # Workflow с откатом, СОЗНАТЕЛЬНО оставленные без вердикта: имя файла →
 # причина со ссылкой на задачу. Тормоз без газа не принимается (AGENTS.md) —
@@ -71,10 +79,13 @@ def _strip_shell_comments(script: str) -> str:
     )
 
 
-def rollback_steps(workflows_dir: Path = WORKFLOWS_DIR) -> list[tuple[str, str, str]]:
-    """(файл, имя шага, его `if`) для КАЖДОГО шага, реально запускающего
-    `wrangler rollback`. `if` пустой — значит условия нет вовсе."""
-    found: list[tuple[str, str, str]] = []
+def rollback_steps(
+    workflows_dir: Path = WORKFLOWS_DIR,
+) -> list[tuple[str, str, str, list]]:
+    """(файл, имя шага, его `if`, шаги его job) для КАЖДОГО шага, реально
+    запускающего `wrangler rollback`. `if` пустой — условия нет вовсе; шаги
+    job нужны для проверки издателя вердикта (см. докстринг модуля)."""
+    found: list[tuple[str, str, str, list]] = []
     for path in sorted(workflows_dir.glob("*.y*ml")):
         doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         if not isinstance(doc, dict):
@@ -82,9 +93,8 @@ def rollback_steps(workflows_dir: Path = WORKFLOWS_DIR) -> list[tuple[str, str, 
         for job in (doc.get("jobs") or {}).values():
             if not isinstance(job, dict):
                 continue
-            for step in (job.get("steps") or []):
-                if not isinstance(step, dict):
-                    continue
+            job_steps = [s for s in (job.get("steps") or []) if isinstance(s, dict)]
+            for step in job_steps:
                 run = step.get("run")
                 if not isinstance(run, str):
                     continue
@@ -93,8 +103,46 @@ def rollback_steps(workflows_dir: Path = WORKFLOWS_DIR) -> list[tuple[str, str, 
                         path.name,
                         str(step.get("name") or step.get("id") or "(без имени)"),
                         str(step.get("if") or ""),
+                        job_steps,
                     ))
     return found
+
+
+def _verdict_producer_problems(
+    workflow: str, name: str, condition: str, job_steps: list,
+) -> list[str]:
+    """`if:` спрашивает вердикт — проверяем, что издатель существует и пишет.
+    Пустой список — проверка пройдена."""
+    problems: list[str] = []
+    producers = _VERDICT_PRODUCER_RE.findall(condition)
+    if not producers:
+        problems.append(
+            f"{workflow}, шаг «{name}»: `if:` упоминает {VERDICT_OUTPUT} без "
+            "`steps.<id>.outputs.verdict` — издателя вердикта не проверить; "
+            "ссылайся на конкретный шаг канарейки (образец — deploy-worker.yml)")
+        return problems
+    for producer_id in producers:
+        producer = next(
+            (s for s in job_steps if s.get("id") == producer_id), None)
+        if producer is None:
+            problems.append(
+                f"{workflow}, шаг «{name}»: `if:` спрашивает "
+                f"steps.{producer_id}.{VERDICT_OUTPUT}, но шага с id "
+                f"'{producer_id}' в этом job нет — в Actions такой output "
+                "пуст, `'' != 'backend-down'` истинно, и откат срабатывает "
+                "безусловно: тот же класс #1426, молча. Газ: поправь id в "
+                "`if:` на реальный шаг канарейки или добавь шаг, пишущий "
+                "вердикт (образец — deploy-worker.yml)")
+            continue
+        producer_run = _strip_shell_comments(str(producer.get("run") or ""))
+        if "verdict=" not in producer_run or "GITHUB_OUTPUT" not in producer_run:
+            problems.append(
+                f"{workflow}, шаг «{name}»: `if:` спрашивает вердикт шага "
+                f"'{producer_id}', но run этого шага не пишет `verdict=` в "
+                "`GITHUB_OUTPUT` — вердикт не издаётся, output пуст, откат "
+                "безусловен (класс #1426). Газ: пиши вердикт ДО выхода "
+                "(образец — шаг canary_ui в deploy-worker.yml)")
+    return problems
 
 
 def check_rollback_guarded(workflows_dir: Path = WORKFLOWS_DIR) -> list[str]:
@@ -103,22 +151,23 @@ def check_rollback_guarded(workflows_dir: Path = WORKFLOWS_DIR) -> list[str]:
     present = {path.name for path in workflows_dir.glob("*.y*ml")}
     problems: list[str] = []
 
-    for workflow, name, condition in steps:
-        if VERDICT_OUTPUT in condition:
+    for workflow, name, condition, job_steps in steps:
+        if VERDICT_OUTPUT not in condition:
+            if workflow in UNGUARDED_ROLLBACK_WORKFLOWS:
+                continue
+            problems.append(
+                f"{workflow}, шаг «{name}»: запускает wrangler rollback, но его "
+                f"`if:` не спрашивает вердикт канарейки ({VERDICT_OUTPUT}). Так "
+                "был откачен корректный деплой в прогоне 35639422589: красноту "
+                "вызвала исчерпанная квота DO, а не код (#1426). Газ: добавь в "
+                f"условие `steps.<канарейка>.{VERDICT_OUTPUT} != 'backend-down'`, "
+                "либо внеси workflow в UNGUARDED_ROLLBACK_WORKFLOWS с причиной и "
+                "номером задачи."
+            )
             continue
-        if workflow in UNGUARDED_ROLLBACK_WORKFLOWS:
-            continue
-        problems.append(
-            f"{workflow}, шаг «{name}»: запускает wrangler rollback, но его "
-            f"`if:` не спрашивает вердикт канарейки ({VERDICT_OUTPUT}). Так "
-            "был откачен корректный деплой в прогоне 35639422589: красноту "
-            "вызвала исчерпанная квота DO, а не код (#1426). Газ: добавь в "
-            f"условие `steps.<канарейка>.{VERDICT_OUTPUT} != 'backend-down'`, "
-            "либо внеси workflow в UNGUARDED_ROLLBACK_WORKFLOWS с причиной и "
-            "номером задачи."
-        )
+        problems.extend(_verdict_producer_problems(workflow, name, condition, job_steps))
 
-    with_rollback = {workflow for workflow, _, _ in steps}
+    with_rollback = {workflow for workflow, _, _, _ in steps}
     for workflow, reason in sorted(UNGUARDED_ROLLBACK_WORKFLOWS.items()):
         if workflow not in present:
             problems.append(
@@ -145,7 +194,7 @@ def main() -> int:
             print(f"::error::{problem}")
         return 1
     steps = rollback_steps(WORKFLOWS_DIR)
-    guarded = sum(1 for _, _, condition in steps if VERDICT_OUTPUT in condition)
+    guarded = sum(1 for _, _, condition, _ in steps if VERDICT_OUTPUT in condition)
     print(
         f"canary-rollback: {len(steps)} шагов с wrangler rollback, "
         f"{guarded} спрашивают вердикт канарейки, "

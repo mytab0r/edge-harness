@@ -506,8 +506,9 @@ def test_backend_down_alert_does_not_claim_the_cause_it_does_not_have():
         "o/r", "77", rollback_confirmed=False, post_rollback_ok=False,
         canary_ran=True, backend_down=True)
     assert "воркер назвал" not in text, text
-    # Причина — по адресу, а не угадайкой.
-    assert "логе шага «Канарейка UI»" in text, text
+    # Причина — по адресу, а не угадайкой; имя шага — ТОЧНОЕ (как в
+    # deploy-worker.yml), чтобы адрес был находимым, а не приблизительным.
+    assert "логе шага «Канарейка UI на проде»" in text, text
     # Лечение квотой — условное.
     assert re.search(r"если[^\n]*квот", text), text
     assert "00:00 UTC" in text, "лечение обязано быть названо — тормоз без газа не принимается"
@@ -526,8 +527,11 @@ def test_backend_down_does_not_swallow_the_other_outcomes():
 def test_verdict_env_is_read_as_a_string_not_a_bool():
     """`CANARY_VERDICT` — строка выхода шага, и пустая строка (шаг упал ДО
     канарейки) не должна читаться как «бэкенд лежит»: умолчание
-    консервативное, как и у условия самого отката."""
-    import os
-    for value, expected in (("backend-down", True), ("deploy", False), ("", False), (None, False)):
-        got = (value or "").strip() == "backend-down"
+    консервативное, как и у условия самого отката. Тест зовёт КОД
+    (verdict_is_backend_down — то, что читает main()), а не копию выражения:
+    копия зеленеет и тогда, когда прод-путь изменился (замечание AI-ревью
+    PR #1441)."""
+    for value, expected in (("backend-down", True), ("deploy", False), ("", False), (None, False),
+                            (" backend-down ", True), ("backend-down-extra", False)):
+        got = dwra.verdict_is_backend_down(value)
         assert got is expected, (value, got)

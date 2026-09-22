@@ -21,6 +21,7 @@ rows_read Durable Objects (#1411) — живой зонд того же пери
 
 import http.server
 import json
+import socket
 import os
 import subprocess
 import threading
@@ -199,3 +200,21 @@ def test_healthy_probes_go_to_browser_not_to_verdicts():
     assert "BACKEND-DOWN" not in result.stderr, result.stderr
     assert "DEPLOY-BAD" not in result.stderr, result.stderr
     assert "бэкенд отвечает" in result.stdout, (result.stdout, result.stderr)
+
+
+def test_unanswered_probes_take_no_verdict_and_go_to_browser():
+    """Консервативная ветка зонда (находка AI-ревью PR #1441): сеть не
+    ответила вовсе (оба зонда упали) — решение НЕ принимается, канарейка
+    идёт в браузер. Замыкание сети здесь честное: закрытый порт, не
+    подставной код возврата (AGENTS.md: «недоступность» воспроизводится
+    закрытым портом, не подставным кодом)."""
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    dead_port = sock.getsockname()[1]
+    sock.close()  # порт свободен и никто его не слушает
+    result = _run_canary(dead_port)
+    assert result.returncode != 3, (result.returncode, result.stderr)
+    assert "BACKEND-DOWN" not in result.stderr, result.stderr
+    assert "DEPLOY-BAD" not in result.stderr, result.stderr
+    # Решение не принято — канал ушёл в браузерную часть, а не в вердикт.
+    assert "дальше решает браузер" in result.stdout, (result.stdout, result.stderr)
