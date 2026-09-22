@@ -31,11 +31,38 @@ workflow_dispatch) — все они делят ОДИН и тот же бюдж
 `::error::`) обязаны различаться и кодом, и префиксом — чинятся они
 по-разному, «квоты нет» не должно выглядеть как «сеть легла» и наоборот.
 
-`gh api rate_limit` подтверждено НЕ тратит собственную квоту (замер
-2026-09-06: три подряд вызова этой же командой не увеличили
-`resources.core.used`, задокументировано и в GitHub REST API rate limits) —
-эту проверку можно звать перед КАЖДЫМ дорогим job'ом без риска ускорить то,
-от чего она защищает.
+ДВА ИСТОЧНИКА ОСТАТКА, И ОНИ НЕ СОГЛАСНЫ (#1437, замер 2026-09-22).
+`gh api rate_limit` не тратит собственную квоту — и ровно поэтому НЕ
+отражает счётчик, который применяется: эндпоинт исключён из лимитирования и
+отдаёт свой, отдельный бак. Живой случай, прогон 35715554412, job `test`,
+PR #1449:
+
+    10:24:21  rate_guard: квота ок (5000/5000) для job'а «repo-ci-invariants»
+    10:27:02  ##[error]repo_invariants: gh api …/issues/120/comments:
+              gh: API rate limit exceeded for installation … (HTTP 403)
+
+Полный бак и 403 по тому же токену, в том же job'е, через 2 мин 41 с. Это
+не «за две минуты выбрали 5000» — `remaining` РАВЕН `limit`, то есть на том
+счётчике не потрачено НИЧЕГО, пока применяемый уже пуст. Значит `resources.
+core` из `rate_limit` — не тот бак, и предсказывать 403 им нельзя в
+принципе, а не «порог подобран не так».
+
+Второй источник — заголовки `X-Ratelimit-*` ЛЮБОГО обычного ответа: их
+отдаёт тот самый счётчик, который и приводит к 403 (`X-Ratelimit-Resource`
+называет бак прямо). Поэтому `fetch_enforced` делает один дешёвый реальный
+запрос и читает остаток из заголовков.
+
+Решение принимается по МЕНЬШЕМУ из двух остатков. Это осознанно
+консервативно: что заголовки для `github.token` показывают именно
+применяемый бак — из логов CI ещё НЕ подтверждено (см. `docs/research/
+21-github-actions.md`, раздел про #1437), подтверждено обратное про
+`rate_limit`. Минимум безопасен при любом исходе замера, а оба числа
+печатаются рядом — следующий же прогон с 403 даст сравнение прямо в логе,
+без отдельной кампании.
+
+Цена, названная вслух: один настоящий запрос на вызов гейта (было ноль).
+Против 150-250 запросов дорогого пути, который он гасит, это дёшево; но
+«бесплатно» — больше неверное слово.
 
 Запуск: python scripts/lib/rate_guard.py --job <имя>
 Тесты:  python -m pytest scripts/lib/test_rate_guard.py -q
@@ -52,6 +79,7 @@ _console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_u
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -90,6 +118,52 @@ def fetch_core(env: dict | None = None) -> dict:
         raise QuotaCheckFailed(f"ответ rate_limit не разобран: {error}")
 
 
+_HEADER_RE = re.compile(r"^x-ratelimit-([a-z]+):\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+
+
+def parse_ratelimit_headers(raw: str) -> dict:
+    """`X-Ratelimit-*` из сырого ответа `gh api -i` → тот же словарь, что
+    отдаёт `fetch_core` (limit/used/remaining/reset + resource).
+
+    Заголовки — прод-форма: регистр у GitHub «X-Ratelimit-Remaining», но
+    HTTP-заголовки регистронезависимы, и прокси их нормализуют по-разному —
+    разбор регистронезависимый намеренно, иначе гейт ослепнет от смены
+    регистра и скажет «не смог прочитать» там, где данные есть."""
+    found = {name.lower(): value for name, value in _HEADER_RE.findall(raw)}
+    missing = [name for name in ("limit", "remaining", "reset") if name not in found]
+    if missing:
+        raise QuotaCheckFailed(
+            f"в ответе нет заголовков X-Ratelimit-{'/'.join(missing)} — "
+            f"остаток по применяемому счётчику прочитать нечем")
+    try:
+        parsed = {name: int(found[name]) for name in ("limit", "remaining", "reset")}
+    except ValueError as error:
+        raise QuotaCheckFailed(f"заголовок X-Ratelimit-* не число: {error}")
+    parsed["used"] = int(found["used"]) if found.get("used", "").isdigit() else (
+        parsed["limit"] - parsed["remaining"])
+    parsed["resource"] = found.get("resource", "?")
+    return parsed
+
+
+def fetch_enforced(repo: str, env: dict | None = None) -> dict:
+    """Остаток по ПРИМЕНЯЕМОМУ счётчику — из заголовков одного настоящего
+    запроса (`gh api -i repos/<repo>`), а не из `rate_limit` (тот отдаёт
+    свой бак, см. докстринг модуля, #1437).
+
+    Эндпоинт выбран самый дешёвый из тех, что доступны `github.token` в
+    своём репозитории, и он же тратит ровно один запрос — цена названа в
+    докстринге модуля."""
+    result = subprocess.run(
+        ["gh", "api", "-i", f"repos/{repo}"],
+        capture_output=True, text=True, encoding="utf-8",
+        env={**os.environ, **(env or {}), "NO_COLOR": "1"},
+    )
+    if result.returncode != 0:
+        raise QuotaCheckFailed(
+            result.stderr.strip() or f"gh api -i repos/{repo} завершился с кодом {result.returncode}")
+    return parse_ratelimit_headers(result.stdout)
+
+
 def should_skip(core: dict, threshold: int) -> bool:
     """True — квоты меньше порога, дорогой путь пропускаем. Строго `<`:
     остаток РОВНО на пороге ещё считается достаточным («порог» — это «мало»,
@@ -114,7 +188,21 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--job", required=True, help="имя job'а/шага — только для сообщения")
     parser.add_argument("--threshold", type=int, default=DEFAULT_THRESHOLD)
+    parser.add_argument(
+        "--repo", default=os.environ.get("GITHUB_REPOSITORY", ""),
+        help="owner/repo, у которого спрашивают применяемый счётчик; "
+             "по умолчанию $GITHUB_REPOSITORY (в Actions задан всегда)")
     args = parser.parse_args()
+
+    repo = (args.repo or "").strip()
+    if not repo:
+        # Без репозитория применяемый счётчик прочитать нечем, а читать
+        # ТОЛЬКО rate_limit — это и есть дефект #1437 («полный бак» за две
+        # минуты до 403). Молчать и пропускать дорогой путь вперёд нельзя:
+        # «возможности измерить нет» и «квота есть» — разные факты.
+        print("::error::rate_guard: репозиторий не назван (--repo или $GITHUB_REPOSITORY) — "
+              f"остаток по применяемому счётчику для job'а «{args.job}» прочитать нечем (#1437)")
+        return 1
 
     try:
         core = fetch_core()
@@ -126,9 +214,29 @@ def main() -> int:
         print(f"::error::rate_guard: не смог прочитать квоту GitHub API для job'а «{args.job}»: {error}")
         return 1
 
-    remaining, limit = core["remaining"], core["limit"]
-    if should_skip(core, args.threshold):
-        reset_at = reset_human(core)
+    try:
+        enforced = fetch_enforced(repo)
+    except QuotaCheckFailed as error:
+        print("::error::rate_guard: не смог прочитать остаток по ПРИМЕНЯЕМОМУ счётчику "
+              f"(заголовки X-Ratelimit-*) для job'а «{args.job}»: {error}")
+        return 1
+
+    # Оба числа печатаются рядом ВСЕГДА, а не только при пропуске: это и есть
+    # замер, которого требует #1437 — следующий же прогон, упавший 403, даст в
+    # том же логе оба остатка на момент проверки, без отдельной кампании.
+    print(
+        f"rate_guard: rate_limit говорит {core['remaining']}/{core['limit']}, "
+        f"заголовки ({enforced['resource']}) — {enforced['remaining']}/{enforced['limit']} "
+        f"(use {enforced['used']}); решение по меньшему (#1437)"
+    )
+
+    # Меньшее из двух. Источники расходятся (доказано: полный бак rate_limit за
+    # 2 мин 41 с до 403), какой из них верен для github.token — замеряется этим
+    # же выводом; минимум безопасен при любом исходе замера.
+    applied = min((core, enforced), key=lambda source: source["remaining"])
+    remaining, limit = applied["remaining"], applied["limit"]
+    if should_skip(applied, args.threshold):
+        reset_at = reset_human(applied)
         write_output({
             "skip": "true",
             "reason": f"квота {remaining}/{limit} ниже порога {args.threshold}",

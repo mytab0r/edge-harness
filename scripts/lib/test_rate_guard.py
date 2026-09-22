@@ -46,6 +46,51 @@ def _patch_gh(monkeypatch, *, stdout="", returncode=0, stderr=""):
     return calls
 
 
+# Дословный ответ `gh api -i repos/mytab0r/edge-harness`, живой вызов
+# 2026-09-22 10:35:01 UTC. Прод-форма, не пересказ: заголовки в том же
+# регистре и порядке, которые реально пришли. Честная оговорка о
+# происхождении: снят из агентской сессии (PAT, лимит 15000), не из job'а
+# GitHub Actions — значения чисел там будут другие, ФОРМА та же. Ровно на
+# этом различии и стоит вся задача #1437, поэтому оно названо здесь, а не
+# подразумевается.
+REAL_RESPONSE_WITH_HEADERS = """HTTP/1.1 200 OK
+Cache-Control: private, max-age=60, s-maxage=60
+Content-Type: application/json; charset=utf-8
+Date: Tue, 22 Sep 2026 10:35:01 GMT
+Server: github.com
+X-Accepted-Github-Permissions: metadata=read
+X-Github-Api-Version-Selected: 2022-11-28
+X-Ratelimit-Limit: 15000
+X-Ratelimit-Remaining: 14592
+X-Ratelimit-Reset: 1790075485
+X-Ratelimit-Resource: core
+X-Ratelimit-Used: 408
+
+{"id":1,"full_name":"mytab0r/edge-harness"}
+"""
+
+
+def _patch_gh_two_sources(monkeypatch, *, rate_limit_stdout, headers_stdout,
+                          headers_returncode=0, headers_stderr=""):
+    """Стенд под ДВА разных вызова: `gh api rate_limit` и `gh api -i repos/...`.
+
+    Прежний `_patch_gh` отдавал один и тот же stdout на любой вызов — для
+    гейта, у которого источников остатка стало два и они РАСХОДЯТСЯ (#1437),
+    такой стенд отвечает на вопрос «а что если источники разные?» одинаковым
+    ответом, то есть не отвечает вовсе."""
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if "-i" in cmd:
+            return _Result(returncode=headers_returncode, stdout=headers_stdout,
+                           stderr=headers_stderr)
+        return _Result(returncode=0, stdout=rate_limit_stdout)
+
+    monkeypatch.setattr(rg.subprocess, "run", fake_run)
+    return calls
+
+
 # ── fetch_core: разбор прод-формы ответа ─────────────────────────────────────
 
 
@@ -105,7 +150,9 @@ def test_reset_human_formats_utc():
 
 
 def test_main_ok_quota_writes_skip_false(monkeypatch, tmp_path, capsys):
-    _patch_gh(monkeypatch, stdout=REAL_RATE_LIMIT_RESPONSE)
+    _patch_gh_two_sources(monkeypatch, rate_limit_stdout=REAL_RATE_LIMIT_RESPONSE,
+                          headers_stdout=REAL_RESPONSE_WITH_HEADERS)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "mytab0r/edge-harness")
     output_file = tmp_path / "github_output"
     monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
     monkeypatch.setattr(sys, "argv", ["rate_guard.py", "--job", "orchestra"])
@@ -123,7 +170,9 @@ def test_main_ok_quota_writes_skip_false(monkeypatch, tmp_path, capsys):
 
 def test_main_low_quota_skips_with_warning_not_error(monkeypatch, tmp_path, capsys):
     low = json.dumps({"resources": {"core": {"limit": 1000, "used": 950, "remaining": 50, "reset": 1788676450}}})
-    _patch_gh(monkeypatch, stdout=low)
+    _patch_gh_two_sources(monkeypatch, rate_limit_stdout=low,
+                          headers_stdout=REAL_RESPONSE_WITH_HEADERS)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "mytab0r/edge-harness")
     output_file = tmp_path / "github_output"
     monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
     monkeypatch.setattr(sys, "argv", ["rate_guard.py", "--job", "ai-review", "--threshold", "300"])
@@ -148,6 +197,7 @@ def test_main_hard_failure_is_not_confused_with_low_quota(monkeypatch, tmp_path,
     # модуля). Мутация: подмена `return 1` на `return 0` в ветке
     # QuotaCheckFailed красит этот тест.
     _patch_gh(monkeypatch, returncode=1, stderr="dial tcp: connection refused")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "mytab0r/edge-harness")
     output_file = tmp_path / "github_output"
     monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
     monkeypatch.setattr(sys, "argv", ["rate_guard.py", "--job", "orchestra"])
@@ -170,10 +220,142 @@ def test_default_threshold_is_300():
 
 def test_main_without_github_output_env_does_not_raise(monkeypatch, capsys):
     # Локальный прогон/дебаг без GITHUB_OUTPUT (не в Actions) — не должен падать.
-    _patch_gh(monkeypatch, stdout=REAL_RATE_LIMIT_RESPONSE)
+    # Репозиторий вне Actions передаётся явно: $GITHUB_REPOSITORY там не задан,
+    # а применяемый счётчик спрашивают у конкретного репозитория (#1437).
+    _patch_gh_two_sources(monkeypatch, rate_limit_stdout=REAL_RATE_LIMIT_RESPONSE,
+                          headers_stdout=REAL_RESPONSE_WITH_HEADERS)
     monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
-    monkeypatch.setattr(sys, "argv", ["rate_guard.py", "--job", "test"])
+    monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
+    monkeypatch.setattr(sys, "argv",
+                        ["rate_guard.py", "--job", "test", "--repo", "mytab0r/edge-harness"])
 
     code = rg.main()
 
     assert code == 0
+
+
+# ── #1437: rate_limit и применяемый счётчик расходятся ───────────────────────
+
+
+def test_headers_are_parsed_from_the_real_response_shape(monkeypatch):
+    """Прод-форма ответа `gh api -i`, снятая живым вызовом, разбирается целиком
+    — включая `resource`, который называет бак прямо."""
+    parsed = rg.parse_ratelimit_headers(REAL_RESPONSE_WITH_HEADERS)
+
+    assert parsed == {"limit": 15000, "remaining": 14592, "reset": 1790075485,
+                      "used": 408, "resource": "core"}
+
+
+def test_headers_are_read_case_insensitively():
+    """HTTP-заголовки регистронезависимы, и прокси нормализуют их по-разному.
+    Разбор, завязанный на один регистр, ослеп бы на смене регистра и сказал
+    «прочитать нечем» там, где данные есть — это тот же silent-wrong, только
+    с другой стороны."""
+    lower = REAL_RESPONSE_WITH_HEADERS.replace("X-Ratelimit-", "x-ratelimit-")
+
+    assert rg.parse_ratelimit_headers(lower)["remaining"] == 14592
+
+
+def test_missing_ratelimit_headers_are_loud_not_assumed_full():
+    """Заголовков нет — это «измерить нечем», а не «квота полная». Подстановка
+    полного бака здесь и есть дефект #1437, только перенесённый на этаж ниже."""
+    with pytest.raises(rg.QuotaCheckFailed) as error:
+        rg.parse_ratelimit_headers("HTTP/1.1 200 OK\nServer: github.com\n\n{}")
+
+    assert "X-Ratelimit" in str(error.value)
+
+
+def test_decision_takes_the_smaller_of_the_two_sources(monkeypatch, tmp_path, capsys):
+    """ЯДРО #1437, воспроизведённое числами живого случая (прогон 35715554412,
+    job `test`, PR #1449): `rate_limit` отдал ПОЛНЫЙ бак 5000/5000, а через
+    2 мин 41 с тот же токен получил 403 «rate limit exceeded for
+    installation». Полный бак и исчерпание одновременно — значит это разные
+    счётчики, и решать по `rate_limit` нельзя.
+
+    Здесь применяемый счётчик (заголовки) показывает 12 при пороге 300, а
+    `rate_limit` — 5000/5000. Гейт обязан пропустить дорогой путь."""
+    full_rate_limit = json.dumps({"resources": {"core": {
+        "limit": 5000, "used": 0, "remaining": 5000, "reset": 1790075485}}})
+    drained_headers = REAL_RESPONSE_WITH_HEADERS.replace(
+        "X-Ratelimit-Remaining: 14592", "X-Ratelimit-Remaining: 12").replace(
+        "X-Ratelimit-Limit: 15000", "X-Ratelimit-Limit: 1000")
+    _patch_gh_two_sources(monkeypatch, rate_limit_stdout=full_rate_limit,
+                          headers_stdout=drained_headers)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "mytab0r/edge-harness")
+    output_file = tmp_path / "github_output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
+    monkeypatch.setattr(sys, "argv", ["rate_guard.py", "--job", "repo-ci-invariants"])
+
+    code = rg.main()
+
+    assert code == 0
+    assert "skip=true" in output_file.read_text(encoding="utf-8")
+    captured = capsys.readouterr()
+    assert "::warning::" in captured.out
+    assert "12/1000" in captured.out, captured.out
+
+
+def test_both_readings_are_printed_side_by_side(monkeypatch, tmp_path, capsys):
+    """Замер, которого требует #1437, обязан попадать в лог КАЖДОГО прогона, а
+    не только упавшего: иначе следующий 403 снова придётся ловить отдельной
+    кампанией. Оба остатка печатаются рядом даже когда гейт пропускает."""
+    _patch_gh_two_sources(monkeypatch, rate_limit_stdout=REAL_RATE_LIMIT_RESPONSE,
+                          headers_stdout=REAL_RESPONSE_WITH_HEADERS)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "mytab0r/edge-harness")
+    monkeypatch.setenv("GITHUB_OUTPUT", str(tmp_path / "github_output"))
+    monkeypatch.setattr(sys, "argv", ["rate_guard.py", "--job", "orchestra"])
+
+    rg.main()
+
+    out = capsys.readouterr().out
+    assert "5000/5000" in out, out          # rate_limit
+    assert "14592/15000" in out, out        # применяемый счётчик
+    assert "core" in out, out               # X-Ratelimit-Resource
+
+
+def test_unreadable_enforced_counter_is_an_error_not_a_green_pass(monkeypatch, tmp_path, capsys):
+    """Применяемый счётчик не прочитался — дорогой путь НЕ идёт вперёд молча.
+    Возврат к «ну, rate_limit же сказал ок» вернул бы ровно #1437."""
+    _patch_gh_two_sources(monkeypatch, rate_limit_stdout=REAL_RATE_LIMIT_RESPONSE,
+                          headers_stdout="", headers_returncode=1,
+                          headers_stderr="HTTP 403: API rate limit exceeded for installation")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "mytab0r/edge-harness")
+    output_file = tmp_path / "github_output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
+    monkeypatch.setattr(sys, "argv", ["rate_guard.py", "--job", "orchestra"])
+
+    code = rg.main()
+
+    assert code == 1
+    captured = capsys.readouterr()
+    assert "::error::" in captured.out
+    assert "ПРИМЕНЯЕМОМУ" in captured.out
+    assert "skip=false" not in (output_file.read_text(encoding="utf-8") if output_file.exists() else "")
+
+
+def test_missing_github_repository_is_loud(monkeypatch, tmp_path, capsys):
+    """Репозиторий неизвестен — применяемый счётчик прочитать нечем. Тихий
+    откат к одному только rate_limit был бы возвратом дефекта через заднюю
+    дверь."""
+    _patch_gh_two_sources(monkeypatch, rate_limit_stdout=REAL_RATE_LIMIT_RESPONSE,
+                          headers_stdout=REAL_RESPONSE_WITH_HEADERS)
+    monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
+    monkeypatch.setenv("GITHUB_OUTPUT", str(tmp_path / "github_output"))
+    monkeypatch.setattr(sys, "argv", ["rate_guard.py", "--job", "orchestra"])
+    # ни --repo, ни $GITHUB_REPOSITORY
+
+    code = rg.main()
+
+    assert code == 1
+    assert "::error::" in capsys.readouterr().out
+
+
+def test_enforced_reader_calls_the_repo_endpoint_not_rate_limit(monkeypatch):
+    """Читать заголовки у самого `rate_limit` бессмысленно: этот эндпоинт
+    исключён из лимитирования и отдаёт свой бак — измерено 2026-09-22, у него
+    даже `reset` другой. Запрос обязан идти по обычному пути."""
+    calls = _patch_gh(monkeypatch, stdout=REAL_RESPONSE_WITH_HEADERS)
+
+    rg.fetch_enforced("mytab0r/edge-harness")
+
+    assert calls == [["gh", "api", "-i", "repos/mytab0r/edge-harness"]]

@@ -46,6 +46,24 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Гейт квоты GITHUB_TOKEN — ПЕРВЫМ шагом, до любого чтения API (#454,
+      # переезд из середины job'а — #1437). Причина переезда: гейт стоял
+      # ниже трёх шагов, которые сами ходят в API, и защищал ровно один
+      # четвёртый. Живой случай — прогон 35715554412 (PR #1449): шаг
+      # инвариантов был пропущен корректно, а `test` всё равно покраснел на
+      # шаге «Коллизия имён с апстримом», который гейта не знал. Теперь один
+      # гейт наверху и одно условие `steps.quota.outputs.skip` у всех
+      # потребителей API этого job'а — одно место правды вместо четырёх
+      # независимых решений.
+      #
+      # Порог и обоснование — scripts/lib/rate_guard.py. Что именно он
+      # измеряет (и почему НЕ `rate_limit`) — там же, #1437.
+      - name: Квота GitHub API — ранняя проверка (все шаги, читающие API)
+        id: quota
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/lib/rate_guard.py --job repo-ci
+
       - name: Python-скрипты компилируются
         run: python -m compileall -q scripts
 
@@ -59,6 +77,7 @@ jobs:
       # закрывает его — следующий прогон repo-ci перечитывает список и красный
       # уходит сам, снимать вручную нечего.
       - name: Белые пятна без метки task (класс #179)
+        if: steps.quota.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -118,7 +137,7 @@ jobs:
       # а не в пульсе orchestra: то же обоснование по цене, что у детектора
       # рассинхрона выше (пульс уже самый дорогой потребитель квоты, #454).
       - name: Автоперенос поля «Чем блокируется» в граф (#529)
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && steps.quota.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: python scripts/lib/declared_deps.py wire "$GITHUB_REPOSITORY"
@@ -513,6 +532,7 @@ jobs:
       # реальный апстримный артефакт на пине из dsh-edge/upstream.json, а не
       # захардкоженный список — так она не протухнет к следующему бампу.
       - name: Коллизия имён с апстримом (namespace/label/inject/slot)
+        if: steps.quota.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: node dsh-edge/check-upstream-namespace-collision.mjs
@@ -722,20 +742,6 @@ jobs:
         run: |
           pip install --quiet pytest
           python -m pytest scripts/lib/test_rate_guard.py -q
-
-      # Ранний отказ по квоте GITHUB_TOKEN вместо 403 посреди работы (#454):
-      # шаг ниже читает issues/PR/openspec живым `gh api` — та же причина
-      # живого падения, что у PR #428 (оба обязательных гейта, `test` в том
-      # числе, упали с `API rate limit exceeded for installation`). Мало
-      # квоты → шаг инвариантов пропускается (условие ниже) и job `test`
-      # остаётся зелёным вместо случайного красного по чужой причине;
-      # предупреждение печатается здесь же, до пропуска. Порог и обоснование —
-      # scripts/lib/rate_guard.py.
-      - name: Квота GitHub API — ранняя проверка (инварианты)
-        id: quota
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python scripts/lib/rate_guard.py --job repo-ci-invariants
 
       # Живой снимок инвариантов состояния репозитория (#244) — на каждый
       # push/PR, раньше следующего пульса orchestra (см. также periodic-шаг
