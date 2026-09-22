@@ -1,0 +1,49 @@
+# Живой замер тредов в личном диалоге с ботом (#1463). Обоснование, различение
+# исходов и работа с секретами — целиком в докстринге scripts/telegram/
+# thread_probe.py, здесь только проводка.
+#
+# Почему триггер `push` по путям, а не только `workflow_dispatch`:
+# workflow_dispatch физически недоступен, пока файл не лёг на ветку по
+# умолчанию — а ответ «работают ли темы» нужен ДО слияния, иначе задача
+# упирается в собственное слияние. Фильтр по путям делает прогон
+# самоограниченным: пуш, не трогающий сам замер, его не запускает, и
+# открытый PR не шлёт владельцу сообщение на каждый коммит.
+#
+# Замер ПИШЕТ в чат владельца (иначе это не замер, а пересказ документации) —
+# ровно три сообщения и удаление созданной темы за собой.
+name: telegram-thread-probe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/telegram-thread-probe.yml"
+      - "scripts/telegram/thread_probe.py"
+
+permissions:
+  contents: read
+
+# Параллельные прогоны замера писали бы владельцу вперемешку и удаляли бы
+# чужие темы. Отмена устаревшего допустима: смысл имеет только последний.
+concurrency:
+  group: telegram-thread-probe
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Стенд замера (настоящий сервер, не заглушка)
+        run: python -m pytest scripts/telegram/test_thread_probe.py -q
+
+      - name: Замер тредов в личке
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scripts/telegram/thread_probe.py
