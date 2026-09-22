@@ -2884,6 +2884,7 @@ def _archive_with_opener(repo: str, opener, task_numbers: list[int]) -> tuple[li
                          "повтор на следующем проходе")
             still_queued.append(number)
             continue
+        marked = False
         try:
             # Порядок важен (#1432): свойство «убрано» ставится ПЕРЕД снятием
             # очереди. Упадём между вызовами — запись останется в очереди,
@@ -2891,13 +2892,23 @@ def _archive_with_opener(repo: str, opener, task_numbers: list[int]) -> tuple[li
             # окно, в котором задача уже не в очереди и ещё не помечена
             # убранной — то есть невидима обоим механизмам.
             _mark_session_archived(repo, number)
+            marked = True
             _clear_archive_pending(repo, number)
         except RuntimeError as error:
-            # Сессия убрана, а метка осталась — следующий проход повторит
-            # архивацию уже архивированной сессии. Это безвредно (тот же
-            # идемпотентный RPC) и честнее, чем потерять запись.
-            lines.append(f"{done}; метка {SESSION_ARCHIVE_PENDING_LABEL} не снята ({error}) — "
-                         "повтор безвреден, запись останется до успешного снятия")
+            # Сессия убрана, а запись свойств неполна — следующий проход
+            # повторит архивацию уже архивированной сессии. Это безвредно (тот
+            # же идемпотентный RPC) и честнее, чем потерять запись. Какой из
+            # двух вызовов упал — различает текст: данные для этого здесь
+            # есть, а владелец читает факт, не гипотезу (находка ai-review
+            # PR #1435, чеклист).
+            if marked:
+                lines.append(f"{done}; свойство {SESSION_ARCHIVED_LABEL} поставлено, метка "
+                             f"{SESSION_ARCHIVE_PENDING_LABEL} не снята ({error}) — "
+                             "повтор безвреден, запись останется до успешного снятия")
+            else:
+                lines.append(f"{done}; свойство {SESSION_ARCHIVED_LABEL} НЕ поставлено ({error}) — "
+                             f"запись остаётся в очереди {SESSION_ARCHIVE_PENDING_LABEL}, "
+                             "повтор безвреден и поставит свойство вместе с уборкой")
             still_queued.append(number)
             continue
         lines.append(done)
@@ -2951,10 +2962,12 @@ def closed_tasks_needing_archive(repo: str, limit: int = CLOSED_TASK_SWEEP_LIMIT
     репозитории лежат сотни давно закрытых задач, и попытка пометить все за
     один проход упёрлась бы в лимит GitHub API. Очередь повторяется на каждом
     пульсе, хвост растает за несколько часов."""
-    # Метки несут двоеточие, а разбор выражения поиска у GitHub режет
-    # квалификатор по первому — без кавычек `label:session:archive-pending`
-    # читается как метка `session`, и фильтр молча отбирает не то (#938 на
-    # поверхности поиска). Кавычки ставит одно место правды.
+    # Значения меток с двоеточием идут через одно место правды
+    # (label_search_value, кавычки выражения поиска). Замер 2026-09-22
+    # (#1432): %3A внутри значения квалификатора движок НЕ декодирует —
+    # «label:area%3Aprocess» → 0, сырое двоеточие и кавычки работают
+    # (по 343) — см. docs/research/21-github-actions.md и докстринг
+    # label_search_value.
     query = (f"repo:{repo} is:issue is:closed label:task "
              f"-label:{review_labels.label_search_value(SESSION_ARCHIVE_PENDING_LABEL)} "
              f"-label:{review_labels.label_search_value(SESSION_ARCHIVED_LABEL)}")

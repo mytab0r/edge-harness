@@ -10817,12 +10817,12 @@ def test_sweep_query_excludes_both_labels(monkeypatch):
 
     sch.sweep_closed_task_sessions("o/r")
 
-    # Кавычки обязательны, и это не косметика: разбор выражения поиска у
-    # GitHub режет квалификатор по ПЕРВОМУ двоеточию, а обе метки его несут.
-    # Без кавычек `-label:session:archive-pending` читается как метка
-    # `session`, и фильтр молча отбирает не то — пустым списком, не ошибкой
-    # (тот же класс #938, другая поверхность; поймано гвардией
-    # label-query-encoding на PR #1435).
+    # Значения меток с двоеточием — через label_search_value: кавычки.
+    # Замер 2026-09-22 (#1432): %3A внутри значения квалификатора движок не
+    # декодирует (→ 0), кавычки и сырое двоеточие работают одинаково (по 343
+    # на area:process) — выбранная форма значения и одно место правды, не
+    # «режет по первому двоеточию» (это опровергнуто тем же замером);
+    # docs/research/21-github-actions.md.
     assert f'-label:"{sch.SESSION_ARCHIVE_PENDING_LABEL}"' in seen["q"], seen
     assert f'-label:"{sch.SESSION_ARCHIVED_LABEL}"' in seen["q"], seen
     assert "is:closed" in seen["q"], "открытую задачу трогать нельзя — её сессию допишет следующий прогон"
@@ -10871,6 +10871,59 @@ def test_archived_marker_is_set_before_the_queue_entry_is_cleared(monkeypatch):
     sch.archive_runner_sessions("o/r", [5])
 
     assert order == ["marked", "cleared"], order
+
+
+def _archive_property_stand(monkeypatch, *, fail_on):
+    """Стенд `_archive_with_opener` через archive_runner_sessions: RPC сессии
+    успешен, gh падает ТОЛЬКО на вызове из `fail_on` («mark» — POST свойства
+    session:archived, «clear» — DELETE метки очереди)."""
+    def fake_gh(*args):
+        joined = " ".join(args)
+        if "DELETE" in joined:
+            if fail_on == "clear":
+                raise RuntimeError("HTTP 502: удаление не прошло")
+            return None
+        if sch.SESSION_ARCHIVED_LABEL in joined:
+            if fail_on == "mark":
+                raise RuntimeError("HTTP 502: метка не легла")
+            return None
+        if "labels" in joined:
+            return None  # постановка очереди до попытки
+        raise AssertionError(joined)
+
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_morde_opener", lambda: object())
+    monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
+    monkeypatch.setattr(sch, "_morde_rpc", lambda opener, method, payload: {})
+    monkeypatch.setattr(sch, "gh", fake_gh)
+
+
+def test_report_distinguishes_a_failed_property_mark_from_a_failed_clear(monkeypatch):
+    """В try-блоке два вызова — упавший POST свойства и упавший DELETE очереди
+    лечатся и читаются по-разному, и строка отчёта не имеет права описывать
+    один текстом другого (находка ai-review PR #1435, чеклист): «не снята»
+    про метку, которой в этом проходе могло и не быть."""
+    _archive_property_stand(monkeypatch, fail_on="mark")
+
+    lines, hard = sch.archive_runner_sessions("o/r", [5])
+
+    assert hard is False
+    assert any(f"свойство {sch.SESSION_ARCHIVED_LABEL} НЕ поставлено" in line
+               for line in lines), lines
+    assert not any("не снята" in line for line in lines), lines
+
+
+def test_report_distinguishes_a_failed_clear_from_a_failed_mark(monkeypatch):
+    """Вторая ветка того же различения: свойство поставлено, очередь не снята —
+    «не снята» честна, потому что POST в этом проходе прошёл."""
+    _archive_property_stand(monkeypatch, fail_on="clear")
+
+    lines, hard = sch.archive_runner_sessions("o/r", [5])
+
+    assert hard is False
+    assert any(f"свойство {sch.SESSION_ARCHIVED_LABEL} поставлено, метка "
+               f"{sch.SESSION_ARCHIVE_PENDING_LABEL} не снята" in line for line in lines), lines
 
 
 def test_main_runs_the_catch_up_pass_every_pulse(monkeypatch):
