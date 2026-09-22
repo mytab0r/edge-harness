@@ -489,10 +489,28 @@ def test_backend_down_text_states_the_fact_and_not_a_missing_rollback():
         "o/r", "77", rollback_confirmed=False, post_rollback_ok=False,
         canary_ran=True, backend_down=True)
     assert "НЕ ПОДТВЕРЖДЁН" not in text, text
-    assert "виноват НЕ деплой" in text
-    assert "квота" in text
-    assert "00:00 UTC" in text, "лечение обязано быть названо — тормоз без газа не принимается"
+    # Исход назван фактом, решение названо.
+    assert "бэкенд лежит" in text, text
+    assert "СОЗНАТЕЛЬНО не делался" in text, text
+    assert "Прод сейчас на СВЕЖЕЙ версии" in text, text
     assert "https://github.com/o/r/actions/runs/77" in text
+
+
+def test_backend_down_alert_does_not_claim_the_cause_it_does_not_have():
+    """Вердикт шага (`backend-down`) не несёт ПРИЧИНУ — алерт не имеет права
+    утверждать «воркер назвал её сам (квота)»: при 1101-странице Cloudflare
+    это было бы утверждением о факте, которого нет («Алерт не гадает»).
+    Причина живёт в логе канарейки — алерт обязан назвать её адрес, а лечение
+    квотой дать условно («если это…»)."""
+    text = dwra.rollback_alert_text(
+        "o/r", "77", rollback_confirmed=False, post_rollback_ok=False,
+        canary_ran=True, backend_down=True)
+    assert "воркер назвал" not in text, text
+    # Причина — по адресу, а не угадайкой.
+    assert "логе шага «Канарейка UI»" in text, text
+    # Лечение квотой — условное.
+    assert re.search(r"если[^\n]*квот", text), text
+    assert "00:00 UTC" in text, "лечение обязано быть названо — тормоз без газа не принимается"
 
 
 def test_backend_down_does_not_swallow_the_other_outcomes():

@@ -10,7 +10,13 @@
 // Без --url проверяется прод (https://edge-harness.mytab0r.workers.dev).
 // Нужен установленный браузер: npx playwright install chromium.
 
-import { classifyApiFailure, EXIT_BACKEND_DOWN } from "./canary_outcome.mjs";
+import {
+  EXIT_BACKEND_DOWN,
+  EXIT_DEPLOY_BAD,
+  apiFailureCause,
+  backendDownLines,
+  probeOutcome,
+} from "./canary_outcome.mjs";
 // Playwright грузится ПОЗЖЕ, отдельным `await import` перед браузерной
 // частью. Верхнеуровневый импорт означал бы, что зонд готовности ниже
 // невозможно исполнить без установленного браузера, — а весь смысл зонда
@@ -26,48 +32,39 @@ if (!token) {
 
 const base = urlArg.replace(/\/$/, "");
 
-// Готовность бэкенда проверяется ПЕРВОЙ, до единой строки браузерной части
-// (issue #1426). Порядок — не стиль, а суть: в живом случае (прогон
-// 35639422589) канарейка умирала на `page.fill("#gate-token")`, потому что
-// страница не инициализировалась при 500 от API, — до проверки `/api/ready`
-// в конце файла исполнение просто не доходило. Красный таймаут локатора
-// неотличим от сломанной вёрстки, и шаг автооката откатывал исправный код.
-//
-// Зонд дешёвый (один SQL-раундтрип на той стороне) и отвечает кодом, который
-// воркер ставит сам, — гадать не нужно.
+// Исход различается ПЕРВЫМ, до единой строки браузерной части (issue #1426).
+// Порядок — не стиль, а суть: в живом случае (прогон 35639422589) канарейка
+// умирала на `page.fill("#gate-token")`, потому что страница не
+// инициализировалась при 500 от API, — красный таймаут локатора неотличим от
+// сломанной вёрстки, и шаг автооката откатывал исправный код. Зондов два, по
+// правилу задачи: статика (GET /) и API (GET /api/ready — один дешёвый
+// SQL-раундтрип, контракт {ok:true}).
 {
-  let status = null;
-  let body = "";
+  let staticStatus = null;
+  let apiStatus = null;
+  let apiBody = "";
+  try {
+    staticStatus = (await fetch(`${base}/`)).status;
+  } catch {
+    // Сети нет вовсе — решение не принимается, консервативно разбирается ниже.
+  }
   try {
     const probe = await fetch(`${base}/api/ready`, { headers: { Authorization: `Bearer ${token}` } });
-    status = probe.status;
-    body = await probe.text();
-  } catch (error) {
-    // Сети нет вовсе — это НЕ распознанный инфраструктурный отказ: маршрут
-    // может не отдаваться именно из-за деплоя. Прежнее поведение (упасть и
-    // дать откатить) сохраняется, разбирается ниже общим путём.
-    status = null;
+    apiStatus = probe.status;
+    apiBody = await probe.text();
+  } catch {
+    apiStatus = null;
   }
-  if (status !== null && status >= 500) {
-    const verdict = classifyApiFailure(status, body);
-    if (verdict.infra) {
-      console.error(`canary-ui: ${verdict.reason}`);
-      console.error(
-        "canary-ui: BACKEND-DOWN — деплой НЕ откатываю, прогон красный. " +
-        "Откат вернул бы прежнюю версию в ту же самую поломку, а заодно " +
-        "похоронил бы исправление, если оно в этом деплое.",
-      );
-      process.exit(EXIT_BACKEND_DOWN);
-    }
-    console.error(
-      `canary-ui: зонд /api/ready — ${status}, но отказ НЕ распознан как ` +
-      "инфраструктурный; сужу деплой дальше браузером, откат остаётся возможным",
-    );
-  } else if (status !== null) {
-    console.log(`canary-ui: зонд /api/ready — ${status}, бэкенд отвечает`);
-  } else {
-    console.error("canary-ui: зонд /api/ready — ответа нет вовсе; сужу деплой дальше браузером");
+  const probe = probeOutcome(staticStatus, apiStatus, apiBody);
+  if (probe.outcome === "backend-down") {
+    for (const line of backendDownLines(probe.reason)) console.error(line);
+    process.exit(EXIT_BACKEND_DOWN);
   }
+  if (probe.outcome === "deploy-bad") {
+    console.error(`canary-ui: DEPLOY-BAD — ${probe.reason}; откат оправдан.`);
+    process.exit(EXIT_DEPLOY_BAD);
+  }
+  console.log(`canary-ui: зонд исхода — ${probe.reason}; дальше решает браузер`);
 }
 
 const { chromium } = await import("playwright");
@@ -169,14 +166,31 @@ try {
   // отрисовка страницы браузером выше. UI может «висеть живым» (шелл грузится,
   // сокет коннектится), пока журнал/API уже 500'ят на исчерпании суточной
   // квоты — этот запрос ловит именно тот класс, прямым HTTP, не через страницу.
+  // 5xx здесь — тот же исход «бэкенд лежит» (#1426): статика к этому моменту
+  // доказано отдаётся (страница загружена), поэтому отказ идёт в ту же ветку —
+  // красный БЕЗ отката, а не «деплой плохой».
+  let storageProbe = null;
   try {
     const readyRes = await fetch(`${base}/api/ready`, { headers: { Authorization: `Bearer ${token}` } });
     if (!readyRes.ok) {
       const body = await readyRes.text();
-      fails.push(`/api/ready вернул ${readyRes.status}: ${body.slice(0, 300)}`);
+      if (readyRes.status >= 500) {
+        storageProbe = { status: readyRes.status, body };
+      } else {
+        fails.push(`/api/ready вернул ${readyRes.status}: ${body.slice(0, 300)}`);
+      }
     }
   } catch (error) {
     fails.push(`/api/ready недоступен: ${error instanceof Error ? error.message : error}`);
+  }
+
+  if (storageProbe) {
+    const cause = apiFailureCause(storageProbe.status, storageProbe.body);
+    const reason = cause ??
+      `бэкенд отдаёт ${storageProbe.status} на /api/ready; тело ответа: ` +
+      `${storageProbe.body.trim().slice(0, 300) || "(пусто)"}`;
+    for (const line of backendDownLines(reason)) console.error(line);
+    process.exit(EXIT_BACKEND_DOWN);
   }
 
   if (fails.length) {

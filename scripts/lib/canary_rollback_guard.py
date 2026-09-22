@@ -53,9 +53,10 @@ VERDICT_OUTPUT = "outputs.verdict"
 UNGUARDED_ROLLBACK_WORKFLOWS: dict[str, str] = {
     "deploy-dsh-edge.yml":
         "канарейка здесь другая — bash/curl через scripts/lib/canary_http.sh "
-        "против ЧУЖОГО воркера dsh-edge, у которого нет контракта "
-        "storage_quota_exceeded; распознавание его инфраструктурных отказов "
-        "(прод-форма известна: 'Exceeded allowed rows read in Durable Objects "
+        "против ЧУЖОГО воркера dsh-edge: её шаг не издаёт вердикт вовсе, "
+        "нечего спрашивать в `if:`; правило #1426 (статика отдаётся + /api/* "
+        "5xx = не откатывать) к ней не применено, прод-форма её инфраструктурных "
+        "отказов известна ('Exceeded allowed rows read in Durable Objects "
         "free tier' в detail) — отдельная задача #1440",
 }
 
