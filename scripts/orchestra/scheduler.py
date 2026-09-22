@@ -1353,6 +1353,26 @@ def dispatch_conflict_rework(
                 "заняты — расшивка отложена"
             )
             continue
+        # Тот же гейт, что у доводки по находкам ai-review (#1448): свободный
+        # слот означает «есть куда запустить», а не «по этой задаче никто не
+        # работает». Задача #1448 называет ИМЕННО этот диспатчер, и первая
+        # редакция фикса его пропустила — найдено исполнением ai-review
+        # PR #1449 (стенд: задача с живым прогоном, метка conflict, попыток 0
+        # — диспатч уходил).
+        try:
+            alive_run = active_worker_run_for_task(repo, int(task_number))
+        except RuntimeError as error:
+            observations.append(
+                f"⚠️ PR #{number}: не удалось сверить, идёт ли прогон по задаче "
+                f"#{task_number} ({error}) — расшивка пропущена этим проходом"
+            )
+            continue
+        if alive_run is not None:
+            observations.append(
+                f"⏸️ PR #{number}: по задаче #{task_number} уже идёт прогон воркера "
+                f"{alive_run} — расшивку не запускаю (#1448)"
+            )
+            continue
         if issue["assignees"]:
             who = ", ".join(a["login"] for a in issue["assignees"])
             gh("-X", "DELETE", f"repos/{repo}/issues/{task_number}/assignees", "-f", f"assignees[]={who}")
@@ -1460,8 +1480,12 @@ def active_worker_run_for_task(repo: str, task_number: int) -> str | None:
     Зато обратная связь есть: воркер САМ пишет в задачу маркер git-шага с
     номером своего прогона (`WORKER_GIT_STEP_MARKER … worker run <id>`), и
     репозиторий этот формат уже разбирает — им же считается бюджет попыток
-    (`ai_rework_attempts`). Берём последний такой номер и спрашиваем у API
-    состояние ЭТОГО прогона.
+    (`ai_rework_attempts`). Собираем ВСЕ такие номера, дедуплицируем
+    (`dict.fromkeys` — воркер пишет маркер на каждый git-шаг, один прогон
+    оставляет их пачкой) и идём от свежих к старым, спрашивая у API
+    состояние каждого; первый незавершённый и есть ответ. Не «последний
+    номер»: старый прогон может быть жив, когда более новый уже завершился,
+    — это и есть тот самый дубль, который гейт обязан увидеть.
 
     Честный потолок, названный вслух: прогон, диспатченный секунды назад,
     до git-шага ещё не дошёл и маркера не оставил — в этом окне дубль
@@ -1476,15 +1500,26 @@ def active_worker_run_for_task(repo: str, task_number: int) -> str | None:
         match = git_step_run.search(comment.get("body") or "")
         if match:
             run_ids.append(match.group(1))
-    for run_id in reversed(run_ids):  # новые комментарии в конце — проверяем с них
-        try:
-            run = gh(f"repos/{repo}/actions/runs/{run_id}")
-        except RuntimeError:
-            # Прогон не отдался — молчать нельзя, но и блокировать диспатч
-            # по неизвестности тоже: вызывающий получит None и решит сам,
-            # а строка отчёта у него уже есть.
-            continue
-        if (run or {}).get("status") in ("queued", "in_progress", "waiting", "requested"):
+    # Дедуп (находка ai-review PR #1449, замечание без блокировки): маркер
+    # git-шага пишется на КАЖДЫЙ git-шаг прогона, поэтому один прогон
+    # оставляет в задаче пачку одинаковых номеров, а цена гейта — один GET
+    # на номер. dict.fromkeys сохраняет порядок первых вхождений, reversed
+    # ниже даёт обход от свежих к старым.
+    for run_id in reversed(list(dict.fromkeys(run_ids))):
+        # Отказ чтения НЕ глотается: `except: continue` отдавал бы тот же
+        # None, что и «живых нет», и вызывающий диспатчил бы дальше без
+        # единой строки в отчёте. Прежний комментарий здесь утверждал
+        # «молчать нельзя» и «строка отчёта у вызывающего уже есть» — оба
+        # утверждения коду не соответствовали (находка ai-review PR #1449).
+        # Конвенция этого файла — отдать ошибку наверх, ⚠️ ставит вызывающий.
+        run = gh(f"repos/{repo}/actions/runs/{run_id}")
+        # Проверяем ЗАВЕРШЁННОСТЬ, а не перечисляем неконечные статусы — тот
+        # же вывод, который этот файл уже оплатил в #1260 шестьюдесятью
+        # строками выше. Белый список («queued/in_progress/waiting/requested»)
+        # молча пропускал `pending`: прогон живой, гейт отвечает «никого нет»
+        # (найдено исполнением, ai-review PR #1449). Новый статус у GitHub
+        # ломает белый список и не ломает эту проверку.
+        if (run or {}).get("status") != "completed":
             return run_id
     return None
 
@@ -2032,7 +2067,14 @@ def dispatch_ai_review_rework(
         # работа (#1448): свободный слот говорит «есть куда запустить», а не
         # «по этой задаче никто не работает». Живой случай 2026-09-22: два
         # прогона по #1426 одновременно, старты 04:48 и 07:20.
-        alive_run = active_worker_run_for_task(repo, int(task_number))
+        try:
+            alive_run = active_worker_run_for_task(repo, int(task_number))
+        except RuntimeError as error:
+            observations.append(
+                f"⚠️ PR #{number}: не удалось сверить, идёт ли прогон по задаче "
+                f"#{task_number} ({error}) — диспатч пропущен этим проходом"
+            )
+            continue
         if alive_run is not None:
             observations.append(
                 f"⏸️ PR #{number}: по задаче #{task_number} уже идёт прогон воркера "
@@ -5044,6 +5086,27 @@ def dispatch_worker(
                 )
                 return observations, actions
             target = rework_free[0]["number"]
+            # Третий АДРЕСНЫЙ путь диспатча — тот же гейт, что у двух других
+            # (#1448). «Свободная задача» здесь означает «без назначенца», а
+            # адресные диспатчи аренду СНИМАЮТ перед запуском: задача с живым
+            # прогоном выглядит свободной ровно так же, как та, по которой
+            # никто не работает. Сам комментарий выше называет этот прогон
+            # адресным — гейт обязан стоять и здесь, иначе закрыты две двери
+            # из трёх.
+            try:
+                alive_run = active_worker_run_for_task(repo, int(target))
+            except RuntimeError as error:
+                observations.append(
+                    f"⚠️ не удалось сверить, идёт ли прогон по задаче #{target} "
+                    f"({error}) — адресный dispatch пропущен этим проходом"
+                )
+                return observations, actions
+            if alive_run is not None:
+                observations.append(
+                    f"⏸️ по задаче #{target} уже идёт прогон воркера {alive_run} — "
+                    "адресный dispatch не запускаю (#1448)"
+                )
+                return observations, actions
             gh(
                 "-X", "POST",
                 f"repos/{repo}/actions/workflows/worker.yml/dispatches",
