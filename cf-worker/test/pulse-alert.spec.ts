@@ -1,7 +1,7 @@
 import { runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
-import { DSH_EDGE_UPDATE, HEARTBEAT } from "../src/config";
+import { ALERT_CATEGORY, DSH_EDGE_UPDATE, HEARTBEAT } from "../src/config";
 
 // Живость пульса владельцу (issue #1103): конвейер простоял 40+ минут
 // 2026-09-13 и не ожил сам — движение вернул ручной workflow_dispatch. Ни
@@ -163,6 +163,11 @@ describe("живость пульса владельцу: серия падаю�
       expect(telegramTexts[0]).toContain("403");
       expect(telegramTexts[0]).not.toContain("null");
       expect(telegramTexts[0]).toContain("GH_DISPATCH_TOKEN");
+      // Категория сигнала (#1461): «пульс не тикает» — поломка, и она видна
+      // ПЕРВОЙ строкой, а не растворена в тексте (находка ai-ревью PR #1462:
+      // оба вызова #tickPulseAlert остались без decorateAlert, и проверка
+      // только toContain этого не замечала).
+      expect(telegramTexts[0].startsWith(`${ALERT_CATEGORY.breakage}\n`)).toBe(true);
 
       // Квота сброшена (живой инцидент: восстановилась в течение часа) —
       // следующий тик снова успешен, ровно один recovery-алерт.
@@ -171,6 +176,8 @@ describe("живость пульса владельцу: серия падаю�
         await instance.alarm();
       });
       expect(telegramCalls).toEqual(["sendMessage", "sendMessage"]);
+      // Recovery — тот же класс события (поломка), та же категория.
+      expect(telegramTexts[1].startsWith(`${ALERT_CATEGORY.breakage}\n`)).toBe(true);
 
       // Ещё один здоровый тик подряд — второй recovery не шлём (флаг уже 0).
       await runInDurableObject(stub, async (instance) => {

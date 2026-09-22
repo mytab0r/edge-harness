@@ -92,6 +92,15 @@ _RL_SPEC = importlib.util.spec_from_file_location(
 review_labels = importlib.util.module_from_spec(_RL_SPEC)
 _RL_SPEC.loader.exec_module(review_labels)  # type: ignore[union-attr]
 
+# Категория сигнала владельцу — одно место правды (alert_category, #1461):
+# всё, что уходит в Telegram, шло одним потоком, и решение, которого ждут от
+# человека, стояло вперемешку с «деплой откатился». Подключение тем же
+# приёмом, что pool_issue/review_labels выше.
+_AC_SPEC = importlib.util.spec_from_file_location(
+    "alert_category", Path(__file__).resolve().parents[1] / "lib" / "alert_category.py")
+alert_category = importlib.util.module_from_spec(_AC_SPEC)
+_AC_SPEC.loader.exec_module(alert_category)  # type: ignore[union-attr]
+
 WORKER_WORKFLOW = "worker.yml"
 ORCHESTRA_WORKFLOW = "orchestra.yml"
 
@@ -1720,7 +1729,8 @@ def edit_issue_comment(repo: str, comment_id: int, text: str) -> None:
     gh("-X", "PATCH", f"repos/{repo}/issues/comments/{comment_id}", "-f", "body=" + text)
 
 
-def send_telegram(text: str, as_html: bool = False, reply_markup: dict | None = None) -> bool:
+def send_telegram(text: str, as_html: bool = False, reply_markup: dict | None = None,
+                  *, category: str) -> bool:
     """Best-effort: место правды — комментарий в задаче #120, Telegram — активный
     канал. Промах кричит warning'ом в лог, не молчит (см. WORKER-PLAYBOOK).
 
@@ -1735,8 +1745,26 @@ def send_telegram(text: str, as_html: bool = False, reply_markup: dict | None = 
     у сборщика, повторное экранирование убило бы ссылки.
 
     reply_markup (#254) — инлайн-клавиатура решения владельца (см.
-    build_decision_keyboard); необязательна, обычные алерты её не передают —
-    сигнатура обратно совместима, поведение существующих вызовов не меняется."""
+    build_decision_keyboard); необязательна, обычные алерты её не передают.
+    Сама сигнатура при этом обратно НЕ совместима со временем до #1461:
+    вызов без `category` — ошибка программиста, а не старый законный вызов,
+    и гвардия (scripts/lib/alert_category_guard.py) ловит её по исходнику,
+    не дожидаясь редкой ветки в рантайме.
+
+    category (#1461) — ОБЯЗАТЕЛЬНЫЙ именованный аргумент, реестр
+    scripts/lib/alert_category.py. Обязательный намеренно: умолчание «прочее»
+    вернуло бы ровно то состояние, ради ухода из которого категория и
+    заводится — всё одним потоком, решение владельца вперемешку с «деплой
+    откатился». Незнакомая категория падает UnknownAlertCategory ДО сетевого
+    вызова и одинаково при заданном и незаданном токене: это ошибка
+    программиста, а не свойство окружения.
+
+    Сегодня категория видна префиксом первой строки. Когда подтвердятся треды
+    в личке (`message_thread_id` в приватных чатах Bot API — требует режима
+    тем у бота через @BotFather и живого замера, см. #1461), она же станет
+    адресом темы, и ни одна точка отправки от этого не изменится: они
+    называют КАТЕГОРИЮ, а не адрес."""
+    prefix = alert_category.category_prefix(category)  # падает на незнакомой, до сети
     if not prod_writes_allowed():
         # Тот же класс, что gh() -X POST/PUT/PATCH/DELETE (2026-09-11, закрыт
         # безусловно issue #1074): вне GitHub Actions реальный алерт владельцу
@@ -1751,7 +1779,7 @@ def send_telegram(text: str, as_html: bool = False, reply_markup: dict | None = 
         print("::warning::TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID не заданы — сигнал не отправлен",
               file=sys.stderr)
         return False
-    payload_text = text if as_html else tg_html(text)
+    payload_text = f"{prefix}\n" + (text if as_html else tg_html(text))
     args = ["curl", "-fsS", "--max-time", "30", "-X", "POST",
             f"https://api.telegram.org/bot{token}/sendMessage",
             "--data-urlencode", f"chat_id={chat}",
@@ -1838,8 +1866,9 @@ def escalate(repo: str, issue_number: int, text: str, options: list[str] | None 
         posted = False
         skipped = False
     delivered = (
-        send_telegram(text, reply_markup=build_decision_keyboard(issue_number, options))
-        if options else send_telegram(text)
+        send_telegram(text, reply_markup=build_decision_keyboard(issue_number, options),
+                      category=alert_category.OWNER_DECISION)
+        if options else send_telegram(text, category=alert_category.OWNER_DECISION)
     )
     comment_note = "оставлен" if posted else ("пропущен (DRY-RUN)" if skipped else "НЕ оставлен")
     return (f"Telegram: {'доставлен' if delivered else 'НЕ доставлен'}; "
@@ -1925,7 +1954,9 @@ def heartbeat_check(repo: str, now: datetime) -> list[str]:
                 f"Успешных прогонов {ORCHESTRA_WORKFLOW} (schedule/workflow_dispatch) "
                 "не найдено за последние 100 прогонов каждого события — пульс не "
                 "подтверждён, возможен отключённый workflow (docs/research/21).")
-        delivered = send_telegram(text)
+        # Поломка, не «конвейер»: пульса нет вовсе, и сам он не вернётся —
+        # отключённый workflow включает человек.
+        delivered = send_telegram(text, category=alert_category.BREAKAGE)
         # posted/attempted — находка AI-ревью PR #318, третий раунд: строка
         # отчёта раньше безусловно утверждала «след в #120», даже если
         # post_issue_comment упал (RuntimeError уходил только в warning) —
@@ -1972,7 +2003,7 @@ def heartbeat_check(repo: str, now: datetime) -> list[str]:
                    f"(порог {HEARTBEAT_MAX_AGE_MINUTES})"]
         return healthy + ([cadence_line] if cadence_line else [])
     text = heartbeat_alert_text(age, last_ok)
-    delivered = send_telegram(text)
+    delivered = send_telegram(text, category=alert_category.BREAKAGE)
     # posted/attempted — тот же класс, что и в ветке HEARTBEAT_NO_TICKS выше
     # (находка AI-ревью PR #318, третий раунд): безусловное «след в #120» в
     # тексте отчёта было неверно, если post_issue_comment упал.
@@ -2271,7 +2302,7 @@ def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], list[str], bool]
                 post_issue_comment(repo, WATCHDOG_ISSUE, text)
             except RuntimeError as err:
                 print(f"::warning::напоминание в #{WATCHDOG_ISSUE} не доставлено: {err}", file=sys.stderr)
-            delivered = send_telegram(text)
+            delivered = send_telegram(text, category=alert_category.PIPELINE)
             return ([line], [f"⏳ напоминание о длящейся паузе: следующая проба через "
                      f"{int(remaining)} мин (Telegram: "
                      f"{'доставлен' if delivered else 'НЕ доставлен'}; след в #{WATCHDOG_ISSUE})"],
@@ -2287,7 +2318,7 @@ def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], list[str], bool]
             post_issue_comment(repo, WATCHDOG_ISSUE, text)
         except RuntimeError as err:
             print(f"::warning::сигнал в #{WATCHDOG_ISSUE} не доставлен: {err}", file=sys.stderr)
-        delivered = send_telegram(text)
+        delivered = send_telegram(text, category=alert_category.PIPELINE)
         return ([], [f"🔎 пробный диспатч после паузы {int(backoff)} мин (попытка {attempt}) — "
                  f"{failures} красных {WORKER_WORKFLOW} подряд (Telegram: "
                  f"{'доставлен' if delivered else 'НЕ доставлен'}; сигнал в #{WATCHDOG_ISSUE})"],
@@ -2301,7 +2332,9 @@ def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], list[str], bool]
         post_issue_comment(repo, WATCHDOG_ISSUE, text)
     except RuntimeError as err:
         print(f"::warning::сигнал в #{WATCHDOG_ISSUE} не доставлен: {err}", file=sys.stderr)
-    delivered = send_telegram(text)
+    # Конвейер, а не поломка: у паузы назван газ — зонд после backoff вернёт
+    # движение сам (#196/#205). Поломка — это то, что само не починится.
+    delivered = send_telegram(text, category=alert_category.PIPELINE)
     return ([], [f"🚨 конвейер на паузе: {failures} красных прогонов {WORKER_WORKFLOW} "
              f"подряд — диспатч остановлен (Telegram: "
              f"{'доставлен' if delivered else 'НЕ доставлен'}; сигнал в #{WATCHDOG_ISSUE})"],

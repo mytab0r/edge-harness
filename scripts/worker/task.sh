@@ -128,6 +128,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # когда-нибудь изменят. Повторный сёрс безвреден — файл только определяет.
 # shellcheck source=scripts/lib/canary_http.sh
 source "$SCRIPT_DIR/../lib/canary_http.sh"
+# Категория сигнала владельцу (#1461) — реестр общий с Python и TS,
+# расхождение красит CI (scripts/lib/test_alert_category_sync.py).
+# shellcheck source=scripts/lib/alert_category.sh
+source "$SCRIPT_DIR/../lib/alert_category.sh"
 # Пины DSH, integrity, GLM-патч профиля, redact — единственное место правды в lib.
 # shellcheck source=scripts/lib/dsh-ci.sh
 source "$SCRIPT_DIR/../lib/dsh-ci.sh"
@@ -243,7 +247,15 @@ fi
 # parse_mode=HTML — всегда (#170): без него Telegram рендерит plain text и
 # кликабельных ссылок не бывает. Второй отправитель репозитория —
 # pulse_guard.send_telegram; новых отправителей заводить нельзя, формат один.
-telegram_report() { # $1 — текст (динамические части — уже через tg_html)
+telegram_report() { # $1 — категория (scripts/lib/alert_category.sh), $2 — текст
+  # Категория первым аргументом и обязательна (#1461): всё, что уходит
+  # владельцу, шло одним потоком, и умолчание «прочее» вернуло бы ровно это.
+  # Незнакомая категория валит alert_prefix ДО сетевого вызова.
+  local _category_prefix
+  if ! _category_prefix=$(alert_prefix "$1"); then
+    echo "::warning::telegram_report вызван с неизвестной категорией '$1' — отчёт не отправлен"
+    return 1
+  fi
   if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
     echo "::warning::TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID не заданы — Telegram-отчёт не отправлен"
     return 1
@@ -259,7 +271,8 @@ telegram_report() { # $1 — текст (динамические части —
       "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
       --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
       --data-urlencode "parse_mode=HTML" \
-      --data-urlencode "text=$1" >/dev/null; then
+      --data-urlencode "text=${_category_prefix}
+$2" >/dev/null; then
     echo "::warning::Telegram не принял отчёт — комментарий в задаче остаётся местом правды"
     return 1
   fi
@@ -892,7 +905,7 @@ COMMENT
   # (parse_mode=HTML в telegram_report), заголовок — первые 6 слов,
   # экранированные tg_html.
   pr_number=${pr_url##*/}
-  telegram_report "🤖 worker: PR ${verb} — <a href=\"${pr_url}\">#${pr_number}</a> по задаче <a href=\"https://github.com/${GITHUB_REPOSITORY}/issues/${number}\">#${number}</a> «$(tg_html "$(short_title "$title")")»" || true
+  telegram_report pipeline "🤖 worker: PR ${verb} — <a href=\"${pr_url}\">#${pr_number}</a> по задаче <a href=\"https://github.com/${GITHUB_REPOSITORY}/issues/${number}\">#${number}</a> «$(tg_html "$(short_title "$title")")»" || true
   echo "PR $verb: $pr_url — job зелёный"
   exit 0
 fi
@@ -921,7 +934,8 @@ $ANSWER_TAIL
 COMMENT
   )
   gh issue comment "$number" --body "$comment" >/dev/null
-  telegram_report "worker: задача #$number — эскалация владельцу (метка blocked)" || true
+  # Эскалация — «решение владельца»: без его действия задача не поедет (#1461).
+  telegram_report decision "worker: задача #$number — эскалация владельцу (метка blocked)" || true
   echo "Эскалация оформлена (blocked) — job зелёный, ждём владельца"
   exit 0
 fi
@@ -1051,7 +1065,8 @@ $ANSWER_TAIL
 COMMENT
   )
   gh issue comment "$number" --body "$comment" >/dev/null
-  telegram_report "worker: задача #$number — $failure_kind ($reason). Задача возвращена в пул" || true
+  # Возврат в пул — ход работы конвейера, не поломка (#1461).
+  telegram_report pipeline "worker: задача #$number — $failure_kind ($reason). Задача возвращена в пул" || true
   if [ "$job_exit" != "green" ]; then
     die "$failure_kind: $reason"
   fi
@@ -1119,5 +1134,7 @@ $ANSWER_TAIL
 COMMENT
   )
 gh issue comment "$number" --body "$comment" >/dev/null
-telegram_report "worker: задача #$number — ПРОВАЛ ($reason). Детали в задаче" || true
+# ПРОВАЛ прогона — исход конвейера, «воркер не справился» чинится конвейером,
+# хранилище здесь не ломалось (#1461).
+telegram_report pipeline "worker: задача #$number — ПРОВАЛ ($reason). Детали в задаче" || true
 die "Воркер не справился: $reason"

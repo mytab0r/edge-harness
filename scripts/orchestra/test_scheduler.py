@@ -5626,7 +5626,7 @@ def test_after_merge_notifies_telegram_about_merge_once(monkeypatch):
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda repo, numbers: ([], False))
     monkeypatch.setattr(
         sch, "send_telegram",
-        lambda text, as_html=False: sent.append((text, as_html)) or True)
+        lambda text, as_html=False, **_kw: sent.append((text, as_html)) or True)
 
     observations, actions, hard_failure, _archive_hard = sch.after_merge("o/r", merged, [])
 
@@ -5671,7 +5671,7 @@ def test_after_merge_announces_only_own_branch_task_not_prose_mentions(monkeypat
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda repo, numbers: ([], False))
     monkeypatch.setattr(
         sch, "send_telegram",
-        lambda text, as_html=False: sent.append((text, as_html)) or True)
+        lambda text, as_html=False, **_kw: sent.append((text, as_html)) or True)
 
     sch.after_merge("o/r", merged, [])
 
@@ -5708,7 +5708,7 @@ def test_after_merge_without_own_branch_task_sends_nothing(monkeypatch):
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda repo, numbers: ([], False))
     monkeypatch.setattr(
         sch, "send_telegram",
-        lambda text, as_html=False: sent.append(text) or True)
+        lambda text, as_html=False, **_kw: sent.append(text) or True)
 
     observations, actions, hard_failure, _archive_hard = sch.after_merge("o/r", merged, [])
 
@@ -5737,7 +5737,7 @@ def test_after_merge_telegram_miss_is_loud_but_not_fatal(monkeypatch):
     monkeypatch.setattr(sch, "gh", fake_gh)
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda repo, numbers: ([], False))
-    monkeypatch.setattr(sch, "send_telegram", lambda text, as_html=False: False)
+    monkeypatch.setattr(sch, "send_telegram", lambda text, as_html=False, **_kw: False)
     monkeypatch.setattr(sch, "update_remaining_pulls", lambda repo, merged_number, others: ([], []))
 
     observations, actions, hard_failure, _archive_hard = sch.after_merge("o/r", merged, [])
@@ -6206,8 +6206,8 @@ def test_after_merge_resume_series_by_merge_posts_marker(monkeypatch):
         raise AssertionError(f"нет маршрута для: {joined}")
 
     patch_gh(monkeypatch, fake_gh)
-    monkeypatch.setattr(pg, "send_telegram", lambda text: True)  # канал escalate
-    monkeypatch.setattr(sch, "send_telegram", lambda text, as_html=False: True)
+    monkeypatch.setattr(pg, "send_telegram", lambda text, **_kw: True)  # канал escalate
+    monkeypatch.setattr(sch, "send_telegram", lambda text, as_html=False, **_kw: True)
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda repo, numbers: ([], False))
 
@@ -6386,8 +6386,8 @@ def test_after_merge_resume_ignores_fake_dedup_marker_without_job_token(monkeypa
         raise AssertionError(f"нет маршрута для: {joined}")
 
     patch_gh(monkeypatch, fake_gh)
-    monkeypatch.setattr(pg, "send_telegram", lambda text: True)
-    monkeypatch.setattr(sch, "send_telegram", lambda text, as_html=False: True)
+    monkeypatch.setattr(pg, "send_telegram", lambda text, **_kw: True)
+    monkeypatch.setattr(sch, "send_telegram", lambda text, as_html=False, **_kw: True)
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda repo, numbers: ([], False))
 
@@ -6420,8 +6420,8 @@ def test_after_merge_resume_does_not_claim_reset_when_marker_not_posted(monkeypa
         f"{REPO}/issues/120/comments?per_page": [],
     })
     patch_gh(monkeypatch, fake)
-    monkeypatch.setattr(pg, "send_telegram", lambda text: True)  # канал escalate
-    monkeypatch.setattr(sch, "send_telegram", lambda text, as_html=False: True)
+    monkeypatch.setattr(pg, "send_telegram", lambda text, **_kw: True)  # канал escalate
+    monkeypatch.setattr(sch, "send_telegram", lambda text, as_html=False, **_kw: True)
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda repo, numbers: ([], False))
 
