@@ -41,6 +41,8 @@ _console_utf8_spec = importlib.util.spec_from_file_location(
 _console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))
 # --- конец console_utf8 bootstrap ---
 
+import ast
+import re
 import sys
 
 import yaml
@@ -106,9 +108,12 @@ _GATE_EXISTS_STEP_NOT_BEHIND_IT = (
 _GUARD_CATALOGUE = (
     "гасить целиком нельзя: шаг гоняет ВЕСЬ каталог scripts/ci/guards, где "
     "подавляющее большинство гвардий в API не ходит, и пропуск по чужой квоте снял "
-    "бы проверки, к квоте отношения не имеющие. GH_TOKEN здесь передан на будущее "
-    "(см. комментарий шага в repo-ci.yml). Правильное закрытие — гейт внутри тех "
-    "гвардий каталога, которые реально читают API, когда такие появятся"
+    "бы проверки, к квоте отношения не имеющие. ИСПРАВЛЕНО #1004: прежняя редакция "
+    "этой причины добавляла «GH_TOKEN передан на будущее, потребителей нет» — я "
+    "процитировал комментарий repo-ci.yml вместо замера, и он был ложным. "
+    "Потребителей четыре, и закрыты они не гейтом шага, а обёрткой "
+    "rate_guard.run_guard_main вокруг собственного main каждого; отсутствие "
+    "обёртки у нового потребителя красит catalogue_problems ниже"
 )
 
 ALLOWED_UNGATED_API_STEPS: dict[str, str] = {
@@ -235,6 +240,219 @@ def ungated_api_steps(workflows_dir: Path = WORKFLOWS_DIR) -> list[str]:
     return found
 
 
+# ── Вторая поверхность того же класса: гвардии каталога (#1004) ──────────────
+#
+# Шаг «Каталог гвардий scripts/ci/guards — перебор» гейтом квоты НЕ гасится, и
+# это правильно: он гоняет весь каталог, где подавляющее большинство гвардий в
+# API не ходит. Но ЧЕТЫРЕ ходят, и до #1004 они падали трейсбеком на
+# исчерпанном бюджете — то есть красили чужой PR чужой причиной уже ПОСЛЕ
+# того, как гейт корректно пропустил дорогие шаги (живой случай: прогон
+# 35727716021, PR #1458, `decision-doc-numbering-guard`, HTTP 403).
+#
+# Обоснование «ни одна гвардия каталога не читает gh api», стоявшее в
+# run_guards.sh и в repo-ci.yml, было ЛОЖНЫМ (issue #1004 назвала одного
+# потребителя, замер 2026-09-22 нашёл четырёх) — и я перенёс эту ложную
+# посылку в реестр выше, процитировав комментарий вместо замера. Эта проверка
+# закрывает саму возможность: модуль, который читает API, обязан пропускать
+# свой `main` через `rate_guard.run_guard_main`.
+CATALOGUE_DIR = REPO_ROOT / "scripts" / "ci" / "guards"
+
+# Имена вызовов, означающих «этот модуль ходит в GitHub API». Разбор — AST,
+# не поиск подстроки, и это оплачено ревью PR #1460 дважды в одном месте:
+#
+#   * текстовый маркер `gh(` совпал с прозой комментария
+#     («Оркестрация без keyword-аргументов gh()») в
+#     `ci_guard_registration_guard.py`, который наружу не ходит вовсе, —
+#     замер был завышен, а число «четыре» оказалось пересказом;
+#   * тот же текстовый поиск НЕ видел `invariant_numbering.py`, который ходит
+#     в API транзитивно: своих маркеров у него нет, вызов живёт этажом ниже.
+#
+# AST снимает первую половину (комментарий вызовом не является), обход
+# зависимостей — вторую.
+_API_CALL_NAMES = frozenset({"list_pages", "gh"})
+# Имя-суффикс, а не точное равенство: живой замер на дереве этого PR показал
+# `_gh_api(...)` в `pr_mutation_claim_check.py` — точный набор имён его
+# пропускал, и детектор недоставал ровно так же, как текстовый до него.
+_API_CALL_SUFFIX = "gh_api"
+# Сама обёртка из обхода исключена, иначе получается замкнутый круг: модуль
+# подключает `rate_guard`, `rate_guard` зондирует остаток бюджета своим
+# `gh api` — и модуль становится «потребителем API» ровно оттого, что его
+# уже починили. Замер на дереве этого PR показал круг вживую:
+# `ci-guard-registration` и `mutation-claim-guard` всплыли с единственным
+# достижимым модулем `rate_guard.py`. Собственный запрос обёртки к бюджету
+# обработан внутри неё самой (`QuotaExhausted` → skip, rc 0) — это не
+# потребитель, которого надо чинить.
+_WRAPPER_MODULE = "scripts/lib/rate_guard.py"
+_QUOTA_WRAPPER = "run_guard_main"
+_GUARD_SCRIPT_MODULE_RE = re.compile(r"python3?\s+(scripts/[A-Za-z0-9_/]+\.py)")
+
+
+def _is_gh_argv(node: ast.AST) -> bool:
+    """Литерал вида `["gh", "api", …]` — вызов CLI через subprocess.
+
+    Второй способ сходить в API, и он не ловится именем функции: зовут
+    `subprocess.run`, а «gh» лежит первым элементом списка аргументов. Живой
+    случай — `plugin_manager_roster_guard.py`, которого набор имён не видел."""
+    if not isinstance(node, (ast.List, ast.Tuple)) or not node.elts:
+        return False
+    head = node.elts[0]
+    return isinstance(head, ast.Constant) and head.value == "gh"
+
+
+def _calls_api_directly(source: str) -> bool:
+    """Ходит ли модуль в GitHub API: вызовом примитива или `gh` через shell.
+
+    Определение `def gh(...)` вызовом не является и сюда не попадает —
+    иначе модуль, предоставляющий примитив, считался бы его потребителем."""
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+        if name in _API_CALL_NAMES or (name or "").endswith(_API_CALL_SUFFIX):
+            return True
+        if any(_is_gh_argv(arg) for arg in node.args):
+            return True
+    return False
+
+
+def _module_dependencies(source: str, repo_root: Path) -> list[str]:
+    """Модули репозитория, которые этот модуль подгружает.
+
+    Проводка здесь своя, а не `ast` по `import`: модули репозитория грузят
+    друг друга через `importlib.util.spec_from_file_location(..., <путь>)`,
+    и обычного `import` между ними нет — обход по `ast.Import` нашёл бы
+    ноль зависимостей и молча зеленел бы ровно там, где нужен.
+
+    Признак — строковый литерал, кончающийся на `.py`, внутри вызова
+    `spec_from_file_location`. Имя файла ищется под `scripts/`; неоднозначное
+    (два файла с одним именем) пропускается, и это сказано вслух, а не
+    умолчано: лучше честный пробел, чем тихо взятая не та зависимость."""
+    deps: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+        if name != "spec_from_file_location":
+            continue
+        for literal in ast.walk(node):
+            if not (isinstance(literal, ast.Constant) and isinstance(literal.value, str)):
+                continue
+            if not literal.value.endswith(".py"):
+                continue
+            matches = sorted((repo_root / "scripts").rglob(Path(literal.value).name))
+            if len(matches) == 1:
+                deps.append(matches[0].relative_to(repo_root).as_posix())
+    return list(dict.fromkeys(deps))
+
+
+def _api_reachable_from(
+    rel: str, repo_root: Path, seen: set[str] | None = None
+) -> list[str]:
+    """Модули, вызывающие примитив API, достижимые из `rel` (включая сам `rel`).
+
+    Обход транзитивный, не на один шаг: «один hop» — произвольная глубина,
+    которую следующее звено молча обойдёт.
+
+    Это ВЕРХНЯЯ ОЦЕНКА, и это сказано вслух, а не выдаётся за факт: статически
+    видно «модуль загружает модуль, который умеет ходить в API», а не «на этом
+    прогоне вызов случится». Замер 2026-09-22 на живом дереве показал обе
+    стороны: `declared_deps.py` под заглушкой `gh`, отвечающей 403, реально
+    падает трейсбеком (EXIT=1), а `deploy_workflow_registry_guard.py` — нет
+    (EXIT=0), хотя оба загружают модули с вызовами API.
+
+    Завышение принято сознательно, потому что его цена — ноль: `run_guard_main`
+    ловит только отказ формы «бюджет исчерпан» и пробрасывает всё остальное,
+    так что обёртка на модуле, который в API не пошёл, не делает ничего.
+    Обратная ошибка (пропустить настоящего потребителя) стоит красной
+    обязательной проверки на чужой причине — ровно то, ради чего заведён
+    #1004."""
+    seen = seen if seen is not None else set()
+    if rel in seen:
+        return []
+    seen.add(rel)
+    path = repo_root / rel
+    if not path.exists() or Path(rel).name.startswith("test_") or rel == _WRAPPER_MODULE:
+        return []
+    try:
+        source = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    reachable = [rel] if _calls_api_directly(source) else []
+    for dep in _module_dependencies(source, repo_root):
+        reachable.extend(_api_reachable_from(dep, repo_root, seen))
+    return sorted(dict.fromkeys(reachable))
+
+
+def catalogue_modules_reading_api(
+    catalogue_dir: Path = CATALOGUE_DIR, repo_root: Path = REPO_ROOT
+) -> dict[str, dict[str, list[str]]]:
+    """{гвардия: {модуль-точка-входа: [модули с вызовами API]}}.
+
+    Тесты гвардий сюда не входят намеренно: они ходят по заглушкам и бюджет
+    не тратят."""
+    found: dict[str, dict[str, list[str]]] = {}
+    for script in sorted(catalogue_dir.glob("*.sh")):
+        entries: dict[str, list[str]] = {}
+        for rel in dict.fromkeys(
+            _GUARD_SCRIPT_MODULE_RE.findall(script.read_text(encoding="utf-8"))
+        ):
+            reachable = _api_reachable_from(rel, repo_root)
+            if reachable:
+                entries[rel] = reachable
+        if entries:
+            found[script.stem] = entries
+    return found
+
+
+def _has_quota_wrapper(source: str) -> bool:
+    """True — модуль реально использует обёртку, а не упоминает её прозой.
+
+    Проверка по сырому тексту ловила имя обёртки в докстринге: модуль,
+    читающий API без обёртки, оставался зелёным, пока проза упоминала
+    `run_guard_main` (поймано исполнением мутации, не чтением исходника:
+    обёртка снята до вызова в `__main__` — `catalogue_problems` молчал).
+    Тот же класс «проза вместо кода», что у маркеров чтения API выше.
+    AST видит только код: имя или атрибут `run_guard_main`, как в
+    `_rate_guard.run_guard_main(...)`."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        # Модуль, который не парсится, не исполняется; требовать обёртку от
+        # него — пере-флажок в сторону строгого, не тихий пропуск.
+        return _QUOTA_WRAPPER in source
+    return any(
+        (isinstance(node, ast.Attribute) and node.attr == _QUOTA_WRAPPER)
+        or (isinstance(node, ast.Name) and node.id == _QUOTA_WRAPPER)
+        for node in ast.walk(tree)
+    )
+
+
+def catalogue_problems(
+    catalogue_dir: Path = CATALOGUE_DIR, repo_root: Path = REPO_ROOT
+) -> list[str]:
+    """Точка входа гвардии может дойти до API, но не обёрнута `run_guard_main`.
+
+    Требование — к ТОЧКЕ ВХОДА, первому звену: именно её запускает гвардия, и
+    именно её трейсбек красит обязательную проверку."""
+    problems: list[str] = []
+    for guard_name, entries in catalogue_modules_reading_api(catalogue_dir, repo_root).items():
+        for entry, reachable in entries.items():
+            text = (repo_root / entry).read_text(encoding="utf-8")
+            if _has_quota_wrapper(text):
+                continue
+            via = ", ".join(m for m in reachable if m != entry)
+            where = f" (через {via})" if via else ""
+            problems.append(
+                f"{guard_name} запускает {entry}, откуда достижим вызов GitHub API{where}, "
+                f"но его `main` не обёрнут `rate_guard.{_QUOTA_WRAPPER}` — при исчерпанном "
+                f"бюджете гвардия упадёт трейсбеком и покрасит обязательную "
+                f"проверку чужой причиной (#1004)"
+            )
+    return problems
+
+
 def check(workflows_dir: Path = WORKFLOWS_DIR) -> list[str]:
     """Нарушения: незакрытый шаг без записи в реестре, запись без причины,
     мёртвая запись (шага больше нет — реестр не должен переживать
@@ -258,6 +476,7 @@ def check(workflows_dir: Path = WORKFLOWS_DIR) -> list[str]:
                 f"{key}: мёртвая запись в ALLOWED_UNGATED_API_STEPS — такого незакрытого "
                 f"шага в .github/workflows/ больше нет (шаг закрыт гейтом, переименован "
                 f"или удалён). Убери запись")
+    problems.extend(catalogue_problems())
     return problems
 
 
