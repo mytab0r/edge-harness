@@ -6,11 +6,25 @@
 // страница сломана — сервер здоров.
 //
 // Использование:
-//   node scripts/canary-ui.mjs --url http://127.0.0.1:8808 --token dev-token
+//   HANDS_TOKEN=… node scripts/canary-ui.mjs --url http://127.0.0.1:8808
+// Токен читается ТОЛЬКО из env HANDS_TOKEN: флага --token у скрипта нет,
+// такой аргумент был бы молча проигнорирован, а запуск без env выходит
+// кодом 2 — см. таблицу кодов в docs/agents/INFRA-CF.md (находка
+// AI-ревью PR #1441, чеклист круга 4).
 // Без --url проверяется прод (https://edge-harness.mytab0r.workers.dev).
 // Нужен установленный браузер: npx playwright install chromium.
 
-import { chromium } from "playwright";
+import {
+  EXIT_BACKEND_DOWN,
+  EXIT_DEPLOY_BAD,
+  apiFailureCause,
+  backendDownLines,
+  probeOutcome,
+} from "./canary_outcome.mjs";
+// Playwright грузится ПОЗЖЕ, отдельным `await import` перед браузерной
+// частью. Верхнеуровневый импорт означал бы, что зонд готовности ниже
+// невозможно исполнить без установленного браузера, — а весь смысл зонда
+// в том, чтобы решить судьбу прода ДО и БЕЗ браузера (#1426).
 
 const args = process.argv.slice(2);
 const urlArg = args.includes("--url") ? args[args.indexOf("--url") + 1] : "https://edge-harness.mytab0r.workers.dev";
@@ -21,6 +35,43 @@ if (!token) {
 }
 
 const base = urlArg.replace(/\/$/, "");
+
+// Исход различается ПЕРВЫМ, до единой строки браузерной части (issue #1426).
+// Порядок — не стиль, а суть: в живом случае (прогон 35639422589) канарейка
+// умирала на `page.fill("#gate-token")`, потому что страница не
+// инициализировалась при 500 от API, — красный таймаут локатора неотличим от
+// сломанной вёрстки, и шаг автооката откатывал исправный код. Зондов два, по
+// правилу задачи: статика (GET /) и API (GET /api/ready — один дешёвый
+// SQL-раундтрип, контракт {ok:true}).
+{
+  let staticStatus = null;
+  let apiStatus = null;
+  let apiBody = "";
+  try {
+    staticStatus = (await fetch(`${base}/`)).status;
+  } catch {
+    // Сети нет вовсе — решение не принимается, консервативно разбирается ниже.
+  }
+  try {
+    const probe = await fetch(`${base}/api/ready`, { headers: { Authorization: `Bearer ${token}` } });
+    apiStatus = probe.status;
+    apiBody = await probe.text();
+  } catch {
+    apiStatus = null;
+  }
+  const probe = probeOutcome(staticStatus, apiStatus, apiBody);
+  if (probe.outcome === "backend-down") {
+    for (const line of backendDownLines(probe.reason)) console.error(line);
+    process.exit(EXIT_BACKEND_DOWN);
+  }
+  if (probe.outcome === "deploy-bad") {
+    console.error(`canary-ui: DEPLOY-BAD — ${probe.reason}; откат оправдан.`);
+    process.exit(EXIT_DEPLOY_BAD);
+  }
+  console.log(`canary-ui: зонд исхода — ${probe.reason}; дальше решает браузер`);
+}
+
+const { chromium } = await import("playwright");
 const browser = await chromium.launch();
 try {
   const page = await browser.newPage();
@@ -119,19 +170,36 @@ try {
   // отрисовка страницы браузером выше. UI может «висеть живым» (шелл грузится,
   // сокет коннектится), пока журнал/API уже 500'ят на исчерпании суточной
   // квоты — этот запрос ловит именно тот класс, прямым HTTP, не через страницу.
+  // 5xx здесь — тот же исход «бэкенд лежит» (#1426): статика к этому моменту
+  // доказано отдаётся (страница загружена), поэтому отказ идёт в ту же ветку —
+  // красный БЕЗ отката, а не «деплой плохой».
+  let storageProbe = null;
   try {
     const readyRes = await fetch(`${base}/api/ready`, { headers: { Authorization: `Bearer ${token}` } });
     if (!readyRes.ok) {
       const body = await readyRes.text();
-      fails.push(`/api/ready вернул ${readyRes.status}: ${body.slice(0, 300)}`);
+      if (readyRes.status >= 500) {
+        storageProbe = { status: readyRes.status, body };
+      } else {
+        fails.push(`/api/ready вернул ${readyRes.status}: ${body.slice(0, 300)}`);
+      }
     }
   } catch (error) {
     fails.push(`/api/ready недоступен: ${error instanceof Error ? error.message : error}`);
   }
 
+  if (storageProbe) {
+    const cause = apiFailureCause(storageProbe.status, storageProbe.body);
+    const reason = cause ??
+      `бэкенд отдаёт ${storageProbe.status} на /api/ready; тело ответа: ` +
+      `${storageProbe.body.trim().slice(0, 300) || "(пусто)"}`;
+    for (const line of backendDownLines(reason)) console.error(line);
+    process.exit(EXIT_BACKEND_DOWN);
+  }
+
   if (fails.length) {
     for (const message of fails) console.error(`  ✗ ${message}`);
-    console.error("canary-ui: FAIL");
+    console.error("canary-ui: FAIL — деплой признан плохим, откат оправдан");
     process.exit(1);
   }
   const hands = await page.evaluate(() => document.getElementById("hands").textContent);

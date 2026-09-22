@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Гвардия класса «откат прода без вопроса о причине» (issue #1426).
+#
+# Прогон 35639422589 (deploy-worker.yml, job deploy на 61b185aa, слияние
+# PR #1420): деплой прошёл, канарейка упала по таймауту локатора
+# `#gate-token`, `wrangler rollback` откатил КОРРЕКТНЫЙ код. Поле не
+# появилось не из-за деплоя — была исчерпана суточная квота rows_read
+# Durable Objects (#1411): /api/status отдавал 500, страница не
+# инициализировалась, статика отдавалась нормально. Кольцо: фикс квоты не
+# задеплоить, пока квота исчерпана.
+#
+# Две стороны, обе обязательны:
+#   * канарейка различает исходы (тест поведенческий: настоящий http.server,
+#     настоящий node-скрипт — не заглушка);
+#   * ни один шаг с `wrangler rollback` не запускается, не спросив вердикт.
+#
+# Правило различения — из постановки задачи #1426: статика отдаётся + /api/*
+# отвечает 5xx = «бэкенд лежит» (в т.ч. error code: 1101 и квота DO); статика
+# не отдаётся = «деплой плохой», откат остаётся.
+#
+# Доказано мутациями — ИСПОЛНЕНО, не пересказано. Числа сняты с ФИНАЛЬНОГО
+# дерева ветки (переисполнены после правок круга 4 AI-ревью PR #1441: часть
+# прежних записей была снята с промежуточного состояния, класс #1194).
+# База: 50 passed (канарейка 6 + гвардия отката 12 + алерт 32).
+#   1) сузить «бэкенд лежит» до отказов, чью причину назвало тело (узкое
+#      правило прежней редакции этого PR) — «1 failed, 49 passed» (база:
+#      50 passed по трём наборам), краснеет
+#      test_unrecognized_5xx_is_still_backend_down: голый 5xx без причины в
+#      теле снова уходил бы в откат;
+#   1b) не распознавать страницу error code: 1101 — «1 failed, 5 passed»
+#      (база: 6 passed, набор канарейки), краснеет
+#      test_incident_5xx_with_healthy_static_forbids_rollback: живой случай
+#      #1426 теряет названную причину. Первая попытка дала «5 passed»: тест
+#      ловил «1101» в цитате тела, а не в названной причине; утверждение
+#      усилено до фразы причины, после чего мутация краснеет. Ложная первая
+#      попытка записана как была — это и есть разница исполнения и пересказа;
+#   2) снять различение вовсе (любой отказ — вина деплоя) — «3 failed,
+#      3 passed» (база: 6 passed, набор канарейки), краснеют все три теста
+#      «бэкенд лежит»;
+#   3) убрать требование исправной статики (любой 5xx = «бэкенд лежит»,
+#      обратный перекос) — «1 failed, 5 passed» (база: 6 passed, набор
+#      канарейки), краснеет test_static_down_is_deploy_bad_and_rolls_back:
+#      битая статика перестала бы откатываться;
+#   4) вырезать зонд из начала файла (состояние до #1426, где до проверки
+#      /api/ready исполнение просто не доходило) — «6 failed» (база: 6 passed,
+#      набор канарейки): краснеют ВСЕ шесть — канарейка умирает на
+#      import("playwright") до всякого решения;
+#   5) снять условие вердикта с шага автооката deploy-worker.yml — «3 failed,
+#      47 passed» (база: 50 passed по трём наборам), краснеют
+#      test_live_repository_is_consistent,
+#      test_live_repository_really_has_rollback_steps и
+#      test_rollback_gates_only_on_post_deploy_failures;
+#   6) снять проверку издателя вердикта (блокирующая находка AI-ревью
+#      PR #1441: копипаст `if:` с чужим id канарейки зелён подстроку, а в
+#      Actions пустой output делает откат безусловным) — «2 failed,
+#      10 passed», краснеют test_rollback_if_referencing_missing_producer_
+#      step_reddens и test_producer_step_without_verdict_write_reddens.
+#      База для этой мутации: 12 passed (набор гвардии отката);
+#   7) снять проводку CANARY_VERDICT из шага эскалации deploy-worker.yml
+#      (находка AI-ревью PR #1441, круг 2: ветка backend_down алерта жива
+#      только пока env приходит от шага-издателя вердикта) — «2 failed,
+#      30 passed» (набор алерта), краснеют
+#      test_canary_verdict_env_points_at_the_real_canary_verdict_producer_
+#      step_id и test_escalation_step_env_names_match_what_main_actually_
+#      reads. База для этой мутации: 32 passed (набор алерта).
+#
+# Регистрируется каталогом (#749), не рукописным шагом repo-ci.yml.
+set -euo pipefail
+pip install --quiet pytest pyyaml
+python scripts/lib/canary_rollback_guard.py
+python -m pytest scripts/lib/test_canary_rollback_guard.py -q
+python -m pytest scripts/lib/test_canary_rollback_verdict.py -q
+python -m pytest scripts/orchestra/test_deploy_worker_rollback_alert.py -q

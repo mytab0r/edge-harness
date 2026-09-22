@@ -15,7 +15,7 @@
 заводим (тот же принцип, что уже применяют `branch_protection_watch.py` и
 `scripts/measure/quotas.py`).
 
-Три исхода (см. `rollback_alert_text`), от тише к громче:
+Четыре исхода (см. `rollback_alert_text`), от тише к громче:
 1. rollback_confirmed=True, post_rollback_ok=True — откат сработал, прод жив
    на предыдущей версии: информационный сигнал, не паника.
 2. rollback_confirmed=False — `wrangler rollback` не подтвердил успех (лог не
@@ -25,6 +25,12 @@
    ПОВТОРНАЯ проверка после него красная: живость откатанной версии не
    подтверждена — худший случай (владелец, задача #614, п.1), обязан быть
    самым громким.
+4. backend_down=True — разбирается ПЕРВЫМ (раньше п.2, чтобы не кричать «не
+   подтверждён» там, где откат сознательно не делался): канарейка
+   распознала «бэкенд лежит по посторонней причине» (5xx от /api/* при
+   отдающейся статике, #1426), откат не запускался вовсе. Точную причину
+   алерт не знает (вердикт шага её не несёт) и не выдумывает — называет
+   адрес, где она записана: лог шага «Канарейка UI на проде» этого прогона.
 
 Кроме исхода, текст называет ТРИГГЕР честно (`canary_ran`, находка
 четвёртого гейта PR #617, правило «Алерт не гадает»): шаги отката/эскалации
@@ -88,9 +94,29 @@ def rollback_alert_text(
     post_rollback_ok: bool,
     canary_ran: bool,
     server_url: str = "https://github.com",
+    backend_down: bool = False,
 ) -> str:
     run_url = f"{server_url}/{repo}/actions/runs/{run_id}" if run_id else "без ссылки"
     clause = trigger_clause(canary_ran)
+    # Четвёртый исход и ПЕРВЫЙ по порядку разбора (#1426): отката не было не
+    # потому, что он не удался, а потому, что он был бы вреден. Ветка обязана
+    # стоять раньше `not rollback_confirmed`, иначе владелец получает
+    # «АВТООТКАТ НЕ ПОДТВЕРЖДЁН — прод, возможно, остался на сломанной
+    # версии»: утверждение о факте, которого нет. Алерт не гадает (AGENTS.md).
+    if backend_down:
+        return (
+            f"🚨 edge-harness: {MARKER}\n"
+            "Деплой cf-worker прошёл, канарейка красная — но распознан исход "
+            "«бэкенд лежит по посторонней причине»: API отдаёт 5xx при "
+            "отдающейся статике (#1426). Откат СОЗНАТЕЛЬНО не делался: "
+            "прежняя версия упрётся в тот же отказ, а если исправление в "
+            "этом деплое — откат его похоронит. Прод сейчас на СВЕЖЕЙ версии.\n"
+            "Точная причина названа в логе шага «Канарейка UI на проде» этого прогона; "
+            "если это исчерпание суточной квоты Durable Objects — снимается "
+            "сбросом в 00:00 UTC (#1411), не откатом.\n"
+            f"{clause}\n"
+            f"Прогон: {run_url}"
+        )
     if not rollback_confirmed:
         return (
             f"🚨 edge-harness: {MARKER}\n"
@@ -129,13 +155,23 @@ def escalate_rollback(
     post_rollback_ok: bool,
     canary_ran: bool,
     server_url: str = "https://github.com",
+    backend_down: bool = False,
 ) -> str:
     """Канал — тот же, что предохранитель конвейера (#120 + Telegram,
     `pulse_guard.escalate`), см. докстринг модуля."""
     text = rollback_alert_text(
-        repo, run_id, rollback_confirmed, post_rollback_ok, canary_ran, server_url
+        repo, run_id, rollback_confirmed, post_rollback_ok, canary_ran, server_url,
+        backend_down,
     )
     return escalate(repo, WATCHDOG_ISSUE, text)
+
+
+def verdict_is_backend_down(canary_verdict: str | None) -> bool:
+    """Единственное место чтения `CANARY_VERDICT` (#1426): строка выхода шага,
+    а не булево. `backend-down` — распознанный посторонний отказ бэкенда;
+    пустая/чужая строка (шаг упал ДО канарейки) — нет: умолчание
+    консервативное, как и у условия самого отката."""
+    return (canary_verdict or "").strip() == "backend-down"
 
 
 def main() -> int:
@@ -145,8 +181,14 @@ def main() -> int:
     rollback_confirmed = parse_bool_env(os.environ.get("ROLLBACK_CONFIRMED"))
     post_rollback_ok = parse_bool_env(os.environ.get("POST_ROLLBACK_OK"))
     canary_ran = parse_bool_env(os.environ.get("CANARY_RAN"))
+    # Вердикт канарейки — строка выхода шага, а не булево: `backend-down`
+    # означает распознанный посторонний отказ бэкенда (#1426). Пустая строка
+    # (шаг упал ДО канарейки) — не `backend-down`, и поведение остаётся
+    # прежним; умолчание консервативное, как и у условия самого отката.
+    backend_down = verdict_is_backend_down(os.environ.get("CANARY_VERDICT"))
     result = escalate_rollback(
-        repo, run_id, rollback_confirmed, post_rollback_ok, canary_ran, server_url
+        repo, run_id, rollback_confirmed, post_rollback_ok, canary_ran, server_url,
+        backend_down,
     )
     print(f"Эскалация автооткота deploy-worker: {result}")
     return 0
