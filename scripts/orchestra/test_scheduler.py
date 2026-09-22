@@ -211,22 +211,48 @@ def test_archive_no_config_is_not_hard_failure(monkeypatch):
     assert any("не заданы" in line for line in lines)
 
 
-def test_archive_login_failure_is_hard_failure(monkeypatch):
+def test_archive_login_failure_is_not_hard_failure_because_the_queue_holds_it(monkeypatch):
+    """#1422: недоступная морда — ровно тот случай, ради которого очередь и
+    заведена. Метка поставлена, повтор случится сам; красить этим весь прогон
+    orchestra нельзя — пульс читает красный прогон как «конвейер мёртв» и
+    уводит владельцу ложный сигнал при живых мержах."""
     monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
     monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_set_archive_pending", lambda repo, number: None)
 
     def broken_login(opener):
         raise RuntimeError("логин в морду не удался: HTTP 403")
 
     monkeypatch.setattr(sch, "_morde_login", broken_login)
     lines, hard = sch.archive_runner_sessions("o/r", [5])
+    assert hard is False
+    assert any("повтор на следующем проходе" in line for line in lines)
+
+
+def test_archive_label_not_set_is_the_hard_failure(monkeypatch):
+    """Единственный по-настоящему жёсткий сбой этой функции (#1422): без метки
+    повторять будет НЕЧЕМУ — факт работы потерян, лечится только руками. До
+    #1422 всё было наоборот: безобидная неудачная уборка красила прогон, а
+    вот эта, настоящая потеря, проходила тихой строкой."""
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(
+        sch, "_set_archive_pending",
+        lambda repo, number: (_ for _ in ()).throw(RuntimeError("HTTP 500: метка не поставлена")),
+    )
+    monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
+    monkeypatch.setattr(sch, "_morde_rpc", lambda opener, method, payload: None)
+    monkeypatch.setattr(sch, "_clear_archive_pending", lambda repo, number: None)
+    lines, hard = sch.archive_runner_sessions("o/r", [5])
     assert hard is True
-    assert any("сломана" in line for line in lines)
+    assert any("НЕ поставлена" in line for line in lines)
 
 
 def test_archive_session_not_found_is_not_hard_failure(monkeypatch):
     monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
     monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_set_archive_pending", lambda repo, number: None)
+    monkeypatch.setattr(sch, "_clear_archive_pending", lambda repo, number: None)
     monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
     monkeypatch.setattr(
         sch, "_morde_rpc",
@@ -237,17 +263,21 @@ def test_archive_session_not_found_is_not_hard_failure(monkeypatch):
     assert any("архивировать нечего" in line for line in lines)
 
 
-def test_archive_rpc_failure_is_hard_failure(monkeypatch):
+def test_archive_rpc_failure_is_not_hard_failure_but_stays_queued(monkeypatch):
+    """#1422: неудачная уборка — штатная работа очереди, не поломка конвейера.
+    Красит прогон ВОЗРАСТ записи, и считает его догоняющий проход, который
+    видит очередь целиком."""
     monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
     monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_set_archive_pending", lambda repo, number: None)
     monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
     monkeypatch.setattr(
         sch, "_morde_rpc",
         lambda opener, method, payload: (_ for _ in ()).throw(RuntimeError("internal: что-то сломалось")),
     )
     lines, hard = sch.archive_runner_sessions("o/r", [5])
-    assert hard is True
-    assert any("сломана" in line for line in lines)
+    assert hard is False
+    assert any("остаётся в очереди" in line for line in lines)
 
 
 # ── append_session_notes (#480): заметки-итоги в сессии harness-<N> ──────────────
@@ -695,7 +725,11 @@ def test_main_exits_nonzero_and_escalates_on_archive_hard_failure(monkeypatch):
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
     monkeypatch.setattr(sch, "unhealthy_pulls", lambda repo, now, pulls, *, pool=None: [])
-    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], ["✅ PR #1 слит"], True, pulls))
+    # #1422: архивный жёсткий сбой — ЭТО и есть «метку поставить не удалось»
+    # (четвёртый элемент), а не сводный флаг хвоста мержа (третий). Разведены
+    # они именно потому, что архивный текст на чужом сбое утверждал факт,
+    # которого нет (находка ai-review PR #1424).
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], ["✅ PR #1 слит"], False, True, pulls))
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
     monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], True))
@@ -724,6 +758,55 @@ def test_main_exits_nonzero_and_escalates_on_archive_hard_failure(monkeypatch):
     assert "issues?q=is%3Aissue+label%3Asession%3Aarchive-pending" in text, text
 
 
+def test_merge_tail_failure_does_not_speak_about_the_archive_queue(monkeypatch):
+    """Дефект, найденный ai-review PR #1424, и он был МОЙ: `merge_loop` отдавал
+    СВОДНЫЙ жёсткий сбой (заметки-итоги ИЛИ архив), main называл его архивным
+    и печатал «очередь висит дольше N ч». Достижимый путь — живой сценарий
+    задачи: морда легла, мерж прошёл, `append_session_notes` отдал hard, архив
+    по новой политике нет, просроченных записей ноль — и владельцу уходило
+    утверждение о факте, которого не было. До #1422 текст был грубым, но не
+    ложным; ложным его сделало именно моё разделение, пока флаг оставался
+    сводным.
+
+    Мутация «слить флаги обратно» обязана красить этот тест."""
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "independent_pulse_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
+    monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
+    monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
+    monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls, merged=None, *, pool=None: [])
+    monkeypatch.setattr(sch, "reap_stalled_worker_run", lambda repo, now, pool, pulls: ([], []))
+    monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
+    monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
+    monkeypatch.setattr(sch, "unhealthy_pulls", lambda repo, now, pulls, *, pool=None: [])
+    # Третий элемент True (сбой заметок-итогов), четвёртый False (архив цел).
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], ["✅ PR #1 слит"], True, False, pulls))
+    monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
+    monkeypatch.setattr(sch, "accept_merged_tasks",
+                        lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False))
+    monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], True))
+    monkeypatch.setattr(sch, "wip_gate", lambda repo, now, pulls, pool, dispatch_allowed: ([], [], True))
+    monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool, *, wip_allowed, pulls: ([], []))
+    monkeypatch.setattr(sch, "summary", lambda lines: None)
+    monkeypatch.setattr(sch, "detect_and_act", lambda repo, now, lines, run_url=None: [])
+    monkeypatch.setattr(sch, "escalate_stale_auto_tasks", lambda repo, now: [])
+    monkeypatch.setattr(sch, "groom_auto_tasks", lambda repo, now, lines: [])
+    monkeypatch.setattr(sch, "retry_pending_session_archives", lambda repo, now: ([], (False, None)))
+    escalated = []
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue, text: escalated.append(text) or "ок")
+
+    assert sch.main() == 1, "сбой хвоста мержа обязан красить прогон — он реальный"
+    assert escalated, "и обязан быть назван владельцу"
+    text = escalated[0]
+    assert "хвост мержа сломан" in text, text
+    # Ключевое: ни слова про очередь архива. Утверждение о возрасте записи —
+    # факт, которого на этом пути нет ни одного.
+    assert "НЕ тает" not in text, f"текст про очередь на чужом сбое: {text}"
+    assert f"{sch.SESSION_ARCHIVE_QUEUE_STALE_HOURS} ч" not in text, text
+    assert "очередь архива тут не при чём" in text, text
+
+
 def test_main_exits_nonzero_and_escalates_on_stall_hard_failure(monkeypatch):
     """Находка ревью PR #248: до фикса RuntimeError из detect_and_act/
     escalate_stale_auto_tasks (сеть, gh без авторизации) выходил из main()
@@ -745,7 +828,7 @@ def test_main_exits_nonzero_and_escalates_on_stall_hard_failure(monkeypatch):
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
     monkeypatch.setattr(sch, "unhealthy_pulls", lambda repo, now, pulls, *, pool=None: [])
-    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], ["✅ PR #1 слит"], False, pulls))
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], ["✅ PR #1 слит"], False, False, pulls))
     monkeypatch.setattr(sch, "trigger_ai_review", lambda repo, now, pulls: ([], []))
     monkeypatch.setattr(sch, "stale_ready_pulls", lambda repo, now, pulls: [])
     monkeypatch.setattr(sch, "reject_reopened_tasks", lambda repo, pool: [])
@@ -796,7 +879,7 @@ def test_main_stays_green_when_archive_ok(monkeypatch):
     monkeypatch.setattr(sch, "reap_stalled_worker_run", lambda repo, now, pool, pulls: ([], []))
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
-    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], ["✅ PR #1 слит"], False, pulls))
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], ["✅ PR #1 слит"], False, False, pulls))
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
     monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], True))
@@ -827,7 +910,7 @@ def test_main_exits_nonzero_when_acceptance_hard_failure(monkeypatch):
     monkeypatch.setattr(sch, "reap_stalled_worker_run", lambda repo, now, pool, pulls: ([], []))
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
-    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, pulls))
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, False, pulls))
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
     monkeypatch.setattr(
         sch, "accept_merged_tasks",
@@ -2525,7 +2608,7 @@ def test_update_branch_skips_when_ai_review_running_for_pr(monkeypatch):
     patch_gh(monkeypatch, fake)
     monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
 
-    observations, actions, hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
+    observations, actions, hard_failure, _archive_hard, merged_number, updated = sch.merge_queue(REPO, pulls)
 
     assert not hard_failure
     assert merged_number is None
@@ -2639,7 +2722,7 @@ def test_merge_queue_behind_not_close_to_merge_skips_without_update(monkeypatch)
     fake = FakeGh({"pulls/2/update-branch": None, "pulls/2": {"mergeable_state": "behind"}})
     patch_gh(monkeypatch, fake)
 
-    observations, actions, hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
+    observations, actions, hard_failure, _archive_hard, merged_number, updated = sch.merge_queue(REPO, pulls)
 
     assert not hard_failure
     assert merged_number is None
@@ -2654,7 +2737,7 @@ def test_merge_queue_behind_close_to_merge_updates(monkeypatch):
     patch_gh(monkeypatch, fake)
     monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
 
-    observations, actions, hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
+    observations, actions, hard_failure, _archive_hard, merged_number, updated = sch.merge_queue(REPO, pulls)
 
     assert not hard_failure
     assert merged_number is None
@@ -2669,7 +2752,7 @@ def test_merge_queue_behind_conflict_updates_even_without_verdicts(monkeypatch):
     patch_gh(monkeypatch, fake)
     monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
 
-    observations, actions, hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
+    observations, actions, hard_failure, _archive_hard, merged_number, updated = sch.merge_queue(REPO, pulls)
 
     assert not hard_failure
     assert merged_number is None
@@ -2697,7 +2780,7 @@ def test_merge_queue_two_behind_prs_share_one_update_branch_budget(monkeypatch):
     patch_gh(monkeypatch, fake)
     monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
 
-    observations, actions, hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
+    observations, actions, hard_failure, _archive_hard, merged_number, updated = sch.merge_queue(REPO, pulls)
 
     assert not hard_failure
     assert merged_number is None
@@ -2726,7 +2809,7 @@ def test_merge_queue_two_behind_prs_stop_at_budget_exhausted(monkeypatch):
     patch_gh(monkeypatch, fake)
     monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
 
-    observations, actions, hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
+    observations, actions, hard_failure, _archive_hard, merged_number, updated = sch.merge_queue(REPO, pulls)
 
     assert not hard_failure
     assert merged_number is None
@@ -2884,7 +2967,7 @@ def test_merge_queue_behind_network_error_reported_not_raised(monkeypatch):
     patch_gh(monkeypatch, fake)
     monkeypatch.delenv("ORCHESTRA_PAT", raising=False)
 
-    observations, actions, hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)  # не должно кинуть исключение
+    observations, actions, hard_failure, _archive_hard, merged_number, updated = sch.merge_queue(REPO, pulls)  # не должно кинуть исключение
 
     assert not hard_failure
     assert merged_number is None
@@ -2914,7 +2997,7 @@ def test_merge_queue_clean_state_without_ai_ok_not_merged(monkeypatch):
     })
     patch_gh(monkeypatch, fake)
 
-    observations, actions, hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
+    observations, actions, hard_failure, _archive_hard, merged_number, updated = sch.merge_queue(REPO, pulls)
 
     assert not hard_failure
     assert merged_number is None
@@ -2963,9 +3046,9 @@ def test_merge_queue_merges_review_large_with_large_ok_prod_form(monkeypatch):
     # Предмет теста — решение merge_queue (гейт меток + агрегация чеков), не
     # проводка after_merge (архив/deploy/release задачи) — та разобрана
     # отдельными тестами after_merge_* ниже в этом файле.
-    monkeypatch.setattr(sch, "after_merge", lambda repo, pull, others, merge_sha=None: ([], [], False))
+    monkeypatch.setattr(sch, "after_merge", lambda repo, pull, others, merge_sha=None: ([], [], False, False))
 
-    observations, actions, hard_failure, merged_number, updated = sch.merge_queue(REPO, pulls)
+    observations, actions, hard_failure, _archive_hard, merged_number, updated = sch.merge_queue(REPO, pulls)
 
     assert not hard_failure
     assert merged_number == 333
@@ -2989,9 +3072,9 @@ def test_merge_loop_merges_multiple_prs_in_one_run(monkeypatch):
     (каждый прогресс был слиянием, а не обновлением ветки)."""
     calls = []
     results = [
-        ([], ["✅ PR #1 слит (squash)"], False, 1, True),
-        ([], ["✅ PR #2 слит (squash)"], False, 2, True),
-        (["⏸️ очередь пуста"], [], False, None, False),
+        ([], ["✅ PR #1 слит (squash)"], False, False, 1, True),
+        ([], ["✅ PR #2 слит (squash)"], False, False, 2, True),
+        (["⏸️ очередь пуста"], [], False, False, None, False),
     ]
 
     def fake_merge_queue(repo, pulls):
@@ -3003,7 +3086,7 @@ def test_merge_loop_merges_multiple_prs_in_one_run(monkeypatch):
     slept = []
     monkeypatch.setattr(sch.time, "sleep", lambda s: slept.append(s))
 
-    observations, actions, hard_failure, final_pulls = sch.merge_loop(REPO, [])
+    observations, actions, hard_failure, _archive_hard, final_pulls = sch.merge_loop(REPO, [])
 
     assert not hard_failure
     assert len(calls) == 3
@@ -3024,7 +3107,7 @@ def test_merge_loop_stops_at_max_merges_cap(monkeypatch):
         calls.append(1)
         if len(calls) > sch.MERGE_LOOP_MAX_MERGES + 5:
             raise AssertionError("цикл слияний не останавливается на потолке — уходит в бесконечность")
-        return ([], [f"✅ PR #{len(calls)} слит (squash)"], False, len(calls), True)
+        return ([], [f"✅ PR #{len(calls)} слит (squash)"], False, False, len(calls), True)
 
     monkeypatch.setattr(sch, "merge_queue", fake_merge_queue)
     monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
@@ -3033,7 +3116,7 @@ def test_merge_loop_stops_at_max_merges_cap(monkeypatch):
         lambda s: pytest.fail("не должен ждать — каждый проход сливал, прогресс всегда был мержем"),
     )
 
-    observations, actions, hard_failure, final_pulls = sch.merge_loop(REPO, [])
+    observations, actions, hard_failure, _archive_hard, final_pulls = sch.merge_loop(REPO, [])
 
     assert not hard_failure
     assert len(calls) == sch.MERGE_LOOP_MAX_MERGES, "цикл обязан остановиться ровно на потолке слияний"
@@ -3052,7 +3135,7 @@ def test_merge_loop_stops_immediately_without_progress(monkeypatch):
 
     def fake_merge_queue(repo, pulls):
         calls.append(1)
-        return (["⏸️ #1 — нет вердикта ai:ok"], [], False, None, False)
+        return (["⏸️ #1 — нет вердикта ai:ok"], [], False, False, None, False)
 
     monkeypatch.setattr(sch, "merge_queue", fake_merge_queue)
     monkeypatch.setattr(
@@ -3060,7 +3143,7 @@ def test_merge_loop_stops_immediately_without_progress(monkeypatch):
         lambda repo: (_ for _ in ()).throw(AssertionError("без прогресса open_pulls звать не за чем")))
     monkeypatch.setattr(sch.time, "sleep", lambda s: pytest.fail("нечего ждать — прогресса не было"))
 
-    observations, actions, hard_failure, final_pulls = sch.merge_loop(REPO, sentinel_pulls)
+    observations, actions, hard_failure, _archive_hard, final_pulls = sch.merge_loop(REPO, sentinel_pulls)
 
     assert not hard_failure
     assert len(calls) == 1, "без прогресса цикл обязан остановиться после первого прохода"
@@ -3077,8 +3160,8 @@ def test_merge_loop_waits_after_branch_update_before_retry(monkeypatch):
     не по бесконечному опросу."""
     calls = []
     results = [
-        ([], ["🔄 #1 обновлён из main"], False, None, True),
-        (["⏸️ #1 — behind main, checks ещё не готовы"], [], False, None, False),
+        ([], ["🔄 #1 обновлён из main"], False, False, None, True),
+        (["⏸️ #1 — behind main, checks ещё не готовы"], [], False, False, None, False),
     ]
 
     def fake_merge_queue(repo, pulls):
@@ -3090,7 +3173,7 @@ def test_merge_loop_waits_after_branch_update_before_retry(monkeypatch):
     slept = []
     monkeypatch.setattr(sch.time, "sleep", lambda s: slept.append(s))
 
-    observations, actions, hard_failure, final_pulls = sch.merge_loop(REPO, [])
+    observations, actions, hard_failure, _archive_hard, final_pulls = sch.merge_loop(REPO, [])
 
     assert not hard_failure
     assert len(calls) == 2
@@ -5026,7 +5109,7 @@ def test_main_skips_generic_worker_dispatch_when_conflict_rework_already_dispatc
     monkeypatch.setattr(sch, "reap_stalled_worker_run", lambda repo, now, pool, pulls: ([], []))
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
-    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, pulls))
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, False, pulls))
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
     monkeypatch.setattr(sch, "accept_merged_tasks",
                          lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False))
@@ -5326,7 +5409,7 @@ def test_after_merge_notifies_telegram_about_merge_once(monkeypatch):
         sch, "send_telegram",
         lambda text, as_html=False: sent.append((text, as_html)) or True)
 
-    observations, actions, hard_failure = sch.after_merge("o/r", merged, [])
+    observations, actions, hard_failure, _archive_hard = sch.after_merge("o/r", merged, [])
 
     assert len(sent) == 1, "один PR — одно сообщение, а не по одному на задачу"
     text, as_html = sent[0]
@@ -5408,7 +5491,7 @@ def test_after_merge_without_own_branch_task_sends_nothing(monkeypatch):
         sch, "send_telegram",
         lambda text, as_html=False: sent.append(text) or True)
 
-    observations, actions, hard_failure = sch.after_merge("o/r", merged, [])
+    observations, actions, hard_failure, _archive_hard = sch.after_merge("o/r", merged, [])
 
     assert sent == [], "нет объявленной задачи — нет и «выполнена» в канале"
     assert hard_failure is False
@@ -5438,7 +5521,7 @@ def test_after_merge_telegram_miss_is_loud_but_not_fatal(monkeypatch):
     monkeypatch.setattr(sch, "send_telegram", lambda text, as_html=False: False)
     monkeypatch.setattr(sch, "update_remaining_pulls", lambda repo, merged_number, others: ([], []))
 
-    observations, actions, hard_failure = sch.after_merge("o/r", merged, [])
+    observations, actions, hard_failure, _archive_hard = sch.after_merge("o/r", merged, [])
 
     assert hard_failure is False
     assert any("⚠️" in line and "Telegram" in line for line in (observations + actions))
@@ -5481,7 +5564,7 @@ def test_after_merge_dispatches_dsh_edge_deploy(monkeypatch):
     })
     monkeypatch.setattr(sch, "gh", fake)
     monkeypatch.setattr(sch, "update_remaining_pulls", lambda repo, merged_number, others: ([], []))
-    observations, actions, hard_failure = sch.after_merge(REPO, merged, [], merge_sha="dbe8c9956d")
+    observations, actions, hard_failure, _archive_hard = sch.after_merge(REPO, merged, [], merge_sha="dbe8c9956d")
 
     assert hard_failure is False
     dispatched = [c for c in fake.calls if c.startswith("-X POST") and "/dispatches" in c]
@@ -5506,7 +5589,7 @@ def test_after_merge_skips_dsh_edge_deploy_for_other_paths(monkeypatch):
     })
     monkeypatch.setattr(sch, "gh", fake)
     monkeypatch.setattr(sch, "update_remaining_pulls", lambda repo, merged_number, others: ([], []))
-    observations, actions, hard_failure = sch.after_merge(REPO, merged, [], merge_sha="sha78merge")
+    observations, actions, hard_failure, _archive_hard = sch.after_merge(REPO, merged, [], merge_sha="sha78merge")
 
     assert hard_failure is False
     dispatched = [c for c in fake.calls if c.startswith("-X POST") and "/dispatches" in c]
@@ -5541,7 +5624,7 @@ def test_after_merge_missing_merge_sha_is_observed_not_raised(monkeypatch):
     })
     monkeypatch.setattr(sch, "gh", fake)
     monkeypatch.setattr(sch, "update_remaining_pulls", lambda repo, merged_number, others: ([], []))
-    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+    observations, actions, hard_failure, _archive_hard = sch.after_merge(REPO, merged, [])
 
     assert hard_failure is False
     assert any("реакция на мерж" in line and "не выполнена" in line for line in observations)
@@ -5691,7 +5774,7 @@ def test_after_merge_moves_unresolved_checklist_into_findings_registry(monkeypat
     monkeypatch.setattr(sch, "gh", fake)
     monkeypatch.setattr(sch, "update_remaining_pulls", lambda *a, **k: ([], []))
 
-    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+    observations, actions, hard_failure, _archive_hard = sch.after_merge(REPO, merged, [])
 
     assert hard_failure is False
     assert any("+2" in line and "-0" in line for line in actions)
@@ -5711,7 +5794,7 @@ def test_after_merge_no_checklist_no_registry_write(monkeypatch):
     monkeypatch.setattr(sch, "gh", fake)
     monkeypatch.setattr(sch, "update_remaining_pulls", lambda *a, **k: ([], []))
 
-    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+    observations, actions, hard_failure, _archive_hard = sch.after_merge(REPO, merged, [])
 
     assert hard_failure is False
     assert not any("реестр находок" in line for line in observations + actions)
@@ -5728,7 +5811,7 @@ def test_after_merge_skips_items_without_file_and_reports_it(monkeypatch):
     monkeypatch.setattr(sch, "gh", fake)
     monkeypatch.setattr(sch, "update_remaining_pulls", lambda *a, **k: ([], []))
 
-    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+    observations, actions, hard_failure, _archive_hard = sch.after_merge(REPO, merged, [])
 
     assert hard_failure is False
     assert not any(c.startswith("-X PUT") for c in fake.calls)
@@ -5747,7 +5830,7 @@ def test_after_merge_closes_findings_marked_resolved_in_pr_body(monkeypatch):
     monkeypatch.setattr(sch, "gh", fake)
     monkeypatch.setattr(sch, "update_remaining_pulls", lambda *a, **k: ([], []))
 
-    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+    observations, actions, hard_failure, _archive_hard = sch.after_merge(REPO, merged, [])
 
     assert hard_failure is False
     assert any("+0" in line and "-1" in line for line in actions)
@@ -5770,7 +5853,7 @@ def test_after_merge_survives_broken_json_registry_with_loud_observation(monkeyp
     monkeypatch.setattr(sch, "gh", fake)
     monkeypatch.setattr(sch, "update_remaining_pulls", lambda *a, **k: ([], []))
 
-    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+    observations, actions, hard_failure, _archive_hard = sch.after_merge(REPO, merged, [])
 
     assert hard_failure is False
     assert any("не обновлён" in line and "битый JSON" in line
@@ -5820,7 +5903,7 @@ def test_after_merge_never_calls_create_pool_issue_for_review_findings(monkeypat
     monkeypatch.setattr(sch, "gh", fake)
     monkeypatch.setattr(sch, "update_remaining_pulls", lambda *a, **k: ([], []))
 
-    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+    observations, actions, hard_failure, _archive_hard = sch.after_merge(REPO, merged, [])
     assert hard_failure is False
 
 
@@ -5909,7 +5992,7 @@ def test_after_merge_resume_series_by_merge_posts_marker(monkeypatch):
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda repo, numbers: ([], False))
 
-    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+    observations, actions, hard_failure, _archive_hard = sch.after_merge(REPO, merged, [])
 
     assert hard_failure is False
     # видимый результат: маркер реально лежит в #120 с нужным содержимым
@@ -5939,7 +6022,7 @@ def test_after_merge_resume_skips_when_merge_predates_red_run(monkeypatch):
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda repo, numbers: ([], False))
 
-    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+    observations, actions, hard_failure, _archive_hard = sch.after_merge(REPO, merged, [])
 
     assert hard_failure is False
     assert not any("сброшена мержем" in line for line in actions + observations)
@@ -5967,7 +6050,7 @@ def test_after_merge_resume_skips_when_series_closed(monkeypatch):
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda repo, numbers: ([], False))
 
-    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+    observations, actions, hard_failure, _archive_hard = sch.after_merge(REPO, merged, [])
 
     assert hard_failure is False
     assert not any("сброшена мержем" in line for line in actions + observations)
@@ -5995,7 +6078,7 @@ def test_after_merge_resume_skips_without_claim_trace(monkeypatch):
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda repo, numbers: ([], False))
 
-    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+    observations, actions, hard_failure, _archive_hard = sch.after_merge(REPO, merged, [])
 
     assert hard_failure is False
     assert not any("сброшена мержем" in line for line in actions + observations)
@@ -6024,7 +6107,7 @@ def test_after_merge_resume_dedupes_by_pr_marker(monkeypatch):
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda repo, numbers: ([], False))
 
-    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+    observations, actions, hard_failure, _archive_hard = sch.after_merge(REPO, merged, [])
 
     assert hard_failure is False
     assert not any("сброшена мержем" in line for line in actions + observations)
@@ -6089,7 +6172,7 @@ def test_after_merge_resume_ignores_fake_dedup_marker_without_job_token(monkeypa
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda repo, numbers: ([], False))
 
-    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+    observations, actions, hard_failure, _archive_hard = sch.after_merge(REPO, merged, [])
 
     assert hard_failure is False
     # видимый результат: НАСТОЯЩИЙ маркер дописан в #120 — дедуп не спутал
@@ -6123,7 +6206,7 @@ def test_after_merge_resume_does_not_claim_reset_when_marker_not_posted(monkeypa
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda repo, numbers: ([], False))
 
-    observations, actions, hard_failure = sch.after_merge(REPO, merged, [])
+    observations, actions, hard_failure, _archive_hard = sch.after_merge(REPO, merged, [])
 
     assert hard_failure is False
     assert not any("сброшена мержем" in line for line in actions + observations), \
@@ -7916,7 +7999,7 @@ def test_main_still_dispatches_worker_for_rework_when_wip_gate_closed(monkeypatc
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
     live_pulls = [{"marker": "same snapshot merge_loop produced"}]
-    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, live_pulls))
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, False, live_pulls))
     monkeypatch.setattr(sch, "trigger_ai_review", lambda repo, now, pulls: ([], []))
     # Разблокировка застрявших ai:ok+review:large без large-ok (#939) — не
     # предмет этого теста: снимок здесь маркер-заглушка без labels[].
@@ -7984,7 +8067,7 @@ def test_main_skips_worker_dispatch_while_fuse_paused(monkeypatch):
     monkeypatch.setattr(sch, "reap_stalled_worker_run", lambda repo, now, pool, pulls: ([], []))
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
-    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, pulls))
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, False, pulls))
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [issue(89, assignees=())])
     monkeypatch.setattr(sch, "accept_merged_tasks", lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: (["⏸️ пауза диспатча"], [], False))
@@ -8659,7 +8742,7 @@ def test_main_closes_reopened_task_before_acceptance_sees_it(monkeypatch):
     # внутреннюю логику (pulls тут всегда пуст, реальная реализация тоже
     # вернула бы []); сигнатура обязана принимать pool, иначе main() упадёт.
     monkeypatch.setattr(sch, "unhealthy_pulls", lambda repo, now, pulls, *, pool=None: [])
-    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, pulls))
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, False, pulls))
     monkeypatch.setattr(sch, "trigger_ai_review", lambda repo, now, pulls: ([], []))
     monkeypatch.setattr(sch, "stale_ready_pulls", lambda repo, now, pulls: [])
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], True))
@@ -10151,6 +10234,20 @@ def test_create_task_replacement_body_passes_declared_dependency_gate(monkeypatc
 # — повторять было некому и нечего.
 
 
+# Фиксированное «сейчас» для возрастных проверок очереди (#1422): возраст
+# записи считается от события `labeled`, и обе стороны сравнения обязаны быть
+# детерминированными, иначе тест зависит от часов раннера.
+_NOW = datetime(2026, 9, 21, 18, 0, tzinfo=timezone.utc)
+
+
+def _labeled_route(number: int, at: str) -> tuple[str, list]:
+    """Прод-форма ответа `GET /repos/{repo}/issues/{n}/events` — снята с живого
+    API: событие постановки метки несёт `event`, `label.name` и `created_at`."""
+    return (f"issues/{number}/events",
+            [{"event": "labeled", "label": {"name": sch.SESSION_ARCHIVE_PENDING_LABEL},
+              "created_at": at}])
+
+
 def _archive_stand(monkeypatch, *, rpc, routes=None):
     monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
     monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
@@ -10170,7 +10267,7 @@ def test_archive_failure_leaves_the_work_in_the_queue(monkeypatch):
 
     lines, hard = sch.archive_runner_sessions("o/r", [5])
 
-    assert hard is True
+    assert hard is False, "#1422: запись в очереди — работающий механизм, не поломка конвейера"
     posted = [c for c in fake.calls if c.startswith("-X POST") and "labels" in c]
     deleted = [c for c in fake.calls if c.startswith("-X DELETE") and "labels" in c]
     assert len(posted) == 1, f"метка обязана ставиться ДО попытки: {fake.calls}"
@@ -10206,7 +10303,11 @@ def test_archive_session_not_found_also_clears_the_queue(monkeypatch):
 
 def test_queue_survives_unreachable_morde(monkeypatch):
     """Недоступная морда — ровно тот случай, ради которого очередь заведена:
-    метка ставится ДО логина, поэтому падение на логине не теряет запись."""
+    метка ставится ДО логина, поэтому падение на логине не теряет запись.
+
+    #1422: и именно поэтому прогон при этом НЕ красный — запись цела, повтор
+    случится сам. Красный прогон orchestra читается пульсом как «конвейер
+    мёртв», и тратить этот сигнал на работающую очередь нельзя."""
     monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
     monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
     monkeypatch.setattr(sch, "_morde_opener", lambda: object())
@@ -10217,7 +10318,7 @@ def test_queue_survives_unreachable_morde(monkeypatch):
 
     lines, hard = sch.archive_runner_sessions("o/r", [5])
 
-    assert hard is True
+    assert hard is False, "#1422: запись цела — красить прогон нечем"
     assert [c for c in fake.calls if c.startswith("-X POST") and "labels" in c], fake.calls
     assert any("повтор на следующем проходе" in line for line in lines), lines
 
@@ -10242,7 +10343,7 @@ def test_retry_pass_drains_the_queue_without_remembering_anything(monkeypatch):
     })
     monkeypatch.setattr(sch, "gh", fake)
 
-    lines, hard = sch.retry_pending_session_archives("o/r")
+    lines, (hard, _stale_since) = sch.retry_pending_session_archives("o/r", _NOW)
 
     assert hard is False
     assert archived == ["harness-7", "harness-9"], archived
@@ -10264,7 +10365,7 @@ def test_retry_pass_is_quiet_when_the_queue_is_empty(monkeypatch):
     })
     monkeypatch.setattr(sch, "gh", fake)
 
-    lines, hard = sch.retry_pending_session_archives("o/r")
+    lines, (hard, _stale_since) = sch.retry_pending_session_archives("o/r", _NOW)
 
     assert (lines, hard) == ([], False)
 
@@ -10377,6 +10478,254 @@ def test_after_merge_without_branch_task_does_not_touch_the_archive_at_all(monke
     assert archive_calls == [], archive_calls
 
 
+def _stale_queue_stand(monkeypatch, *, labeled_at, numbers=(7,)):
+    """Стенд догоняющего прохода: очередь непуста, уборка падает, возраст
+    записи задаётся событием `labeled`."""
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_morde_opener", lambda: object())
+    monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
+    monkeypatch.setattr(sch, "_morde_rpc", lambda opener, method, payload: (_ for _ in ()).throw(
+        RuntimeError("internal: HTTP 500")))
+    routes = {
+        f"issues?state=all&labels={sch.SESSION_ARCHIVE_PENDING_LABEL.replace(':', '%3A')}":
+            [{"number": n} for n in numbers],
+    }
+    for n in numbers:
+        routes[f"issues/{n}/labels"] = None
+        if labeled_at is not None:
+            routes.update([_labeled_route(n, labeled_at)])
+        else:
+            # Прод-форма отказа: gh() поднимает RuntimeError с текстом ответа
+            # API — возраст в этот момент установить физически нечем.
+            routes[f"issues/{n}/events"] = RuntimeError("gh api .../events: HTTP 502")
+    fake = FakeGh(routes)
+    monkeypatch.setattr(sch, "gh", fake)
+    return fake
+
+
+def test_fresh_queue_entry_does_not_redden_the_pulse(monkeypatch):
+    """Главная сцена #1422. Живой случай 2026-09-21: квота rows_read DO
+    исчерпана (#1411), уборка падала на каждом проходе, прогон orchestra
+    краснел, и pulse_guard уводил владельцу «пульсы orchestra пропадали» —
+    при полностью живом конвейере, который в те же минуты слил четыре PR.
+    Свежая запись в очереди — это работающий механизм, а не мёртвый конвейер."""
+    fresh = (_NOW - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _stale_queue_stand(monkeypatch, labeled_at=fresh)
+
+    lines, (hard, _stale_since) = sch.retry_pending_session_archives("o/r", _NOW)
+
+    assert hard is False, lines
+    assert not any("НЕ тает" in line or "сломана причина" in line for line in lines), lines
+
+
+def test_queue_older_than_the_threshold_reddens_the_pulse(monkeypatch):
+    """Вторая половина того же различения: просроченная запись — это уже
+    сломанная ПРИЧИНА, а не уборка, и молчать о ней нельзя. Ровно эту политику
+    текст алерта обещал с #1417, а исполнять её код начал только здесь."""
+    old = (_NOW - timedelta(hours=sch.SESSION_ARCHIVE_QUEUE_STALE_HOURS + 1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _stale_queue_stand(monkeypatch, labeled_at=old)
+
+    lines, (hard, _stale_since) = sch.retry_pending_session_archives("o/r", _NOW)
+
+    assert hard is True, lines
+    assert any("сломана причина, а не уборка" in line for line in lines), lines
+
+
+def test_unknown_queue_age_counts_as_stale_not_as_fresh(monkeypatch):
+    """Возраст установить не удалось — fail-safe в сторону громкого, тот же
+    выбор, что у active_run_kind в wake_orchestra.sh (#1408). Обратное
+    умолчание («событий нет — значит свежая») прятало бы застрявшую очередь
+    на любом сбое API."""
+    _stale_queue_stand(monkeypatch, labeled_at=None)
+
+    lines, (hard, _stale_since) = sch.retry_pending_session_archives("o/r", _NOW)
+
+    assert hard is True, lines
+    assert any("установить не удалось" in line for line in lines), lines
+
+
+def test_queue_age_is_read_from_the_latest_labeling_not_the_first(monkeypatch):
+    """Запись могли снять и поставить заново (успешная уборка, потом новый
+    мерж той же задачи). Возраст обязан считаться от ПОСЛЕДНЕЙ постановки —
+    иначе давняя история красит прогон за работу, начатую минуту назад."""
+    monkeypatch.setattr(sch, "gh", FakeGh({"issues/7/events": [
+        {"event": "labeled", "label": {"name": sch.SESSION_ARCHIVE_PENDING_LABEL},
+         "created_at": "2026-09-01T00:00:00Z"},
+        {"event": "unlabeled", "label": {"name": sch.SESSION_ARCHIVE_PENDING_LABEL},
+         "created_at": "2026-09-01T01:00:00Z"},
+        {"event": "labeled", "label": {"name": sch.SESSION_ARCHIVE_PENDING_LABEL},
+         "created_at": (_NOW - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")},
+    ]}))
+
+    age = sch.archive_pending_age_hours("o/r", 7, _NOW)
+
+    assert age is not None and age < 1, age
+
+
+def test_queue_age_ignores_other_labels(monkeypatch):
+    """Событий `labeled` у задачи много (task, area:*, review:*). Считать
+    возраст по чужой метке значило бы мерить не то: наша запись могла лечь
+    минуту назад, а метка `task` — месяц."""
+    monkeypatch.setattr(sch, "gh", FakeGh({"issues/7/events": [
+        {"event": "labeled", "label": {"name": "task"}, "created_at": "2026-09-01T00:00:00Z"},
+    ]}))
+
+    assert sch.archive_pending_age_hours("o/r", 7, _NOW) is None
+
+
+def test_unreachable_morde_in_the_catch_up_pass_still_judges_by_age(monkeypatch):
+    """Замечание ревью PR #1424 (некритичное, но дыра настоящая): ветка «морда
+    недоступна» в догоняющем проходе тестом не была прибита вовсе, а она
+    изменена этой задачей — раньше отдавала безусловный hard, теперь судит по
+    ВОЗРАСТУ, как и успешный проход. Живой сценарий ровно такой: квота DO
+    исчерпана, логин в морду не проходит, очередь стоит."""
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_morde_opener", lambda: object())
+    monkeypatch.setattr(sch, "_morde_login", lambda opener: (_ for _ in ()).throw(
+        RuntimeError("логин в морду не удался: HTTP 500")))
+    fresh = (_NOW - timedelta(minutes=20)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    routes = {
+        f"issues?state=all&labels={sch.SESSION_ARCHIVE_PENDING_LABEL.replace(':', '%3A')}":
+            [{"number": 7}],
+    }
+    routes.update([_labeled_route(7, fresh)])
+    monkeypatch.setattr(sch, "gh", FakeGh(routes))
+
+    lines, (hard, since) = sch.retry_pending_session_archives("o/r", _NOW)
+
+    assert hard is False, f"свежая запись при лежащей морде прогон не красит: {lines}"
+    assert since is None, "просроченных записей нет — сравнивать эпизод не с чем"
+    assert any("морда недоступна" in line for line in lines), lines
+
+
+def test_unreachable_morde_with_a_stale_entry_does_redden(monkeypatch):
+    """Вторая половина той же ветки: просроченная запись при лежащей морде —
+    это и есть «сломана причина, а не уборка», и молчать нельзя."""
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_morde_opener", lambda: object())
+    monkeypatch.setattr(sch, "_morde_login", lambda opener: (_ for _ in ()).throw(
+        RuntimeError("логин в морду не удался: HTTP 500")))
+    old = (_NOW - timedelta(hours=sch.SESSION_ARCHIVE_QUEUE_STALE_HOURS + 1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    routes = {
+        f"issues?state=all&labels={sch.SESSION_ARCHIVE_PENDING_LABEL.replace(':', '%3A')}":
+            [{"number": 7}],
+    }
+    routes.update([_labeled_route(7, old)])
+    monkeypatch.setattr(sch, "gh", FakeGh(routes))
+
+    lines, (hard, since) = sch.retry_pending_session_archives("o/r", _NOW)
+
+    assert hard is True, lines
+    assert since is not None, "эпизод обязан знать, с чем сравнивать время алерта"
+    assert any("сломана причина, а не уборка" in line for line in lines), lines
+
+
+def test_stale_episode_is_new_when_no_alert_was_ever_sent(monkeypatch):
+    """Первый эпизод обязан заговорить: маркера нет — сигнал уходит."""
+    monkeypatch.setattr(sch, "issue_marker_times", lambda repo, issue, marker: [])
+    assert sch.archive_stale_episode_is_new("o/r", _NOW - timedelta(hours=3)) is True
+
+
+def test_stale_episode_is_not_new_while_the_same_entry_hangs(monkeypatch):
+    """Главная сцена находки-указателя ai-review PR #1424 (реестр [83]) и
+    прямая жалоба владельца: причина живёт часами (квота DO сбрасывается в
+    00:00 UTC), пульс тикает каждые ~20 минут, и тот же алерт уходил бы
+    десятками. Запись легла ДО последнего алерта — значит это тот же эпизод."""
+    alert_at = _NOW - timedelta(hours=1)
+    monkeypatch.setattr(sch, "issue_marker_times", lambda repo, issue, marker: [alert_at])
+    labeled_before_the_alert = _NOW - timedelta(hours=3)
+    assert sch.archive_stale_episode_is_new("o/r", labeled_before_the_alert) is False
+
+
+def test_stale_episode_is_new_again_when_the_queue_refilled_after_the_alert(monkeypatch):
+    """Газ, и он автоматический: очередь растаяла и набралась заново — запись
+    НОВЕЕ последнего алерта, значит это другой эпизод и молчать нельзя. Без
+    этой ветки глушилка стала бы односторонним тормозом («тормоз без газа»)."""
+    alert_at = _NOW - timedelta(hours=5)
+    monkeypatch.setattr(sch, "issue_marker_times", lambda repo, issue, marker: [alert_at])
+    labeled_after_the_alert = _NOW - timedelta(hours=3)
+    assert sch.archive_stale_episode_is_new("o/r", labeled_after_the_alert) is True
+
+
+def test_stale_episode_unknown_age_does_not_repeat_the_alert(monkeypatch):
+    """Возраст неизвестен, но алерт уже был: различить «то же самое» и «новое»
+    здесь нечем, а повторять сказанное — ровно тот дефект, против которого
+    задача. Fail-safe по ВОЗРАСТУ (считать просроченным) и fail-safe по
+    ЧАСТОТЕ (не повторять) смотрят в разные стороны сознательно: первый
+    решает «сказать ли вообще», второй — «сказать ли ещё раз»."""
+    monkeypatch.setattr(sch, "issue_marker_times", lambda repo, issue, marker: [_NOW - timedelta(hours=1)])
+    assert sch.archive_stale_episode_is_new("o/r", None) is False
+
+
+def test_stale_episode_marker_read_failure_speaks_up(monkeypatch):
+    """Сбой чтения маркеров — лишний алерт дешевле проглоченного."""
+    def boom(repo, issue, marker):
+        raise RuntimeError("gh api .../comments: HTTP 502")
+    monkeypatch.setattr(sch, "issue_marker_times", boom)
+    assert sch.archive_stale_episode_is_new("o/r", _NOW - timedelta(hours=3)) is True
+
+
+def _main_stand_for_stale_queue(monkeypatch, *, episode_new: bool, escalated: list, lines_seen: list):
+    """Стенд main() для ветки «очередь не тает»: всё лишнее погашено, живыми
+    остаются только догоняющий проход и решение об эпизоде."""
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "independent_pulse_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
+    monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
+    monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
+    monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls, merged=None, *, pool=None: [])
+    monkeypatch.setattr(sch, "reap_stalled_worker_run", lambda repo, now, pool, pulls: ([], []))
+    monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
+    monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
+    monkeypatch.setattr(sch, "unhealthy_pulls", lambda repo, now, pulls, *, pool=None: [])
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, False, pulls))
+    monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
+    monkeypatch.setattr(sch, "accept_merged_tasks",
+                        lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False))
+    monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], True))
+    monkeypatch.setattr(sch, "wip_gate", lambda repo, now, pulls, pool, dispatch_allowed: ([], [], True))
+    monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool, *, wip_allowed, pulls: ([], []))
+    monkeypatch.setattr(sch, "detect_and_act", lambda repo, now, lines, run_url=None: [])
+    monkeypatch.setattr(sch, "escalate_stale_auto_tasks", lambda repo, now: [])
+    monkeypatch.setattr(sch, "groom_auto_tasks", lambda repo, now, lines: [])
+    monkeypatch.setattr(sch, "summary", lambda lines: lines_seen.extend(lines))
+    monkeypatch.setattr(sch, "retry_pending_session_archives",
+                        lambda repo, now: (["🚨 #7: висит в очереди 5.0 ч"], (True, now)))
+    monkeypatch.setattr(sch, "archive_stale_episode_is_new", lambda repo, since: episode_new)
+    monkeypatch.setattr(sch, "escalate",
+                        lambda repo, issue, text: escalated.append(text) or "ок")
+
+
+def test_new_stale_episode_alerts_and_carries_the_marker(monkeypatch):
+    """Маркер обязан быть В ТЕКСТЕ: `issue_marker_times` ищет его подстрокой в
+    теле комментария, и алерт без маркера не опознаётся как открытый эпизод —
+    глушилка не сработает НИКОГДА, а владелец получит тот же поток."""
+    escalated, lines_seen = [], []
+    _main_stand_for_stale_queue(monkeypatch, episode_new=True, escalated=escalated, lines_seen=lines_seen)
+
+    assert sch.main() == 1
+    assert escalated, "новый эпизод обязан заговорить"
+    assert sch.SESSION_ARCHIVE_STALE_MARKER in escalated[0], escalated[0]
+
+
+def test_continuing_stale_episode_neither_alerts_nor_reddens(monkeypatch):
+    """Вторая половина: пока эпизод тот же, прогон ЗЕЛЁНЫЙ. Красный прогон
+    orchestra pulse_guard читает как «пульсы пропадали», то есть «конвейер
+    мёртв», — живой случай 2026-09-21: владельцу ушло восемь сообщений за
+    полтора часа, пока конвейер работал. Факт при этом не теряется: строка в
+    отчёте и маркер в #120 остаются."""
+    escalated, lines_seen = [], []
+    _main_stand_for_stale_queue(monkeypatch, episode_new=False, escalated=escalated, lines_seen=lines_seen)
+
+    assert sch.main() == 0, "продолжение эпизода не имеет права красить прогон"
+    assert escalated == [], "повтор того же алерта владельцу не уходит"
+    assert any("уже объявлен" in line for line in lines_seen), lines_seen
+
+
 def test_main_runs_the_catch_up_pass_every_pulse(monkeypatch):
     """Проводка, без которой механизм — украшение: очередь обязана разбираться
     САМА на каждом пульсе, иначе метка просто копится и «не потеряно» остаётся
@@ -10394,7 +10743,7 @@ def test_main_runs_the_catch_up_pass_every_pulse(monkeypatch):
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
     monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
     monkeypatch.setattr(sch, "unhealthy_pulls", lambda repo, now, pulls, *, pool=None: [])
-    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, pulls))
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, False, pulls))
     monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
     monkeypatch.setattr(sch, "accept_merged_tasks",
                         lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False))
@@ -10407,7 +10756,7 @@ def test_main_runs_the_catch_up_pass_every_pulse(monkeypatch):
     monkeypatch.setattr(sch, "summary", lambda lines: lines_seen.extend(lines))
     monkeypatch.setattr(
         sch, "retry_pending_session_archives",
-        lambda repo: called.append(repo) or (["🔁 очередь архива сессий: повторяю 1 — #7"], False))
+        lambda repo, now: called.append(repo) or (["🔁 очередь архива сессий: повторяю 1 — #7"], (False, None)))
 
     assert sch.main() == 0
     assert called == ["o/r"], "догоняющий проход не вызван из пульса"
@@ -10436,7 +10785,7 @@ def test_main_reddens_when_the_catch_up_pass_itself_is_broken(monkeypatch):
     monkeypatch.setattr(sch, "reap_stalled_worker_run", lambda repo, now, pool, pulls: ([], []))
     monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
     monkeypatch.setattr(sch, "unhealthy_pulls", lambda repo, now, pulls, *, pool=None: [])
-    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, pulls))
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, False, pulls))
     monkeypatch.setattr(sch, "accept_merged_tasks",
                         lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False))
     monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], True))
@@ -10444,10 +10793,10 @@ def test_main_reddens_when_the_catch_up_pass_itself_is_broken(monkeypatch):
     monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool, *, wip_allowed, pulls: ([], []))
     monkeypatch.setattr(sch, "groom_auto_tasks", lambda repo, now, lines: [])
     monkeypatch.setattr(sch, "retry_pending_session_archives",
-                        lambda repo: (["🚨 очередь архива сессий: морда недоступна"], True))
+                        lambda repo, now: (["🚨 очередь архива сессий: морда недоступна"], (True, None)))
     escalated = []
     monkeypatch.setattr(sch, "escalate",
                         lambda repo, issue, text: escalated.append(text) or "ок")
 
     assert sch.main() == 1
-    assert escalated and "архив сессии раннера" in escalated[0], escalated
+    assert escalated and "Очередь архива сессий раннера НЕ тает" in escalated[0], escalated
