@@ -417,3 +417,49 @@ def test_enforced_reader_calls_the_repo_endpoint_not_rate_limit(monkeypatch):
     rg.fetch_enforced("mytab0r/edge-harness")
 
     assert calls == [["gh", "api", "-i", "repos/mytab0r/edge-harness"]]
+
+
+# ── #1004: обёртка main() гвардии, читающей API ──────────────────────────────
+
+
+def test_exhausted_budget_in_a_guard_is_a_warning_not_a_red_check(capsys):
+    """Живой случай: прогон 35727716021 (PR #1458). Гейт квоты корректно
+    пропустил дорогие шаги, а шаг «Каталог гвардий» всё равно свалил
+    обязательную проверку — `decision-doc-numbering-guard` упал трейсбеком.
+    Текст отказа — дословный из того лога."""
+    def failing() -> int:
+        raise RuntimeError(
+            "gh api repos/mytab0r/edge-harness/pulls?state=open&per_page=100&page=1: "
+            "gh: API rate limit exceeded for installation … (HTTP 403)")
+
+    code = rg.run_guard_main(failing, guard="decision-doc-numbering-guard")
+
+    assert code == 0, "исчерпанный бюджет не имеет права красить обязательную проверку"
+    out = capsys.readouterr().out
+    assert "::warning::" in out
+    assert "::error::" not in out
+    assert "decision-doc-numbering-guard" in out
+
+
+def test_a_real_failure_is_not_swallowed_by_the_wrapper():
+    """Обёртка обязана быть узкой: всё, что не про квоту, проходит наверх
+    нетронутым. Проглотить настоящую поломку было бы silent-wrong, ради
+    которого весь класс и чинится."""
+    def broken() -> int:
+        raise RuntimeError("scripts/lib/foo.py: ожидался список, пришёл dict")
+
+    with pytest.raises(RuntimeError, match="ожидался список"):
+        rg.run_guard_main(broken, guard="x")
+
+
+def test_wrapper_returns_the_guards_own_code_when_nothing_throws():
+    assert rg.run_guard_main(lambda: 0, guard="x") == 0
+    assert rg.run_guard_main(lambda: 1, guard="x") == 1
+
+
+def test_classifier_is_one_place_of_truth_for_both_surfaces():
+    """Гейт и обёртка спрашивают ОДНУ функцию: две копии регулярки разошлись
+    бы на первом же новом варианте текста отказа."""
+    assert rg.is_rate_limit_refusal("gh: API rate limit exceeded for installation")
+    assert rg.is_rate_limit_refusal("You have exceeded a secondary rate limit")
+    assert not rg.is_rate_limit_refusal("dial tcp: connection refused")
