@@ -1293,6 +1293,12 @@ class FakeGh:
             "gh api repos/.../actions/variables/DSH_PROVIDER_QUOTA_UNTIL: "
             "HTTP 404: Not Found (https://api.github.com/...)"
         ),
+        # Состояние прогона по номеру (#1448): гейт «по этой задаче уже идёт
+        # прогон» спрашивает его для каждого номера из маркеров git-шага в
+        # задаче. Дефолт — ЗАВЕРШЁННЫЙ прогон, то есть «живого нет»: так
+        # ведут себя все прежние сценарии, где доводка обязана диспатчиться.
+        # Сценарии про сам гейт переопределяют этот маршрут явно.
+        "actions/runs/": {"status": "completed", "conclusion": "success"},
     }
 
     def __init__(self, routes: dict):
@@ -3546,6 +3552,9 @@ def test_dispatch_ai_review_rework_uses_free_slot_when_one_worker_slot_busy(monk
     fake = FakeGh({
         "pulls/560/files?per_page=100": [],
         "issues/560/comments?per_page=100": [],
+        # Гейт «по этой задаче уже идёт прогон» (#1448) читает комментарии
+        # ЗАДАЧИ (474), не PR: маркеров git-шага нет — живого прогона нет.
+        "issues/474/comments?per_page=100": [],
         # #1253/#1274 (слито в main после этой ветки): dispatch_ai_review_rework
         # сортирует очередь по моменту простановки ai:changes-requested и
         # сверяет висящий бонусный повтор — оба читают timeline PR. Ветка
@@ -11373,3 +11382,124 @@ def test_sweep_unknown_queue_depth_is_loud_and_adds_nothing(monkeypatch):
 
     assert calls == []
     assert any("глубину не узнать" in line for line in lines), lines
+
+
+# ── Гейт «по этой задаче уже идёт прогон» (#1448) ────────────────────────────
+
+
+def _rework_stand_with_task_run(monkeypatch, *, run_status):
+    """Стенд доводки, у задачи которой есть маркер git-шага с номером
+    прогона — то есть по ней воркер уже работал/работает."""
+    fake = FakeGh({
+        "pulls/560/files": [{"filename": "a.py"}],
+        "issues/560/comments?per_page=100": [],
+        "issues/560/timeline?per_page=100": [],
+        "issues/474/comments?per_page=100": [
+            {"created_at": "2026-09-22T04:49:00Z",
+             "body": "🤖 [worker: git-шаг] worker run 34600000777"},
+        ],
+        # Ключ ровно тот же, что у дефолтного маршрута FakeGh: словарь
+        # собирается как {**DEFAULT, **routes}, и совпадение ищется по
+        # порядку вставки — более длинный, «специфичный» ключ дефолт НЕ
+        # перекрыл бы (проверено: гейт возвращал None при живом прогоне).
+        "actions/runs/": {"status": run_status, "conclusion": None},
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "-X DELETE repos/mytab0r/edge-harness/issues/474/assignees": None,
+        "-X POST repos/mytab0r/edge-harness/issues/560/comments": None,
+        "-X POST repos/mytab0r/edge-harness/actions/workflows/worker.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    return fake
+
+
+def test_second_run_on_the_same_task_is_refused(monkeypatch):
+    """Живой случай 2026-09-22: два прогона воркера по задаче #1426
+    одновременно (старты 04:48 и 07:20). Свободный слот говорит «есть куда
+    запустить», а не «по этой задаче никто не работает» — это разные вещи, и
+    до #1448 различал их только человек.
+
+    Цена дубля не в минутах раннера: каждый прогон льёт транскрипт в морду по
+    ~360 rows_read на событие, и два прогона того дня выбрали 8,2 млн при
+    суточном лимите 5 млн."""
+    _rework_stand_with_task_run(monkeypatch, run_status="in_progress")
+
+    assert sch.active_worker_run_for_task(REPO, 474) == "34600000777"
+
+
+def test_finished_run_on_the_same_task_does_not_block(monkeypatch):
+    """Обратная сторона, и она важнее: завершённый прогон блокировать не
+    должен — иначе задача, которую однажды доводили, больше никогда не
+    получит доводки. Тормоз без газа не принимается."""
+    _rework_stand_with_task_run(monkeypatch, run_status="completed")
+
+    assert sch.active_worker_run_for_task(REPO, 474) is None
+
+
+def test_task_without_any_worker_marker_does_not_block(monkeypatch):
+    """Задача, по которой воркер ещё не работал: маркеров нет, блокировать
+    нечего. Это обычный путь первого диспатча."""
+    fake = FakeGh({"issues/474/comments?per_page=100": []})
+    patch_gh(monkeypatch, fake)
+
+    assert sch.active_worker_run_for_task(REPO, 474) is None
+
+
+def test_unreadable_run_does_not_block_the_dispatch(monkeypatch):
+    """Состояние прогона не отдалось. Блокировать по неизвестности нельзя:
+    это тормоз, который нечем снять — задача встала бы навсегда из-за
+    единственного отказа API. Fail-safe здесь в сторону «не блокируем»
+    осознанно: цена лишнего дубля (квота) меньше цены задачи, которую
+    конвейер больше не берёт вовсе."""
+    fake = FakeGh({
+        "issues/474/comments?per_page=100": [
+            {"created_at": "2026-09-22T04:49:00Z",
+             "body": "🤖 [worker: git-шаг] worker run 34600000777"},
+        ],
+        "actions/runs/": RuntimeError("HTTP 500: run не отдался"),
+    })
+    patch_gh(monkeypatch, fake)
+
+    assert sch.active_worker_run_for_task(REPO, 474) is None
+
+
+def test_dispatch_refuses_when_a_run_for_this_task_is_alive(monkeypatch):
+    """Проводка, без которой функция — украшение.
+
+    Мутация «снять вызов active_worker_run_for_task из диспатча» оставляла
+    ВСЕ четыре теста выше зелёными: они проверяют функцию в отрыве и её
+    отсутствие в решении не замечают. Это ровно тот класс, который ai-ревью
+    находило в соседних PR трижды за сутки, — поэтому тест написан здесь, а
+    не оставлен на ревью.
+
+    Сцена — живой случай 2026-09-22: по задаче уже идёт прогон воркера,
+    второй слот свободен. Свободный слот НЕ повод запускать второй прогон по
+    той же задаче."""
+    task = issue(474, assignees=("mytab0r",))
+    p = pull(560, labels=["ai:changes-requested"], ref="agent/474-ai-rework")
+    fake = FakeGh({
+        "pulls/560/files?per_page=100": [],
+        "issues/560/comments?per_page=100": [],
+        "issues/560/timeline?per_page=100": [],
+        "issues/474/comments?per_page=100": [
+            {"created_at": "2026-09-22T04:49:00Z",
+             "body": "🤖 [worker: git-шаг] worker run 34600000777"},
+        ],
+        "actions/runs/": {"status": "in_progress", "conclusion": None},
+        "workflows/worker.yml/runs?status=in_progress": {"workflow_runs": []},
+        "workflows/worker.yml/runs?status=queued": {"workflow_runs": []},
+        "-X DELETE repos/mytab0r/edge-harness/issues/474/assignees": None,
+        "workflows/worker.yml/dispatches": None,
+    })
+    patch_gh(monkeypatch, fake)
+    assume_worker_not_stalled(monkeypatch)
+    patch_post_issue_comment(monkeypatch, lambda *a: None)
+    monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: "замок снят")
+
+    observations, actions, dispatched = sch.dispatch_ai_review_rework(REPO, [p], pool=[task])
+
+    assert dispatched is False, "второй прогон по той же задаче запускать нельзя"
+    assert not any("dispatches" in call for call in fake.mutating_calls()), fake.mutating_calls()
+    # Отказ обязан назвать ФАКТ — какой именно прогон уже идёт, а не просто
+    # «отложено»: иначе читатель отчёта идёт гадать (AGENTS.md).
+    assert any("34600000777" in line for line in observations), observations

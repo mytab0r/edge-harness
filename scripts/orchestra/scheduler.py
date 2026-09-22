@@ -1442,6 +1442,53 @@ def ai_rework_attempts(repo: str, pr_number: int, task_number: int, fingerprint:
     return len(counted)
 
 
+def active_worker_run_for_task(repo: str, task_number: int) -> str | None:
+    """id прогона воркера, который ПРЯМО СЕЙЧАС работает над ЭТОЙ задачей, —
+    или None (#1448).
+
+    Зачем. Адресный диспатч доводки гейтился только свободным слотом
+    (`free_worker_slot`, #827), а слотов два. Проверки «прогон по ЭТОЙ задаче
+    уже идёт» не было нигде, и живой случай 2026-09-22 дал ровно это: два
+    прогона по задаче #1426 одновременно (старты 04:48 и 07:20). Цена не в
+    минутах раннера: каждый прогон льёт транскрипт в морду по ~360 rows_read
+    на событие, и два прогона того дня выбрали 8,2 млн при суточном лимите
+    5 млн (#1443). Плюс оба пушат в одну ветку — гонка, наблюдавшаяся дважды.
+
+    Признак машинный и НЕ проза имени прогона: REST API не отдаёт `inputs`
+    прогона вовсе (проверено на живом прогоне: в ответе есть только
+    `display_title`/`name`), поэтому номер задачи из прогона взять неоткуда.
+    Зато обратная связь есть: воркер САМ пишет в задачу маркер git-шага с
+    номером своего прогона (`WORKER_GIT_STEP_MARKER … worker run <id>`), и
+    репозиторий этот формат уже разбирает — им же считается бюджет попыток
+    (`ai_rework_attempts`). Берём последний такой номер и спрашиваем у API
+    состояние ЭТОГО прогона.
+
+    Честный потолок, названный вслух: прогон, диспатченный секунды назад,
+    до git-шага ещё не дошёл и маркера не оставил — в этом окне дубль
+    по-прежнему возможен. Окно порядка минуты против наблюдавшегося разрыва
+    в два с половиной часа; закрыть его полностью можно только маркером на
+    самом диспатче, что и станет следующим шагом, если окно окажется живым."""
+    git_step_run = re.compile(
+        rf"{re.escape(WORKER_GIT_STEP_MARKER)}.*worker run (\d+)(?!\d)"
+    )
+    run_ids: list[str] = []
+    for comment in all_issue_comments(repo, task_number):
+        match = git_step_run.search(comment.get("body") or "")
+        if match:
+            run_ids.append(match.group(1))
+    for run_id in reversed(run_ids):  # новые комментарии в конце — проверяем с них
+        try:
+            run = gh(f"repos/{repo}/actions/runs/{run_id}")
+        except RuntimeError:
+            # Прогон не отдался — молчать нельзя, но и блокировать диспатч
+            # по неизвестности тоже: вызывающий получит None и решит сам,
+            # а строка отчёта у него уже есть.
+            continue
+        if (run or {}).get("status") in ("queued", "in_progress", "waiting", "requested"):
+            return run_id
+    return None
+
+
 def rebuttal_is_genuine(body: str) -> bool:
     """True — комментарий похоже НАЧИНАЕТСЯ с маркера возражения агента
     (AI_REWORK_REBUTTAL_MARKER), а не является дисПатчем оркестратора или
@@ -1979,6 +2026,17 @@ def dispatch_ai_review_rework(
             observations.append(
                 f"⏸️ PR #{number} ждёт доводки по находкам ai-review, но все "
                 f"{WORKER_MAX_CONCURRENCY} слота воркера заняты — отложено"
+            )
+            continue
+        # Второй прогон по ТОЙ ЖЕ задаче — это не параллелизм, а двойная
+        # работа (#1448): свободный слот говорит «есть куда запустить», а не
+        # «по этой задаче никто не работает». Живой случай 2026-09-22: два
+        # прогона по #1426 одновременно, старты 04:48 и 07:20.
+        alive_run = active_worker_run_for_task(repo, int(task_number))
+        if alive_run is not None:
+            observations.append(
+                f"⏸️ PR #{number}: по задаче #{task_number} уже идёт прогон воркера "
+                f"{alive_run} — второй не запускаю (#1448)"
             )
             continue
         if issue["assignees"]:
