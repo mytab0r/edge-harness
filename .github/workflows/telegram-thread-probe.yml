@@ -40,7 +40,9 @@ jobs:
           python-version: "3.12"
 
       - name: Стенд замера (настоящий сервер, не заглушка)
-        run: python -m pytest scripts/telegram/test_thread_probe.py -q
+        run: |
+          pip install --quiet pytest
+          python -m pytest scripts/telegram/test_thread_probe.py -q
 
       - name: Замер тредов в личке
         env:
