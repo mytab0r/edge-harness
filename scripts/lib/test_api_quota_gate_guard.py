@@ -276,3 +276,107 @@ def test_the_repo_ci_test_job_reads_no_api_beside_the_gate():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+# ── #1004: вторая поверхность класса — гвардии каталога scripts/ci/guards ────
+
+
+def _catalogue(tmp_path: Path, guard_name: str, script: str, modules: dict[str, str]) -> tuple[Path, Path]:
+    """Настоящий каталог гвардий + настоящие модули на диске: гвардия
+    разбирает их своим обычным путём (поведенческий стенд, не пересказ)."""
+    root = tmp_path / "repo"
+    guards = root / "scripts" / "ci" / "guards"
+    guards.mkdir(parents=True, exist_ok=True)
+    (guards / f"{guard_name}.sh").write_text(script, encoding="utf-8")
+    for rel, text in modules.items():
+        module = root / rel
+        module.parent.mkdir(parents=True, exist_ok=True)
+        module.write_text(text, encoding="utf-8")
+    return guards, root
+
+
+READS_API_NO_WRAPPER = '''
+import review_labels
+def main() -> int:
+    pulls = review_labels.list_pages("repos/o/r/pulls?state=open&per_page=100", gh)
+    return 0
+sys.exit(main())
+'''
+
+READS_API_WRAPPED = READS_API_NO_WRAPPER.replace(
+    "sys.exit(main())", 'sys.exit(_rate_guard.run_guard_main(main, guard="x"))')
+
+NO_API = '''
+def main() -> int:
+    return 0
+sys.exit(main())
+'''
+
+
+def test_catalogue_guard_reading_api_without_the_wrapper_is_a_violation(tmp_path):
+    """Живой случай #1004: прогон 35727716021 (PR #1458). Гейт квоты корректно
+    пропустил дорогие шаги, а шаг «Каталог гвардий» всё равно свалил
+    обязательную проверку — `decision-doc-numbering-guard` упал трейсбеком на
+    `HTTP 403: API rate limit exceeded for installation`."""
+    guards, root = _catalogue(
+        tmp_path, "reader", "python scripts/lib/reader.py\n",
+        {"scripts/lib/reader.py": READS_API_NO_WRAPPER})
+
+    problems = guard.catalogue_problems(guards, root)
+
+    assert len(problems) == 1
+    assert "scripts/lib/reader.py" in problems[0]
+    assert "run_guard_main" in problems[0]
+
+
+def test_catalogue_guard_with_the_wrapper_passes(tmp_path):
+    guards, root = _catalogue(
+        tmp_path, "reader", "python scripts/lib/reader.py\n",
+        {"scripts/lib/reader.py": READS_API_WRAPPED})
+
+    assert guard.catalogue_problems(guards, root) == []
+
+
+def test_catalogue_guard_that_does_not_touch_the_api_is_not_asked_for_a_wrapper(tmp_path):
+    """Газ: обёртка требуется только от тех, кто реально ходит в API.
+    Требовать её от всех — тормоз без причины на десятках гвардий."""
+    guards, root = _catalogue(
+        tmp_path, "pure", "python scripts/lib/pure.py\n",
+        {"scripts/lib/pure.py": NO_API})
+
+    assert guard.catalogue_modules_reading_api(guards, root) == {}
+    assert guard.catalogue_problems(guards, root) == []
+
+
+def test_tests_of_a_guard_are_not_counted_as_api_readers(tmp_path):
+    """Тест гвардии ходит по заглушкам и бюджет не тратит — требовать от него
+    обёртки значило бы считать потребителем того, кто не потребляет."""
+    guards, root = _catalogue(
+        tmp_path, "tested",
+        "python -m pytest scripts/lib/test_reader.py -q\npython scripts/lib/pure.py\n",
+        {"scripts/lib/test_reader.py": READS_API_NO_WRAPPER,
+         "scripts/lib/pure.py": NO_API})
+
+    assert guard.catalogue_modules_reading_api(guards, root) == {}
+
+
+def test_live_catalogue_has_exactly_the_four_measured_readers():
+    """Замер 2026-09-22, зафиксированный числом и поимённо: обоснование «ни
+    одна гвардия каталога не читает gh api» (run_guards.sh, repo-ci.yml) было
+    ложным, и issue #1004 называла ОДНОГО потребителя. Их четыре.
+
+    Тест падает и когда появится пятый (его надо обернуть и назвать здесь), и
+    когда исчезнет один из четырёх — реестр не имеет права врать в обе
+    стороны."""
+    readers = guard.catalogue_modules_reading_api()
+
+    assert sorted(readers) == [
+        "ci-guard-registration",
+        "decision-doc-numbering-guard",
+        "mutation-claim-guard",
+        "plugin-manager-roster-guard",
+    ], readers
+
+
+def test_live_catalogue_readers_all_carry_the_wrapper():
+    assert guard.catalogue_problems() == []

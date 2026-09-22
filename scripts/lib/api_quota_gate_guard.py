@@ -41,6 +41,7 @@ _console_utf8_spec = importlib.util.spec_from_file_location(
 _console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))
 # --- конец console_utf8 bootstrap ---
 
+import re
 import sys
 
 import yaml
@@ -106,9 +107,12 @@ _GATE_EXISTS_STEP_NOT_BEHIND_IT = (
 _GUARD_CATALOGUE = (
     "гасить целиком нельзя: шаг гоняет ВЕСЬ каталог scripts/ci/guards, где "
     "подавляющее большинство гвардий в API не ходит, и пропуск по чужой квоте снял "
-    "бы проверки, к квоте отношения не имеющие. GH_TOKEN здесь передан на будущее "
-    "(см. комментарий шага в repo-ci.yml). Правильное закрытие — гейт внутри тех "
-    "гвардий каталога, которые реально читают API, когда такие появятся"
+    "бы проверки, к квоте отношения не имеющие. ИСПРАВЛЕНО #1004: прежняя редакция "
+    "этой причины добавляла «GH_TOKEN передан на будущее, потребителей нет» — я "
+    "процитировал комментарий repo-ci.yml вместо замера, и он был ложным. "
+    "Потребителей четыре, и закрыты они не гейтом шага, а обёрткой "
+    "rate_guard.run_guard_main вокруг собственного main каждого; отсутствие "
+    "обёртки у нового потребителя красит catalogue_problems ниже"
 )
 
 ALLOWED_UNGATED_API_STEPS: dict[str, str] = {
@@ -235,6 +239,76 @@ def ungated_api_steps(workflows_dir: Path = WORKFLOWS_DIR) -> list[str]:
     return found
 
 
+# ── Вторая поверхность того же класса: гвардии каталога (#1004) ──────────────
+#
+# Шаг «Каталог гвардий scripts/ci/guards — перебор» гейтом квоты НЕ гасится, и
+# это правильно: он гоняет весь каталог, где подавляющее большинство гвардий в
+# API не ходит. Но ЧЕТЫРЕ ходят, и до #1004 они падали трейсбеком на
+# исчерпанном бюджете — то есть красили чужой PR чужой причиной уже ПОСЛЕ
+# того, как гейт корректно пропустил дорогие шаги (живой случай: прогон
+# 35727716021, PR #1458, `decision-doc-numbering-guard`, HTTP 403).
+#
+# Обоснование «ни одна гвардия каталога не читает gh api», стоявшее в
+# run_guards.sh и в repo-ci.yml, было ЛОЖНЫМ (issue #1004 назвала одного
+# потребителя, замер 2026-09-22 нашёл четырёх) — и я перенёс эту ложную
+# посылку в реестр выше, процитировав комментарий вместо замера. Эта проверка
+# закрывает саму возможность: модуль, который читает API, обязан пропускать
+# свой `main` через `rate_guard.run_guard_main`.
+CATALOGUE_DIR = REPO_ROOT / "scripts" / "ci" / "guards"
+_API_READ_MARKERS = ("list_pages", "gh(", '"gh", "api"', "gh_api")
+_MARKERS_DEFINITION = "_API_READ_MARKERS = ("
+_QUOTA_WRAPPER = "run_guard_main"
+_GUARD_SCRIPT_MODULE_RE = re.compile(r"python3?\s+(scripts/[A-Za-z0-9_/]+\.py)")
+
+
+def catalogue_modules_reading_api(
+    catalogue_dir: Path = CATALOGUE_DIR, repo_root: Path = REPO_ROOT
+) -> dict[str, list[str]]:
+    """{имя гвардии: [модули, которые она запускает и которые читают API]}.
+
+    Признак «читает API» — вызов из `_API_READ_MARKERS` в ПРОД-модуле, который
+    гвардия реально запускает (не в её тестах): тесты ходят по заглушкам и
+    бюджет не тратят."""
+    found: dict[str, list[str]] = {}
+    for script in sorted(catalogue_dir.glob("*.sh")):
+        modules = []
+        for rel in dict.fromkeys(_GUARD_SCRIPT_MODULE_RE.findall(script.read_text(encoding="utf-8"))):
+            module = repo_root / rel
+            if not module.exists() or Path(rel).name.startswith("test_"):
+                continue
+            text = module.read_text(encoding="utf-8")
+            if _MARKERS_DEFINITION in text:
+                # Самоссылка: маркеры лежат литералами в ЭТОМ модуле, и
+                # наивный поиск подстроки находит их в нём самом. Модуль в API
+                # не ходит (он разбирает YAML и исходники), поэтому исключение
+                # узкое и по признаку «здесь маркеры и определены», а не по
+                # имени файла — переименование его не обойдёт.
+                continue
+            if any(marker in text for marker in _API_READ_MARKERS):
+                modules.append(rel)
+        if modules:
+            found[script.stem] = modules
+    return found
+
+
+def catalogue_problems(
+    catalogue_dir: Path = CATALOGUE_DIR, repo_root: Path = REPO_ROOT
+) -> list[str]:
+    """Модуль каталога читает API, но его `main` не обёрнут `run_guard_main`."""
+    problems: list[str] = []
+    for guard_name, modules in catalogue_modules_reading_api(catalogue_dir, repo_root).items():
+        for rel in modules:
+            text = (repo_root / rel).read_text(encoding="utf-8")
+            if _QUOTA_WRAPPER not in text:
+                problems.append(
+                    f"{guard_name} запускает {rel}, который читает GitHub API, но его "
+                    f"`main` не обёрнут `rate_guard.{_QUOTA_WRAPPER}` — при исчерпанном "
+                    f"бюджете гвардия упадёт трейсбеком и покрасит обязательную "
+                    f"проверку чужой причиной (#1004)"
+                )
+    return problems
+
+
 def check(workflows_dir: Path = WORKFLOWS_DIR) -> list[str]:
     """Нарушения: незакрытый шаг без записи в реестре, запись без причины,
     мёртвая запись (шага больше нет — реестр не должен переживать
@@ -258,6 +332,7 @@ def check(workflows_dir: Path = WORKFLOWS_DIR) -> list[str]:
                 f"{key}: мёртвая запись в ALLOWED_UNGATED_API_STEPS — такого незакрытого "
                 f"шага в .github/workflows/ больше нет (шаг закрыт гейтом, переименован "
                 f"или удалён). Убери запись")
+    problems.extend(catalogue_problems())
     return problems
 
 
