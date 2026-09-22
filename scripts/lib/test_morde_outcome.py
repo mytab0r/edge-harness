@@ -126,48 +126,69 @@ def test_terminal_outcomes_split_into_normal_and_loss():
 # Поэтому признак теперь бесмаркерный, а область — узкая: ЛЮБОЕ сопоставление
 # текста ошибки со строковым литералом (`in`/`not in`, `==`/`!=`,
 # `.startswith`-семейство, `re.search/match/…` со строковым паттерном) внутри
-# тел функций, которые ходят в морду. Формы `==` и `re.search` добавлены тем
-# же ревью вторым заходом: прежний признак разбирал только `in` и
-# `startswith`, а текст отказа называл правило обобщённо — честный
-# разработчик уходил ровно в непокрытые формы и молча возвращал класс.
-# Узость обязательна: `in str(` встречается в scheduler.py и по
-# другим поводам (например проверка содержимого ответа gh), и бесмаркерный
-# признак по всему файлу давал бы ложные срабатывания — то есть гвардию,
-# которую начнут глушить.
+# тел функций, которые ходят в морду, и тел вызываемых ими функций.
+# Формы `==` и `re.search` добавлены тем же ревью вторым заходом: прежний
+# признак разбирал только `in` и `startswith`, а текст отказа называл правило
+# обобщённо — честный разработчик уходил ровно в непокрытые формы и молча
+# возвращал класс. Узость обязательна: `in str(` встречается в scheduler.py
+# и по другим поводам (например проверка содержимого ответа gh), и
+# бесмаркерный признак по всему файлу давал бы ложные срабатывания — то есть
+# гвардию, которую начнут глушить.
 
 
 # Двери морды в scheduler.py — единственные обёртки, через которые файл
 # ходит в dsh-edge. Область гвардии выводится из ИСХОДНИКА (функции с
-# вызовом двери или потреблением `morde_outcome`), а не хардкодится списком
-# имён: хардкод двух имён покрывал два из семи ходоков, и четвёртая копия
-# правила в любом из остальных пяти мест прошла бы молча (находка ai-review
-# PR #1434). Новый вызывающий морды попадает в область сам, без правки
+# вызовом двери, потреблением `morde_outcome` или упоминанием дверей, ПЛЮС
+# достижимые из них по вызовам), а не хардкодится списком имён: хардкод двух
+# имён покрывал два из семи ходоков, и четвёртая копия правила в любом из
+# остальных пяти мест прошла бы молча (находка ai-review PR #1434). Новый
+# вызывающий морды и его helper'ы попадают в область сами, без правки
 # гвардии.
 MORDE_DOORS = frozenset({"_morde_opener", "_morde_login", "_morde_rpc", "_morde_ingest"})
 
 
 def _morde_going_function_names(source: str) -> list[str]:
-    """Имена всех функций scheduler.py, которые ходят в морду: вызывают
-    дверь `_morde_*`, потребляют общий классификатор `morde_outcome` или
-    упоминают двери в своём тексте (упоминание — тоже маркер «функция живёт
-    на маршруте морды», как `post_entity_snapshot`, гейтящий сырые записи
-    той же `_guard_raw_subprocess_write`, что `_morde_rpc`)."""
+    """Имена всех функций scheduler.py в области гвардии: функции, которые
+    ходят в морду — вызывают дверь `_morde_*`, потребляют общий классификатор
+    `morde_outcome` или упоминают двери в своём тексте (упоминание — тоже
+    маркер «функция живёт на маршруте морды», как `post_entity_snapshot`,
+    гейтящий сырые записи той же `_guard_raw_subprocess_write`, что
+    `_morde_rpc`) — ПЛЮС всё, что они вызывают, напрямую или через цепочку.
+
+    Достижимость по вызовам добавлена четвёртым кругом ревью PR #1434: копия
+    правила, спрятанная в helper рядом с ходоком (`def _refuses(message):
+    return "…" in message`), ни дверей, ни классификатора не зовёт, а точка
+    вызова — не строковое сравнение, то есть старая область её не видела и
+    гвардия молча зеленела. Спрятать копию в helper — та же рукописная
+    классификация; теперь helper и его собственные helper'ы попадают в
+    область сами, без правки гвардии."""
     tree = ast.parse(source)
-    names: list[str] = []
-    for node in tree.body:
-        if not isinstance(node, ast.FunctionDef):
-            continue
-        called = {
+    top_level = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
+    callee_names = {f.name for f in top_level}
+    callees: dict[str, set[str]] = {}
+    for node in top_level:
+        callees[node.name] = {
             n.func.id
             for n in ast.walk(node)
             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-        }
+        } & callee_names
+    names: list[str] = []
+    for node in top_level:
         touched = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
         segment = ast.get_source_segment(source, node) or ""
-        if (called & MORDE_DOORS or "morde_outcome" in touched
+        if (callees[node.name] & MORDE_DOORS or "morde_outcome" in touched
                 or "_morde_" in segment):
             names.append(node.name)
-    return names
+    # Транзитивное замыкание по рёбрам вызова: helper ходока и helper'ы
+    # самого helper'а наследуют область.
+    scope: set[str] = set(names)
+    frontier = list(names)
+    while frontier:
+        for callee in callees.get(frontier.pop(), ()):
+            if callee not in scope:
+                scope.add(callee)
+                frontier.append(callee)
+    return [f.name for f in top_level if f.name in scope]
 
 
 def _string_comparisons_against_error(source: str, function_name: str) -> list[str]:
@@ -193,9 +214,21 @@ def _string_comparisons_against_error(source: str, function_name: str) -> list[s
       ошибки>)` и `паттерн_объект.search(…)` — строковый литерал первым
       аргументом.
 
-    Честный потолок: паттерн, собранный заранее (`re.compile(r"…")`) и
-    вызванный одним аргументом (`compiled(str(error))`), признак не видит —
-    текст отказа называет покрытые формы, а не «любые»."""
+    Проверяется не только тело самой ходящей в морду функции, но и тела
+    функций, которых она вызывает (напрямую или транзитивно, см.
+    `_morde_going_function_names`): копия, спрятанная в helper, — та же
+    рукописная классификация (четвёртый круг ревью PR #1434).
+
+    Честный потолок, названный прямо:
+
+    * паттерн, собранный заранее (`re.compile(r"…")`) и вызванный одним
+      аргументом (`compiled(str(error))`), признак не видит;
+    * текст отказа, принятый helper'ом под параметром ВНЕ набора
+      `ERROR_VARIABLE_NAMES` (`def _refuses(raw): … in raw`), — не видит:
+      набор имён в тексте отказа гвардии назван, форма с чужим именем —
+      не идиома, и расширять набор до однобуквенных значило бы получить
+      ложные срабатывания, то есть гвардию, которую начнут глушить.
+    Текст отказа называет покрытые формы, а не «любые»."""
     tree = ast.parse(source)
     target = None
     for node in ast.walk(tree):
@@ -245,12 +278,24 @@ def _string_comparisons_against_error(source: str, function_name: str) -> list[s
     return found
 
 
+# Имена, под которыми в scheduler.py живёт текст отказа; читает
+# `_mentions_error`. Держит и идиоматичные короткие формы: `except … as e:`
+# (и `ex`), параметр `msg` — та же переменная ошибки, и без них копия правила
+# в такой форме проходила молча (четвёртый круг ревью PR #1434, подтверждено
+# мутацией). Расширяется только вместе с потолком в докстринге признака.
+ERROR_VARIABLE_NAMES = frozenset(
+    {"error", "err", "exc", "e", "ex", "msg", "message", "detail", "text"})
+
+
 def _mentions_error(node: ast.expr) -> bool:
     """Упоминает ли выражение переменную ошибки — под любым из принятых в
-    файле имён. Имя проверяется по вхождению, а не по точному совпадению:
-    `str(error)`, `f"{error}"`, `message`, `detail` — всё это текст отказа."""
+    файле имён (`ERROR_VARIABLE_NAMES`). Имя проверяется по вхождению, а не
+    по точному совпадению: `str(error)`, `f"{error}"`, `message`, `detail` —
+    всё это текст отказа. На реальном scheduler.py ни одно сравнение в
+    области гвардии ни одно из этих имён не упоминает — добавление коротких
+    форм ложных срабатываний не даёт, проверено прогоном детектора."""
     names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
-    return bool(names & {"error", "err", "exc", "message", "detail", "text"})
+    return bool(names & ERROR_VARIABLE_NAMES)
 
 
 def test_scheduler_has_no_handwritten_outcome_classification():
@@ -269,8 +314,9 @@ def test_scheduler_has_no_handwritten_outcome_classification():
     assert offenders == {}, (
         "в scheduler.py снова рукописная классификация отказа морды — текст "
         "ошибки сопоставляется со строковым литералом (in/not in, ==/!=, "
-        "startswith/…, re.search/match/…) прямо в теле функции, ходящей в "
-        f"морду (место правды — scripts/lib/morde_outcome.py, #1433): {offenders}"
+        "startswith/…, re.search/match/…) в теле функции, ходящей в морду, "
+        "или в теле вызываемой ею функции — напрямую или транзитивно "
+        f"(место правды — scripts/lib/morde_outcome.py, #1433): {offenders}"
     )
 
 
@@ -288,7 +334,7 @@ def test_the_guard_sees_a_marker_it_has_never_heard_of():
     source = (
         "def _archive_with_opener(repo, opener, task_numbers):\n"
         "    try:\n"
-        "        pass\n"
+        "        _morde_rpc(opener, \"workspace.archiveSession\", {})\n"
         "    except RuntimeError as error:\n"
         '        if "СовершенноНовыйОтказКоторогоНиктоНеВидел" in str(error):\n'
         "            return []\n"
@@ -315,7 +361,7 @@ def test_the_guard_sees_equality_comparison():
     source = (
         "def _archive_with_opener(repo, opener, task_numbers):\n"
         "    try:\n"
-        "        pass\n"
+        "        _morde_rpc(opener, \"workspace.archiveSession\", {})\n"
         "    except RuntimeError as error:\n"
         '        if str(error) == "session-not-found":\n'
         "            return []\n"
@@ -331,7 +377,7 @@ def test_the_guard_sees_equality_with_the_literal_on_the_left():
     source = (
         "def _archive_with_opener(repo, opener, task_numbers):\n"
         "    try:\n"
-        "        pass\n"
+        "        _morde_rpc(opener, \"workspace.archiveSession\", {})\n"
         "    except RuntimeError as error:\n"
         '        if "session-not-found" != str(error):\n'
         "            return []\n"
@@ -347,7 +393,7 @@ def test_the_guard_sees_a_regular_expression_over_the_error_text():
     source = (
         "def _archive_with_opener(repo, opener, task_numbers):\n"
         "    try:\n"
-        "        pass\n"
+        "        _morde_rpc(opener, \"workspace.archiveSession\", {})\n"
         "    except RuntimeError as error:\n"
         '        if re.search(r"session-not-found", str(error)):\n'
         "            return []\n"
@@ -355,6 +401,103 @@ def test_the_guard_sees_a_regular_expression_over_the_error_text():
     assert _string_comparisons_against_error(source, "_archive_with_opener") == [
         "session-not-found"
     ]
+
+
+def test_the_guard_sees_a_copy_hidden_in_a_helper_called_from_a_walker():
+    """Форма А четвёртого круга ревью: копия правила спрятана в helper рядом
+    с ходоком. Helper дверей не зовёт, классификатор не потребляет, `_morde_`
+    в его тексте не упоминается, а точка вызова — не строковое сравнение,
+    поэтому старая область его не видела и гвардия молча зеленела (обе
+    посадки ревью исполнены на этом дереве, см. шапку гвардии). Достижимость
+    по вызовам заводит helper и helper его helper'а в область сам."""
+
+    def one_helper(source: str) -> None:
+        scope = _morde_going_function_names(source)
+        assert "_session_format_refuses" in scope, (
+            "helper ходока не в области гвардии — копия, спрятанная в нём, "
+            "пройдёт молча"
+        )
+        assert _string_comparisons_against_error(
+            source, "_session_format_refuses") == [
+            "СпрятанныйВHelperОтказНовогоНеВиданного"
+        ]
+
+    # helper определён ДО ходока — и после: порядок определений свободен.
+    one_helper(
+        "def _session_format_refuses(message):\n"
+        '    return "СпрятанныйВHelperОтказНовогоНеВиданного" in message\n'
+        "\n"
+        "\n"
+        "def _archive_with_opener(repo, opener, task_numbers):\n"
+        "    try:\n"
+        "        _morde_rpc(opener, \"workspace.archiveSession\", {})\n"
+        "    except RuntimeError as error:\n"
+        "        if _session_format_refuses(str(error)):\n"
+        "            return []\n"
+        "        return []\n"
+    )
+    one_helper(
+        "def _archive_with_opener(repo, opener, task_numbers):\n"
+        "    try:\n"
+        "        _morde_rpc(opener, \"workspace.archiveSession\", {})\n"
+        "    except RuntimeError as error:\n"
+        "        if _session_format_refuses(str(error)):\n"
+        "            return []\n"
+        "        return []\n"
+        "\n"
+        "\n"
+        "def _session_format_refuses(message):\n"
+        '    return "СпрятанныйВHelperОтказНовогоНеВиданного" in message\n'
+    )
+
+
+def test_the_guard_sees_a_copy_two_calls_deep():
+    """Транзитивность достижимости: копия в helper'е helper'а — та же копия.
+    Одноуровневая область снова зеленила бы молча."""
+    source = (
+        "def _refuses_deep(message):\n"
+        '    return "КопияНаВторомУровнеНовуюНеВидали" in message\n'
+        "\n"
+        "\n"
+        "def _session_format_refuses(message):\n"
+        "    return _refuses_deep(message)\n"
+        "\n"
+        "\n"
+        "def _archive_with_opener(repo, opener, task_numbers):\n"
+        "    try:\n"
+        "        _morde_rpc(opener, \"workspace.archiveSession\", {})\n"
+        "    except RuntimeError as error:\n"
+        "        if _session_format_refuses(str(error)):\n"
+        "            return []\n"
+        "        return []\n"
+    )
+    scope = _morde_going_function_names(source)
+    assert "_refuses_deep" in scope
+    assert _string_comparisons_against_error(source, "_refuses_deep") == [
+        "КопияНаВторомУровнеНовуюНеВидали"
+    ]
+
+
+def test_the_guard_sees_the_copy_behind_the_idiomatic_except_alias():
+    """Форма Б того же круга: копия прямо в теле ходока, но при идиоматичном
+    коротком псевдониме `except … as e:` — набор имён ошибки его не знал и
+    гвардия молча зеленела (посадка ревью исполнена на этом дереве). `ex` и
+    `msg` — соседние идиоматичные имена той же переменной, страхуются тем же
+    тестом: сужение набора обратно до длинных имён краснеет здесь."""
+    for alias in ("e", "ex", "msg"):
+        source = (
+            "def _archive_with_opener(repo, opener, task_numbers):\n"
+            "    try:\n"
+            "        pass\n"
+            f"    except RuntimeError as {alias}:\n"
+            f'        if "ОтказНаКороткомИмениНовогоНеВиданный" in str({alias}):\n'
+            "            return []\n"
+            "        return []\n"
+        )
+        assert _string_comparisons_against_error(
+            source, "_archive_with_opener") == [
+            "ОтказНаКороткомИмениНовогоНеВиданный"
+        ], f"псевдоним {alias} не распознан как переменная ошибки"
 
 
 def test_precompiled_pattern_is_the_declared_blind_spot_not_an_accident():
@@ -369,12 +512,40 @@ def test_precompiled_pattern_is_the_declared_blind_spot_not_an_accident():
     source = (
         "def _archive_with_opener(repo, opener, task_numbers):\n"
         "    try:\n"
-        "        pass\n"
+        "        _morde_rpc(opener, \"workspace.archiveSession\", {})\n"
         "    except RuntimeError as error:\n"
         "        if _NOT_FOUND_RE.search(str(error)):\n"
         "            return []\n"
     )
     assert _string_comparisons_against_error(source, "_archive_with_opener") == []
+
+
+def test_error_text_under_a_foreign_parameter_name_is_the_declared_blind_spot():
+    """Второй честный потолок, закреплённый машиной рядом с `re.compile`.
+
+    Текст отказа, принятый helper'ом (он сам в области — достижимость) под
+    параметром ВНЕ набора `ERROR_VARIABLE_NAMES`, признак не видит. Докстринг
+    признака называет этот потолок и набор имён прямо; покраснеет тест в двух
+    случаях, и оба — работа: форму покрыли (набор расширили — тогда потолок
+    из докстринга убирают) или признак сломали так, что стал ловить лишнее.
+    Идиоматичные имена (`message`, `text`, `msg`, `e`, …) потолком НЕ
+    являются — они покрыты и страхуются тестом псевдонимов выше."""
+    source = (
+        "def _session_format_refuses(raw):\n"
+        '    return "ПотолокЧужогоИмениПараметраНовуюНеВидали" in raw\n'
+        "\n"
+        "\n"
+        "def _archive_with_opener(repo, opener, task_numbers):\n"
+        "    try:\n"
+        "        _morde_rpc(opener, \"workspace.archiveSession\", {})\n"
+        "    except RuntimeError as error:\n"
+        "        if _session_format_refuses(str(error)):\n"
+        "            return []\n"
+        "        return []\n"
+    )
+    assert "_session_format_refuses" in _morde_going_function_names(source)
+    assert _string_comparisons_against_error(
+        source, "_session_format_refuses") == []
 
 
 def test_the_guard_does_not_fire_on_calls_that_are_not_about_the_error():
