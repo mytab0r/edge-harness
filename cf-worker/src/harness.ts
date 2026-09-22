@@ -2001,12 +2001,15 @@ export class Harness extends DurableObject<Env> {
     if (decision === "incident") {
       void this.#telegramApi("sendMessage", {
         chat_id: this.env.TELEGRAM_CHAT_ID,
-        text: pulseAlertText(lastPulse),
+        // «Пульс не тикает» — поломка: само не починится, пока DO не проснётся
+        // (реестр категорий, #1461). Тот же класс события, что и алерты
+        // хранилища в #tickStorageReadyAlert выше.
+        text: decorateAlert("breakage", pulseAlertText(lastPulse)),
       });
     } else if (decision === "recovery") {
       void this.#telegramApi("sendMessage", {
         chat_id: this.env.TELEGRAM_CHAT_ID,
-        text: "✅ edge-harness: пульс оркестратора снова в норме",
+        text: decorateAlert("breakage", "✅ edge-harness: пульс оркестратора снова в норме"),
       });
     }
   }

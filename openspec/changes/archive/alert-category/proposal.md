@@ -10,14 +10,24 @@
 выражена машинно нигде — только эмодзи внутри текста, который каждый
 отправитель собирает сам.
 
-Замер отправителей 2026-09-22 (вызовы пересчитаны, не оценены):
+Замер отправителей 2026-09-22 (вызовы пересчитаны СТРУКТУРНО — AST для
+Python, разбор вызова для bash/TS, тем же способом, каким их проверяет
+гвардия; не оценены на глаз):
 
 ```
-scripts/orchestra/pulse_guard.py::send_telegram    6 вызовов (7 строк)
+scripts/orchestra/pulse_guard.py::send_telegram    7 вызовов (у решения
+                                                   владельца две ветки —
+                                                   с клавиатурой и без)
 scripts/orchestra/scheduler.py                     1
 scripts/orchestra/apply_owner_decision.py          1
-scripts/worker/task.sh::telegram_report            bash, отдельный отправитель
-cf-worker/src/harness.ts::#telegramApi             TypeScript, третий
+scripts/worker/task.sh::telegram_report            4 вызова, bash,
+                                                   отдельный отправитель
+cf-worker/src/harness.ts::#telegramApi             4 sendMessage, TypeScript,
+                                                   третий (плюс тост-ответ на
+                                                   нажатие кнопки и правка уже
+                                                   категоризованного сообщения
+                                                   решения — новых сигналов
+                                                   не создают)
 ```
 
 Три несвязанных отправителя на трёх языках.
@@ -37,7 +47,8 @@ cf-worker/src/harness.ts::#telegramApi             TypeScript, третий
 
 Адресация отделена от категоризации намеренно: сегодня категория видна
 префиксом первой строки, завтра тот же идентификатор станет
-`message_thread_id` темы — и ни одна из девяти точек отправки не изменится.
+`message_thread_id` темы — и ни одна из семнадцати категоризуемых точек
+отправки (9 Python + 4 bash + 4 TS) не изменится.
 
 ## Чего это НЕ делает
 

@@ -934,7 +934,8 @@ $ANSWER_TAIL
 COMMENT
   )
   gh issue comment "$number" --body "$comment" >/dev/null
-  telegram_report "worker: задача #$number — эскалация владельцу (метка blocked)" || true
+  # Эскалация — «решение владельца»: без его действия задача не поедет (#1461).
+  telegram_report decision "worker: задача #$number — эскалация владельцу (метка blocked)" || true
   echo "Эскалация оформлена (blocked) — job зелёный, ждём владельца"
   exit 0
 fi
@@ -1064,7 +1065,8 @@ $ANSWER_TAIL
 COMMENT
   )
   gh issue comment "$number" --body "$comment" >/dev/null
-  telegram_report "worker: задача #$number — $failure_kind ($reason). Задача возвращена в пул" || true
+  # Возврат в пул — ход работы конвейера, не поломка (#1461).
+  telegram_report pipeline "worker: задача #$number — $failure_kind ($reason). Задача возвращена в пул" || true
   if [ "$job_exit" != "green" ]; then
     die "$failure_kind: $reason"
   fi
@@ -1132,5 +1134,7 @@ $ANSWER_TAIL
 COMMENT
   )
 gh issue comment "$number" --body "$comment" >/dev/null
-telegram_report "worker: задача #$number — ПРОВАЛ ($reason). Детали в задаче" || true
+# ПРОВАЛ прогона — исход конвейера, «воркер не справился» чинится конвейером,
+# хранилище здесь не ломалось (#1461).
+telegram_report pipeline "worker: задача #$number — ПРОВАЛ ($reason). Детали в задаче" || true
 die "Воркер не справился: $reason"

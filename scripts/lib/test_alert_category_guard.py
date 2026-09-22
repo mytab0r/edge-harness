@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Тесты гвардии «сигнал без категории» (#1461).
 
-Поведенческие: каждый сценарий — настоящий .py-файл на диске, который гвардия
-разбирает своим обычным путём (AGENTS.md, #891/#893).
+Поведенческие: каждый сценарий — настоящий файл на диске (.py, .sh или .ts),
+который гвардия разбирает своим обычным путём (AGENTS.md, #891/#893), а не
+сверка с копией правила в тесте.
 """
 
 # --- console_utf8 bootstrap (класс: печать кириллицы валит encoding на Windows, issue #723) ---
@@ -159,3 +160,199 @@ def test_runtime_computed_value_is_found(tmp_path):
     root = _repo(tmp_path, "caller.py", "send_telegram('текст', category=pick())\n")
 
     assert len(guard.check(root)) == 1
+
+
+def test_typo_in_registry_constant_is_found(tmp_path):
+    """Находка ai-ревью PR #1462: `alert_category.PIEPLEINE` проходит проверку
+    «ссылается на реестр», гвардия молчит — а в рантайме редкой ветки падает
+    AttributeError'ом. Базы недостаточно: имя сверяется с реестром."""
+    root = _repo(tmp_path, "caller.py",
+                 "send_telegram('текст', category=alert_category.PIEPLEINE)\n")
+
+    problems = guard.check(root)
+
+    assert len(problems) == 1
+    assert "PIEPLEINE не объявлена" in problems[0]
+    assert "PIPELINE" in problems[0], "подсказка обязана называть годные имена дословно"
+
+
+def test_non_category_registry_attribute_is_found(tmp_path):
+    """Атрибут реестра, не являющийся категорией (`CATEGORY_ORDER`), — тоже
+    нарушение: в `category=` нужно значение реестра, а не любой его атрибут."""
+    root = _repo(tmp_path, "caller.py",
+                 "send_telegram('текст', category=alert_category.CATEGORY_ORDER)\n")
+
+    assert len(guard.check(root)) == 1
+
+
+# ── второй отправитель: bash telegram_report (находка ai-ревью PR #1462) ────────
+
+
+def _repo_sh(tmp_path: Path, name: str, source: str) -> Path:
+    root = tmp_path / "repo"
+    (root / "scripts" / "worker").mkdir(parents=True, exist_ok=True)
+    (root / "scripts" / "worker" / name).write_text(source, encoding="utf-8")
+    return root
+
+
+def test_bash_call_without_category_is_found(tmp_path):
+    """Живой дефект этого PR: три из четырёх вызовов task.sh остались со старой
+    сигнатурой — текст вместо категории. alert_prefix валится, `|| true`
+    глотает отказ, job зелёный, а владелец не узнаёт ни об эскалации, ни о
+    провале. Python-часть гвардии эти файлы не читала."""
+    root = _repo_sh(tmp_path, "task.sh",
+                    'telegram_report "worker: задача #7 — ПРОВАЛ" || true\n')
+
+    problems = guard.check(root)
+
+    assert len(problems) == 1
+    assert "task.sh:1" in problems[0]
+    assert "не разрешается статически" in problems[0]
+
+
+def test_bash_call_with_known_category_passes(tmp_path):
+    root = _repo_sh(tmp_path, "task.sh",
+                    'telegram_report decision "worker: эскалация владельцу" || true\n')
+
+    assert guard.check(root) == []
+
+
+def test_bash_call_with_unknown_word_is_found(tmp_path):
+    root = _repo_sh(tmp_path, "task.sh", 'telegram_report urgent "текст"\n')
+
+    problems = guard.check(root)
+
+    assert len(problems) == 1
+    assert "'urgent' не объявлена" in problems[0]
+
+
+def test_bash_call_with_variable_is_found(tmp_path):
+    """Переменная статически не разрешается так же, как текст: пропускать её
+    значило бы оставить дверь, через которую категория снова стала бы
+    необязательной."""
+    root = _repo_sh(tmp_path, "task.sh", 'telegram_report "$category" "текст"\n')
+
+    assert len(guard.check(root)) == 1
+
+
+def test_bash_continuation_call_is_seen(tmp_path):
+    r"""Вызов, перенесённый `\`, не должен прятать нарушение — тот же урок, что
+    у многострочного вызова на Python (#1438)."""
+    root = _repo_sh(tmp_path, "task.sh", 'telegram_report \\\n  "текст без категории"\n')
+
+    assert len(guard.check(root)) == 1
+
+
+def test_bash_definition_comments_and_warnings_are_not_offenders(tmp_path):
+    """Определение отправителя, его warning о чужой ошибке и комментарий с
+    именем функции — не вызовы. Срезать по первому `#` нельзя: сами тексты
+    несут «задача #123»."""
+    root = _repo_sh(tmp_path, "task.sh",
+                    'telegram_report() { :; }\n'
+                    'echo "::warning::telegram_report вызван с неизвестной категорией"\n'
+                    '# второй отправитель — telegram_report в task.sh\n'
+                    'telegram_report pipeline "задача #5 — отчёт" || true\n')
+
+    assert guard.check(root) == []
+
+
+def test_bash_test_scripts_are_not_scanned(tmp_path):
+    """Смоки зовут отправитель через заглушку (`telegram_report() { … }`) —
+    владельцу они ничего не отправляют."""
+    root = tmp_path / "repo"
+    (root / "scripts" / "worker" / "test").mkdir(parents=True)
+    (root / "scripts" / "worker" / "test" / "x.smoke.sh").write_text(
+        'telegram_report "текст"\n', encoding="utf-8")
+
+    assert guard.check(root) == []
+
+
+# ── третий отправитель: TS #telegramApi("sendMessage") (находка ai-ревью) ───────
+
+
+def _repo_ts(tmp_path: Path, name: str, source: str) -> Path:
+    root = tmp_path / "repo"
+    (root / "cf-worker" / "src").mkdir(parents=True, exist_ok=True)
+    (root / "cf-worker" / "src" / name).write_text(source, encoding="utf-8")
+    return root
+
+
+def test_ts_send_message_without_decorate_alert_is_found(tmp_path):
+    """Второй живой дефект этого PR: `#tickPulseAlert` шлёт инцидент и
+    recovery голым текстом рядом с оформленным `#tickStorageReadyAlert` —
+    а существующая спека проверяет только `toContain` и этого не видит."""
+    root = _repo_ts(tmp_path, "harness.ts",
+                    'class H { go() { void this.#telegramApi("sendMessage", '
+                    '{ chat_id: 1, text: pulseAlertText(last) }); } }\n')
+
+    problems = guard.check(root)
+
+    assert len(problems) == 1
+    assert "harness.ts:1" in problems[0]
+    assert "без decorateAlert" in problems[0]
+
+
+def test_ts_send_message_with_decorate_alert_passes(tmp_path):
+    root = _repo_ts(tmp_path, "harness.ts",
+                    'class H { go() { void this.#telegramApi("sendMessage", '
+                    '{ text: decorateAlert("breakage", "инцидент") }); } }\n')
+
+    assert guard.check(root) == []
+
+
+def test_ts_decorate_alert_with_unknown_category_is_found(tmp_path):
+    root = _repo_ts(tmp_path, "harness.ts",
+                    'class H { go() { void this.#telegramApi("sendMessage", '
+                    '{ text: decorateAlert("urgent", "x") }); } }\n')
+
+    assert len(guard.check(root)) == 1
+
+
+def test_ts_decorate_alert_with_variable_is_found(tmp_path):
+    root = _repo_ts(tmp_path, "harness.ts",
+                    'class H { go(cat: string) { void this.#telegramApi("sendMessage", '
+                    '{ text: decorateAlert(cat, "x") }); } }\n')
+
+    assert len(guard.check(root)) == 1
+
+
+def test_ts_send_message_without_text_is_found(tmp_path):
+    root = _repo_ts(tmp_path, "harness.ts",
+                    'class H { go(p: unknown) { void this.#telegramApi("sendMessage", p); } }\n')
+
+    assert len(guard.check(root)) == 1
+
+
+def test_ts_non_message_methods_are_not_new_signals(tmp_path):
+    """`answerCallbackQuery` — тост-ответ на нажатие кнопки самим владельцем,
+    `editMessageText` — правка УЖЕ категоризованного сообщения решения:
+    нового сигнала в общий поток они не создают (честная граница, названная
+    в дельта-спеке). Новый sendMessage мимо decorateAlert — красится."""
+    root = _repo_ts(tmp_path, "harness.ts",
+                    'class H {\n'
+                    '  a() { void this.#telegramApi("answerCallbackQuery", { text: "Принято" }); }\n'
+                    '  b() { void this.#telegramApi("editMessageText", { text: `${t}\\n✅ ок` }); }\n'
+                    '}\n')
+
+    assert guard.check(root) == []
+
+
+def test_ts_spec_files_are_not_scanned(tmp_path):
+    root = tmp_path / "repo"
+    (root / "cf-worker" / "src").mkdir(parents=True)
+    (root / "cf-worker" / "src" / "x.spec.ts").write_text(
+        'it("x", () => { this.#telegramApi("sendMessage", { text: "голый" }); });\n',
+        encoding="utf-8")
+
+    assert guard.check(root) == []
+
+
+def test_ts_paren_inside_string_does_not_break_body_extraction(tmp_path):
+    """Баланс скобок обязан пропускать строковые литералы целиком: скобка в
+    тексте сообщения (или в `?.trim()`) не обрывает payload на середине —
+    иначе гвардия молча пропускала бы всё, что идёт после такой строки."""
+    root = _repo_ts(tmp_path, "harness.ts",
+                    'class H { go() { void this.#telegramApi("sendMessage", '
+                    '{ text: decorateAlert("infra", "деплой (ок) (снова)") }); } }\n')
+
+    assert guard.check(root) == []
