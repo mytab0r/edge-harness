@@ -76,8 +76,21 @@ def test_a_non_gh_subprocess_is_not_touched():
 
 def test_the_debt_list_names_a_reason_for_every_entry():
     """Тормоз без газа не принимается (AGENTS.md). Запись в списке долга
-    без причины — это «потом разберёмся», а не осознанное исключение."""
+    без причины — это «потом разберёмся», а не осознанное исключение.
+
+    Тот же тест держит два тормоза из замечания ai-review PR #1447 («белый
+    список переживает переименования и может молча расти»):
+
+    * каждая запись обязана соответствовать РОВНО ОДНОМУ живому
+      `def test_*` в каталоге scripts/orchestra — переименование или
+      удаление теста красит список, мёртвая запись не может молча
+      освобождать будущих однофамильцев;
+    * размер списка не превосходит замеренного потолка
+      MAX_KNOWN_LIVE_GH_DEBT — рост долга меняется только осознанной
+      правкой числа в conftest.py, а не довеском записи в общем PR.
+    """
     import importlib.util
+    import re
     from pathlib import Path
 
     spec = importlib.util.spec_from_file_location(
@@ -89,3 +102,21 @@ def test_the_debt_list_names_a_reason_for_every_entry():
     for name, reason in conftest.ALLOWED_LIVE_GH.items():
         assert reason.strip(), f"{name}: исключение без причины"
         assert "#1438" in reason, f"{name}: причина без адреса задачи — читатель не найдёт, чем это лечится"
+
+    live_tests: dict[str, list[str]] = {}
+    for path in sorted(Path(__file__).parent.glob("test_*.py")):
+        for match in re.finditer(
+                r"^\s*def (test_[A-Za-z0-9_]+)\(", path.read_text(encoding="utf-8"), re.M):
+            live_tests.setdefault(match.group(1), []).append(path.name)
+    for name in conftest.ALLOWED_LIVE_GH:
+        files = live_tests.get(name, [])
+        assert files, (f"{name}: запись указывает на несуществующий тест — "
+                       "тест переименовали или удалили; сними запись или поправь имя")
+        assert len(files) == 1, (f"{name}: запись соответствует нескольким тестам {files} — "
+                                 "по голому имени не понять, какой именно освобождён; "
+                                 "переименуй так, чтобы имя было уникально в каталоге")
+    assert len(conftest.ALLOWED_LIVE_GH) <= conftest.MAX_KNOWN_LIVE_GH_DEBT, (
+        f"список долга вырос до {len(conftest.ALLOWED_LIVE_GH)} "
+        f"при потолке {conftest.MAX_KNOWN_LIVE_GH_DEBT}: рост утечек — "
+        "осознанное решение; подними MAX_KNOWN_LIVE_GH_DEBT в conftest.py "
+        "с причиной, а не молча")
