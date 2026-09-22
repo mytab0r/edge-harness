@@ -64,6 +64,13 @@ _console_utf8_spec = importlib.util.spec_from_file_location(
 _console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))
 # --- конец console_utf8 bootstrap ---
 
+# --- rate_guard: исчерпанный бюджет API — предупреждение, не красный required-гейт (#1004) ---
+_rate_guard_spec = importlib.util.spec_from_file_location(
+    "rate_guard", Path(__file__).resolve().parent / "rate_guard.py")
+_rate_guard = importlib.util.module_from_spec(_rate_guard_spec)
+_rate_guard_spec.loader.exec_module(_rate_guard)
+# --- конец rate_guard ---
+
 import json
 import os
 import re
@@ -544,4 +551,4 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    raise SystemExit(_rate_guard.run_guard_main(lambda: main(sys.argv[1:]), guard='decision-doc-numbering-guard'))
