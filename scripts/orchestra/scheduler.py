@@ -255,6 +255,7 @@ from pulse_guard import (
     prod_writes_allowed,
     recent_runs,
     resume_alert_text,
+    alert_category,
     send_telegram,
 )
 # Сигнал дрейфа пина апстрима (#134): вся логика — upstream_drift.py, здесь
@@ -3760,6 +3761,7 @@ def after_merge(
         if send_telegram(
             merge_telegram_text(repo, pull["number"], tg_task_number, tg_task_title),
             as_html=True,
+            category=alert_category.PIPELINE,
         ):
             actions.append(f"📣 Telegram: «#{tg_task_number} выполнена — слито в main» доставлено")
         else:

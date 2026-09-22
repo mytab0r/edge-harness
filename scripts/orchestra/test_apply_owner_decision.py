@@ -312,7 +312,7 @@ def test_notify_refusal_answers_both_addressees_with_reason_and_gas(monkeypatch)
     posted, sent = [], []
     monkeypatch.setattr(aod, "refusal_already_reported", lambda repo, issue, marker: False)
     monkeypatch.setattr(aod, "post_issue_comment", lambda repo, issue, text: posted.append((repo, issue, text)))
-    monkeypatch.setattr(aod, "send_telegram", lambda text: sent.append(text) or True)
+    monkeypatch.setattr(aod, "send_telegram", lambda text, **_kw: sent.append(text) or True)
 
     aod.notify_refusal("o/r", 471, 2, _refusal())
 
@@ -330,7 +330,7 @@ def test_notify_refusal_does_not_repeat_the_trace_but_still_answers_the_press(mo
     posted, sent = [], []
     monkeypatch.setattr(aod, "refusal_already_reported", lambda repo, issue, marker: True)
     monkeypatch.setattr(aod, "post_issue_comment", lambda repo, issue, text: posted.append(text))
-    monkeypatch.setattr(aod, "send_telegram", lambda text: sent.append(text) or True)
+    monkeypatch.setattr(aod, "send_telegram", lambda text, **_kw: sent.append(text) or True)
 
     aod.notify_refusal("o/r", 471, 2, _refusal())
 
@@ -357,7 +357,7 @@ def test_notify_refusal_says_loudly_when_a_channel_did_not_deliver(monkeypatch, 
     нажатие остаётся без ответа, а лог утверждает обратное."""
     monkeypatch.setattr(aod, "refusal_already_reported",
                         lambda repo, issue, marker: (_ for _ in ()).throw(RuntimeError("gh 403")))
-    monkeypatch.setattr(aod, "send_telegram", lambda text: False)
+    monkeypatch.setattr(aod, "send_telegram", lambda text, **_kw: False)
 
     aod.notify_refusal("o/r", 471, 2, _refusal())
 
@@ -414,7 +414,7 @@ def test_notify_refusal_posts_nothing_if_the_text_would_apply_the_decision(monke
                         lambda refusal, issue, option: f"РЕШЕНИЕ: {option}\nотказ")
     monkeypatch.setattr(aod, "refusal_already_reported", lambda repo, issue, marker: False)
     monkeypatch.setattr(aod, "post_issue_comment", lambda repo, issue, text: posted.append(text))
-    monkeypatch.setattr(aod, "send_telegram", lambda text: True)
+    monkeypatch.setattr(aod, "send_telegram", lambda text, **_kw: True)
 
     with pytest.raises(RuntimeError, match="маркер решения"):
         aod.notify_refusal("o/r", 471, 2, _refusal())

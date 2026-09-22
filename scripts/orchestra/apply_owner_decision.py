@@ -154,8 +154,8 @@ import hmac
 import os
 import sys
 
-from pulse_guard import (DECISION_COMMENT_PREFIX, all_issue_comments, gh, post_issue_comment,
-                         send_telegram)
+from pulse_guard import (DECISION_COMMENT_PREFIX, alert_category, all_issue_comments, gh,
+                         post_issue_comment, send_telegram)
 from waiting_owner_guard import DECISION_MARKER_RE, WAITING_OWNER_LABEL
 
 # Имя переменной окружения, несущей секрет подписи (#1251) — ОДНО место
@@ -389,7 +389,10 @@ def notify_refusal(repo: str, issue_number: int, option: int,
         print(f"::warning::apply_owner_decision: след отказа в #{issue_number} НЕ записан "
               f"({error}) — причина осталась только в этом логе", file=sys.stderr)
 
-    if send_telegram(refusal_telegram_text(repo, issue_number, option, refusal)):
+    # Решение владельца, а не поломка: его решение НЕ применилось, и следующий
+    # шаг — снова за ним.
+    if send_telegram(refusal_telegram_text(repo, issue_number, option, refusal),
+                     category=alert_category.OWNER_DECISION):
         print("apply_owner_decision: владельцу отправлено уведомление об отказе")
     else:
         print("::warning::apply_owner_decision: уведомление владельцу НЕ отправлено — "

@@ -194,6 +194,32 @@ export const GITHUB = {
  *  укладывается с большим запасом даже при 10-значном номере issue и
  *  двузначном номере варианта (не подтверждено больше пары цифр вариантов —
  *  UI не предполагает десятки кнопок в одном сообщении). */
+/** Категория сигнала владельцу — TS-копия реестра scripts/lib/alert_category.py
+ *  (#1461). Копия, а не чтение: воркер живёт в Cloudflare и Python-модуль ему
+ *  недоступен физически. Расхождение при этом не проходит молча —
+ *  scripts/lib/test_alert_category_sync.py читает все три исходника (.py, .sh
+ *  и этот) и требует совпадения id и префиксов; тот же приём, которым уже
+ *  держится `callbackPrefix` ниже (#254).
+ *
+ *  Порядок ключей значим: от «требует человека» к «к сведению». Он же задаёт
+ *  порядок тем, когда включатся треды в личке, и порядок в сводке, пока не
+ *  включились. */
+export const ALERT_CATEGORY = {
+  decision: "🙋 Решение владельца",
+  breakage: "🔴 Поломка",
+  pipeline: "⚙️ Конвейер",
+  infra: "🏗 Инфраструктура",
+} as const;
+
+export type AlertCategory = keyof typeof ALERT_CATEGORY;
+
+/** Текст сигнала с видимой категорией первой строкой — ровно то же, что
+ *  делает `alert_category.decorate` на Python-стороне. Отдельной строкой, а не
+ *  склейкой: тексты сигналов уже начинаются со своих эмодзи. */
+export function decorateAlert(category: AlertCategory, text: string): string {
+  return `${ALERT_CATEGORY[category]}\n${text}`;
+}
+
 export const TELEGRAM = {
   apiBase: "https://api.telegram.org",
   /** Заголовок вебхука Telegram (`setWebhook(secret_token=...)`), которым

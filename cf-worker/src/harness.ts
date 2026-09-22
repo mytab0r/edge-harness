@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { DSH_EDGE_UPDATE, EGRESS_USER_AGENT, GITHUB, HEARTBEAT, LIMITS, RETENTION, SESSION, TELEGRAM } from "./config";
+import { decorateAlert, DSH_EDGE_UPDATE, EGRESS_USER_AGENT, GITHUB, HEARTBEAT, LIMITS, RETENTION, SESSION, TELEGRAM } from "./config";
 import { msg } from "./messages";
 import { matchRoute } from "./api-spec";
 import { redact } from "./redact";
@@ -1931,12 +1931,12 @@ export class Harness extends DurableObject<Env> {
     if (decision === "incident") {
       void this.#telegramApi("sendMessage", {
         chat_id: this.env.TELEGRAM_CHAT_ID,
-        text: `⚠️ Хранилище журнала не отвечает: ${result.detail}`,
+        text: decorateAlert("breakage", `⚠️ Хранилище журнала не отвечает: ${result.detail}`),
       });
     } else if (decision === "recovery") {
       void this.#telegramApi("sendMessage", {
         chat_id: this.env.TELEGRAM_CHAT_ID,
-        text: "✅ Хранилище журнала снова отвечает",
+        text: decorateAlert("breakage", "✅ Хранилище журнала снова отвечает"),
       });
     }
   }
