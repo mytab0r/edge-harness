@@ -18,9 +18,16 @@
 #
 # ИСПРАВЛЕНО #1004: прежняя редакция обосновывала step-уровень фразой «ни одна
 # гвардия каталога сегодня не читает gh api … без единого потребителя». Это
-# перестало быть правдой, и надолго: замер 2026-09-22 нашёл ЧЕТЫРЕХ
-# потребителей — ci-guard-registration, decision-doc-numbering-guard,
-# mutation-claim-guard, plugin-manager-roster-guard. Обоснование step-уровня
+# перестало быть правдой, и надолго: замер 2026-09-22 (переделан после ревью
+# PR #1460 — первая версия считала маркеры подстрокой и ошиблась в обе
+# стороны) нашёл ШЕСТЬ потребителей:
+#   decision-doc-numbering-guard, declared-deps-guard,
+#   deploy-workflow-registry-guard, invariant-numbering-guard,
+#   mutation-claim-guard, plugin-manager-roster-guard.
+# Число и поимённый список держит тест
+# scripts/lib/test_api_quota_gate_guard.py::
+# test_live_catalogue_has_exactly_the_six_measured_readers — он падает и на
+# седьмом, и на исчезнувшем шестом. Обоснование step-уровня
 # остаётся верным (радиус), но опирается теперь на радиус, а не на
 # отсутствие потребителей. Каждый потребитель обязан пропускать свой `main`
 # через `rate_guard.run_guard_main` — иначе исчерпанный бюджет красит

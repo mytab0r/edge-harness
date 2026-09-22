@@ -34,8 +34,30 @@
 потребителя.
 
 Замер 2026-09-22 (`api_quota_gate_guard.catalogue_modules_reading_api`) даёт
-**четырёх**: `ci-guard-registration`, `decision-doc-numbering-guard`,
+**шестерых**: `decision-doc-numbering-guard`, `declared-deps-guard`,
+`deploy-workflow-registry-guard`, `invariant-numbering-guard`,
 `mutation-claim-guard`, `plugin-manager-roster-guard`.
+
+Число переделано после ревью PR #1460, и история его ошибок — существенная
+часть замера, а не сноска. Первая редакция искала маркеры подстрокой и
+ошиблась в ОБЕ стороны:
+
+* **завышение** — `gh(` совпал с прозой комментария «Оркестрация без
+  keyword-аргументов gh()» в `ci_guard_registration_guard.py`: модуль наружу
+  не ходит вовсе, а в списке стоял;
+* **занижение** — `invariant_numbering.py` ходит в API транзитивно
+  (`collect_sources` → `dn.build_refs` → `review_labels.list_pages`), своих
+  маркеров не имеет, и детектор молча зеленел ровно на том состоянии, ради
+  которого заводился. Проверено исполнением: под заглушкой `gh`, отвечающей
+  `HTTP 403 rate limit exceeded`, `python scripts/lib/invariant_numbering.py
+  check` падал `decision_numbering.GhError`, EXIT=1; после обёртки —
+  `::warning::` и EXIT=0.
+
+Переделка на AST сняла завышение (комментарий вызовом не является) и обход
+зависимостей — занижение. При переделке нашлись ещё два пропуска, которых
+ревью не называло: `_gh_api(...)` в `pr_mutation_claim_check.py` и
+`subprocess.run(["gh", "api", …])` в `plugin_manager_roster_guard.py` — оба
+мимо точного набора имён.
 
 Хуже: закрывая #1437, я процитировал этот комментарий в причине реестра
 (`_GUARD_CATALOGUE`) вместо того, чтобы замерить — и внёс ложную посылку в
@@ -43,7 +65,7 @@
 
 ## Что делается
 
-Одна обёртка на все четыре — `rate_guard.run_guard_main`: исчерпанный бюджет
+Одна обёртка на всех шестерых — `rate_guard.run_guard_main`: исчерпанный бюджет
 даёт `::warning::` и код 0 (проверка пропущена, job зелёный), любая другая
 ошибка проходит наверх нетронутой. Классификатор один и тот же у гейта и у
 обёртки (`rate_guard.is_rate_limit_refusal`), две копии регулярки разошлись бы

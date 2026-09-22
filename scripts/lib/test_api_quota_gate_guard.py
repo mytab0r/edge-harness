@@ -360,22 +360,82 @@ def test_tests_of_a_guard_are_not_counted_as_api_readers(tmp_path):
     assert guard.catalogue_modules_reading_api(guards, root) == {}
 
 
-def test_live_catalogue_has_exactly_the_four_measured_readers():
-    """Замер 2026-09-22, зафиксированный числом и поимённо: обоснование «ни
-    одна гвардия каталога не читает gh api» (run_guards.sh, repo-ci.yml) было
-    ложным, и issue #1004 называла ОДНОГО потребителя. Их четыре.
+def test_live_catalogue_has_exactly_the_six_measured_readers():
+    """Замер 2026-09-22, переделанный после ревью PR #1460 и зафиксированный
+    числом и поимённо.
 
-    Тест падает и когда появится пятый (его надо обернуть и назвать здесь), и
-    когда исчезнет один из четырёх — реестр не имеет права врать в обе
-    стороны."""
+    История числа — она же и есть содержание этого теста. Обоснование «ни одна
+    гвардия каталога не читает gh api» (run_guards.sh, repo-ci.yml) было ложным,
+    issue #1004 называла ОДНОГО потребителя, первая версия этого PR насчитала
+    четырёх — и все три числа были пересказом, а не замером:
+
+      * текстовый маркер `gh(` совпал с прозой комментария в
+        `ci_guard_registration_guard.py` — гвардия, не ходящая наружу вовсе,
+        попала в список (завышение, найдено ревью);
+      * `invariant_numbering.py` ходит в API ТРАНЗИТИВНО, своих маркеров не
+        имеет — и в список не попал (занижение, найдено ревью, исполнено
+        мутацией: под заглушкой `gh` с 403 он падал трейсбеком);
+      * точный набор имён пропускал `_gh_api(...)`
+        (`pr_mutation_claim_check.py`) и `subprocess.run(["gh", "api", …])`
+        (`plugin_manager_roster_guard.py`) — занижение, найденное уже мной
+        при переделке на AST.
+
+    Тест падает и когда появится седьмой (его надо обернуть и назвать здесь), и
+    когда исчезнет один из шести — реестр не имеет права врать в обе стороны."""
     readers = guard.catalogue_modules_reading_api()
 
     assert sorted(readers) == [
-        "ci-guard-registration",
         "decision-doc-numbering-guard",
+        "declared-deps-guard",
+        "deploy-workflow-registry-guard",
+        "invariant-numbering-guard",
         "mutation-claim-guard",
         "plugin-manager-roster-guard",
     ], readers
+
+
+def test_prose_mentioning_gh_is_not_counted_as_a_call():
+    """Находка ревью PR #1460 дословно: комментарий «Оркестрация без
+    keyword-аргументов gh()» делал модуль потребителем API. AST комментария
+    не видит — и это проверяется, а не подразумевается."""
+    assert not guard._calls_api_directly(
+        "# Оркестрация без keyword-аргументов gh()\n"
+        'TEXT = "list_pages и gh api — про них тут только написано"\n'
+        "def main():\n    return 0\n")
+
+
+def test_subprocess_gh_argv_counts_as_an_api_call():
+    """Второй способ сходить в API: зовут `subprocess.run`, а «gh» лежит
+    первым элементом списка. Именем функции это не ловится."""
+    assert guard._calls_api_directly(
+        "import subprocess\n"
+        'def main():\n    return subprocess.run(["gh", "api", "repos/x/y"])\n')
+
+
+def test_private_gh_api_helper_counts_as_an_api_call():
+    """`_gh_api` — то же самое под своим именем; точный набор имён его
+    пропускал."""
+    assert guard._calls_api_directly(
+        "def _gh_api(*a):\n    ...\n"
+        "def main():\n    return _gh_api('repos/x/y/pulls')\n")
+
+
+def test_defining_the_primitive_is_not_consuming_it():
+    """`def gh(...)` вызовом не является: модуль, предоставляющий примитив,
+    не становится его потребителем."""
+    assert not guard._calls_api_directly(
+        "def gh(*args):\n    return None\n")
+
+
+def test_the_wrapper_module_itself_is_not_a_consumer():
+    """Замкнутый круг, всплывший при переделке: модуль подключает
+    `rate_guard`, `rate_guard` зондирует бюджет своим `gh api` — и модуль
+    становится «потребителем» ровно оттого, что его уже починили."""
+    assert guard._WRAPPER_MODULE == "scripts/lib/rate_guard.py"
+    readers = guard.catalogue_modules_reading_api()
+    for entries in readers.values():
+        for reachable in entries.values():
+            assert guard._WRAPPER_MODULE not in reachable
 
 
 def test_live_catalogue_readers_all_carry_the_wrapper():
