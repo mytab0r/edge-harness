@@ -134,6 +134,18 @@ import sys
 # скрипты этого репозитория запускаются как файлы, не как пакет). Реюз
 # генерик-ядра (find_number_collisions/next_free_number) и git/gh-примитивов
 # — не вторая реализация того же класса (см. докстринг выше).
+# --- rate_guard: исчерпанный бюджет API — предупреждение, не красный required-гейт (#1004) ---
+# Найдено ревью PR #1460: этот модуль ходит в API ТРАНЗИТИВНО —
+# `collect_sources` → `dn.build_refs` → `review_labels.list_pages(..., gh)` →
+# `gh api repos/<repo>/pulls?state=open`. Текстовый детектор маркеров его не
+# видел, потому что ни одного маркера в ЭТОМ файле нет: вызов живёт этажом
+# ниже. Обёртка здесь — не «на всякий случай», а по исполненной мутации.
+_rate_guard_spec = importlib.util.spec_from_file_location(
+    "rate_guard", Path(__file__).resolve().parent / "rate_guard.py")
+_rate_guard = importlib.util.module_from_spec(_rate_guard_spec)
+_rate_guard_spec.loader.exec_module(_rate_guard)
+# --- конец rate_guard ---
+
 _DN_SPEC = importlib.util.spec_from_file_location(
     "decision_numbering", Path(__file__).resolve().parent / "decision_numbering.py")
 dn = importlib.util.module_from_spec(_DN_SPEC)
@@ -397,4 +409,5 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    raise SystemExit(_rate_guard.run_guard_main(
+        lambda: main(sys.argv[1:]), guard="invariant-numbering-guard"))
