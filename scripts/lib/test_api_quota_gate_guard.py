@@ -167,6 +167,47 @@ def test_yaml_suffix_workflows_are_scanned_too(tmp_path):
     assert guard.ungated_api_steps(directory) == ["evil.yaml::test::Дорогое чтение API"]
 
 
+def test_token_spelling_variants_are_all_recognised(tmp_path):
+    """Одно и то же значение GitHub Actions принимает в нескольких
+    орфографиях, и сравнение посимвольно видело бы только одну: шаг с
+    `${{github.token}}` или с `secrets.GITHUB_TOKEN` проходил бы мимо
+    гвардии, а она печатала бы зелёное «все закрыты» (находка ai-review
+    PR #1451, без блокировки). Гвардия, держащая класс на одной точной
+    строке, — ложно-зелёная по построению."""
+    directory = _workflow(tmp_path, "spellings.yml", """
+name: spellings
+on: [push]
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Без пробелов
+        env:
+          GH_TOKEN: ${{github.token}}
+        run: gh api repos/o/r/issues
+  b:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Через secrets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh api repos/o/r/issues
+  c:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Второе имя переменной
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: gh api repos/o/r/issues
+""")
+
+    assert guard.ungated_api_steps(directory) == [
+        "spellings.yml::a::Без пробелов",
+        "spellings.yml::b::Через secrets",
+        "spellings.yml::c::Второе имя переменной",
+    ]
+
+
 # ── check(): реестр долга ────────────────────────────────────────────────────
 
 

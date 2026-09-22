@@ -314,11 +314,12 @@ def test_both_readings_are_printed_side_by_side(monkeypatch, tmp_path, capsys):
 
 
 def test_unreadable_enforced_counter_is_an_error_not_a_green_pass(monkeypatch, tmp_path, capsys):
-    """Применяемый счётчик не прочитался — дорогой путь НЕ идёт вперёд молча.
-    Возврат к «ну, rate_limit же сказал ок» вернул бы ровно #1437."""
+    """Применяемый счётчик не прочитался ПО-НАСТОЯЩЕМУ (сеть легла) — дорогой
+    путь НЕ идёт вперёд молча. Возврат к «ну, rate_limit же сказал ок» вернул
+    бы ровно #1437."""
     _patch_gh_two_sources(monkeypatch, rate_limit_stdout=REAL_RATE_LIMIT_RESPONSE,
                           headers_stdout="", headers_returncode=1,
-                          headers_stderr="HTTP 403: API rate limit exceeded for installation")
+                          headers_stderr="dial tcp 140.82.121.6:443: connect: connection refused")
     monkeypatch.setenv("GITHUB_REPOSITORY", "mytab0r/edge-harness")
     output_file = tmp_path / "github_output"
     monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
@@ -331,6 +332,63 @@ def test_unreadable_enforced_counter_is_an_error_not_a_green_pass(monkeypatch, t
     assert "::error::" in captured.out
     assert "ПРИМЕНЯЕМОМУ" in captured.out
     assert "skip=false" not in (output_file.read_text(encoding="utf-8") if output_file.exists() else "")
+
+
+def test_exhausted_counter_is_a_measurement_not_a_failure(monkeypatch, tmp_path, capsys):
+    """САМОЕ ТЯЖЁЛОЕ состояние объекта: бак реально пуст, и зонд получает
+    403 «rate limit exceeded». Это ОТВЕТ счётчика, а не отказ измерения —
+    исход обязан быть обычным skip: `skip=true`, код 0, `::warning::`, job
+    зелёный, дорогие шаги выключены.
+
+    Первая редакция этого PR роняла здесь красным, то есть в худшем случае
+    воспроизводила дефект #1437 детерминированно: первый шаг КАЖДОГО
+    открытого PR красный, пока бак не сбросится (до часа), и пульс
+    оркестратора умирает на гейте до очереди слияний. Находка ai-review
+    PR #1451, блокирующая; текст отказа — дословный из лога прогона
+    35715554412."""
+    _patch_gh_two_sources(
+        monkeypatch, rate_limit_stdout=REAL_RATE_LIMIT_RESPONSE,
+        headers_stdout="", headers_returncode=1,
+        headers_stderr="gh: API rate limit exceeded for installation. If you reach out to "
+                       "GitHub Support for help, please include the request ID "
+                       "205B:9E2A9:3347C48:A84182D:6AB257F5 … (HTTP 403)")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "mytab0r/edge-harness")
+    output_file = tmp_path / "github_output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
+    monkeypatch.setattr(sys, "argv", ["rate_guard.py", "--job", "repo-ci"])
+
+    code = rg.main()
+
+    assert code == 0, "исчерпанный бак не имеет права ронять обязательную проверку"
+    assert "skip=true" in output_file.read_text(encoding="utf-8")
+    captured = capsys.readouterr()
+    assert "::warning::" in captured.out
+    assert "::error::" not in captured.out
+
+
+def test_secondary_rate_limit_is_the_same_outcome(monkeypatch, tmp_path, capsys):
+    """Вторичный лимит формулируется другими словами, но значит то же:
+    счётчик ответил «пусто». Разная реакция на два текста одного факта —
+    та же угадайка, которую правило «алерт не гадает» запрещает."""
+    _patch_gh_two_sources(
+        monkeypatch, rate_limit_stdout=REAL_RATE_LIMIT_RESPONSE,
+        headers_stdout="", headers_returncode=1,
+        headers_stderr="gh: You have exceeded a secondary rate limit (HTTP 403)")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "mytab0r/edge-harness")
+    output_file = tmp_path / "github_output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
+    monkeypatch.setattr(sys, "argv", ["rate_guard.py", "--job", "repo-ci"])
+
+    assert rg.main() == 0
+    assert "skip=true" in output_file.read_text(encoding="utf-8")
+    assert "::error::" not in capsys.readouterr().out
+
+
+def test_quota_exhausted_stays_catchable_as_quota_check_failed():
+    """Подкласс, а не отдельная ветка иерархии: вызывающий, который ловит
+    только базовый QuotaCheckFailed, продолжает работать — ошибка не
+    протечёт наружу необработанной, если кто-то забудет про подкласс."""
+    assert issubclass(rg.QuotaExhausted, rg.QuotaCheckFailed)
 
 
 def test_missing_github_repository_is_loud(monkeypatch, tmp_path, capsys):

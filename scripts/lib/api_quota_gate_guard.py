@@ -52,7 +52,28 @@ WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
 # job'а. Секретный PAT (`secrets.GH_PIPELINE_PAT`) — ДРУГОЙ бюджет (личный
 # 5000/час, не общий 1000/час репозитория), и под это правило не попадает:
 # смешивать их значило бы гасить шаги из-за чужой квоты.
+# Орфографий у одного и того же значения несколько: `${{ github.token }}`,
+# `${{github.token}}`, `${{ secrets.GITHUB_TOKEN }}` — GitHub Actions
+# трактует их одинаково, а сравнение посимвольно видело бы только первую
+# (находка ai-review PR #1451, без блокировки: гвардия печатала бы зелёное
+# «все закрыты» и молча пропускала шаг). Сравниваем по НОРМАЛИЗОВАННОМУ
+# выражению внутри `${{ }}`, без пробелов и регистра.
+_JOB_TOKEN_EXPRESSIONS = frozenset({"github.token", "secrets.github_token"})
+
+# Имя переменной окружения тоже не одно: `GH_TOKEN` понимает gh CLI,
+# `GITHUB_TOKEN` — и gh, и actions/github-script, и любой свой скрипт.
+_TOKEN_ENV_NAMES = ("GH_TOKEN", "GITHUB_TOKEN")
+
+# Оставлено для читаемости сообщений и как канонический вид значения.
 JOB_TOKEN_VALUE = "${{ github.token }}"
+
+
+def _is_job_token(value: object) -> bool:
+    """True — значение раскрывается в токен job'а, при любой орфографии."""
+    text = str(value or "").strip()
+    if not (text.startswith("${{") and text.endswith("}}")):
+        return False
+    return text[3:-2].replace(" ", "").lower() in _JOB_TOKEN_EXPRESSIONS
 
 # Признак самого гейта — вызов rate_guard.py в `run` шага.
 GATE_SCRIPT = "rate_guard.py"
@@ -162,7 +183,9 @@ def _uses_job_token(step: dict, job: dict, workflow: dict) -> bool:
     проверять только шаг значило бы не заметить самый широкий радиус."""
     for scope in (step, job, workflow):
         env = scope.get("env") if isinstance(scope, dict) else None
-        if isinstance(env, dict) and str(env.get("GH_TOKEN", "")).strip() == JOB_TOKEN_VALUE:
+        if not isinstance(env, dict):
+            continue
+        if any(_is_job_token(env.get(name)) for name in _TOKEN_ENV_NAMES):
             return True
     return False
 
