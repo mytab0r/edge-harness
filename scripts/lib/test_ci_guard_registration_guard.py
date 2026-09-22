@@ -478,10 +478,10 @@ def test_allowlist_job_state_exempt_entry_is_not_flagged(tmp_path):
     жить в каталоге без спекулятивной инфраструктуры (design.md #749).
     Проверке не подлежит — иначе именованное исключение красило бы CI на
     каждом прогоне без возможности его снять."""
-    allowlist = frozenset({"Квота GitHub API — ранняя проверка (инварианты)"})
+    allowlist = frozenset({"Квота GitHub API — ранняя проверка (все шаги, читающие API)"})
     doc = {"jobs": {"test": {"steps": [
         {
-            "name": "Квота GitHub API — ранняя проверка (инварианты)",
+            "name": "Квота GitHub API — ранняя проверка (все шаги, читающие API)",
             "run": "python scripts/lib/rate_guard.py --job repo-ci-invariants",
         },
     ]}}}
@@ -692,13 +692,12 @@ def test_quota_invariants_job_state_pair_is_present_in_repo_ci():
         (REPO_ROOT / ".github" / "workflows" / "repo-ci.yml").read_text(encoding="utf-8")
     )
     steps = doc["jobs"]["test"]["steps"]
-    quota = [s for s in steps if s.get("name") == "Квота GitHub API — ранняя проверка (инварианты)"]
-    invariants = [
-        s for s in steps
-        if s.get("name") == "Инварианты состояния репозитория — живой снимок (7 — required)"
-    ]
+    # Имена читаются из того же модуля, что и множество исключений (#1437):
+    # повтор строки здесь делал переименование шага двухместной правкой.
+    quota = [s for s in steps if s.get("name") == crg.QUOTA_GATE_STEP_NAME]
+    invariants = [s for s in steps if s.get("name") == crg.QUOTA_GATED_STEP_NAME]
     assert len(quota) == 1 and quota[0].get("id") == "quota", (
-        "шаг «Квота GitHub API — ранняя проверка (инварианты)» с id: quota "
+        f"шаг «{crg.QUOTA_GATE_STEP_NAME}» с id: quota "
         "исчез или потерял id — пара ALLOWLIST_JOB_STATE_EXEMPT мертва, "
         "сними запись из множества или верни шаг"
     )
