@@ -69,16 +69,31 @@ def _production_scripts() -> list[Path]:
     ]
 
 
+# Две законные формы подстановки метки, и они НЕ взаимозаменяемы (#1432):
+#   label_query_value  — метка как значение query-параметра (`issues?labels=`):
+#                        кодируется процентами;
+#   label_search_value — метка как часть выражения поиска
+#                        (`search/issues?q=label:`): выражение кодируется
+#                        целиком уже на сборке URL, а ломает запрос другое —
+#                        разбор режет квалификатор по первому двоеточию, и
+#                        `label:session:archive-pending` читается как метка
+#                        `session`. Лечится кавычками выражения поиска.
+# Расширение предусмотрено докстрингом этого файла («третья форма обязана
+# получить собственный признак здесь же, не тихо остаться дырой»): вторая
+# форма пришла с #1432 и получила его.
+_ENCODERS = ("label_query_value", "label_search_value")
+
+
 def _is_label_query_value_call(expr: ast.expr) -> bool:
-    """True — выражение внутри `{...}` это вызов `label_query_value(...)`,
-    голый или через атрибут (`review_labels.label_query_value(...)`)."""
+    """True — выражение внутри `{...}` это вызов одного из кодировщиков
+    метки, голый или через атрибут (`review_labels.label_query_value(...)`)."""
     if not isinstance(expr, ast.Call):
         return False
     func = expr.func
     if isinstance(func, ast.Attribute):
-        return func.attr == "label_query_value"
+        return func.attr in _ENCODERS
     if isinstance(func, ast.Name):
-        return func.id == "label_query_value"
+        return func.id in _ENCODERS
     return False
 
 
@@ -221,3 +236,36 @@ def test_label_query_value_encodes_colon_like_prod_waiting_owner_label():
 # `f"...&labels={WAITING_OWNER_LABEL}&per_page=100"` (без
 # review_labels.label_query_value) — test_every_labels_query_substitution_is_url_encoded
 # краснеет, называя это же место offender'ом. Верни фикс — тест снова зелёный.
+
+
+def test_search_qualifier_accepts_the_search_encoder():
+    """Вторая законная форма (#1432): в выражении поиска метку кавычит
+    `label_search_value`, а не кодирует процентами. Проба живёт ВНУТРИ
+    REPO_ROOT по той же причине, что у соседних проб выше."""
+    probe = REPO_ROOT / "scripts" / "lib" / "_probe_q_label_search_encoded.py"
+    probe.write_text(
+        'from review_labels import label_search_value\n'
+        'def f(repo, label):\n'
+        '    return f"search/issues?q=repo:{repo} label:{label_search_value(label)}"\n',
+        encoding="utf-8")
+    try:
+        offenders = _unencoded_labels_offenders(probe)
+    finally:
+        probe.unlink()
+    assert offenders == []
+
+
+def test_search_qualifier_without_any_encoder_still_reddens():
+    """Обратная сторона, и она важнее: расширение списка кодировщиков не
+    должно открыть дверь голой подстановке — иначе гвардия «расширилась» до
+    бесполезности."""
+    probe = REPO_ROOT / "scripts" / "lib" / "_probe_q_label_search_bare.py"
+    probe.write_text(
+        'def f(repo, label):\n'
+        '    return f"search/issues?q=repo:{repo} label:{label}"\n',
+        encoding="utf-8")
+    try:
+        offenders = _unencoded_labels_offenders(probe)
+    finally:
+        probe.unlink()
+    assert offenders == [f"{probe.relative_to(REPO_ROOT)}:2"]

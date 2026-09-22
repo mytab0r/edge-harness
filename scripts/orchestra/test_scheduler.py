@@ -10817,8 +10817,14 @@ def test_sweep_query_excludes_both_labels(monkeypatch):
 
     sch.sweep_closed_task_sessions("o/r")
 
-    assert f"-label:{sch.SESSION_ARCHIVE_PENDING_LABEL}" in seen["q"], seen
-    assert f"-label:{sch.SESSION_ARCHIVED_LABEL}" in seen["q"], seen
+    # Кавычки обязательны, и это не косметика: разбор выражения поиска у
+    # GitHub режет квалификатор по ПЕРВОМУ двоеточию, а обе метки его несут.
+    # Без кавычек `-label:session:archive-pending` читается как метка
+    # `session`, и фильтр молча отбирает не то — пустым списком, не ошибкой
+    # (тот же класс #938, другая поверхность; поймано гвардией
+    # label-query-encoding на PR #1435).
+    assert f'-label:"{sch.SESSION_ARCHIVE_PENDING_LABEL}"' in seen["q"], seen
+    assert f'-label:"{sch.SESSION_ARCHIVED_LABEL}"' in seen["q"], seen
     assert "is:closed" in seen["q"], "открытую задачу трогать нельзя — её сессию допишет следующий прогон"
 
 
@@ -10902,6 +10908,52 @@ def test_main_runs_the_catch_up_pass_every_pulse(monkeypatch):
     assert sch.main() == 0
     assert called == ["o/r"], "догоняющий проход не вызван из пульса"
     assert any("очередь архива сессий" in line for line in lines_seen), lines_seen
+
+
+def test_main_runs_the_closed_task_sweep_every_pulse(monkeypatch):
+    """Зеркало `test_main_runs_the_catch_up_pass_every_pulse` для второго
+    постановщика очереди (#1432).
+
+    Находка ai-ревью PR #1435, исполненная мутацией не мной: замена вызова
+    `sweep_closed_task_sessions(repo)` в `main()` на пустой список оставляла
+    ВСЕ восемь тестов свипа зелёными — каждый звал функцию напрямую, и её
+    отсутствие в пульсе не замечал никто. Свип, не вызванный из пульса, —
+    украшение: сессии закрытых задач так и лежат неубранными, а свойство
+    «убрано» никому не ставится."""
+    called, lines_seen = [], []
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setattr(sch, "heartbeat_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "independent_pulse_check", lambda repo, now: [])
+    monkeypatch.setattr(sch, "upstream_drift_lines", lambda repo: [])
+    monkeypatch.setattr(sch, "open_pulls", lambda repo: [])
+    monkeypatch.setattr(sch, "all_merged_pulls", lambda repo: [])
+    monkeypatch.setattr(sch, "reap_stale", lambda repo, now, pulls, merged=None, *, pool=None: [])
+    monkeypatch.setattr(sch, "reap_stalled_worker_run", lambda repo, now, pool, pulls: ([], []))
+    monkeypatch.setattr(sch.claim_task, "collect_stale", lambda repo, now: ([], []))
+    monkeypatch.setattr(sch, "mark_conflicts", lambda repo, pulls: [])
+    monkeypatch.setattr(sch, "unhealthy_pulls", lambda repo, now, pulls, *, pool=None: [])
+    monkeypatch.setattr(sch, "merge_loop", lambda repo, pulls: ([], [], False, False, pulls))
+    monkeypatch.setattr(sch, "open_task_issues", lambda repo: [])
+    monkeypatch.setattr(sch, "accept_merged_tasks",
+                        lambda repo, pool, merged, now=None, open_pulls_list=None: ([], [], False))
+    monkeypatch.setattr(sch, "conveyor_gate", lambda repo, now: ([], [], True))
+    monkeypatch.setattr(sch, "wip_gate", lambda repo, now, pulls, pool, dispatch_allowed: ([], [], True))
+    monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool, *, wip_allowed, pulls: ([], []))
+    monkeypatch.setattr(sch, "detect_and_act", lambda repo, now, lines, run_url=None: [])
+    monkeypatch.setattr(sch, "escalate_stale_auto_tasks", lambda repo, now: [])
+    monkeypatch.setattr(sch, "groom_auto_tasks", lambda repo, now, lines: [])
+    monkeypatch.setattr(sch, "summary", lambda lines: lines_seen.extend(lines))
+    monkeypatch.setattr(sch, "retry_pending_session_archives", lambda repo, now: ([], (False, None)))
+    # Настоящий свип в стенде не зовётся (сеть), но сам ВЫЗОВ обязан быть —
+    # это и есть предмет теста. Прежний стенд спасался только пустым
+    # DSH_EDGE_URL, то есть молчанием, а не отсутствием вызова.
+    monkeypatch.setattr(
+        sch, "sweep_closed_task_sessions",
+        lambda repo: called.append(repo) or ["🧹 в очередь уборки поставлено 2 закрытых задач: #11, #12"])
+
+    assert sch.main() == 0
+    assert called == ["o/r"], "свип закрытых задач не вызван из пульса"
+    assert any("в очередь уборки поставлено" in line for line in lines_seen), lines_seen
 
 
 def test_main_reddens_when_the_catch_up_pass_itself_is_broken(monkeypatch):

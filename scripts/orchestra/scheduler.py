@@ -2951,9 +2951,21 @@ def closed_tasks_needing_archive(repo: str, limit: int = CLOSED_TASK_SWEEP_LIMIT
     репозитории лежат сотни давно закрытых задач, и попытка пометить все за
     один проход упёрлась бы в лимит GitHub API. Очередь повторяется на каждом
     пульсе, хвост растает за несколько часов."""
+    # Метки несут двоеточие, а разбор выражения поиска у GitHub режет
+    # квалификатор по первому — без кавычек `label:session:archive-pending`
+    # читается как метка `session`, и фильтр молча отбирает не то (#938 на
+    # поверхности поиска). Кавычки ставит одно место правды.
     query = (f"repo:{repo} is:issue is:closed label:task "
-             f"-label:{SESSION_ARCHIVE_PENDING_LABEL} -label:{SESSION_ARCHIVED_LABEL}")
+             f"-label:{review_labels.label_search_value(SESSION_ARCHIVE_PENDING_LABEL)} "
+             f"-label:{review_labels.label_search_value(SESSION_ARCHIVED_LABEL)}")
     try:
+        # Одна страница — сознательно, не пропущенный обход (класс #308).
+        # Страница здесь не «первая из многих», а ВСЯ порция прохода: потолок
+        # `limit` и есть размер порции, остальное берёт следующий пульс.
+        # Обход страниц дал бы ровно то, ради чего потолок и введён, —
+        # попытку пометить сотни задач за один проход (находка ai-review
+        # PR #1435: форма вызова обязана объяснять себя, иначе читатель
+        # считает её забытой пагинацией).
         found = gh("search/issues?q=" + urllib.parse.quote(query) + f"&per_page={limit}")
     except RuntimeError:
         # Поиск не отдался — не наша забота этого прохода: очередь и так
@@ -2979,15 +2991,25 @@ def sweep_closed_task_sessions(repo: str) -> list[str]:
             _set_archive_pending(repo, number)
             queued.append(number)
         except RuntimeError as error:
-            failed.append(f"#{number} ({error})")
+            # Какой именно вызов упал — часть факта, а не украшение: поиск и
+            # простановка метки лечатся по-разному (первый — квота/фильтр,
+            # вторая — права токена). Сюда попадает только простановка;
+            # отказ поиска разобран в closed_tasks_needing_archive и до сюда
+            # не доходит вовсе (находка ai-review PR #1435).
+            failed.append(f"#{number} (простановка метки: {error})")
     lines = []
     if queued:
         lines.append(
             f"🧹 в очередь уборки поставлено {len(queued)} закрытых задач: "
             + ", ".join(f"#{n}" for n in queued))
     if failed:
-        # Громко: без метки повторять будет нечему — тот же единственный
-        # жёсткий сбой, что у archive_runner_sessions.
+        # Громко — и обоснование именно такое, а не «метка не легла, значит
+        # потеряли работу» (находка ai-review PR #1435: прежняя формулировка
+        # переворачивала смысл). Сам номер НЕ теряется: задача закрыта, обеих
+        # меток на ней нет, и СЛЕДУЮЩИЙ же свип найдёт её тем же запросом.
+        # Кричать нужно потому, что не поставленная метка — признак сломанной
+        # записи меток вообще: если она не ложится, не ляжет и `session:
+        # archived`, то есть очередь перестаёт двигаться с обоих концов.
         lines.append(f"🚨 метка очереди НЕ поставлена: {', '.join(failed)}")
     return lines
 
