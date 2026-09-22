@@ -355,6 +355,30 @@ runs workflow `dispatch-latency-probe` (31 schedule-ран против ~465 о�
 (`urllib.parse.quote` целиком или `gh -f q=`). Для REST-суффиксов `labels=` — по-прежнему
 `label_query_value`. Гвардия — `scripts/lib/test_label_query_encoding_guard.py`.
 
+**Отрицание той же формой — замерено (тот же день, #1432, находка ai-review
+PR #1435: не померенная форма ходила в прод-запросе свипа).** Прод-запрос
+свипа (`closed_tasks_needing_archive`) — это НЕ положительный квалификатор, а
+`repo:… is:issue is:closed label:task -label:"session:archive-pending"
+-label:"session:archived"`, поэтому проверена именно отрицательная форма:
+
+| форма q | total_count |
+|---|---|
+| `is:issue` — все issues | 950 |
+| `is:issue -label:"area:process"` | 606 |
+| `is:issue label:"area:process"` | 344 |
+| `is:issue is:closed label:task` — все закрытые задачи | 504 |
+| `… -label:"session:archive-pending" -label:"session:archived"` — прод-запрос свипа | 501 |
+| `… -label:session:archive-pending -label:session:archived` — сырое двоеточие | 501 |
+| `… label:"session:archived"` | 0 |
+| `… label:"session:archive-pending"` | 3 |
+
+Два факта. (1) Отрицание с кавычками работает без потерь: 606 + 344 = 950
+точно. (2) Прод-запрос свипа сходится той же арифметикой: 504 закрытых минус 3
+с `session:archive-pending` = 501 — отрицание не «молчит», а вычитает ровно
+помеченное. Числа между двумя прогонами одного дня дрейфуют на единицу (343 →
+344: issues заводятся между замерами) — сравнивать можно только суммы внутри
+одного прогона.
+
 ---
 
 ## Cold start: официальных данных нет

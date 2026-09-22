@@ -94,6 +94,30 @@ _ri_for_regex = importlib.util.module_from_spec(_ri_spec)
 _ri_spec.loader.exec_module(_ri_for_regex)  # type: ignore[union-attr]
 
 
+# ── Сетевые вызовы, не относящиеся к предмету конкретного стенда ────────────────
+
+
+@pytest.fixture(autouse=True)
+def _walking_skeleton_off_network(monkeypatch):
+    """Стендам `main()` не нужен сетевой ходячий скелет: `main()` зовёт
+    `write_walking_skeleton_snapshot` безусловно (scheduler.py), а функция по
+    контракту best-effort — без этой фикстуры каждый стенд пульса делал два
+    ЖИВЫХ запроса `gh api repos/o/r/pulls/<N>` и `/issues/<N>` из юнит-теста
+    (находка ai-review PR #1435, круг 3; тот же класс у соседнего стенда —
+    открытая находка [98]). Глушится ОДНОЙ фикстурой на весь файл, а не
+    точечно в каждом стенде: новый стенд main() наследует заглушку
+    автоматически, а не повторяет чужую забывчивость. Тестам самой функции
+    (сейчас их нет) понадобится бэкап реальной — здесь она не тестируется.
+    raising=False обязателен: закоммиченный рецепт MUTATION-PROOF
+    («историческая» мутация #1262 ниже по файлу) исполняет ЭТОТ файл против
+    scheduler.py, откаченного на ref 66d12179, — там функции ещё нет, и
+    строгий setattr ронял setup раньше ожидаемого рецептом AttributeError
+    на review_findings (гейт guard-gate, круг 4)."""
+    monkeypatch.setattr(sch, "write_walking_skeleton_snapshot",
+                        lambda repo, pulls: ["🚶 ходячий скелет: заглушён в юнит-тесте"],
+                        raising=False)
+
+
 # ── Живой HTTP-сервер: контракт логина морды (303 + Set-Cookie) ──────────────────
 
 
@@ -249,6 +273,10 @@ def test_archive_label_not_set_is_the_hard_failure(monkeypatch):
     monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
     monkeypatch.setattr(sch, "_morde_rpc", lambda opener, method, payload: None)
     monkeypatch.setattr(sch, "_clear_archive_pending", lambda repo, number: None)
+    # Свойство «убрано» идёт в той же ветке успеха, что и снятие очереди
+    # (#1432): без заглушки POST уходит в НАСТОЯЩИЙ gh из юнит-теста, а без
+    # gh в PATH — падает FileNotFoundError мимо `except RuntimeError`.
+    monkeypatch.setattr(sch, "_mark_session_archived", lambda repo, number: None)
     lines, hard = sch.archive_runner_sessions("o/r", [5])
     assert hard is True
     assert any("НЕ поставлена" in line for line in lines)
@@ -259,6 +287,9 @@ def test_archive_session_not_found_is_not_hard_failure(monkeypatch):
     monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
     monkeypatch.setattr(sch, "_set_archive_pending", lambda repo, number: None)
     monkeypatch.setattr(sch, "_clear_archive_pending", lambda repo, number: None)
+    # Терминальный исход проваливается в общую ветку mark/clear (#1432) —
+    # оба вызова обязаны быть заглушены, иначе POST/DELETE уходят в сеть.
+    monkeypatch.setattr(sch, "_mark_session_archived", lambda repo, number: None)
     monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
     monkeypatch.setattr(
         sch, "_morde_rpc",
@@ -354,6 +385,11 @@ def test_new_terminal_marker_flips_both_morde_callers_at_once(monkeypatch):
     monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
     monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
     monkeypatch.setattr(sch, "_clear_archive_pending", lambda repo, number: None)
+    # Терминальная ветка проваливается в mark/clear (#1432): незаглушённый
+    # POST свойства уходил в настоящий gh, ловил RuntimeError и возвращал
+    # номер в очереди — тест краснел на исправном коде (находка ai-review
+    # PR #1435, круг 3).
+    monkeypatch.setattr(sch, "_mark_session_archived", lambda repo, number: None)
     raised: list[str] = [refusal]
 
     def failing_rpc(opener, method, payload):

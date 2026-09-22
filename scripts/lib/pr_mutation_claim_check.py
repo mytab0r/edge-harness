@@ -14,10 +14,20 @@
     import json, pathlib
     body = pathlib.Path("ЧЕРНОВИК-ТЕЛА.md").read_text(encoding="utf-8")
     pathlib.Path("/tmp/evt.json").write_text(
-        json.dumps({"pull_request": {"number": 0, "body": body}}), encoding="utf-8")
+        json.dumps({"pull_request": {"number": 1435, "body": body}}), encoding="utf-8")
     EOF
     GITHUB_EVENT_NAME=pull_request GITHUB_EVENT_PATH=/tmp/evt.json \
       GITHUB_REPOSITORY=<owner>/<repo> python scripts/lib/pr_mutation_claim_check.py
+
+Требования рецепта, оплаченные находкой ai-review PR #1435 (круг 3; прежняя
+редакция писала `"number": 0`, а `if not number:` принимает ноль за
+ОТСУТСТВИЕ номера — скрипт выходил «неожиданная форма события», не проверив
+тело вовсе): (1) номер — СУЩЕСТВУЮЩЕГО PR, список изменённых файлов читается
+по сети `gh api .../pulls/<номер>/files`; у черновика тела, у которого PR ещё
+нет, рабочего номера не существует в принципе; (2) нужен авторизованный `gh`
+(GH_TOKEN) — без него проверки 1–2 (по телу, без сети) исполняются, а третья
+громко отказывается на списке файлов. «Две секунды вместо шести минут» — про
+проверку тела и мутаций у существующего PR, не про черновик без PR.
 
 Зачем это написано здесь. Возможность существовала и раньше, но нигде не
 названа — и каждая рассинхронизация тела стоила полного цикла CI плюс
