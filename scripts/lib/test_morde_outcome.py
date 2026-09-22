@@ -19,8 +19,8 @@
 Запуск: python -m pytest scripts/lib/test_morde_outcome.py -q
 """
 
+import ast
 import importlib.util
-import re
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -116,34 +116,130 @@ def test_terminal_outcomes_split_into_normal_and_loss():
 
 
 # ── Гвардия: второй копии правила в scheduler.py не появляется ──────────────
+#
+# Прежняя редакция зашивала альтернацию из ЧЕТЫРЁХ известных маркеров
+# (`HTTP 404`, `session-not-found`, …) — и была слепа ровно на тот сценарий,
+# класс которого закрывает (находка ai-review PR #1434). Все три исторические
+# копии родились одинаково: каждая писала СВОЙ свежий маркер, которого до неё
+# в списке не было. Гвардия по списку известных их бы не заметила ни одну.
+#
+# Поэтому признак теперь бесмаркерный, а область — узкая: ЛЮБОЕ сравнение
+# текста ошибки со строковым литералом внутри тел функций, которые ходят в
+# морду. Узость обязательна: `in str(` встречается в scheduler.py и по
+# другим поводам (например проверка содержимого ответа gh), и бесмаркерный
+# признак по всему файлу давал бы ложные срабатывания — то есть гвардию,
+# которую начнут глушить.
 
-# Рукописная классификация отказа морды — строковый маркер отказа внутри
-# условия. Паттерн собран конкатенацией, чтобы гвардия не совпала сама с
-# собой (живой случай: тест ловил собственный исходник, #1406).
-HANDWRITTEN_RE = re.compile(
-    r'if\s+"(?:' + "|".join([
-        "HTTP 404",
-        "session-not-" + "found",
-        "SessionFormat" + "Unsupported",
-        "Exceeded allowed rows",
-    ]) + r')[^"]*"\s+in\s+str\('
-)
+
+FUNCTIONS_THAT_CALL_THE_MORDE = ("_archive_with_opener", "append_session_notes")
+
+
+def _string_comparisons_against_error(source: str, function_name: str) -> list[str]:
+    """Строковые литералы, с которыми тело `function_name` сравнивает текст
+    ошибки. Любой такой литерал — рукописная классификация отказа, то есть
+    вторая копия правила, где бы она ни появилась и как бы ни назывался её
+    маркер.
+
+    Разбор по AST, а не регуляркой: форма записи (`in str(error)`,
+    `in f"{error}"`, `in message`, перенос на две строки) меняется свободно,
+    а смысл — нет. Регулярка ловила бы форму и промахивалась бы по смыслу,
+    что с прежней редакцией и случилось."""
+    tree = ast.parse(source)
+    target = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == function_name:
+            target = node
+            break
+    assert target is not None, f"функция {function_name} исчезла из scheduler.py"
+
+    found: list[str] = []
+    for node in ast.walk(target):
+        # `"литерал" in <что-то>` и `"литерал" not in <что-то>`
+        if isinstance(node, ast.Compare):
+            for op, comparator in zip(node.ops, node.comparators):
+                if not isinstance(op, (ast.In, ast.NotIn)):
+                    continue
+                left = node.left
+                if isinstance(left, ast.Constant) and isinstance(left.value, str):
+                    if _mentions_error(comparator):
+                        found.append(left.value)
+        # `str(error).startswith("литерал")` / `.endswith(...)` — та же классификация
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr in ("startswith", "endswith", "find", "index", "count"):
+                if _mentions_error(node.func.value):
+                    for arg in node.args:
+                        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                            found.append(arg.value)
+    return found
+
+
+def _mentions_error(node: ast.expr) -> bool:
+    """Упоминает ли выражение переменную ошибки — под любым из принятых в
+    файле имён. Имя проверяется по вхождению, а не по точному совпадению:
+    `str(error)`, `f"{error}"`, `message`, `detail` — всё это текст отказа."""
+    names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+    return bool(names & {"error", "err", "exc", "message", "detail", "text"})
 
 
 def test_scheduler_has_no_handwritten_outcome_classification():
     """Место правды одно. Новая копия правила — отложенный рецидив: она будет
-    знать про свой отказ и не знать про остальные, ровно как три прежние."""
-    offenders = HANDWRITTEN_RE.findall(SCHEDULER.read_text(encoding="utf-8"))
-    assert offenders == [], (
-        "в scheduler.py снова рукописная классификация отказа морды "
-        f"(место правды — scripts/lib/morde_outcome.py, #1433): {offenders}"
+    знать про свой отказ и не знать про остальные, ровно как три прежние.
+
+    Мутация, доказывающая бесмаркерность: вписать в `_archive_with_opener`
+    условие с ЛЮБЫМ новым, здесь не перечисленным маркером — тест краснеет
+    (прежняя редакция такую копию пропускала молча)."""
+    source = SCHEDULER.read_text(encoding="utf-8")
+    offenders = {}
+    for name in FUNCTIONS_THAT_CALL_THE_MORDE:
+        literals = _string_comparisons_against_error(source, name)
+        if literals:
+            offenders[name] = literals
+    assert offenders == {}, (
+        "в scheduler.py снова рукописная классификация отказа морды — текст "
+        "ошибки сравнивается со строковым литералом прямо в теле функции, "
+        f"ходящей в морду (место правды — scripts/lib/morde_outcome.py, #1433): {offenders}"
     )
 
 
+def test_the_guard_sees_a_marker_it_has_never_heard_of():
+    """Главный тест этой пары, и он про саму гвардию, а не про scheduler.py.
+
+    Прежняя редакция зашивала список известных маркеров — и пропускала
+    ЧЕТВЁРТУЮ копию с новым маркером, то есть ровно тот способ, которым
+    родились все три исторические (находка ai-review PR #1434). Здесь
+    проверяется, что признак бесмаркерный: литерал придуман только что и ни
+    в одном списке репозитория не значится."""
+    source = (
+        "def _archive_with_opener(repo, opener, task_numbers):\n"
+        "    try:\n"
+        "        pass\n"
+        "    except RuntimeError as error:\n"
+        '        if "СовершенноНовыйОтказКоторогоНиктоНеВидел" in str(error):\n'
+        "            return []\n"
+    )
+    assert _string_comparisons_against_error(source, "_archive_with_opener") == [
+        "СовершенноНовыйОтказКоторогоНиктоНеВидел"
+    ]
+
+
+def test_the_guard_does_not_fire_on_calls_that_are_not_about_the_error():
+    """Обратная сторона: узость области — не формальность. Сравнение строки
+    с чем-то, что не является текстом отказа, копией правила не является, и
+    ложное срабатывание здесь стоило бы дороже пропуска: гвардию, которая
+    кричит не по делу, начинают глушить."""
+    source = (
+        "def _archive_with_opener(repo, opener, task_numbers):\n"
+        '    if "harness-" in session_id:\n'
+        "        return []\n"
+    )
+    assert _string_comparisons_against_error(source, "_archive_with_opener") == []
+
+
 def test_scheduler_actually_uses_the_shared_classifier():
-    """Обратная сторона: гвардия выше зеленеет и тогда, когда классификации
-    не осталось ВООБЩЕ — например если вызывающий просто перестал различать
-    исходы. Значит нужна и проверка, что общий классификатор реально зовут."""
+    """Обратная сторона первой гвардии: она зеленеет и тогда, когда
+    классификации не осталось ВООБЩЕ — например если вызывающий просто
+    перестал различать исходы. Значит нужна и проверка, что общий
+    классификатор реально зовут."""
     text = SCHEDULER.read_text(encoding="utf-8")
     assert "morde_outcome.is_terminal(" in text, (
         "scheduler.py не зовёт общий классификатор — различение исходов пропало"
