@@ -23,13 +23,43 @@ import assert from 'node:assert/strict';
 // dsh-edge/upstream.json), иначе тест зелёный на API, которого в проде уже
 // нет (ровно так «settings namespace … is not registered» тихо проглотило
 // бы регресс ctx.settings.installSection — метода нет в 0.1.1-rc.2).
+//
+// Пиннётся ЗАМКНУТИЕ, а не только прямые зависимости плагина (инцидент
+// 2026-09-22, волна upstream rc.3, опубликована 05:40Z): npm авто-ставит
+// peer-зависимости и резолвит их диапазоны `^0.1.5-rc.2` в НОВЕЙШУЮ
+// подходящую версию с реестра. Пока апстрим не выпустил rc.3, плавающий
+// dsh-fs резолвился в rc.2 и дерево было согласованным; после публикации
+// rc.3 тот же диапазон стал приносить dsh-fs/dsh-sandbox rc.3 с peer
+// `dsh-llm ^0.1.5-rc.3` — конфликт с запиненным tarball'ом rc.2, ERESOLVE,
+// красный прогон на каждом PR. Поэтому в список входят ВСЕ пакеты
+// @deepseek-ai, достижимые из фикстуры по deps+peers (замыкание посчитано
+// по реестру), каждый прижат к rc.2 с собственным integrity: мир фикстуры
+// не плавает внутри @deepseek-ai вовсе, и следующая волна апстрима не
+// может сломать её молча — только громко, несовпадением integrity. Плавают
+// по-прежнему только не-@deepseek транзитивки (zod, eventsource-parser) —
+// их диапазоны ведут к чужим стабильным версиям, не к волне rc.
 const FIXTURES = [
   ['@deepseek-ai/cordis', '4.0.2', 'sha512-asOnXP1TzFSFQlHb1iegDZp0z/8WD1c7YNrwJR/Tx2bzNuMXfcekE/I67Iv6SQXeLB4csxqCngzQKANP7gdw0g=='],
+  ['@deepseek-ai/dsh-anonymous-user-id', '0.1.5-rc.2', 'sha512-YIpZoi8mY/d+BjnPOryDYR7lkwr2uWh5KJWjIqm2sGN+C6imc66lDiSi5wy91JMRzefFWJf26fCiYXAF7ErQAw=='],
+  ['@deepseek-ai/dsh-atomic-write', '0.1.5-rc.2', 'sha512-9bCOLkug83IGuoEBPHUxgfJ/IxsHg/UigGi8Oj0agibcGVq2WdL/fbU8KA3KU5H49KDOxq2/AA3XUI3RiAEtYA=='],
+  ['@deepseek-ai/dsh-attachment', '0.1.5-rc.2', 'sha512-S6b8/WjqzGw+dMDLRXnq+tbijDGkQh38yE+zpQytX2/w/mPR3VzGj5r6McS01WwD76vXR8WFoheSCLyCAro8WQ=='],
+  ['@deepseek-ai/dsh-brand', '0.1.5-rc.2', 'sha512-/+3TzQRYT4M8NINZ9OrsL5VWNyQSXof8mFLx3txiosWA7Bt0H6UcxUdKGXVwj6gCXhsQ74mzEHm2ucsflG0mYA=='],
+  ['@deepseek-ai/dsh-credentials', '0.1.5-rc.2', 'sha512-TfX5MYLlyw0BFERj3dGxVfP9QGcKZUE5eXDSaY7ZfJbfQgK51VfxV5tP899OxIDRD3Bw94K5Rzx+dbUTSWJBtA=='],
+  ['@deepseek-ai/dsh-deepseek-llm-api-extensions', '0.1.5-rc.2', 'sha512-zue4FWkj7Srg8mAwA6XNqT560NkraILiYtAwIcpT4mmt1Nlim+m55x7ACNkwA5Es0uCkEFAU1H6wHSnR7l2EfQ=='],
+  ['@deepseek-ai/dsh-fs', '0.1.5-rc.2', 'sha512-6DHTquXPbpYdykGayqYaXSI9t668tDCoswH/bDezV+nwj4LxjrfY/smEtgp7nC4ubyoKf1hmjpNfUonGC9e7aA=='],
+  ['@deepseek-ai/dsh-home-paths', '0.1.5-rc.2', 'sha512-Ek+DH9+MTiulfWDMKo5r335k4I9XIItk+jq8YaPihpK3klSeiKLW/SpKJhFodRnW1CwEyjIlt2XriycRvceIiw=='],
+  ['@deepseek-ai/dsh-invariants', '0.1.5-rc.2', 'sha512-oUxttB2yjAgkk47AiXOCxk9GwnfGvIEGsQfnMD7fukwIdD3KLJObU7+nz63tbFN80rjwMI8rg+p9QBQ10KU5+g=='],
+  ['@deepseek-ai/dsh-launch-environment', '0.1.5-rc.2', 'sha512-Cr35kPA3W7skJsPLJhUExLDAjVKCmvJgkog0m8EZ+XdK8RlBDsWiH2peRWFtFOjt8QOOeEkupPs1VDpWORIRyw=='],
   ['@deepseek-ai/dsh-llm', '0.1.5-rc.2', 'sha512-Z7BVsBkK24SE4EItQeow8PHms/9GP0DSTi337vTAa/RY7tNg2Snz3INcXUj6CPZfvntQr1in9op9wLI+rfNsqA=='],
   ['@deepseek-ai/dsh-llm-deepseek', '0.1.5-rc.2', 'sha512-qNRbLsE2ro+AfD7NgJwTukQLG82gIkbAISjDHgv0au7TocfPkNkUWSu20mTaBcuLGXzfSgBVn4oYx5N3ws6KVg=='],
+  ['@deepseek-ai/dsh-sandbox', '0.1.5-rc.2', 'sha512-OTOR6Jj9cey5YkhALG0TBwZ/Z3t986aczH6fLbzoIIegix+gwNaEBOqCWs+exVJ0Z2QuN/ItXzn+xHxW8Y0dcA=='],
+  ['@deepseek-ai/dsh-scope', '0.1.5-rc.2', 'sha512-JwItISje52iVIjlGMNayRVMZrvZU/0i3Gr0s+coND5nBp5lS+pOj9Zf1RQzA5cWjHYCWKmDuQc+m6zGlwmtAeQ=='],
+  ['@deepseek-ai/dsh-session', '0.1.5-rc.2', 'sha512-y+klWiGAWR4m4cc4ylurA0cW63673B4N8cr2ANMimweDZAfxL4XVBC7WiD/5DT2DtIhYmVZhz/niyS/WbniUTA=='],
   ['@deepseek-ai/dsh-settings', '0.1.5-rc.2', 'sha512-LI2Y6GkEs9ALMW+7S9jHPeEZDXHtG5X6cix1HdJ1rRxTEO5427QlYhMiz45rk7hqZ8ca2O4XFMW8IWXFZQLxmw=='],
-  ['@deepseek-ai/dsh-credentials', '0.1.5-rc.2', 'sha512-TfX5MYLlyw0BFERj3dGxVfP9QGcKZUE5eXDSaY7ZfJbfQgK51VfxV5tP899OxIDRD3Bw94K5Rzx+dbUTSWJBtA=='],
-  ['@deepseek-ai/dsh-anonymous-user-id', '0.1.5-rc.2', 'sha512-YIpZoi8mY/d+BjnPOryDYR7lkwr2uWh5KJWjIqm2sGN+C6imc66lDiSi5wy91JMRzefFWJf26fCiYXAF7ErQAw=='],
+  ['@deepseek-ai/dsh-timeout', '0.1.5-rc.2', 'sha512-FgfaAw8Zt5X4Y6Ljh833B8Hy7h96FeR+yjNKI3iSyZSqREqOBgvDGXFfQlSu6V3Buvw/cbI/CJUQJvfRBKXOiA=='],
+  ['@deepseek-ai/dsh-typert-protocol', '0.1.5-rc.2', 'sha512-zP8J20rBXa1AFjKL2i83JBeQcePZx8yal3pNojj4t7CCokMcoFMUbr50woa6fY1tRJ7qHxgypO3rH8Q6YWgmiA=='],
+  ['@deepseek-ai/dsh-util-crypto', '0.1.5-rc.2', 'sha512-JR0aJEUL35RE8FVT89wMZMbPwMrbkjNcy+gE9pq70d/m2Zxw3a0iNer+BAxPAKYPbmy0xDDXReTwXiecKVy4sQ=='],
+  ['@deepseek-ai/dsh-util-values', '0.1.5-rc.2', 'sha512-Cr0TkM6dFAD+Iy4sNXH/afJVMHwJXoOztivj+RflkYoACsOq+Ix0vdHn36hwW7mayU8OK3ZKIZUQ6BPo1fHvUg=='],
   ['@deepseek-ai/schemastery', '3.18.2', 'sha512-njDtZsznjYxok7KLLlHOPyuv2efdWVbSflAHgztSfbMsg+CVraEoRe2DjOCgClYv3ZCSm7WXoaUkbB/+RY7tWQ=='],
 ];
 
