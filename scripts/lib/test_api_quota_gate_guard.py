@@ -337,6 +337,25 @@ def test_catalogue_guard_with_the_wrapper_passes(tmp_path):
     assert guard.catalogue_problems(guards, root) == []
 
 
+def test_wrapper_mentioned_only_in_prose_is_still_a_violation(tmp_path):
+    """Поймано исполнением мутации: обёртка снята до вызова в `__main__`,
+    а проверка `_QUOTA_WRAPPER in text` находила имя обёртки в ДОКСТРИНГЕ
+    модуля — `catalogue_problems` молчал на ровно том состоянии, ради
+    которого заведён. Тот же класс «проза вместо кода», что и у маркеров
+    чтения API: упоминание `run_guard_main` в докстринге/комментарии
+    обёрткой не является, использование ищется в коде (AST)."""
+    reader = ('"""Выход идёт через rate_guard.run_guard_main (#1004)."""\n'
+              + READS_API_NO_WRAPPER)
+    guards, root = _catalogue(
+        tmp_path, "reader", "python scripts/lib/reader.py\n",
+        {"scripts/lib/reader.py": reader})
+
+    problems = guard.catalogue_problems(guards, root)
+
+    assert len(problems) == 1
+    assert "scripts/lib/reader.py" in problems[0]
+
+
 def test_catalogue_guard_that_does_not_touch_the_api_is_not_asked_for_a_wrapper(tmp_path):
     """Газ: обёртка требуется только от тех, кто реально ходит в API.
     Требовать её от всех — тормоз без причины на десятках гвардий."""

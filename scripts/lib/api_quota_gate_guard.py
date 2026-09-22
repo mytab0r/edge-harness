@@ -406,6 +406,29 @@ def catalogue_modules_reading_api(
     return found
 
 
+def _has_quota_wrapper(source: str) -> bool:
+    """True — модуль реально использует обёртку, а не упоминает её прозой.
+
+    Проверка по сырому тексту ловила имя обёртки в докстринге: модуль,
+    читающий API без обёртки, оставался зелёным, пока проза упоминала
+    `run_guard_main` (поймано исполнением мутации, не чтением исходника:
+    обёртка снята до вызова в `__main__` — `catalogue_problems` молчал).
+    Тот же класс «проза вместо кода», что у маркеров чтения API выше.
+    AST видит только код: имя или атрибут `run_guard_main`, как в
+    `_rate_guard.run_guard_main(...)`."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        # Модуль, который не парсится, не исполняется; требовать обёртку от
+        # него — пере-флажок в сторону строгого, не тихий пропуск.
+        return _QUOTA_WRAPPER in source
+    return any(
+        (isinstance(node, ast.Attribute) and node.attr == _QUOTA_WRAPPER)
+        or (isinstance(node, ast.Name) and node.id == _QUOTA_WRAPPER)
+        for node in ast.walk(tree)
+    )
+
+
 def catalogue_problems(
     catalogue_dir: Path = CATALOGUE_DIR, repo_root: Path = REPO_ROOT
 ) -> list[str]:
@@ -417,7 +440,7 @@ def catalogue_problems(
     for guard_name, entries in catalogue_modules_reading_api(catalogue_dir, repo_root).items():
         for entry, reachable in entries.items():
             text = (repo_root / entry).read_text(encoding="utf-8")
-            if _QUOTA_WRAPPER in text:
+            if _has_quota_wrapper(text):
                 continue
             via = ", ".join(m for m in reachable if m != entry)
             where = f" (через {via})" if via else ""
