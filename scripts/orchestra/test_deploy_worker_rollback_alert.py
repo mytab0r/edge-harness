@@ -438,22 +438,62 @@ def test_canary_ran_env_points_at_the_real_canary_step_id():
     assert "canary_ui" in step_ids, "шаг с id=canary_ui пропал из workflow"
 
 
+def test_canary_verdict_env_points_at_the_real_canary_verdict_producer_step_id():
+    # Ветка backend_down алерта жива, только пока CANARY_VERDICT приходит
+    # проводкой из шага-ИЗДАТЕЛЯ вердикта (находка AI-ревью PR #1441, круг 2):
+    # переименуют шаг canary_ui или правят env — ветка молча умрёт,
+    # verdict_is_backend_down("") станет False, и владелец снова получит
+    # «АВТООТКАТ НЕ ПОДТВЕРЖДЁН» на постороннем отказе бэкенда — ровно то
+    # утверждение о факте, которого нет, против которого #1426 и заведён.
+    # Зеркало соседних якорей ROLLBACK_CONFIRMED/POST_ROLLBACK_OK/CANARY_RAN.
+    step = _escalation_step()
+    expr = str((step.get("env") or {}).get("CANARY_VERDICT") or "")
+    assert "steps.canary_ui.outputs.verdict" in expr, (
+        f"CANARY_VERDICT больше не ссылается на steps.canary_ui.outputs.verdict "
+        f"(нашли: {expr!r}) — алерт не отличит «бэкенд лежит» от обычного "
+        f"неудавшегося отката и на постороннем отказе скажет "
+        f"«АВТООТКАТ НЕ ПОДТВЕРЖДЁН» (#1426)"
+    )
+    # Издатель вердикта обязан существовать и писать вердикт ДО выхода —
+    # существование прибито гвардией canary_rollback_guard.py по всем
+    # workflow, здесь прибивается id, от которого эта проводка зависит.
+    step_ids = {
+        s.get("id")
+        for s in yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["deploy"]["steps"]
+        if s.get("id")
+    }
+    assert "canary_ui" in step_ids, "шаг с id=canary_ui пропал из workflow"
+
+
 def test_rollback_gates_only_on_post_deploy_failures():
     # Условие — часть контракта из задачи #614: откатываем только то, что
     # реально разворачилось (деплой прошёл), и только при красном job'е после
     # него. Условие не покрыто гвардией (чеклист четвёртого гейта PR #617) —
     # молчаливая правка `if:` уводит весь механизм: без `steps.deploy.outcome`
     # откатывается НЕУДАВШИЙСЯ деплой, без `failure()` откат гоняется на зелёном.
-    expected = "failure() && steps.deploy.outcome == 'success'"
+    #
+    # #1426 добавил ТРЕТЬЕ слагаемое, и различие между шагами теперь
+    # содержательное, а не редакционное:
+    #   * откат и повторная канарейка после него спрашивают вердикт
+    #     канарейки — распознанный посторонний отказ бэкенда откатывать
+    #     нельзя (прежняя версия упрётся в то же самое);
+    #   * шаг эскалации вердикт НЕ спрашивает: владелец обязан услышать и
+    #     про посторонний отказ тоже, просто другим текстом (CANARY_VERDICT
+    #     приходит к нему через env, см. соседний тест).
+    base = "failure() && steps.deploy.outcome == 'success'"
+    gated = base + " && steps.canary_ui.outputs.verdict != 'backend-down'"
     doc = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
     by_id = {s.get("id"): s for s in doc["jobs"]["deploy"]["steps"] if s.get("id")}
     assert "deploy" in by_id, "шаг с id=deploy пропал из workflow"
     for sid in ("auto_rollback", "post_rollback_canary"):
-        assert by_id[sid].get("if") == expected, (
-            f"условие шага {sid} изменилось ({by_id[sid].get('if')!r} вместо {expected!r})"
+        assert by_id[sid].get("if") == gated, (
+            f"условие шага {sid} изменилось ({by_id[sid].get('if')!r} вместо {gated!r})"
         )
-    assert _escalation_step().get("if") == expected, (
-        "шаг эскалации обязан срабатывать при том же условии, что откат"
+    assert _escalation_step().get("if") == base, (
+        "шаг эскалации обязан срабатывать при красном job'е ПОСЛЕ деплоя — "
+        "в том числе когда откат сознательно не делался (#1426): молчание "
+        "про посторонний отказ бэкенда ничем не лучше ложного «откат не "
+        "подтверждён»"
     )
 
 
@@ -464,3 +504,61 @@ def test_post_rollback_ok_env_points_at_the_real_post_rollback_canary_step_id():
         f"POST_ROLLBACK_OK больше не ссылается на steps.post_rollback_canary.outcome "
         f"(нашли: {expr!r}) — переименование шага повторной канарейки смолчится тем же путём"
     )
+
+
+# ── Четвёртый исход: бэкенд лежит, откат сознательно не делался (#1426) ──────
+
+def test_backend_down_text_states_the_fact_and_not_a_missing_rollback():
+    """Ветка обязана стоять РАНЬШЕ «автооткат не подтверждён», иначе владелец
+    получит утверждение о факте, которого нет: отката не было не потому, что
+    он не удался, а потому, что он был бы вреден."""
+    text = dwra.rollback_alert_text(
+        "o/r", "77", rollback_confirmed=False, post_rollback_ok=False,
+        canary_ran=True, backend_down=True)
+    assert "НЕ ПОДТВЕРЖДЁН" not in text, text
+    # Исход назван фактом, решение названо.
+    assert "бэкенд лежит" in text, text
+    assert "СОЗНАТЕЛЬНО не делался" in text, text
+    assert "Прод сейчас на СВЕЖЕЙ версии" in text, text
+    assert "https://github.com/o/r/actions/runs/77" in text
+
+
+def test_backend_down_alert_does_not_claim_the_cause_it_does_not_have():
+    """Вердикт шага (`backend-down`) не несёт ПРИЧИНУ — алерт не имеет права
+    утверждать «воркер назвал её сам (квота)»: при 1101-странице Cloudflare
+    это было бы утверждением о факте, которого нет («Алерт не гадает»).
+    Причина живёт в логе канарейки — алерт обязан назвать её адрес, а лечение
+    квотой дать условно («если это…»)."""
+    text = dwra.rollback_alert_text(
+        "o/r", "77", rollback_confirmed=False, post_rollback_ok=False,
+        canary_ran=True, backend_down=True)
+    assert "воркер назвал" not in text, text
+    # Причина — по адресу, а не угадайкой; имя шага — ТОЧНОЕ (как в
+    # deploy-worker.yml), чтобы адрес был находимым, а не приблизительным.
+    assert "логе шага «Канарейка UI на проде»" in text, text
+    # Лечение квотой — условное.
+    assert re.search(r"если[^\n]*квот", text), text
+    assert "00:00 UTC" in text, "лечение обязано быть названо — тормоз без газа не принимается"
+
+
+def test_backend_down_does_not_swallow_the_other_outcomes():
+    """Обратная сторона: обычный неподтверждённый откат по-прежнему кричит
+    именно об этом — четвёртый исход не превращается в глушилку для трёх."""
+    text = dwra.rollback_alert_text(
+        "o/r", "77", rollback_confirmed=False, post_rollback_ok=False,
+        canary_ran=True, backend_down=False)
+    assert "НЕ ПОДТВЕРЖДЁН" in text, text
+    assert "виноват НЕ деплой" not in text
+
+
+def test_verdict_env_is_read_as_a_string_not_a_bool():
+    """`CANARY_VERDICT` — строка выхода шага, и пустая строка (шаг упал ДО
+    канарейки) не должна читаться как «бэкенд лежит»: умолчание
+    консервативное, как и у условия самого отката. Тест зовёт КОД
+    (verdict_is_backend_down — то, что читает main()), а не копию выражения:
+    копия зеленеет и тогда, когда прод-путь изменился (замечание AI-ревью
+    PR #1441)."""
+    for value, expected in (("backend-down", True), ("deploy", False), ("", False), (None, False),
+                            (" backend-down ", True), ("backend-down-extra", False)):
+        got = dwra.verdict_is_backend_down(value)
+        assert got is expected, (value, got)
