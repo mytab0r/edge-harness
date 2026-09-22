@@ -385,8 +385,23 @@ GITSTUB
 # npm pack: tarball'ы из реестра — пустые файлы нужных имён (целостность сверит
 # openssl-заглушка), локальный каталог — пустой tgz под glob клиента. Опции
 # (-g и пр.) глотаются: install -g у dsh_install не должен падать на basename.
+#
+# `npm root -g` (#1467): прод-код после установки проверяет ВЕРСИЮ НА ДИСКЕ —
+# `--before` это просьба к npm, а доказательство лежит в node_modules. Заглушка
+# обязана понимать эту форму вызова: иначе стенд краснеет на исправном коде
+# (AGENTS.md, «Заглушка внешнего инструмента — это пересказ»). Корень и манифест
+# ниже — настоящие файлы, версия читается из самого dsh-ci.sh, чтобы стенд не
+# завёл вторую копию пина.
+SMOKE_NPM_ROOT="$TMP/npmroot"
+mkdir -p "$SMOKE_NPM_ROOT/@deepseek-ai/cordis"
+printf '{"name":"@deepseek-ai/cordis","version":"%s"}\n' \
+  "$(sed -n 's/^DSH_EXPECTED_CORDIS="\(.*\)"$/\1/p' "$REPO/scripts/lib/dsh-ci.sh")" \
+  >"$SMOKE_NPM_ROOT/@deepseek-ai/cordis/package.json"
+export SMOKE_NPM_ROOT
+
 cat >"$TMP/bin/npm" <<'NPMSTUB'
 #!/usr/bin/env bash
+if [ "${1:-}" = "root" ]; then printf '%s\n' "${SMOKE_NPM_ROOT:?SMOKE_NPM_ROOT не задан}"; exit 0; fi
 [ "${1:-}" = "pack" ] && shift
 dest="."
 specs=()
