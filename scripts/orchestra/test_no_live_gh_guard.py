@@ -60,6 +60,16 @@ def test_live_gh_wrapped_in_a_shell_is_refused_too():
     assert "ЖИВОЙ GitHub" in str(caught.value)
 
 
+def test_live_gh_behind_quotes_in_a_shell_is_refused_too():
+    """Некритичное замечание ai-review PR #1447, поднятое до теста:
+    `bash -c "'gh' api …"` — тот же живой вызов, оболочка сама снимает
+    кавычки. Разбор обёртки обязан видеть `gh` за кавычками тем же глазом,
+    иначе обход остаётся открытым в один шаг."""
+    with pytest.raises(AssertionError) as caught:
+        subprocess.run(["bash", "-c", "'gh' api repos/o/r"], capture_output=True)
+    assert "ЖИВОЙ GitHub" in str(caught.value)
+
+
 def test_a_non_gh_subprocess_is_not_touched():
     """Обратная сторона, и она важнее: гвардия узкая. Тесты этого
     репозитория реально зовут `git`, `python`, `bash` — если бы фикстура

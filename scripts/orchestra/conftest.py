@@ -24,7 +24,7 @@
 
 Починены точечно: `patch_gh` патчит ещё и тот экземпляр `pulse_guard`,
 который держит `upstream_drift`. После этого полный прогон каталога —
-**1633 passed**, и обоих имён в замере больше нет.
+**1634 passed** (замер финального дерева), и обоих имён в замере больше нет.
 
 Механизм утечки — не забытый мок, а РАЗНЫЕ ЭКЗЕМПЛЯРЫ модуля в одном
 прогоне. Держатель — `pulse_guard` (замер на полном прогоне каталога):
@@ -171,14 +171,18 @@ def _command_is_gh(cmd) -> bool:
     if not parts:
         return False
 
-    first = parts[0]
+    first = parts[0].strip("\"'")
     if first == "gh" or first.endswith("/gh"):
         return True
     # bash -c "…gh api…" / sh -c "…": искомое слово внутри строки-скрипта.
+    # Кавычки вокруг 'gh' снимает strip ниже: bash -c "'gh' api …" — это
+    # ровно тот же живой вызов (оболочка сама снимает кавычки), и гвардия
+    # обязана видеть его тем же глазом (замечание ai-review PR #1447).
     if first in _SHELL_WRAPPERS and "-c" in parts:
         script = " ".join(parts[parts.index("-c") + 1:])
         for token in script.replace(";", " ").replace("|", " ").replace("&", " ").split():
-            if token == "gh" or token.endswith("/gh"):
+            bare = token.strip("\"'")
+            if bare == "gh" or bare.endswith("/gh"):
                 return True
     return False
 
