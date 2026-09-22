@@ -19,6 +19,31 @@ DSH_INTEGRITY="sha512-UP1UIh6q3Gme/yXRn/QL2P8IsVlv8Shpg22TRJIZPsCRWLm4CBiA1MUvXm
 DSH_HEADLESS_VERSION="0.1.1-rc.2"
 DSH_HEADLESS_INTEGRITY="sha512-Pk50xwmUUehOxNe8DJ2/tThj7Aw1MmJQeUkfAQh9miF7Tm+WOOxiOOei/H4wjH9cf+FuqtbLDw6jrHmGotfhjw=="
 
+# Пин ТРАНЗИТИВНЫХ зависимостей по дате (#1467). Пины выше держат только два
+# верхних пакета; их собственные зависимости объявлены ДИАПАЗОНАМИ, и каждый
+# прогон резолвит их заново — то есть публикация в чужом реестре меняет то,
+# что стоит в нашем job'е, без единого коммита у нас.
+#
+# Это не гипотеза, а инцидент 2026-09-22, установленный по датам:
+#   @deepseek-ai/cordis 4.0.4 опубликован 15:36:40Z;
+#   dsh@0.1.1-rc.2 зависит от cordis диапазоном "^4.0.1" — 4.0.4 подходит;
+#   последний зелёный прогон ai-review — 15:16 (шаг dsh ~15:20, cordis 4.0.3);
+#   все прогоны после падают на `dsh: user patch-layer watching requires the
+#   Cordis HMR service` — dsh выходит rc=1 за секунду, ДО любого вызова к
+#   провайдеру, и восемь провайдеров цепочки подряд «отказывают» одинаково.
+#   Конвейер слияний встал: ни один PR не может получить ai:ok.
+#
+# `npm --before` резолвит ВСЕ версии так, как реестр выглядел на указанный
+# момент, — это лечит класс (любая транзитивная зависимость), а не случай
+# (cordis). Дату двигают руками вместе с пинами версий выше: обновление
+# перестаёт быть событием чужого реестра и становится нашим коммитом.
+DSH_RESOLVE_BEFORE="2026-09-22T15:00:00Z"
+
+# Видимый результат установки, а не факт «шаг прошёл» (AGENTS.md). Ровно та
+# версия, что стояла в последнем зелёном прогоне; расхождение — громкий отказ,
+# потому что молча уехавшая транзитивная зависимость и есть #1467.
+DSH_EXPECTED_CORDIS="4.0.3"
+
 # Ротация учёток — плагины владельца combo-router + anthropic-oauth-pool
 # (#215). Публикуются релизными ассетами ЭТОГО репозитория (как forge-плагины
 # — .github/workflows/plugin-forge.yml — tarball + .sha256, `gh release
@@ -220,16 +245,41 @@ dsh_install() { # $1 — рабочий каталог для tarball'ов (со
   mkdir -p "$pkgs"
   (
     cd "$pkgs" || exit 1
-    npm pack "@deepseek-ai/dsh@$DSH_VERSION" "@deepseek-ai/dsh-headless@$DSH_HEADLESS_VERSION"
+    npm pack --before="$DSH_RESOLVE_BEFORE" \
+      "@deepseek-ai/dsh@$DSH_VERSION" "@deepseek-ai/dsh-headless@$DSH_HEADLESS_VERSION"
     local dsh_tgz="deepseek-ai-dsh-$DSH_VERSION.tgz"
     local hl_tgz="deepseek-ai-dsh-headless-$DSH_HEADLESS_VERSION.tgz"
     [ -f "$dsh_tgz" ] || dsh_tgz=$(find . -maxdepth 1 -name "*dsh-$DSH_VERSION.tgz" | head -1)
     [ -f "$hl_tgz" ] || hl_tgz=$(find . -maxdepth 1 -name "*dsh-headless-$DSH_HEADLESS_VERSION.tgz" | head -1)
     dsh_verify_integrity "$dsh_tgz" "$DSH_INTEGRITY"
     dsh_verify_integrity "$hl_tgz" "$DSH_HEADLESS_INTEGRITY"
-    npm install -g ./*.tgz
+    npm install -g --before="$DSH_RESOLVE_BEFORE" ./*.tgz
   )
   command -v dsh >/dev/null
+  dsh_verify_resolved_deps
+}
+
+# Что РЕАЛЬНО установилось, а не что мы просили (#1467). Пин по дате — это
+# просьба к npm; доказательство — версия на диске.
+dsh_verify_resolved_deps() {
+  local root manifest got
+  root=$(npm root -g 2>/dev/null) || root=""
+  manifest="$root/@deepseek-ai/dsh/node_modules/@deepseek-ai/cordis/package.json"
+  if [ ! -f "$manifest" ]; then
+    # Вложенная копия может не появиться, если npm поднял cordis на верхний
+    # уровень — это нормальная дедупликация, не отказ. Ищем там.
+    manifest="$root/@deepseek-ai/cordis/package.json"
+  fi
+  if [ ! -f "$manifest" ]; then
+    echo "::error::dsh_install: не найден манифест @deepseek-ai/cordis под $root — проверить, ЧТО установилось, нечем (#1467)" >&2
+    return 1
+  fi
+  got=$(node -e "process.stdout.write(require('$manifest').version)")
+  if [ "$got" != "$DSH_EXPECTED_CORDIS" ]; then
+    echo "::error::dsh_install: @deepseek-ai/cordis $got вместо $DSH_EXPECTED_CORDIS — транзитивная зависимость уехала, несмотря на --before=$DSH_RESOLVE_BEFORE (#1467). Именно так конвейер встал 2026-09-22: dsh падает с «user patch-layer watching requires the Cordis HMR service» ДО обращения к провайдеру. Газ: сверить дату пина и ожидаемую версию здесь же, в scripts/lib/dsh-ci.sh" >&2
+    return 1
+  fi
+  echo "dsh_install: транзитивный пин держит — @deepseek-ai/cordis $got (--before=$DSH_RESOLVE_BEFORE)"
 }
 
 # Скачивание и проверка целостности suite ротации учёток (#215). Единственное
