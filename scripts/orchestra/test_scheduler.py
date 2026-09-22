@@ -347,6 +347,91 @@ def test_append_session_notes_ingest_failure_is_hard_failure(monkeypatch):
     assert any("сломана" in line for line in lines)
 
 
+# Прод-форма отказа, снятая с живого прогона 35647962282 (2026-09-22T00:25Z):
+# морда отвечает HTTP 500 с апстримной ошибкой миграции формата в detail. По
+# КОДУ это неотличимо от «квота исчерпана» (тот же HTTP 500 «Internal runtime
+# error»), поэтому тест кормит дословно тем, что реально пришло, а не нашим
+# пересказом чужого формата.
+UNMIGRATABLE_SESSION_ERROR = (
+    'HTTP 500: {"ok":false,"error":"Internal runtime error.","code":"internal",'
+    '"detail":"SessionFormatUnsupportedMigrationError: '
+    '@deepseek-ai/dsh-session-format-v0-to-v1 refuses this format v0 Session: '
+    'tool/result 67 data has unexpected member \\"truncated\\""}'
+)
+
+QUOTA_EXHAUSTED_ERROR = (
+    'HTTP 500: {"ok":false,"error":"Internal runtime error.","code":"internal",'
+    '"detail":"Error: Exceeded allowed rows read in Durable Objects free tier."}'
+)
+
+
+def test_unmigratable_session_is_terminal_not_a_broken_capability(monkeypatch):
+    """Главная сцена #1430. Живой случай: поле `truncated` в data записал наш
+    же стример (#1404), фикс #1405 убрал его из НОВЫХ событий — но уже
+    записанные сессии остались в хранилище морды такими, какие есть, и
+    апстримная миграция v0→v1 будет отказывать ВСЕГДА: формат в хранилище сам
+    не изменится. Повтор не поможет ни через час, ни завтра, ни после сброса
+    квоты.
+
+    Прежний код красил этим прогон, `pulse_guard` читал красноту как «пульсы
+    orchestra пропадали», и владельцу уходило «конвейер мёртв» при живом
+    конвейере, который в те же минуты сливал PR. Мутация «вернуть безусловный
+    hard_failure» красит именно этот тест."""
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
+    monkeypatch.setattr(
+        sch, "_morde_ingest",
+        lambda opener, session_id, events: (_ for _ in ()).throw(
+            RuntimeError(UNMIGRATABLE_SESSION_ERROR)),
+    )
+
+    lines, hard = sch.append_session_notes([(1251, "заметка")])
+
+    assert hard is False, f"терминальный исход не имеет права красить прогон: {lines}"
+    # И не молчим: потерянная заметка — факт, он обязан быть виден с номером
+    # задачи и причиной (#1430, пункт 2).
+    assert any("#1251" in line and "не поможет никогда" in line for line in lines), lines
+    assert any("формат сессии" in line for line in lines), lines
+    assert not any("возможность сломана" in line for line in lines), lines
+
+
+def test_quota_exhaustion_stays_a_broken_capability(monkeypatch):
+    """Вторая половина различения, и она важнее первой: тот же HTTP 500, но
+    повтор ПОМОЖЕТ — суточная квота DO сбрасывается в 00:00 UTC. Заглушить его
+    значило бы потерять сигнал о реально сломанной морде — ровно та ошибка, в
+    которую легко свалиться, «починив» соседний случай глушилкой по коду
+    ответа."""
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
+    monkeypatch.setattr(
+        sch, "_morde_ingest",
+        lambda opener, session_id, events: (_ for _ in ()).throw(
+            RuntimeError(QUOTA_EXHAUSTED_ERROR)),
+    )
+
+    lines, hard = sch.append_session_notes([(1251, "заметка")])
+
+    assert hard is True, "исчерпанная квота — сломанная возможность, повтор поможет"
+    assert any("сломана" in line and "#1251" in line for line in lines), lines
+
+
+def test_session_failure_terminal_classified_by_content_not_status_code():
+    """Различать эти исходы по коду нельзя — он у них один и тот же. Решает
+    содержание тела отказа; незнакомое содержание — по умолчанию сломанная
+    возможность (громкий путь)."""
+    assert sch.session_failure_is_terminal(UNMIGRATABLE_SESSION_ERROR) is True
+    assert sch.session_failure_terminal_reason(UNMIGRATABLE_SESSION_ERROR) is not None
+    assert sch.session_failure_is_terminal(QUOTA_EXHAUSTED_ERROR) is False
+    assert sch.session_failure_terminal_reason(QUOTA_EXHAUSTED_ERROR) is None
+    assert sch.session_failure_is_terminal("HTTP 502: bad gateway") is False
+    assert sch.session_failure_is_terminal(RuntimeError("Connection reset by peer")) is False
+    # Повреждение, а не честный отказ миграции (ADR 0027) — громкий путь.
+    corruption = 'HTTP 500: {"detail":"SessionPersistenceCorruptionError: checksum mismatch"}'
+    assert sch.session_failure_is_terminal(corruption) is False
+
+
 def test_append_session_notes_one_login_for_several_notes(monkeypatch):
     # Мутация-гвардия: если кто-то перенесёт логин внутрь цикла по заметкам,
     # этот тест покраснеет — login_calls вырастет с 1 до len(notes).
@@ -10299,6 +10384,59 @@ def test_archive_session_not_found_also_clears_the_queue(monkeypatch):
     assert hard is False
     assert [c for c in fake.calls if c.startswith("-X DELETE") and "labels" in c], fake.calls
     assert any("архивировать нечего" in line for line in lines), lines
+
+
+def test_archive_unmigratable_session_also_leaves_the_queue(monkeypatch):
+    """Второй носитель того же терминального класса (#1430, находка ревью
+    PR #1431: различение сделали в заметках-итогах и забыли в архиве сорока
+    строками выше). Немигрируемый формат archiveSession откажется читать
+    всегда — прежде этот отказ проваливался в ветку «остаётся в очереди»:
+    номер навсегда застревал в `session:archive-pending`, каждый пульс делал
+    заведомо безнадёжный RPC, а через SESSION_ARCHIVE_QUEUE_STALE_HOURS
+    прогон краснел «очередь не тает» на неисправимом — тот же ложный «конвейер
+    мёртв», только из второго места. Мутация «убрать terminal-ветку в архиве»
+    красит именно этот тест."""
+    fake = _archive_stand(monkeypatch, rpc=lambda opener, method, payload: (_ for _ in ()).throw(
+        RuntimeError(UNMIGRATABLE_SESSION_ERROR)))
+
+    lines, hard = sch.archive_runner_sessions("o/r", [5])
+
+    assert hard is False, f"терминальный исход не красит прогон: {lines}"
+    deleted = [c for c in fake.calls if c.startswith("-X DELETE") and "labels" in c]
+    assert deleted, f"терминальный номер обязан уйти из очереди: {fake.calls}"
+    assert any("не поможет никогда" in line and "#5" in line for line in lines), lines
+    assert not any("остаётся в очереди" in line for line in lines), lines
+
+
+def test_retry_pass_drops_unmigratable_session_from_the_queue(monkeypatch):
+    """Догоняющий проход: терминальный номер не возвращается в очередь — ни
+    повтора RPC на следующем пульсе, ни просрочки, ни эскалации «очередь не
+    тает» по нему. Строка отчёта остаётся: уборка не удалась, и это названо."""
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_morde_opener", lambda: object())
+    monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
+    attempted = []
+    monkeypatch.setattr(
+        sch, "_morde_rpc",
+        lambda opener, method, payload: attempted.append(payload["sessionId"]) or (_ for _ in ()).throw(
+            RuntimeError(UNMIGRATABLE_SESSION_ERROR)))
+    fake = FakeGh({
+        f"issues?state=all&labels={sch.SESSION_ARCHIVE_PENDING_LABEL.replace(':', '%3A')}": [
+            {"number": 1251},
+        ],
+        "issues/1251/labels": None,
+    })
+    monkeypatch.setattr(sch, "gh", fake)
+
+    lines, (hard, stale_since) = sch.retry_pending_session_archives("o/r", _NOW)
+
+    assert attempted == ["harness-1251"], attempted
+    assert hard is False
+    assert stale_since is None, "терминальная запись не имеет права считать просроченной"
+    deleted = [c for c in fake.calls if c.startswith("-X DELETE") and "labels" in c]
+    assert len(deleted) == 1, f"метка снята — повторов и хвоста больше нет: {fake.calls}"
+    assert any("не поможет никогда" in line for line in lines), lines
 
 
 def test_queue_survives_unreachable_morde(monkeypatch):
