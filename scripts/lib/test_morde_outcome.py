@@ -123,9 +123,14 @@ def test_terminal_outcomes_split_into_normal_and_loss():
 # копии родились одинаково: каждая писала СВОЙ свежий маркер, которого до неё
 # в списке не было. Гвардия по списку известных их бы не заметила ни одну.
 #
-# Поэтому признак теперь бесмаркерный, а область — узкая: ЛЮБОЕ сравнение
-# текста ошибки со строковым литералом внутри тел функций, которые ходят в
-# морду. Узость обязательна: `in str(` встречается в scheduler.py и по
+# Поэтому признак теперь бесмаркерный, а область — узкая: ЛЮБОЕ сопоставление
+# текста ошибки со строковым литералом (`in`/`not in`, `==`/`!=`,
+# `.startswith`-семейство, `re.search/match/…` со строковым паттерном) внутри
+# тел функций, которые ходят в морду. Формы `==` и `re.search` добавлены тем
+# же ревью вторым заходом: прежний признак разбирал только `in` и
+# `startswith`, а текст отказа называл правило обобщённо — честный
+# разработчик уходил ровно в непокрытые формы и молча возвращал класс.
+# Узость обязательна: `in str(` встречается в scheduler.py и по
 # другим поводам (например проверка содержимого ответа gh), и бесмаркерный
 # признак по всему файлу давал бы ложные срабатывания — то есть гвардию,
 # которую начнут глушить.
@@ -166,7 +171,7 @@ def _morde_going_function_names(source: str) -> list[str]:
 
 
 def _string_comparisons_against_error(source: str, function_name: str) -> list[str]:
-    """Строковые литералы, с которыми тело `function_name` сравнивает текст
+    """Строковые литералы, с которыми тело `function_name` классифицирует текст
     ошибки. Любой такой литерал — рукописная классификация отказа, то есть
     вторая копия правила, где бы она ни появилась и как бы ни назывался её
     маркер.
@@ -174,7 +179,23 @@ def _string_comparisons_against_error(source: str, function_name: str) -> list[s
     Разбор по AST, а не регуляркой: форма записи (`in str(error)`,
     `in f"{error}"`, `in message`, перенос на две строки) меняется свободно,
     а смысл — нет. Регулярка ловила бы форму и промахивалась бы по смыслу,
-    что с прежней редакцией и случилось."""
+    что с прежней редакцией и случилось.
+
+    Покрытые формы (и ровно они названы в тексте отказа гвардии — обещание
+    не шире механизма, находка ai-review PR #1434: гвардия молча зеленела на
+    `==` и `re.search`, при том что её собственное сообщение называло правило
+    обобщённо и честный разработчик уходил ровно в эти формы):
+
+    * `"литерал" in/not in <текст ошибки>`;
+    * `<текст ошибки> ==/!= "литерал"` — литерал с ЛЮБОЙ стороны;
+    * `<текст ошибки>.startswith/.endswith/.find/.index/.count("литерал")`;
+    * `re.search/match/fullmatch/findall/finditer("паттерн", <текст
+      ошибки>)` и `паттерн_объект.search(…)` — строковый литерал первым
+      аргументом.
+
+    Честный потолок: паттерн, собранный заранее (`re.compile(r"…")`) и
+    вызванный одним аргументом (`compiled(str(error))`), признак не видит —
+    текст отказа называет покрытые формы, а не «любые»."""
     tree = ast.parse(source)
     target = None
     for node in ast.walk(tree):
@@ -185,15 +206,25 @@ def _string_comparisons_against_error(source: str, function_name: str) -> list[s
 
     found: list[str] = []
     for node in ast.walk(target):
-        # `"литерал" in <что-то>` и `"литерал" not in <что-то>`
         if isinstance(node, ast.Compare):
             for op, comparator in zip(node.ops, node.comparators):
-                if not isinstance(op, (ast.In, ast.NotIn)):
-                    continue
                 left = node.left
-                if isinstance(left, ast.Constant) and isinstance(left.value, str):
-                    if _mentions_error(comparator):
+                # `"литерал" in <что-то>` и `"литерал" not in <что-то>`
+                if isinstance(op, (ast.In, ast.NotIn)):
+                    if isinstance(left, ast.Constant) and isinstance(left.value, str):
+                        if _mentions_error(comparator):
+                            found.append(left.value)
+                # `<текст ошибки> == "литерал"` — и литерал с любой из двух
+                # сторон: `if "session-not-found" == str(error):` — та же
+                # классификация, читается она так же.
+                if isinstance(op, (ast.Eq, ast.NotEq)):
+                    if (isinstance(left, ast.Constant) and isinstance(left.value, str)
+                            and _mentions_error(comparator)):
                         found.append(left.value)
+                    elif (isinstance(comparator, ast.Constant)
+                          and isinstance(comparator.value, str)
+                          and _mentions_error(left)):
+                        found.append(comparator.value)
         # `str(error).startswith("литерал")` / `.endswith(...)` — та же классификация
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             if node.func.attr in ("startswith", "endswith", "find", "index", "count"):
@@ -201,6 +232,16 @@ def _string_comparisons_against_error(source: str, function_name: str) -> list[s
                     for arg in node.args:
                         if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
                             found.append(arg.value)
+            # `re.search(r"паттерн", str(error))` — регэксп повторяет ту же
+            # подстрочную классификацию, только в другой форме записи; объект
+            # не обязан быть именно модулем `re` — собранный заранее паттерн
+            # (`compiled.search("литерал", текст)`) ловится тем же признаком.
+            if node.func.attr in ("search", "match", "fullmatch", "findall", "finditer"):
+                if (len(node.args) >= 2
+                        and isinstance(node.args[0], ast.Constant)
+                        and isinstance(node.args[0].value, str)
+                        and _mentions_error(node.args[1])):
+                    found.append(node.args[0].value)
     return found
 
 
@@ -227,8 +268,9 @@ def test_scheduler_has_no_handwritten_outcome_classification():
             offenders[name] = literals
     assert offenders == {}, (
         "в scheduler.py снова рукописная классификация отказа морды — текст "
-        "ошибки сравнивается со строковым литералом прямо в теле функции, "
-        f"ходящей в морду (место правды — scripts/lib/morde_outcome.py, #1433): {offenders}"
+        "ошибки сопоставляется со строковым литералом (in/not in, ==/!=, "
+        "startswith/…, re.search/match/…) прямо в теле функции, ходящей в "
+        f"морду (место правды — scripts/lib/morde_outcome.py, #1433): {offenders}"
     )
 
 
@@ -238,8 +280,11 @@ def test_the_guard_sees_a_marker_it_has_never_heard_of():
     Прежняя редакция зашивала список известных маркеров — и пропускала
     ЧЕТВЁРТУЮ копию с новым маркером, то есть ровно тот способ, которым
     родились все три исторические (находка ai-review PR #1434). Здесь
-    проверяется, что признак бесмаркерный: литерал придуман только что и ни
-    в одном списке репозитория не значится."""
+    проверяется, что признак бесмаркерный ВО ВСЕХ заявленных формах записи:
+    литералы придуманы только что и ни в одном списке репозитория не
+    значатся. Второй заход того же ревью: формы `==` и `re.search` гвардия
+    пропускала молча, хотя её собственное сообщение называло правило
+    обобщённо, — теперь каждая форма ловится."""
     source = (
         "def _archive_with_opener(repo, opener, task_numbers):\n"
         "    try:\n"
@@ -247,9 +292,15 @@ def test_the_guard_sees_a_marker_it_has_never_heard_of():
         "    except RuntimeError as error:\n"
         '        if "СовершенноНовыйОтказКоторогоНиктоНеВидел" in str(error):\n'
         "            return []\n"
+        '        if str(error) == "РавенствоНовойФормыТожеНигдеНеВиденное":\n'
+        "            return []\n"
+        '        if re.search(r"РегэксповаяФормаИНоваяКоторуюНеВидали", str(error)):\n'
+        "            return []\n"
     )
     assert _string_comparisons_against_error(source, "_archive_with_opener") == [
-        "СовершенноНовыйОтказКоторогоНиктоНеВидел"
+        "СовершенноНовыйОтказКоторогоНиктоНеВидел",
+        "РавенствоНовойФормыТожеНигдеНеВиденное",
+        "РегэксповаяФормаИНоваяКоторуюНеВидали",
     ]
 
 
@@ -257,11 +308,16 @@ def test_the_guard_does_not_fire_on_calls_that_are_not_about_the_error():
     """Обратная сторона: узость области — не формальность. Сравнение строки
     с чем-то, что не является текстом отказа, копией правила не является, и
     ложное срабатывание здесь стоило бы дороже пропуска: гвардию, которая
-    кричит не по делу, начинают глушить."""
+    кричит не по делу, начинают глушить. Формы `==` и `re.search` проверены
+    на обеих сторонах — живой `kind == …` из post_entity_snapshot и поиск по
+    не-ошибочной строке молчание гвардии не ломают."""
     source = (
         "def _archive_with_opener(repo, opener, task_numbers):\n"
         '    if "harness-" in session_id:\n'
         "        return []\n"
+        '    if kind == "model":\n'
+        "        return []\n"
+        '    return re.search("harness-", repo)\n'
     )
     assert _string_comparisons_against_error(source, "_archive_with_opener") == []
 

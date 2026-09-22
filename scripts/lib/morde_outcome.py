@@ -30,8 +30,12 @@
 `active_run_kind` в `scripts/gh/wake_orchestra.sh` (#1408).
 
 Добавить новый терминальный отказ = дописать строку в `TERMINAL_FAILURES`
-ниже. Все потребители начинают трактовать его одинаково, без правки их кода —
-ровно это и проверяет `test_adding_a_marker_reaches_every_caller_at_once`.
+ниже. Все потребители начинают трактовать его одинаково, без правки их кода:
+на уровне модуля это проверяет
+`test_adding_a_marker_reaches_every_caller_at_once`, а на двух ВЫЗЫВАЮЩИХ
+сразу (архив и заметки, с заглушенными дверями морды) —
+`test_new_terminal_marker_flips_both_morde_callers_at_once` в
+`scripts/orchestra/test_scheduler.py`.
 """
 
 # --- console_utf8 bootstrap (класс: печать кириллицы валит encoding на Windows, issue #723) ---

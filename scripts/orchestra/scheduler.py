@@ -3087,7 +3087,6 @@ def append_session_notes(notes: list[tuple[int, str]]) -> tuple[list[str], bool]
                     lines.append(f"⚠️ #{number}: лог итогов не дописан в сессию {session_id} — "
                                  f"повтор не поможет никогда ({reason}): {error}")
                 continue
-                continue
             lines.append(f"🚨 #{number}: лог итогов не дописан в сессию {session_id} (возможность сломана): {error}")
             hard_failure = True
         except (OSError, ValueError) as error:
