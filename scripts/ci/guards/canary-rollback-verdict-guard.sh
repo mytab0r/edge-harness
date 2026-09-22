@@ -19,7 +19,7 @@
 # не отдаётся = «деплой плохой», откат остаётся.
 #
 # Доказано мутациями — ИСПОЛНЕНО, не пересказано.
-# База: 49 passed (канарейка 6 + гвардия отката 12 + алерт 31).
+# База: 50 passed (канарейка 6 + гвардия отката 12 + алерт 32).
 #   1) сузить «бэкенд лежит» до отказов, чью причину назвало тело (узкое
 #      правило прежней редакции этого PR) — «1 failed, 45 passed», краснеет
 #      test_unrecognized_5xx_is_still_backend_down: голый 5xx без причины в
@@ -50,7 +50,14 @@
 #      Actions пустой output делает откат безусловным) — «2 failed,
 #      10 passed», краснеют test_rollback_if_referencing_missing_producer_
 #      step_reddens и test_producer_step_without_verdict_write_reddens.
-#      База для этой мутации: 12 passed (набор гвардии отката).
+#      База для этой мутации: 12 passed (набор гвардии отката);
+#   7) снять проводку CANARY_VERDICT из шага эскалации deploy-worker.yml
+#      (находка AI-ревью PR #1441, круг 2: ветка backend_down алерта жива
+#      только пока env приходит от шага-издателя вердикта) — «2 failed,
+#      30 passed» (набор алерта), краснеют
+#      test_canary_verdict_env_points_at_the_real_canary_verdict_producer_
+#      step_id и test_escalation_step_env_names_match_what_main_actually_
+#      reads. База для этой мутации: 32 passed (набор алерта).
 #
 # Регистрируется каталогом (#749), не рукописным шагом repo-ci.yml.
 set -euo pipefail
@@ -58,3 +65,4 @@ pip install --quiet pytest pyyaml
 python scripts/lib/canary_rollback_guard.py
 python -m pytest scripts/lib/test_canary_rollback_guard.py -q
 python -m pytest scripts/lib/test_canary_rollback_verdict.py -q
+python -m pytest scripts/orchestra/test_deploy_worker_rollback_alert.py -q

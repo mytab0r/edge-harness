@@ -438,6 +438,33 @@ def test_canary_ran_env_points_at_the_real_canary_step_id():
     assert "canary_ui" in step_ids, "шаг с id=canary_ui пропал из workflow"
 
 
+def test_canary_verdict_env_points_at_the_real_canary_verdict_producer_step_id():
+    # Ветка backend_down алерта жива, только пока CANARY_VERDICT приходит
+    # проводкой из шага-ИЗДАТЕЛЯ вердикта (находка AI-ревью PR #1441, круг 2):
+    # переименуют шаг canary_ui или правят env — ветка молча умрёт,
+    # verdict_is_backend_down("") станет False, и владелец снова получит
+    # «АВТООТКАТ НЕ ПОДТВЕРЖДЁН» на постороннем отказе бэкенда — ровно то
+    # утверждение о факте, которого нет, против которого #1426 и заведён.
+    # Зеркало соседних якорей ROLLBACK_CONFIRMED/POST_ROLLBACK_OK/CANARY_RAN.
+    step = _escalation_step()
+    expr = str((step.get("env") or {}).get("CANARY_VERDICT") or "")
+    assert "steps.canary_ui.outputs.verdict" in expr, (
+        f"CANARY_VERDICT больше не ссылается на steps.canary_ui.outputs.verdict "
+        f"(нашли: {expr!r}) — алерт не отличит «бэкенд лежит» от обычного "
+        f"неудавшегося отката и на постороннем отказе скажет "
+        f"«АВТООТКАТ НЕ ПОДТВЕРЖДЁН» (#1426)"
+    )
+    # Издатель вердикта обязан существовать и писать вердикт ДО выхода —
+    # существование прибито гвардией canary_rollback_guard.py по всем
+    # workflow, здесь прибивается id, от которого эта проводка зависит.
+    step_ids = {
+        s.get("id")
+        for s in yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["deploy"]["steps"]
+        if s.get("id")
+    }
+    assert "canary_ui" in step_ids, "шаг с id=canary_ui пропал из workflow"
+
+
 def test_rollback_gates_only_on_post_deploy_failures():
     # Условие — часть контракта из задачи #614: откатываем только то, что
     # реально разворачилось (деплой прошёл), и только при красном job'е после
