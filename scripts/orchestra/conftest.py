@@ -1,8 +1,11 @@
 """Живой `gh` из теста невозможен — fail loud вместо тихого выхода в сеть (#1438).
 
 Чем оплачено. Замер 2026-09-22 на полном прогоне `scripts/orchestra`
-(подмена `subprocess.run`, счёт вызовов `gh`): **19 тестов** реально ходили
-в GitHub. Из них:
+(подмена `subprocess.Popen`, счёт вызовов `gh`): **17 тестов** реально ходят
+в GitHub. Первый замер делался подменой `subprocess.run` и имел то же слепое
+пятно, что и первая редакция гвардии (находка ai-review PR #1447), — список
+пересобран. Из тогдашних девятнадцати две записи сняты не белым списком, а
+починкой (см. «Что уже починено» ниже). Из оставшихся:
 
 * `test_main_skips_generic_worker_dispatch_when_conflict_rework_already_dispatched`
   — 52 запроса к НАСТОЯЩЕМУ `repos/mytab0r/edge-harness/...`, из того же
@@ -11,19 +14,37 @@
   вызов `gh api -X DELETE repos/o/r/git/refs/locks/task-320`. Спасает
   только то, что репозиторий выдуман. Имя репозитория — совпадение, а не
   предохранитель;
-* `test_main_makes_zero_mutating_calls_on_fully_empty_queue` — 21 живой
-  вызов у теста, который сторожит ИМЕННО отсутствие изменяющих вызовов.
-  Гвардия утекала мимо механизма, который охраняет.
+## Что уже починено, а не внесено в список
+
+Два теста-сторожа — `test_main_makes_zero_mutating_calls_on_fully_empty_queue`
+и `test_main_labels_old_unclaimed_task_end_to_end` — утекали в сеть и из-за
+этого падали на полном прогоне каталога. Первый сторожит ИМЕННО отсутствие
+изменяющих вызовов, то есть гвардия утекала мимо механизма, который
+охраняет; держать её в белом списке значило бы выключить её насовсем.
+
+Починены точечно: `patch_gh` патчит ещё и тот экземпляр `pulse_guard`,
+который держит `upstream_drift`. После этого полный прогон каталога —
+**1631 passed**, и обоих имён в замере больше нет.
 
 Механизм утечки — не забытый мок, а РАЗНЫЕ ЭКЗЕМПЛЯРЫ модуля в одном
-прогоне: `test_scheduler.py` грузит `scheduler` через
-`spec_from_file_location`, а `upstream_drift` внутри себя делает
-`import scheduler` и получает другой объект. Тест патчит `gh` у своего,
-прод-код зовёт `gh` у чужого. Замер:
+прогоне. Держатель — `pulse_guard` (замер на полном прогоне каталога):
 
-    sys.modules['scheduler'] id= 140137492084464
-    scheduler, который видит upstream_drift, id= 9604480
-    тот же gh?  False
+    sys.modules['pulse_guard']            id= 139625455672416
+    pulse_guard у upstream_drift          id= 139625481296192
+    тот же объект?  False
+
+`upstream_drift_lines` зовёт `pulse_guard.gh(...)`, тест патчит
+`sys.modules["pulse_guard"].gh` — и это разные объекты, поэтому вызов уходил
+в живую сеть (`repos/pawaca/dsh-edge/tags`).
+
+**Поправка к первой редакции этого файла.** Сначала здесь стояло «второй
+экземпляр `scheduler`, который видит `upstream_drift`, id= 9604480». Это
+было НЕВЕРНО: `upstream_drift` атрибута `sch` не имеет вовсе, а 9604480 —
+`id(None)`, проверено (`python3 -c "print(id(None))"` даёт ровно это число).
+Вывод был построен на диагностике, печатавшей id отсутствующего атрибута.
+Число выглядело правдоподобно — ровно та цена, за которую в AGENTS.md
+записано правило «исполни, не вспоминай»: правдоподобное и верное здесь
+различает только повторный замер.
 
 Класс уже был описан в шапке `test_mechanical_rebase.py` и решён там для
 одного файла; здесь он закрыт для всех.
@@ -69,8 +90,9 @@ import pytest
 # Ключ — nodeid без файла: имя теста. Значение — причина, по которой запись
 # ещё здесь. Список только сокращается.
 _DEBT_REASON = (
-    "утечка патча через второй экземпляр модуля scheduler (#1438) — "
-    "чинится приведением тестов к общему sys.modules, запись снимается вместе с починкой"
+    "утечка патча: прод-код зовёт gh у НЕ ТОГО экземпляра модуля (#1438) — "
+    "чинится патчем того объекта, который реально зовёт прод-код; запись "
+    "снимается вместе с починкой, как уже сняты две сторожевые"
 )
 ALLOWED_LIVE_GH: dict[str, str] = {
     name: _DEBT_REASON
@@ -88,8 +110,6 @@ ALLOWED_LIVE_GH: dict[str, str] = {
         "test_after_merge_telegram_miss_is_loud_but_not_fatal",
         "test_main_still_dispatches_worker_for_rework_when_wip_gate_closed",
         "test_main_skips_worker_dispatch_while_fuse_paused",
-        "test_main_makes_zero_mutating_calls_on_fully_empty_queue",
-        "test_main_labels_old_unclaimed_task_end_to_end",
         "test_new_stale_episode_alerts_and_carries_the_marker",
         "test_continuing_stale_episode_neither_alerts_nor_reddens",
         "test_main_runs_the_catch_up_pass_every_pulse",
@@ -97,24 +117,51 @@ ALLOWED_LIVE_GH: dict[str, str] = {
     )
 }
 
-_REAL_RUN = subprocess.run
+# Точка подмены — Popen, а не run (находка ai-review PR #1447).
+# `subprocess.run` — лишь одна из форм запуска: `check_output`, `check_call`,
+# `call`, `getoutput` CPython строит НАПРЯМУЮ через Popen, минуя run. Пока
+# гвардия патчила только run, новый тест с `subprocess.check_output(["gh", …])`
+# уходил бы в сеть молча — под вывеской «живой gh невозможен». Popen —
+# единственное место, через которое проходят все формы сразу.
+#
+# Тем же замечанием опровергнута и полнота прошлого замера: он считал вызовы
+# той же подменой `run`, то есть имел ровно это слепое пятно. Список ниже
+# пересобран замером через Popen.
+_REAL_POPEN = subprocess.Popen
+
+_SHELL_WRAPPERS = ("bash", "sh", "zsh", "dash", "/bin/bash", "/bin/sh")
 
 
 def _command_is_gh(cmd) -> bool:
-    """Первый элемент команды — `gh`. Форма списка и форма строки обе
-    встречаются в этом репозитории, поэтому разбираются обе; незнакомая
-    форма считается НЕ gh (гвардия не должна падать на чужом вызове —
-    её мишень узкая)."""
+    """Команда запускает `gh` — включая обёртку оболочкой.
+
+    Разбираются три формы: список/кортеж, строка и обёртка
+    `bash -c "gh api …"` (находка ai-review PR #1447: без неё обходной путь
+    открыт в один шаг). Незнакомая форма считается НЕ gh — мишень гвардии
+    узкая намеренно, ложное срабатывание на чужом запуске стоило бы того,
+    что её выключат."""
     try:
         if isinstance(cmd, (list, tuple)):
-            first = str(cmd[0]) if cmd else ""
+            parts = [str(x) for x in cmd]
         elif isinstance(cmd, str):
-            first = cmd.split()[0] if cmd.split() else ""
+            parts = cmd.split()
         else:
             return False
     except Exception:
         return False
-    return first == "gh" or first.endswith("/gh")
+    if not parts:
+        return False
+
+    first = parts[0]
+    if first == "gh" or first.endswith("/gh"):
+        return True
+    # bash -c "…gh api…" / sh -c "…": искомое слово внутри строки-скрипта.
+    if first in _SHELL_WRAPPERS and "-c" in parts:
+        script = " ".join(parts[parts.index("-c") + 1:])
+        for token in script.replace(";", " ").replace("|", " ").replace("&", " ").split():
+            if token == "gh" or token.endswith("/gh"):
+                return True
+    return False
 
 
 @pytest.fixture(autouse=True)
@@ -135,12 +182,12 @@ def forbid_live_gh(request, monkeypatch):
                 "тест ушёл в ЖИВОЙ GitHub: " + shown[:200] + "\n"
                 "Это не замедление, а потеря свойства теста: результат начинает "
                 "зависеть от сети, прав и квоты установки (#1437).\n"
-                "Обычная причина — патч утёк мимо прод-кода: модуль под тестом "
-                "держит СВОЙ экземпляр scheduler (#1438, см. докстринг этого файла "
-                "и шапку test_mechanical_rebase.py). Патчить надо тот объект, "
-                "который реально зовёт прод-код.\n"
+                "Обычная причина — патч утёк мимо прод-кода: в одном прогоне живут "
+                "ДВА экземпляра одного модуля, и прод-код зовёт не тот, который "
+                "пропатчен (#1438; замеренный случай — pulse_guard у upstream_drift). "
+                "Патчить надо тот объект, который реально зовёт прод-код.\n"
                 "Осознанное исключение — запись в ALLOWED_LIVE_GH с причиной."
             )
-        return _REAL_RUN(cmd, *args, **kwargs)
+        return _REAL_POPEN(cmd, *args, **kwargs)
 
-    monkeypatch.setattr(subprocess, "run", guarded)
+    monkeypatch.setattr(subprocess, "Popen", guarded)

@@ -39,6 +39,27 @@ def test_live_gh_from_a_test_is_refused_loudly():
     assert "ALLOWED_LIVE_GH" in message, message
 
 
+def test_live_gh_through_check_output_is_refused_too():
+    """Находка ai-review PR #1447, и она про «гарантия шире механизма».
+
+    Первая редакция фикстуры патчила только `subprocess.run`, а
+    `check_output`/`check_call`/`call` CPython строит НАПРЯМУЮ через `Popen`,
+    минуя `run`. То есть тест с `check_output(["gh", …])` уходил бы в сеть
+    молча — под вывеской «живой gh невозможен». Точка подмены перенесена на
+    `Popen`; этот тест держит её там."""
+    with pytest.raises(AssertionError) as caught:
+        subprocess.check_output(["gh", "api", "repos/o/r"])
+    assert "ЖИВОЙ GitHub" in str(caught.value)
+
+
+def test_live_gh_wrapped_in_a_shell_is_refused_too():
+    """Вторая половина той же находки: `bash -c "gh api …"` — обход в один
+    шаг, если гвардия смотрит только на нулевой элемент команды."""
+    with pytest.raises(AssertionError) as caught:
+        subprocess.run(["bash", "-c", "gh api repos/o/r"], capture_output=True)
+    assert "ЖИВОЙ GitHub" in str(caught.value)
+
+
 def test_a_non_gh_subprocess_is_not_touched():
     """Обратная сторона, и она важнее: гвардия узкая. Тесты этого
     репозитория реально зовут `git`, `python`, `bash` — если бы фикстура
