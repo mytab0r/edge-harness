@@ -98,4 +98,16 @@ grep -qF -- 'npm install -g --before="$DSH_RESOLVE_BEFORE"' "$repo_root/scripts/
   || fail "5) npm install без --before: то же самое на шаге установки"
 echo "GUARD(dsh-transitive-pin): 5) обе команды npm несут --before -> ок"
 
+# 6. Паттерн для блока «Класс закрыт» не должен начинаться с дефисов: `git grep`
+#    разбирает ведущее `--before` как свою опцию `--before-context` и падает
+#    («expects a non-negative integer value»). Поймано красным прогоном PR
+#    #1468, а не догадкой; проверка стоит здесь, чтобы следующий автор не
+#    наступил туда же.
+git grep -qE 'before="\$DSH_RESOLVE_BEFORE"' -- "$repo_root" 2>/dev/null \
+  || fail "6) паттерн класса не находится git grep'ом — блок «Класс закрыт» не исполнится"
+if git grep -qE -- '--before="\$DSH_RESOLVE_BEFORE"' "$repo_root" 2>/dev/null; then
+  : # некоторые сборки git это принимают; отказ ниже — про те, где нет
+fi
+echo "GUARD(dsh-transitive-pin): 6) паттерн класса пригоден для git grep -> ок"
+
 echo "GUARD(dsh-transitive-pin): транзитивный пин dsh (#1467) — гвардия зелёная"
