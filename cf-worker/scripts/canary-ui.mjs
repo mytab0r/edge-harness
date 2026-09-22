@@ -10,7 +10,11 @@
 // Без --url проверяется прод (https://edge-harness.mytab0r.workers.dev).
 // Нужен установленный браузер: npx playwright install chromium.
 
-import { chromium } from "playwright";
+import { classifyApiFailure, EXIT_BACKEND_DOWN } from "./canary_outcome.mjs";
+// Playwright грузится ПОЗЖЕ, отдельным `await import` перед браузерной
+// частью. Верхнеуровневый импорт означал бы, что зонд готовности ниже
+// невозможно исполнить без установленного браузера, — а весь смысл зонда
+// в том, чтобы решить судьбу прода ДО и БЕЗ браузера (#1426).
 
 const args = process.argv.slice(2);
 const urlArg = args.includes("--url") ? args[args.indexOf("--url") + 1] : "https://edge-harness.mytab0r.workers.dev";
@@ -21,6 +25,52 @@ if (!token) {
 }
 
 const base = urlArg.replace(/\/$/, "");
+
+// Готовность бэкенда проверяется ПЕРВОЙ, до единой строки браузерной части
+// (issue #1426). Порядок — не стиль, а суть: в живом случае (прогон
+// 35639422589) канарейка умирала на `page.fill("#gate-token")`, потому что
+// страница не инициализировалась при 500 от API, — до проверки `/api/ready`
+// в конце файла исполнение просто не доходило. Красный таймаут локатора
+// неотличим от сломанной вёрстки, и шаг автооката откатывал исправный код.
+//
+// Зонд дешёвый (один SQL-раундтрип на той стороне) и отвечает кодом, который
+// воркер ставит сам, — гадать не нужно.
+{
+  let status = null;
+  let body = "";
+  try {
+    const probe = await fetch(`${base}/api/ready`, { headers: { Authorization: `Bearer ${token}` } });
+    status = probe.status;
+    body = await probe.text();
+  } catch (error) {
+    // Сети нет вовсе — это НЕ распознанный инфраструктурный отказ: маршрут
+    // может не отдаваться именно из-за деплоя. Прежнее поведение (упасть и
+    // дать откатить) сохраняется, разбирается ниже общим путём.
+    status = null;
+  }
+  if (status !== null && status >= 500) {
+    const verdict = classifyApiFailure(status, body);
+    if (verdict.infra) {
+      console.error(`canary-ui: ${verdict.reason}`);
+      console.error(
+        "canary-ui: BACKEND-DOWN — деплой НЕ откатываю, прогон красный. " +
+        "Откат вернул бы прежнюю версию в ту же самую поломку, а заодно " +
+        "похоронил бы исправление, если оно в этом деплое.",
+      );
+      process.exit(EXIT_BACKEND_DOWN);
+    }
+    console.error(
+      `canary-ui: зонд /api/ready — ${status}, но отказ НЕ распознан как ` +
+      "инфраструктурный; сужу деплой дальше браузером, откат остаётся возможным",
+    );
+  } else if (status !== null) {
+    console.log(`canary-ui: зонд /api/ready — ${status}, бэкенд отвечает`);
+  } else {
+    console.error("canary-ui: зонд /api/ready — ответа нет вовсе; сужу деплой дальше браузером");
+  }
+}
+
+const { chromium } = await import("playwright");
 const browser = await chromium.launch();
 try {
   const page = await browser.newPage();
@@ -131,7 +181,7 @@ try {
 
   if (fails.length) {
     for (const message of fails) console.error(`  ✗ ${message}`);
-    console.error("canary-ui: FAIL");
+    console.error("canary-ui: FAIL — деплой признан плохим, откат оправдан");
     process.exit(1);
   }
   const hands = await page.evaluate(() => document.getElementById("hands").textContent);

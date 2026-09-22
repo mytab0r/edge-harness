@@ -242,7 +242,23 @@ jobs:
         run: |
           npm ci
           npx playwright install --with-deps chromium
+          # Код возврата канарейки — контракт, а не просто «упала» (#1426):
+          #   0 — зелено; 1 — деплой плохой, откат оправдан;
+          #   3 — бэкенд лежит по посторонней причине, откатывать НЕЛЬЗЯ
+          #       (прежняя версия упрётся в то же самое, а исправление, если
+          #       оно в этом деплое, откат похоронит).
+          # Вердикт пишется в output ДО выхода — иначе шаг автооката его не
+          # увидит: при ненулевом коде дальнейшие строки не исполняются.
+          set +e
           node scripts/canary-ui.mjs --url "${{ vars.HARNESS_URL }}" --token "$HANDS_TOKEN"
+          canary_code=$?
+          set -e
+          if [ "$canary_code" = "3" ]; then
+            echo "verdict=backend-down" >> "$GITHUB_OUTPUT"
+          else
+            echo "verdict=deploy" >> "$GITHUB_OUTPUT"
+          fi
+          exit "$canary_code"
         working-directory: cf-worker
         env:
           HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
@@ -272,9 +288,15 @@ jobs:
       # не даёт этому отказу потеряться поверх уже красной канарейки (исходный
       # сигнал остаётся видимым, а не маскируется вторичным), а следующий шаг
       # эскалации честно назовёт «автооткат не подтверждён».
+      # Третье условие (#1426): вердикт канарейки. `backend-down` означает
+      # распознанный посторонний отказ бэкенда — откат тогда не лечит, а
+      # вредит. Пустой вердикт (шаг упал ДО канарейки, например на npm ci)
+      # сюда не попадает: сравнение с 'backend-down' его не исключает, и
+      # поведение остаётся прежним — откатываем. Умолчание консервативное
+      # намеренно.
       - name: Автооткат прода при красной канарейке
         id: auto_rollback
-        if: failure() && steps.deploy.outcome == 'success'
+        if: failure() && steps.deploy.outcome == 'success' && steps.canary_ui.outputs.verdict != 'backend-down'
         continue-on-error: true
         timeout-minutes: 3
         working-directory: cf-worker
@@ -308,7 +330,11 @@ jobs:
       # остаться громкой: continue-on-error здесь НЕТ нарочно.
       - name: Канарейка после автооткота
         id: post_rollback_canary
-        if: failure() && steps.deploy.outcome == 'success'
+        # Тот же вердикт, что у отката (#1426): если откатывать было нельзя,
+        # то и проверять после отката нечего — прод не менялся, повторная
+        # канарейка упрётся в ту же постороннюю поломку и потратит ещё
+        # три минуты раннера на подтверждение уже известного.
+        if: failure() && steps.deploy.outcome == 'success' && steps.canary_ui.outputs.verdict != 'backend-down'
         run: |
           npm ci
           npx playwright install --with-deps chromium
@@ -332,6 +358,10 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           ROLLBACK_CONFIRMED: ${{ steps.auto_rollback.outputs.rolled_back == 'true' }}
+          # Без этого алерт на постороннем отказе бэкенда сказал бы
+          # «АВТООТКАТ НЕ ПОДТВЕРЖДЁН — прод, возможно, остался на
+          # сломанной версии»: утверждение о факте, которого нет (#1426).
+          CANARY_VERDICT: ${{ steps.canary_ui.outputs.verdict }}
           POST_ROLLBACK_OK: ${{ steps.post_rollback_canary.outcome == 'success' }}
           # «Алерт не гадает» (находка четвёртого гейта PR #617): шаги выше
           # срабатывают при ЛЮБОМ провале после деплоя, включая «Секреты

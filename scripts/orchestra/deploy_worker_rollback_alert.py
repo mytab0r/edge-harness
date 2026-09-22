@@ -15,7 +15,7 @@
 заводим (тот же принцип, что уже применяют `branch_protection_watch.py` и
 `scripts/measure/quotas.py`).
 
-Три исхода (см. `rollback_alert_text`), от тише к громче:
+Четыре исхода (см. `rollback_alert_text`), от тише к громче:
 1. rollback_confirmed=True, post_rollback_ok=True — откат сработал, прод жив
    на предыдущей версии: информационный сигнал, не паника.
 2. rollback_confirmed=False — `wrangler rollback` не подтвердил успех (лог не
@@ -88,9 +88,28 @@ def rollback_alert_text(
     post_rollback_ok: bool,
     canary_ran: bool,
     server_url: str = "https://github.com",
+    backend_down: bool = False,
 ) -> str:
     run_url = f"{server_url}/{repo}/actions/runs/{run_id}" if run_id else "без ссылки"
     clause = trigger_clause(canary_ran)
+    # Четвёртый исход и ПЕРВЫЙ по порядку разбора (#1426): отката не было не
+    # потому, что он не удался, а потому, что он был бы вреден. Ветка обязана
+    # стоять раньше `not rollback_confirmed`, иначе владелец получает
+    # «АВТООТКАТ НЕ ПОДТВЕРЖДЁН — прод, возможно, остался на сломанной
+    # версии»: утверждение о факте, которого нет. Алерт не гадает (AGENTS.md).
+    if backend_down:
+        return (
+            f"🚨 edge-harness: {MARKER}\n"
+            "Деплой cf-worker прошёл, канарейка красная — но виноват НЕ деплой: "
+            "бэкенд лежит по посторонней причине, и воркер назвал её сам "
+            "(суточная квота хранилища Durable Objects исчерпана). Откат "
+            "СОЗНАТЕЛЬНО не делался: прежняя версия упрётся в ту же квоту, а "
+            "если исправление в этом деплое — откат его похоронит.\n"
+            "Лечится не откатом: квота сбрасывается в 00:00 UTC (#1411). "
+            "Прод сейчас на СВЕЖЕЙ версии.\n"
+            f"{clause}\n"
+            f"Прогон: {run_url}"
+        )
     if not rollback_confirmed:
         return (
             f"🚨 edge-harness: {MARKER}\n"
@@ -129,11 +148,13 @@ def escalate_rollback(
     post_rollback_ok: bool,
     canary_ran: bool,
     server_url: str = "https://github.com",
+    backend_down: bool = False,
 ) -> str:
     """Канал — тот же, что предохранитель конвейера (#120 + Telegram,
     `pulse_guard.escalate`), см. докстринг модуля."""
     text = rollback_alert_text(
-        repo, run_id, rollback_confirmed, post_rollback_ok, canary_ran, server_url
+        repo, run_id, rollback_confirmed, post_rollback_ok, canary_ran, server_url,
+        backend_down,
     )
     return escalate(repo, WATCHDOG_ISSUE, text)
 
@@ -145,8 +166,14 @@ def main() -> int:
     rollback_confirmed = parse_bool_env(os.environ.get("ROLLBACK_CONFIRMED"))
     post_rollback_ok = parse_bool_env(os.environ.get("POST_ROLLBACK_OK"))
     canary_ran = parse_bool_env(os.environ.get("CANARY_RAN"))
+    # Вердикт канарейки — строка выхода шага, а не булево: `backend-down`
+    # означает распознанный посторонний отказ бэкенда (#1426). Пустая строка
+    # (шаг упал ДО канарейки) — не `backend-down`, и поведение остаётся
+    # прежним; умолчание консервативное, как и у условия самого отката.
+    backend_down = (os.environ.get("CANARY_VERDICT") or "").strip() == "backend-down"
     result = escalate_rollback(
-        repo, run_id, rollback_confirmed, post_rollback_ok, canary_ran, server_url
+        repo, run_id, rollback_confirmed, post_rollback_ok, canary_ran, server_url,
+        backend_down,
     )
     print(f"Эскалация автооткота deploy-worker: {result}")
     return 0
