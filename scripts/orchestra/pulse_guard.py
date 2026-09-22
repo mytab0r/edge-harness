@@ -61,6 +61,8 @@ import os
 import re
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -1790,6 +1792,84 @@ OWNER_DECISION_CALLBACK_PREFIX = "wo"
 TELEGRAM_CALLBACK_DATA_MAX_BYTES = 64
 
 
+# Путь кнопки решения владельца физически проходит ЧЕРЕЗ морду: Telegram шлёт
+# callback на вебхук, вебхук живёт в воркере, воркер превращает нажатие в
+# repository_dispatch. Значит лежащая морда делает кнопку немой — владелец жмёт,
+# ничего не происходит, метка waiting:owner не снимается.
+#
+# Инцидент 2026-09-22 (#1471), измеренный, а не предполагаемый: суточная квота
+# DO rows_read выбрана на 164.5% (8 222 527 из 5 000 000, прогон quotas.yml
+# 35756964420), ВСЕ маршруты API морды отдают 500/1101, owner-decision.yml за
+# сутки не запускался ни разу. Владелец жал кнопку и сообщил, что она не
+# исчезает. Кольцо замкнулось на самом неудобном месте: #1443 просит нажать
+# кнопку, чтобы решить, что делать с квотой, а кнопку убила та же квота.
+#
+# Правило «тормоз без газа не принимается» здесь применяется к каналу решения:
+# механизм, останавливающий работу (задача ждёт владельца), обязан иметь
+# работающий путь возврата. Кнопка, которая не может сработать, — не путь.
+OWNER_BUTTON_PROBE_PATH = "/api/ready"
+OWNER_BUTTON_PROBE_TIMEOUT_SECONDS = 8
+
+BUTTON_PATH_ALIVE = "alive"
+BUTTON_PATH_DEAD = "dead"
+BUTTON_PATH_UNKNOWN = "unknown"
+
+
+def owner_button_path_status(harness_url: str | None = None) -> tuple[str, str]:
+    """Дойдёт ли нажатие кнопки до репозитория: (состояние, почему).
+
+    Три состояния, а не два, и это не педантизм: «морда лежит» и «адрес морды
+    не проброшен в job» лечатся по-разному, и молча слить их значило бы
+    выключить кнопки у всех, у кого просто не задана переменная (AGENTS.md,
+    «Fail loud, не silent-wrong»).
+
+    На UNKNOWN поведение НЕ меняется — кнопки уходят как раньше. Отказ от
+    кнопки только на доказанном отказе: зонд сходил и получил ответ, который
+    кнопке не пережить."""
+    url = harness_url if harness_url is not None else os.environ.get("HARNESS_URL", "")
+    if not url:
+        return BUTTON_PATH_UNKNOWN, "HARNESS_URL не задан — проверить путь кнопки нечем"
+    probe = url.rstrip("/") + OWNER_BUTTON_PROBE_PATH
+    try:
+        with urllib.request.urlopen(probe, timeout=OWNER_BUTTON_PROBE_TIMEOUT_SECONDS) as response:
+            code = response.getcode()
+    except urllib.error.HTTPError as error:
+        return BUTTON_PATH_DEAD, f"{OWNER_BUTTON_PROBE_PATH} отдал HTTP {error.code}"
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        return BUTTON_PATH_DEAD, f"{OWNER_BUTTON_PROBE_PATH} недоступен: {error}"
+    if code != 200:
+        return BUTTON_PATH_DEAD, f"{OWNER_BUTTON_PROBE_PATH} отдал HTTP {code}"
+    return BUTTON_PATH_ALIVE, f"{OWNER_BUTTON_PROBE_PATH} отдал HTTP 200"
+
+
+def decision_fallback_text(repo: str, issue_number: int, options: list[str], why: str) -> str:
+    """Тот же вопрос без кнопок: путь ответа, не зависящий от морды.
+
+    Запасной канал СЛАБЕЕ кнопки, и это сказано владельцу прямо, а не
+    замолчано: маркер «РЕШЕНИЕ: N» в комментарии не аутентифицирован ничем
+    (AGENTS.md, «Атрибуция событий»), тогда как кнопка проверяется HMAC'ом.
+    Выбор здесь между слабым каналом и НИКАКИМ, и он назван вслух."""
+    lines = [
+        "",
+        f"⚠️ Кнопки к этому вопросу не работают: {why}.",
+        "Нажатие идёт через морду, поэтому сейчас оно никуда не придёт.",
+        "",
+        "Ответить можно комментарием в задаче — этот путь идёт через GitHub, мимо морды:",
+        f"https://github.com/{repo}/issues/{issue_number}",
+        "",
+        "Написать в комментарии ровно одну строку с номером выбранного варианта:",
+    ]
+    for i, option in enumerate(options, start=1):
+        lines.append(f"  {DECISION_COMMENT_PREFIX}: {i}   — {option}")
+    lines += [
+        "",
+        "Честно: комментарий, в отличие от кнопки, ничем не подписан — его может "
+        "оставить кто угодно. Это запасной канал на время, пока морда лежит, а не "
+        "равноценная замена.",
+    ]
+    return "\n".join(lines)
+
+
 def build_decision_keyboard(issue_number: int, options: list[str]) -> dict:
     """Инлайн-клавиатура решения владельца (#254): одна кнопка на вариант,
     подпись — сам текст варианта (владелец видит формулировку, не номер),
@@ -1837,10 +1917,22 @@ def escalate(repo: str, issue_number: int, text: str, options: list[str] | None 
         print(f"::warning::след в #{issue_number} не оставлен: {error}", file=sys.stderr)
         posted = False
         skipped = False
-    delivered = (
-        send_telegram(text, reply_markup=build_decision_keyboard(issue_number, options))
-        if options else send_telegram(text)
-    )
+    if options:
+        # Кнопка идёт через морду; лежащая морда делает её немой (#1471).
+        # Зонд стоит ЗДЕСЬ, а не в build_decision_keyboard: клавиатура —
+        # чистая сборка структуры, ей неоткуда ходить в сеть, и звать её из
+        # тестов без стенда должно оставаться дёшево.
+        status, why = owner_button_path_status()
+        if status == BUTTON_PATH_DEAD:
+            print(f"::warning::кнопки решения по #{issue_number} не отправлены: {why} — "
+                  f"вопрос уходит с текстовым путём ответа (#1471)", file=sys.stderr)
+            delivered = send_telegram(
+                text + decision_fallback_text(repo, issue_number, options, why))
+        else:
+            delivered = send_telegram(
+                text, reply_markup=build_decision_keyboard(issue_number, options))
+    else:
+        delivered = send_telegram(text)
     comment_note = "оставлен" if posted else ("пропущен (DRY-RUN)" if skipped else "НЕ оставлен")
     return (f"Telegram: {'доставлен' if delivered else 'НЕ доставлен'}; "
             f"след в #{issue_number}: {comment_note}")

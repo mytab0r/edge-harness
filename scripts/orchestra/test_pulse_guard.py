@@ -11,7 +11,10 @@ conveyor_gate/heartbeat_check проверяется на моке gh — сет
 import importlib.util
 import json
 import re
+import socket
 import sys
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -3325,3 +3328,127 @@ def test_failure_watch_task_body_passes_declared_dependency_gate():
     body_arg = next(a for a in calls[0] if a.startswith("body="))
     assert body_arg.rstrip().endswith("БЛОКИРУЕТСЯ: ничем")
     assert "failure-fingerprint: check:red:test" in body_arg  # дедуп по отпечатку жив
+
+
+# ── Кнопка решения владельца не уходит немой (#1471) ─────────────────────────
+#
+# Инцидент 2026-09-22: суточная квота DO rows_read выбрана на 164.5%, ВСЕ
+# маршруты API морды отдают 500/1101, owner-decision.yml за сутки не запускался
+# ни разу. Владелец жал кнопку — она не исчезала. Кольцо: #1443 просит нажать
+# кнопку, чтобы решить, что делать с квотой, а кнопку убила та же квота.
+#
+# Стенд ниже поднимает НАСТОЯЩИЙ http.server и зовёт НАСТОЯЩИЙ зонд (AGENTS.md,
+# «Заглушка внешнего инструмента — это пересказ»). «Морда недоступна»
+# воспроизводится закрытым портом, а не подставным исключением.
+
+class _Morda(BaseHTTPRequestHandler):
+    status = 200
+
+    def do_GET(self):  # noqa: N802 — имя задано BaseHTTPRequestHandler
+        body = b'{"ok":true}' if type(self).status == 200 else b"error code: 1101"
+        self.send_response(type(self).status)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_args):
+        pass
+
+
+@pytest.fixture
+def morda():
+    server = HTTPServer(("127.0.0.1", 0), _Morda)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _url(server):
+    return f"http://127.0.0.1:{server.server_port}"
+
+
+def test_button_path_alive_when_morda_answers_200(morda):
+    _Morda.status = 200
+
+    status, why = pg.owner_button_path_status(_url(morda))
+
+    assert status == pg.BUTTON_PATH_ALIVE
+    assert "200" in why
+
+
+def test_button_path_dead_when_morda_answers_500(morda):
+    """Ровно состояние инцидента: воркер бросает, маршрут отдаёт 500."""
+    _Morda.status = 500
+
+    status, why = pg.owner_button_path_status(_url(morda))
+
+    assert status == pg.BUTTON_PATH_DEAD
+    assert "500" in why
+
+
+def test_button_path_dead_when_morda_unreachable():
+    """Недоступность — закрытый порт, а не подставное исключение."""
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    closed_port = probe.getsockname()[1]
+    probe.close()
+
+    status, why = pg.owner_button_path_status(f"http://127.0.0.1:{closed_port}")
+
+    assert status == pg.BUTTON_PATH_DEAD
+    assert "недоступен" in why
+
+
+def test_button_path_unknown_without_address_is_not_dead(monkeypatch):
+    """«Адрес не проброшен» и «морда лежит» лечатся по-разному: слить их
+    значило бы выключить кнопки всем, у кого просто не задана переменная."""
+    monkeypatch.delenv("HARNESS_URL", raising=False)
+
+    status, why = pg.owner_button_path_status()
+
+    assert status == pg.BUTTON_PATH_UNKNOWN
+    assert "HARNESS_URL" in why
+
+
+def test_escalate_keeps_buttons_while_the_path_is_alive(morda, monkeypatch):
+    _Morda.status = 200
+    monkeypatch.setenv("HARNESS_URL", _url(morda))
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a, **k: None)
+    sent = {}
+    monkeypatch.setattr(pg, "send_telegram",
+                        lambda text, *a, **kw: sent.update(text=text, markup=kw.get("reply_markup")) or True)
+
+    pg.escalate("o/r", 7, "вопрос", options=["раз", "два"])
+
+    assert sent["markup"] is not None, "живой путь — кнопки на месте"
+    assert "РЕШЕНИЕ" not in sent["text"], "текстовый путь не подмешивается к рабочим кнопкам"
+
+
+def test_escalate_replaces_dead_buttons_with_a_working_reply_path(morda, monkeypatch):
+    """Главное поведение задачи: немую кнопку не отправляем вовсе, вместо неё —
+    путь ответа, не зависящий от морды."""
+    _Morda.status = 500
+    monkeypatch.setenv("HARNESS_URL", _url(morda))
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a, **k: None)
+    sent = {}
+    monkeypatch.setattr(pg, "send_telegram",
+                        lambda text, *a, **kw: sent.update(text=text, markup=kw.get("reply_markup")) or True)
+
+    pg.escalate("o/r", 1443, "что делаем с квотой", options=["поднять интервал", "отключить приём"])
+
+    assert sent["markup"] is None, "кнопка, которая не может сработать, не отправляется"
+    assert f"{pg.DECISION_COMMENT_PREFIX}: 1" in sent["text"]
+    assert f"{pg.DECISION_COMMENT_PREFIX}: 2" in sent["text"]
+    assert "github.com/o/r/issues/1443" in sent["text"], "путь ответа обязан нести адрес"
+    assert "500" in sent["text"], "владельцу назван ФАКТ, а не «что-то сломалось»"
+
+
+def test_fallback_says_out_loud_that_the_comment_is_not_authenticated():
+    """Запасной канал слабее кнопки, и это говорится владельцу, а не
+    замалчивается: маркер в комментарии не подписан ничем (AGENTS.md)."""
+    text = pg.decision_fallback_text("o/r", 5, ["а", "б"], "почему")
+
+    assert "не подписан" in text or "ничем не подписан" in text
