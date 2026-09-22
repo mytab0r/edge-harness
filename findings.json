@@ -882,7 +882,25 @@
       "source_pr": 1424,
       "status": "open",
       "title": "test_main_reddens_when_the_catch_up_pass_itself_is_broken зовёт настоящий gh"
+    },
+    {
+      "detail": "Текст нарушения у гвардии прямо советует газ: «добавь в FRONTEND_DEPLOY_WORKFLOWS, либо в UNWATCHED_DEPLOY_WORKFLOWS с причиной» (deploy_workflow_registry_guard.py:182), и `test_deliberate_exclusion_with_a_reason_is_silent` этот путь одобряет — но только на tmp-дереве. На живом `test_live_repository_really_has_deploy_workflows` сравнивает `found` ровно с `FRONTEND_DEPLOY_WORKFLOWS` (строка 233), excluded в сравнении не участвует. Исполнено на этом PR: дерево с третьим деплойным `deploy-preview.yml` + исключение с причиной → `check_registry_completeness` зелёная, а предикат живого теста краснеет (три имени ≠ два). То есть одна из двух названных дверей газа ведёт в красный CI с `AssertionError`-множеством без подсказки — следующий агент будет чинить по ложному сигналу. Поправь здесь же: `found == set(FRONTEND_DEPLOY_WORKFLOWS) | set(guard.repo_invariants.UNWATCHED_DEPLOY_WORKFLOWS)` — страховка от пустого и уехавшего признака сохраняется, газ начинает работать.",
+      "file": "scripts/lib/test_deploy_workflow_registry_guard.py",
+      "id": 99,
+      "opened_at": "2026-09-22T02:01:32.852763+00:00",
+      "source_pr": 1439,
+      "status": "open",
+      "title": "осознанное исключение красит соседний живой тест — газ не работает на живом дереве"
+    },
+    {
+      "detail": "INFRA-CF.md обещает «список больше не может молча разойтись с реальностью» и «заводишь третий деплой — CI скажет об этом в тот же день», но `_DEPLOY_USES_RE` знает только `cloudflare/wrangler-action`: официальный `cloudflare/pages-action` (ровно та же первая дверь в прод, что и покрытый wrangler-action) и деплой, завёрнутый в локальную composite action или reusable workflow (`uses: ./…`), детектор пропускает молча — тот исход, против которого гвардия написана. Сам файл уже применяет этот стандарт вперёд (`versions upload`/`pages deploy` в run-форму добавлены, хотя в дереве их нет), так что добавь `pages-action` в `_DEPLOY_USES_RE` одной строкой, а в INFRA-CF.md назови границу (деплой внутри composite action / reusable workflow не виден) — либо смягчи категоричные обе фразы до того, что детектор реально читает. Живое дерево сегодня покрыто целиком (проверено прогоном), так что это защита вперёд, не починка.",
+      "file": "scripts/lib/deploy_workflow_registry_guard.py",
+      "id": 100,
+      "opened_at": "2026-09-22T02:01:32.852763+00:00",
+      "source_pr": 1439,
+      "status": "open",
+      "title": "признак деплоя не знает cloudflare/pages-action — гарантия дока шире детектора"
     }
   ],
-  "next_id": 99
+  "next_id": 101
 }
