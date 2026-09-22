@@ -2635,6 +2635,26 @@ def _morde_ingest(opener: urllib.request.OpenerDirector, session_id: str, events
 # архивированной сессии безвреден (идемпотентно), потерянная сессия — нет.
 SESSION_ARCHIVE_PENDING_LABEL = "session:archive-pending"
 
+# Метка-СВОЙСТВО: уборка этой сессии доведена до конца (#1432). Ставится после
+# успешной архивации ЛИБО после терминального «сессии раннера нет» — оба
+# означают «возвращаться сюда больше незачем».
+#
+# Зачем отдельная метка, а не отсутствие `session:archive-pending`: отсутствие
+# очереди означает «сейчас не в работе», а не «сделано». Без признака «сделано»
+# нельзя ответить на вопрос, с которого началась вся история: КАКИЕ сессии
+# осталось убрать. Владелец сформулировал это дословно — «после успеха мы
+# пошли и повесили это свойство, и по этим свойствам мы будем понимать, надо
+# архивировать потом или нет».
+SESSION_ARCHIVED_LABEL = "session:archived"
+
+# Сколько закрытых задач за проход ставится в очередь догоняющей уборкой
+# (#1432). Потолок нужен, потому что на момент включения в репозитории лежат
+# сотни давно закрытых задач: без него первый же проход попытался бы поставить
+# метку на все сразу и упёрся бы в лимит GitHub API. Очередь и так повторяется
+# на каждом пульсе — хвост растает за несколько часов, и это дешевле разового
+# штурма.
+CLOSED_TASK_SWEEP_LIMIT = 20
+
 # Сколько записи позволено провисеть в очереди, прежде чем это перестаёт быть
 # «уборка не удалась, повторим» и становится «сломана причина, а не уборка»
 # (#1422). Ровно эту политику обещает текст алерта после #1417 — до #1422 код
@@ -2669,6 +2689,15 @@ SESSION_ARCHIVE_STALE_MARKER = "[статус: очередь архива се�
 def _set_archive_pending(repo: str, number: int) -> None:
     gh("-X", "POST", f"repos/{repo}/issues/{number}/labels",
        "-f", f"labels[]={SESSION_ARCHIVE_PENDING_LABEL}")
+
+
+def _mark_session_archived(repo: str, number: int) -> None:
+    """Свойство «уборка доведена до конца» (#1432) — ставится ПОСЛЕ факта, не
+    вместо него: сначала сессия убрана (или её заведомо нет), только потом
+    метка. Обратный порядок означал бы «пометили и не сделали» — ровно та
+    потеря, против которой заведена очередь."""
+    gh("-X", "POST", f"repos/{repo}/issues/{number}/labels",
+       "-f", f"labels[]={SESSION_ARCHIVED_LABEL}")
 
 
 def _clear_archive_pending(repo: str, number: int) -> None:
@@ -2856,6 +2885,12 @@ def _archive_with_opener(repo: str, opener, task_numbers: list[int]) -> tuple[li
             still_queued.append(number)
             continue
         try:
+            # Порядок важен (#1432): свойство «убрано» ставится ПЕРЕД снятием
+            # очереди. Упадём между вызовами — запись останется в очереди,
+            # повтор безвреден (RPC идемпотентен). Обратный порядок дал бы
+            # окно, в котором задача уже не в очереди и ещё не помечена
+            # убранной — то есть невидима обоим механизмам.
+            _mark_session_archived(repo, number)
             _clear_archive_pending(repo, number)
         except RuntimeError as error:
             # Сессия убрана, а метка осталась — следующий проход повторит
@@ -2891,6 +2926,70 @@ def archive_stale_episode_is_new(repo: str, oldest_labeled_at: datetime | None) 
     if oldest_labeled_at is None:
         return False
     return max(open_times) < oldest_labeled_at
+
+
+def closed_tasks_needing_archive(repo: str, limit: int = CLOSED_TASK_SWEEP_LIMIT) -> list[int]:
+    """Закрытые задачи, чья сессия раннера ещё не убрана (#1432).
+
+    Критерий — ЗАКРЫТИЕ задачи, а не слияние PR. До #1432 архив вызывался
+    ровно из `after_merge`, то есть только для задач, чей PR слит. Сессия
+    задачи, PR которой не слит (конфликт, `ai:changes-requested`, `blocked`,
+    заброшен) или которая до PR не дошла вовсе (прогон воркера упал), не
+    убиралась НИКОГДА и ничем. Замер 2026-09-22 на живом репозитории: 100
+    прогонов воркера за 30 суток, 26 из них не успех, 25 открытых PR — речь о
+    десятках сессий в месяц, которых механизм не касался по построению.
+
+    Почему именно закрытие, а не «прогон воркера упал»: `session_id` —
+    `harness-<номер ЗАДАЧИ>`, один на все прогоны задачи. Убрать сессию у
+    открытой задачи значит отнять её у следующего прогона, который допишет
+    туда же. Закрытая задача не переоткрывается никогда (правило репозитория,
+    принуждается `reject_reopened_tasks`), значит её сессия доработана
+    окончательно.
+
+    `-label:` обеих меток: очередь (уже в работе) и свойство «убрано» (#1432).
+    Потолок `limit` — не оптимизация, а условие включения: на момент запуска в
+    репозитории лежат сотни давно закрытых задач, и попытка пометить все за
+    один проход упёрлась бы в лимит GitHub API. Очередь повторяется на каждом
+    пульсе, хвост растает за несколько часов."""
+    query = (f"repo:{repo} is:issue is:closed label:task "
+             f"-label:{SESSION_ARCHIVE_PENDING_LABEL} -label:{SESSION_ARCHIVED_LABEL}")
+    try:
+        found = gh("search/issues?q=" + urllib.parse.quote(query) + f"&per_page={limit}")
+    except RuntimeError:
+        # Поиск не отдался — не наша забота этого прохода: очередь и так
+        # повторяется, а выдумывать список по памяти нечем.
+        return []
+    return [item["number"] for item in (found or {}).get("items", [])][:limit]
+
+
+def sweep_closed_task_sessions(repo: str) -> list[str]:
+    """Ставит в очередь уборку сессий закрытых задач (#1432).
+
+    Сам не ходит в морду и не архивирует: только помечает. Уборку делает тот
+    же `retry_pending_session_archives`, что и всегда — второй механизм не
+    заводится, это прямое требование постановки задачи."""
+    if not DSH_EDGE_URL or not DSH_EDGE_ACCESS_KEY:
+        return []  # конфигурации нет — очередь не наша забота
+    numbers = closed_tasks_needing_archive(repo)
+    if not numbers:
+        return []
+    queued, failed = [], []
+    for number in numbers:
+        try:
+            _set_archive_pending(repo, number)
+            queued.append(number)
+        except RuntimeError as error:
+            failed.append(f"#{number} ({error})")
+    lines = []
+    if queued:
+        lines.append(
+            f"🧹 в очередь уборки поставлено {len(queued)} закрытых задач: "
+            + ", ".join(f"#{n}" for n in queued))
+    if failed:
+        # Громко: без метки повторять будет нечему — тот же единственный
+        # жёсткий сбой, что у archive_runner_sessions.
+        lines.append(f"🚨 метка очереди НЕ поставлена: {', '.join(failed)}")
+    return lines
 
 
 def retry_pending_session_archives(
@@ -6668,8 +6767,13 @@ def main() -> int:
     # исход. Состояния между прогонами функция не помнит вовсе: оно целиком
     # в метке, и именно поэтому хвост добирается сам после починки любой
     # причины отказа.
+    # Догоняющая уборка закрытых задач (#1432) ставится в очередь ДО повтора,
+    # чтобы поставленное этим же проходом сразу и убралось — иначе метка
+    # ждала бы следующего пульса впустую.
+    sweep_lines = sweep_closed_task_sessions(repo)
     archive_retry_lines, (archive_retry_hard, archive_stale_since) = \
         retry_pending_session_archives(repo, now)
+    archive_retry_lines = sweep_lines + archive_retry_lines
     (merge_observations, merge_actions, merge_tail_hard_failure,
      archive_label_hard, pulls) = merge_loop(repo, pulls)
     # #196, поведение 1: PR с review:ok без вердикта AI (или ai:failed)

@@ -10726,6 +10726,147 @@ def test_continuing_stale_episode_neither_alerts_nor_reddens(monkeypatch):
     assert any("уже объявлен" in line for line in lines_seen), lines_seen
 
 
+# ── Уборка сессий закрытых задач (#1432) ────────────────────────────────────
+#
+# Класс, названный владельцем: «у меня в dsh куча незаархивированных сессий».
+# Ответ «сломалась архивация, починили» (#1417/#1422) был неполным — основной
+# источник накопления не сбой: архив вызывался РОВНО из after_merge, то есть
+# только для задач, чей PR слит. Замер 2026-09-22: 100 прогонов воркера за 30
+# суток, 26 не успех, 25 открытых PR — десятки сессий в месяц, которых
+# механизм не касался по построению.
+
+
+def _sweep_stand(monkeypatch, *, found, label_calls, fail_on=()):
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+
+    def fake_gh(*args):
+        joined = " ".join(args)
+        if joined.startswith("search/issues"):
+            return {"items": [{"number": n} for n in found]}
+        if joined.startswith("-X POST") and "labels" in joined:
+            number = int(joined.split("/issues/")[1].split("/")[0])
+            if number in fail_on:
+                raise RuntimeError("HTTP 500: метка не поставлена")
+            label_calls.append(number)
+            return None
+        raise AssertionError(f"нет маршрута: {joined}")
+
+    monkeypatch.setattr(sch, "gh", fake_gh)
+
+
+def test_closed_task_without_the_done_marker_goes_into_the_queue(monkeypatch):
+    """Главная сцена #1432: закрытая задача, чья сессия не убрана, обязана
+    попасть в ТУ ЖЕ очередь. Второй механизм не заводится — уборку делает
+    существующий догоняющий проход."""
+    calls = []
+    _sweep_stand(monkeypatch, found=[901, 902], label_calls=calls)
+
+    lines = sch.sweep_closed_task_sessions("o/r")
+
+    assert calls == [901, 902], calls
+    assert any("#901" in line and "#902" in line for line in lines), lines
+
+
+def test_sweep_does_not_touch_the_morde_itself(monkeypatch):
+    """Разделение обязанностей: проход ТОЛЬКО помечает. Если он начнёт сам
+    ходить в морду, появится второй механизм уборки — ровно то, что
+    постановка задачи запрещает, и повтор перестанет быть единственным
+    местом, где уборка вообще случается."""
+    calls = []
+    _sweep_stand(monkeypatch, found=[901], label_calls=calls)
+    monkeypatch.setattr(sch, "_morde_login", lambda opener: (_ for _ in ()).throw(
+        AssertionError("проход уборки не имеет права логиниться в морду")))
+    monkeypatch.setattr(sch, "_morde_rpc", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("проход уборки не имеет права звать RPC")))
+
+    sch.sweep_closed_task_sessions("o/r")
+
+    assert calls == [901]
+
+
+def test_sweep_is_loud_when_the_label_does_not_stick(monkeypatch):
+    """Единственный жёсткий исход и здесь тот же: без метки повторять нечему,
+    и молчать об этом нельзя."""
+    calls = []
+    _sweep_stand(monkeypatch, found=[901, 902], label_calls=calls, fail_on=(902,))
+
+    lines = sch.sweep_closed_task_sessions("o/r")
+
+    assert calls == [901]
+    assert any("НЕ поставлена" in line and "#902" in line for line in lines), lines
+
+
+def test_sweep_query_excludes_both_labels(monkeypatch):
+    """Оба исключения обязательны и означают РАЗНОЕ: `archive-pending` — «уже
+    в очереди» (повторно ставить незачем), `archived` — «сделано, возвращаться
+    незачем». Без второго проход ставил бы метку на уже убранные сессии
+    вечно, на каждом пульсе."""
+    seen = {}
+
+    def fake_gh(*args):
+        joined = " ".join(args)
+        if joined.startswith("search/issues"):
+            seen["q"] = urllib.parse.unquote(joined)
+            return {"items": []}
+        raise AssertionError(joined)
+
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "gh", fake_gh)
+
+    sch.sweep_closed_task_sessions("o/r")
+
+    assert f"-label:{sch.SESSION_ARCHIVE_PENDING_LABEL}" in seen["q"], seen
+    assert f"-label:{sch.SESSION_ARCHIVED_LABEL}" in seen["q"], seen
+    assert "is:closed" in seen["q"], "открытую задачу трогать нельзя — её сессию допишет следующий прогон"
+
+
+def test_sweep_is_capped_per_pulse(monkeypatch):
+    """Потолок — условие включения, а не оптимизация: на момент запуска в
+    репозитории лежат сотни давно закрытых задач, и попытка пометить все за
+    один проход упёрлась бы в лимит GitHub API."""
+    calls = []
+    _sweep_stand(monkeypatch, found=list(range(900, 900 + sch.CLOSED_TASK_SWEEP_LIMIT + 5)),
+                 label_calls=calls)
+
+    sch.sweep_closed_task_sessions("o/r")
+
+    assert len(calls) == sch.CLOSED_TASK_SWEEP_LIMIT, len(calls)
+
+
+def test_archived_marker_is_set_before_the_queue_entry_is_cleared(monkeypatch):
+    """Порядок — то самое требование владельца: «после успеха мы пошли и
+    повесили это свойство». Свойство ставится ПЕРЕД снятием очереди: упадём
+    между вызовами — запись останется в очереди, повтор безвреден. Обратный
+    порядок дал бы окно, в котором задача уже не в очереди и ещё не помечена
+    убранной, то есть невидима обоим механизмам."""
+    order = []
+
+    def fake_gh(*args):
+        joined = " ".join(args)
+        if joined.startswith("-X POST") and sch.SESSION_ARCHIVED_LABEL in joined:
+            order.append("marked")
+            return None
+        if joined.startswith("-X DELETE") and "labels" in joined:
+            order.append("cleared")
+            return None
+        if joined.startswith("-X POST") and "labels" in joined:
+            return None
+        raise AssertionError(joined)
+
+    monkeypatch.setattr(sch, "DSH_EDGE_URL", "http://morde.invalid")
+    monkeypatch.setattr(sch, "DSH_EDGE_ACCESS_KEY", "key")
+    monkeypatch.setattr(sch, "_morde_opener", lambda: object())
+    monkeypatch.setattr(sch, "_morde_login", lambda opener: None)
+    monkeypatch.setattr(sch, "_morde_rpc", lambda opener, method, payload: {})
+    monkeypatch.setattr(sch, "gh", fake_gh)
+
+    sch.archive_runner_sessions("o/r", [5])
+
+    assert order == ["marked", "cleared"], order
+
+
 def test_main_runs_the_catch_up_pass_every_pulse(monkeypatch):
     """Проводка, без которой механизм — украшение: очередь обязана разбираться
     САМА на каждом пульсе, иначе метка просто копится и «не потеряно» остаётся
