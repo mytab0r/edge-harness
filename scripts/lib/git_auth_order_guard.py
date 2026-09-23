@@ -175,7 +175,11 @@ def problems(workflows_dir: Path = WORKFLOWS_DIR) -> list[str]:
     молча не появится."""
     files = _python_files()
     found: list[str] = []
-    for workflow in sorted(workflows_dir.glob("*.yml")):
+    # Оба суффикса, не один: GitHub принимает и `.yaml`, и пропуск был бы
+    # ТИХИМ — job с писателем просто не попал бы под проверку. Класс #635,
+    # гвардия scripts/lib/workflow_glob_suffix_guard.py; она это и поймала.
+    for workflow in sorted(list(workflows_dir.glob("*.yml"))
+                           + list(workflows_dir.glob("*.yaml"))):
         try:
             parsed = yaml.safe_load(workflow.read_text(encoding="utf-8"))
         except yaml.YAMLError as error:
