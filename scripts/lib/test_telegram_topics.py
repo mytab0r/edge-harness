@@ -24,6 +24,7 @@ _console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_u
 import ast
 import http.server
 import json
+import re
 import socket
 import subprocess
 import threading
@@ -541,3 +542,122 @@ def test_every_bash_sender_names_a_known_category():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+# ── Вторая сторона реестра: воркер (#1495) ─────────────────────────────────
+#
+# Гвардия выше разбирает `scripts/**/*.py`. Воркер — TypeScript в `cf-worker/`,
+# и для неё его отправителей не существовало: четыре `sendMessage` уходили
+# владельцу вообще без `message_thread_id`, а CI был зелёным. Тот же дефект
+# границы, что #1490, слоем выше — там проверялось одно имя функции вместо
+# роли, здесь один язык вместо всех мест, откуда сообщение физически уходит.
+
+CONFIG_TS = REPO_ROOT / "cf-worker" / "src" / "config.ts"
+HARNESS_TS = REPO_ROOT / "cf-worker" / "src" / "harness.ts"
+
+#: Единственный санкционированный отправитель воркера. Всё остальное, что
+#: зовёт sendMessage, обязано идти через него — иначе появляется второй путь
+#: к владельцу, и тему он не знает.
+WORKER_SENDER = "#alertOwner"
+
+
+def _ts_method_body(source: str, name: str) -> str:
+    """Тело метода TS от открывающей `{` до парной закрывающей — счётом
+    скобок, а не жадным regex: тело само содержит `{`/`}`. Тот же приём, что
+    в scripts/lib/test_do_hotpath_aggregate_guard.py."""
+    match = re.search(rf"{re.escape(name)}\s*\([^)]*\)\s*:[^{{]*\{{", source)
+    assert match, f"метод {name} не найден в harness.ts — переименован без правки гвардии?"
+    start = source.index("{", match.end() - 1)
+    depth = 0
+    for i in range(start, len(source)):
+        if source[i] == "{":
+            depth += 1
+        elif source[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start:i + 1]
+    raise AssertionError(f"не нашёл закрывающую скобку метода {name}")
+
+
+def _ts_topic_titles() -> dict[str, str]:
+    """`TELEGRAM.topicTitles` из config.ts как словарь. Импортировать .ts в
+    Python нельзя, поэтому читаем исходник текстом — ровно тем же способом,
+    что scripts/lib/test_telegram_callback_format_sync.py уже читает
+    callbackPrefix (#254/#486)."""
+    source = CONFIG_TS.read_text(encoding="utf-8")
+    match = re.search(r"topicTitles:\s*\{(.*?)\}\s*as\s+Record", source, re.S)
+    assert match, "в config.ts не найден литерал TELEGRAM.topicTitles"
+    return dict(re.findall(r'(\w+)\s*:\s*"([^"]+)"', match.group(1)))
+
+
+def test_topic_titles_match_between_python_and_typescript():
+    """Заголовки тем совпадают на обоих языках — иначе две темы одной
+    категории.
+
+    Тема ищется и заводится ПО ЗАГОЛОВКУ: у воркера нет доступа к ветке
+    `data/telegram-topics`, где живёт Python-ская карта, и единственный общий
+    источник правды у двух сторон — сам Telegram. Значит расходиться нельзя
+    именно заголовкам: разошлись — в чате владельца появятся «🔴 Поломки» от
+    Python и «🔴 Поломки » от воркера как ДВЕ РАЗНЫЕ темы, и ни один тест
+    каждой стороны по отдельности этого не увидит (тот же класс, что #486).
+
+    Сверяется реестр ЦЕЛИКОМ, а не та категория, что нужна воркеру: «совпало
+    по тому, что я взял» неотличимо от «совпало»."""
+    assert _ts_topic_titles() == dict(tt.CATEGORIES), (
+        "реестр категорий разошёлся между cf-worker/src/config.ts "
+        "(TELEGRAM.topicTitles) и scripts/lib/telegram_topics.py (CATEGORIES): "
+        f"TS={_ts_topic_titles()} vs Python={dict(tt.CATEGORIES)}"
+    )
+
+
+def test_worker_alert_category_is_known_and_not_the_decision_topic():
+    """Категория алертов воркера существует в реестре и это НЕ тема решений:
+    под алертами воркера кнопок нет и быть не может, а тема решений по
+    определению содержит только то, под чем кнопки есть (#1490)."""
+    source = CONFIG_TS.read_text(encoding="utf-8")
+    match = re.search(r'workerAlertCategory:\s*"([^"]+)"', source)
+    assert match, "в config.ts не найдена TELEGRAM.workerAlertCategory"
+    category = match.group(1)
+    assert category in tt.CATEGORIES, (
+        f"категория алертов воркера «{category}» отсутствует в реестре "
+        f"({sorted(tt.CATEGORIES)})"
+    )
+    assert category != tt.DECISION_CATEGORY, (
+        "алерты воркера уходят в тему решений владельца, а кнопок под ними нет — "
+        "ровно то, что владелец увидел в #1490"
+    )
+
+
+def test_worker_sends_to_owner_only_through_the_single_door():
+    """Все `sendMessage` воркера живут внутри `#alertOwner` — двери, которая
+    знает про темы.
+
+    Это и был дефект #1495: четыре вызова стояли прямо в телах
+    `#tickStorageReadyAlert`/`#tickPulseAlert` и уходили без
+    `message_thread_id`. Проверяется ЧИСЛО вызовов в файле против числа
+    вызовов внутри двери: новый пятый вызов где угодно ещё покраснеет, даже
+    если он выглядит правильным."""
+    source = HARNESS_TS.read_text(encoding="utf-8")
+    everywhere = source.count('"sendMessage"')
+    inside = _ts_method_body(source, WORKER_SENDER).count('"sendMessage"')
+    assert inside > 0, (
+        f"{WORKER_SENDER} не зовёт sendMessage — дверь переименована или выпотрошена, "
+        "а гвардия этого не заметила бы (класс #891: структурная проверка по имени)"
+    )
+    assert everywhere == inside, (
+        f"в harness.ts {everywhere} вызовов sendMessage, а внутри {WORKER_SENDER} — {inside}: "
+        f"лишние уходят владельцу мимо тем (#1495). Зови {WORKER_SENDER}(text), "
+        "он сам резолвит тему и честно помечает сообщение, если темы не досталось"
+    )
+
+
+def test_worker_door_names_the_reason_when_the_topic_is_missing():
+    """Тормоз назвал газ: не досталось темы — сообщение всё равно уходит, но с
+    причиной. Потерять алерт дороже, чем показать его не там (ADR 0028), а
+    молча показать не там — silent-wrong, который читатель не отличит от
+    исправной работы."""
+    body = _ts_method_body(HARNESS_TS.read_text(encoding="utf-8"), WORKER_SENDER)
+    assert "в общем потоке" in body, (
+        f"{WORKER_SENDER} не помечает сообщение, ушедшее мимо темы — владелец не отличит "
+        "«тема не досталась» от «так и задумано» (#1495)"
+    )
