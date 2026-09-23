@@ -530,6 +530,87 @@ export function apply(ctx: Context) {
   Рабочая связка: coding-эндпоинт + `glm-5` + maxTokens 131072 — агент ответил
   корректно. Список моделей: `GET <base>/models` (glm-4.5…glm-5.3-flash).
 
+## Версия dsh — не косметика: `watchUserPatches` и сломанная пара пакетов (2026-09-22/23)
+
+Замерено локальным воспроизведением с инструментовкой установленных файлов
+(закрытая #1467, #1481). Причина здесь, а не в комментарии к задаче, ровно
+потому, что следующий агент сначала прочитает это.
+
+**Что происходит.** После загрузки профиля `runProfile`
+(`@deepseek-ai/dsh/lib/profile-boot-*.js`) заводит слежение за пользовательским
+слоем патчей:
+
+```js
+if (!signalShutdown.signal.aborted && ctx.fiber.state === 2 && ctx.get("loader") !== void 0) try {
+    if (ctx.get("hmr") === void 0) {
+        await ctx.loader.create({ name: "@deepseek-ai/cordis-plugin-hmr", config: { root: [] } });
+    }
+    await watchUserPatches(ctx, { … });   // бросает, если ctx.get("hmr") === undefined
+```
+
+**Две измеренные поломки в `dsh@0.1.1-rc.2`:**
+
+1. Профиль `headless` СОЗНАТЕЛЬНО гасит строку hmr
+   (`@deepseek-ai/dsh-headless/cordis.patch.yml`: `- id: hmr` / `disabled: true`),
+   а фолбэк `loader.create` поднимает сервис в контексте СОЗДАННОЙ ЗАПИСИ —
+   корневой `ctx` его не видит. Замер: внутри записи `ctx.get("hmr")` становится
+   `true` после выхода её fiber в состояние 2, а корневой остаётся `false` и
+   через 5 секунд. Ошибок при этом не печатается: `Entry._init` отдаёт отказ в
+   `ctx.logger.error`, который в headless не виден.
+2. Даже если hmr включить обратно патчем профиля, следующая строка падает
+   `TypeError: hmr.registerConfig is not a function`:
+   `dsh-app-boot@0.1.1-rc.2` зовёт API, которого нет НИ В ОДНОЙ опубликованной
+   версии `@deepseek-ai/cordis-plugin-hmr` (1.0.16, 1.0.16-rc.1/rc.4, 1.0.17,
+   1.0.18, 1.0.19 — проверено `grep` по `lib/index.js` каждой).
+
+То есть путь `watchUserPatches` в этой версии нерабочий при ЛЮБОМ выборе
+транзитивных версий. Выбор `--before` его не лечит и не ломает: при
+`^0.1.1-rc.2` сам `dsh-app-boot` резолвится в `0.1.1-rc.2` и с пином, и без —
+npm не подставляет под предрелизный диапазон предрелизы других tuple, а
+стабильных `0.1.x` в реестре нет.
+
+**Где починено.** В `dsh-app-boot@0.1.7-alpha.2` этого пути нет вовсе (ни
+`registerConfig`, ни текста ошибки), а строка hmr в `dsh-base` переехала на
+свой пакет `@deepseek-ai/dsh-hmr` и гасится условием
+`disabled: !!js "!ctx.get('profileContext')"` вместо жёсткого `true`.
+
+Проверено прогоном на той же машине и том же профиле:
+
+```
+$ dsh --profile headless "скажи ок"                      # 0.1.1-rc.2
+Error: dsh: user patch-layer watching requires the Cordis HMR service
+
+$ dsh --profile headless "скажи ок"                      # 0.1.7-alpha.2
+dsh: MISSING_CREDENTIAL: llm-deepseek: no API key for provider route "deepseek-official"
+
+$ DEEPSEEK_API_KEY=sk-deliberately-invalid-000 dsh --profile headless "скажи ок"
+dsh: AUTH: Authentication Fails, Your api key: ****-000 is invalid
+```
+
+Третья строка — доказательство конец-в-конец: инструмент дошёл до провайдера и
+принёс ЕГО ответ.
+
+**Практический вывод для следующего разбора.** Отказ `dsh` за 0–1 секунды, до
+любого сетевого вызова, — это НЕ отказ провайдера, сколько бы провайдеров
+цепочки ни «отказало» подряд одинаково. Воспроизводится локально (сеть не
+нужна), поэтому разбор не стоит ни одного прогона CI:
+
+```
+npm pack --before=<дата из DSH_RESOLVE_BEFORE> @deepseek-ai/dsh@<DSH_VERSION> @deepseek-ai/dsh-headless@<…>
+npm install -g --before=<та же дата> ./*.tgz
+dsh --profile headless "скажи ок"
+```
+
+**Опровергнуто, чтобы не воспроизводили заново:** `@deepseek-ai/cordis 4.0.4` и
+`cordis-plugin-hmr 1.0.19` виновниками НЕ были — обе версии называл первый
+диагноз по совпадению дат публикации, пин закрепил предыдущие, падение
+осталось тем же.
+
+**Не подтверждено:** почему прогоны были зелёными утром 2026-09-22, когда
+сломанный путь уже существовал. Правдоподобно, что блок просто не выполнялся
+(он входит только при `!signalShutdown.signal.aborted && ctx.fiber.state === 2`),
+но замером это не проверено, и лечению не мешает — в 0.1.7-alpha.2 блока нет.
+
 ## Что не подтверждено
 
 - **Детали протокола E2B за пределами README.** Формат запросов к песочнице, семантика таймаутов, поведение при обрыве — читались только по README пакетов. Перед реализацией собственного удалённого провайдера по этому образцу надо читать `packages/e2b/*/src`.

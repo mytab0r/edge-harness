@@ -14,35 +14,43 @@
 # 0.0.1-rc.1 намеренно НЕ используется: тянет @deepseek-ai/dsh-code-runtime-worker,
 # который в публичном npm отсутствует (tarball 404); с 0.0.1-rc.3 зависимость —
 # dsh-code-runtime-worker-thread, она опубликована (проверено установкой, 475 пакетов).
-DSH_VERSION="0.1.1-rc.2"
-DSH_INTEGRITY="sha512-UP1UIh6q3Gme/yXRn/QL2P8IsVlv8Shpg22TRJIZPsCRWLm4CBiA1MUvXmJAfsOEETBMLAl+xWPtFw6ICsN3wg=="
-DSH_HEADLESS_VERSION="0.1.1-rc.2"
-DSH_HEADLESS_INTEGRITY="sha512-Pk50xwmUUehOxNe8DJ2/tThj7Aw1MmJQeUkfAQh9miF7Tm+WOOxiOOei/H4wjH9cf+FuqtbLDw6jrHmGotfhjw=="
+DSH_VERSION="0.1.7-alpha.2"
+DSH_INTEGRITY="sha512-uXuWobwmpNzqFOTFP61kgf0aH8IzU9LWPF9QWCUfv5DOtgtlm+6+zHvQMboEe0bCaitul61ySvUqd4mMNRedzw=="
+DSH_HEADLESS_VERSION="0.1.7-alpha.2"
+DSH_HEADLESS_INTEGRITY="sha512-kRaYTJ+U5z0IywMMpI77O0w8P+FDFepltMTaJKb+ZhIFtCdWwFcb/f1Ah156qOiRLvhJy+Y2OU+lEdnZq5/Riw=="
 
 # Пин ТРАНЗИТИВНЫХ зависимостей по дате (#1467). Пины выше держат только два
 # верхних пакета; их собственные зависимости объявлены ДИАПАЗОНАМИ, и каждый
 # прогон резолвит их заново — то есть публикация в чужом реестре меняет то,
 # что стоит в нашем job'е, без единого коммита у нас.
 #
-# Это не гипотеза, а инцидент 2026-09-22, установленный по датам:
-#   @deepseek-ai/cordis 4.0.4 опубликован 15:36:40Z;
-#   dsh@0.1.1-rc.2 зависит от cordis диапазоном "^4.0.1" — 4.0.4 подходит;
-#   последний зелёный прогон ai-review — 15:16 (шаг dsh ~15:20, cordis 4.0.3);
-#   все прогоны после падают на `dsh: user patch-layer watching requires the
-#   Cordis HMR service` — dsh выходит rc=1 за секунду, ДО любого вызова к
-#   провайдеру, и восемь провайдеров цепочки подряд «отказывают» одинаково.
-#   Конвейер слияний встал: ни один PR не может получить ai:ok.
+# ОПРОВЕРГНУТО (#1481). Первая редакция этого комментария называла виновником
+# `@deepseek-ai/cordis 4.0.4` по совпадению дат публикации. Пин реально
+# закрепил 4.0.3 — и dsh продолжил падать тем же «user patch-layer watching
+# requires the Cordis HMR service». Причина оказалась другой и установлена
+# локальным воспроизведением с инструментовкой, а не по датам:
+# `dsh-app-boot@0.1.1-rc.2` зовёт `hmr.registerConfig(...)`, которого нет НИ В
+# ОДНОЙ опубликованной версии `@deepseek-ai/cordis-plugin-hmr` (1.0.16…1.0.19),
+# то есть путь `watchUserPatches` не мог отработать ни при каком выборе
+# транзитивных версий. Лечится переходом на 0.1.7-alpha.2, где апстрим этот
+# путь выкинул, а строка hmr переехала на свой пакет `@deepseek-ai/dsh-hmr`.
+# Разбор целиком — закрытая #1467 и #1481.
+#
+# Сам механизм пина при этом остаётся нужным и ниже не отменяется: чужая
+# публикация по-прежнему меняет содержимое нашего job'а без коммита у нас.
 #
 # `npm --before` резолвит ВСЕ версии так, как реестр выглядел на указанный
 # момент, — это лечит класс (любая транзитивная зависимость), а не случай
 # (cordis). Дату двигают руками вместе с пинами версий выше: обновление
 # перестаёт быть событием чужого реестра и становится нашим коммитом.
-DSH_RESOLVE_BEFORE="2026-09-22T15:00:00Z"
+DSH_RESOLVE_BEFORE="2026-09-23T00:00:00Z"
 
 # Видимый результат установки, а не факт «шаг прошёл» (AGENTS.md). Ровно та
-# версия, что стояла в последнем зелёном прогоне; расхождение — громкий отказ,
-# потому что молча уехавшая транзитивная зависимость и есть #1467.
-DSH_EXPECTED_CORDIS="4.0.3"
+# версия, что реально встаёт с пинами выше — замерено установкой
+# dsh@0.1.7-alpha.2 + dsh-headless@0.1.7-alpha.2 (#1481), а не взято из
+# диапазона. Расхождение — громкий отказ: молча уехавшая транзитивная
+# зависимость меняет наш job без коммита у нас.
+DSH_EXPECTED_CORDIS="4.0.4"
 
 # Ротация учёток — плагины владельца combo-router + anthropic-oauth-pool
 # (#215). Публикуются релизными ассетами ЭТОГО репозитория (как forge-плагины
@@ -276,7 +284,7 @@ dsh_verify_resolved_deps() {
   fi
   got=$(node -e "process.stdout.write(require('$manifest').version)")
   if [ "$got" != "$DSH_EXPECTED_CORDIS" ]; then
-    echo "::error::dsh_install: @deepseek-ai/cordis $got вместо $DSH_EXPECTED_CORDIS — транзитивная зависимость уехала, несмотря на --before=$DSH_RESOLVE_BEFORE (#1467). Именно так конвейер встал 2026-09-22: dsh падает с «user patch-layer watching requires the Cordis HMR service» ДО обращения к провайдеру. Газ: сверить дату пина и ожидаемую версию здесь же, в scripts/lib/dsh-ci.sh" >&2
+    echo "::error::dsh_install: @deepseek-ai/cordis $got вместо $DSH_EXPECTED_CORDIS — транзитивная зависимость уехала, несмотря на --before=$DSH_RESOLVE_BEFORE (#1467/#1481). Что именно сломается от этого расхождения — заранее не известно, поэтому отказ громкий, а не предсказание. Газ: сверить дату пина и ожидаемую версию здесь же, в scripts/lib/dsh-ci.sh" >&2
     return 1
   fi
   echo "dsh_install: транзитивный пин держит — @deepseek-ai/cordis $got (--before=$DSH_RESOLVE_BEFORE)"
