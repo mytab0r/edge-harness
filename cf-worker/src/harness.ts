@@ -166,6 +166,26 @@ const SCHEMA = [
   // между тиками alarm чаще, чем сами тики случаются — счётчик «была ли уже
   // эта авария замечена» обязан пережить пересоздание инстанса, иначе
   // Telegram-алерт бил бы на каждый тик заново.
+  // Кэш агрегатов «сколько задач/сообщений в каждом статусе» (#1487). Лежит
+  // в SQL по той же причине, что pulse/retention_state/storage_probe выше:
+  // DO выгружается из памяти через ~10 с простоя, а запросы приходят реже —
+  // кэш в ПОЛЕ ОБЪЕКТА до этой таблицы был холодным почти всегда, и каждый
+  // вызов #status() делал полный GROUP BY по обеим таблицам.
+  //
+  // Замер, ради которого таблица заведена (2026-09-23, два среза quotas.yml
+  // в тихое окно): 325 запросов к морде за сутки — 0.3% лимита — и при этом
+  // 3,3 млн прочитанных строк, то есть ~6 900 строк НА ОДИН ЗАПРОС; за 10
+  // минут тишины +27 запросов и +185 097 строк. Квота rows_read общая на
+  // аккаунт, и при её исчерпании DO отдаёт 500: морда перестаёт отвечать,
+  // канарейка деплоя краснеет, кнопки владельца в Telegram умирают.
+  //
+  // Семантика инвалидации НЕ меняется: ровно те же места, что раньше писали
+  // `#taskCountsCache = null`, теперь зовут #invalidateCounts(...). Значение
+  // хранится как JSON одной строкой — форма ответа /api/status прежняя.
+  `CREATE TABLE IF NOT EXISTS counts_cache (
+     kind  TEXT PRIMARY KEY,
+     json  TEXT NOT NULL
+   )`,
   `CREATE TABLE IF NOT EXISTS storage_probe (
      id      INTEGER PRIMARY KEY CHECK (id = 1),
      ts      INTEGER NOT NULL,
@@ -802,18 +822,15 @@ export function storageErrorResponse(detail: string): Response {
 export class Harness extends DurableObject<Env> {
   #sql: SqlStorage;
 
-  // Кэш агрегата «сколько задач в каждом статусе» (#320, рецепт rows_read).
-  // Не зависит от времени — меняется ТОЛЬКО записью в tasks, поэтому
+  // Кэш агрегатов «сколько задач/сообщений в каждом статусе» (#320/#575)
+  // живёт в таблице counts_cache, а НЕ в полях объекта (#1487): DO
+  // выгружается из памяти через ~10 с простоя, запросы приходят реже, и
+  // поле-кэш было холодным почти всегда — полный GROUP BY уходил на каждый
+  // вызов #status(). Отсутствие строки = «грязно», как раньше null.
+  //
+  // Не зависят от времени — меняются ТОЛЬКО записью в свою таблицу, поэтому
   // инвалидация по месту записи корректна (в отличие от stale_dispatch,
-  // который зависит от текущего момента и обязан читаться заново). null —
-  // «грязно», следующий #taskCounts() пересчитает одним GROUP BY.
-  #taskCountsCache: Record<TaskRow["status"], number> | null = null;
-
-  // Тот же рецепт для messages (#575: инцидент #321 закрыл tasks, messages
-  // осталась с полным GROUP BY на каждый #status()). Ключ — реальный статус
-  // ('new'/'processing'/'done'/'failed'/'ignored'), не фиксированный набор
-  // как у tasks — форма ответа /api/status.messages не менялась этим фиксом.
-  #msgCountsCache: Record<string, number> | null = null;
+  // который зависит от текущего момента и обязан читаться заново).
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -1137,41 +1154,73 @@ export class Harness extends DurableObject<Env> {
 
   // ── Состояние ─────────────────────────────────────────────────────────────────────
 
-  /** #taskCountsCache лениво: пересчёт — единственное место, где GROUP BY по
-   *  ВСЕЙ таблице tasks вообще выполняется, и то не чаще, чем реально меняется
-   *  состав задач (создание/переход статуса), а не каждый heartbeat. */
-  #taskCounts(): Record<TaskRow["status"], number> {
-    if (this.#taskCountsCache === null) {
-      const counts: Record<TaskRow["status"], number> = {
-        queued: 0,
-        dispatched: 0,
-        running: 0,
-        done: 0,
-        failed: 0,
-      };
-      for (const row of this.#rows(this.#sql.exec("SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"))) {
-        counts[String(row.status) as TaskRow["status"]] = Number(row.n);
-      }
-      this.#taskCountsCache = counts;
+  /** Прочитать кэш агрегата из SQL. Отсутствие строки — «грязно» (#1487,
+   *  ровно тот же смысл, что прежний `null` в поле объекта). Битый JSON тоже
+   *  «грязно»: пересчёт дешевле, чем отдать наружу неразобранное. */
+  #cachedCounts(kind: string): Record<string, number> | null {
+    const row = this.#rows(this.#sql.exec("SELECT json FROM counts_cache WHERE kind = ?", kind))[0];
+    if (!row) return null;
+    try {
+      const parsed = JSON.parse(String(row.json));
+      return parsed && typeof parsed === "object" ? (parsed as Record<string, number>) : null;
+    } catch {
+      return null;
     }
-    return this.#taskCountsCache;
   }
 
-  /** #msgCountsCache лениво (#575, тот же рецепт, что #taskCounts выше, #320):
-   *  GROUP BY по ВСЕЙ таблице messages — единственное место, где он вообще
-   *  выполняется, и то не чаще, чем реально меняется состав сообщений
-   *  (приём/захват в обработку/финал/ватчдог), а не каждый вызов #status().
-   *  До этой правки счётчик читался тут же инлайном на каждый вызов —
-   *  ровно тот класс, что #321 уже закрыл для tasks. */
-  #msgCounts(): Record<string, number> {
-    if (this.#msgCountsCache === null) {
-      const counts: Record<string, number> = {};
-      for (const row of this.#rows(this.#sql.exec("SELECT status, COUNT(*) AS n FROM messages GROUP BY status"))) {
-        counts[String(row.status)] = Number(row.n);
-      }
-      this.#msgCountsCache = counts;
+  #storeCounts(kind: string, counts: Record<string, number>): void {
+    this.#sql.exec(
+      "INSERT INTO counts_cache (kind, json) VALUES (?, ?) ON CONFLICT(kind) DO UPDATE SET json = excluded.json",
+      kind,
+      JSON.stringify(counts),
+    );
+  }
+
+  /** Пометить агрегат грязным. Зовётся ровно в тех местах, где раньше стояло
+   *  `#taskCountsCache = null` — список мест этим фиксом не менялся. */
+  #invalidateCounts(kind: string): void {
+    this.#sql.exec("DELETE FROM counts_cache WHERE kind = ?", kind);
+  }
+
+  /** Пересчёт — единственное место, где GROUP BY по ВСЕЙ таблице tasks вообще
+   *  выполняется, и то не чаще, чем реально меняется состав задач
+   *  (создание/переход статуса).
+   *
+   *  #1487: раньше это утверждение было НЕВЕРНО. Кэш лежал в поле объекта, а
+   *  соседний комментарий в этом же файле (см. alarm()) фиксирует, что DO
+   *  выгружается из памяти через ~10 с простоя — то есть между запросами поле
+   *  обнулялось, и «не чаще, чем меняется состав» превращалось в «на каждый
+   *  вызов». Теперь кэш в SQL и переживает выгрузку. */
+  #taskCounts(): Record<TaskRow["status"], number> {
+    const cached = this.#cachedCounts("tasks");
+    if (cached) return cached as Record<TaskRow["status"], number>;
+    const counts: Record<TaskRow["status"], number> = {
+      queued: 0,
+      dispatched: 0,
+      running: 0,
+      done: 0,
+      failed: 0,
+    };
+    for (const row of this.#rows(this.#sql.exec("SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"))) {
+      counts[String(row.status) as TaskRow["status"]] = Number(row.n);
     }
-    return this.#msgCountsCache;
+    this.#storeCounts("tasks", counts);
+    return counts;
+  }
+
+  /** Тот же рецепт для messages (#575, #320) и та же поправка #1487: кэш
+   *  живёт в SQL, а не в поле объекта. Ключ — реальный статус
+   *  ('new'/'processing'/'done'/'failed'/'ignored'), не фиксированный набор
+   *  как у tasks — форма ответа /api/status.messages не менялась. */
+  #msgCounts(): Record<string, number> {
+    const cached = this.#cachedCounts("messages");
+    if (cached) return cached;
+    const counts: Record<string, number> = {};
+    for (const row of this.#rows(this.#sql.exec("SELECT status, COUNT(*) AS n FROM messages GROUP BY status"))) {
+      counts[String(row.status)] = Number(row.n);
+    }
+    this.#storeCounts("messages", counts);
+    return counts;
   }
 
   #status(): Status {
@@ -1348,14 +1397,14 @@ export class Harness extends DurableObject<Env> {
         row.task_id,
       );
       if (cursor.rowsWritten > 0) {
-        this.#taskCountsCache = null;
+        this.#invalidateCounts("tasks");
         changed = true;
       }
     }
     if (row.kind === "job_end") {
       const failed = (row.data as { result?: string } | null)?.result === "fail";
       this.#sql.exec("UPDATE tasks SET status = ? WHERE id = ?", failed ? "failed" : "done", row.task_id);
-      this.#taskCountsCache = null;
+      this.#invalidateCounts("tasks");
       // Руки закончили — «руки живы» уходит сразу, а не через порог свежести.
       this.#sql.exec("DELETE FROM heartbeat WHERE id = 1");
       changed = true;
@@ -1674,10 +1723,10 @@ export class Harness extends DurableObject<Env> {
         // так же, как dispatch/job_start/job_end — те места кэш сбрасывают,
         // а чистка нет. Без сброса /api/status завышает done/failed до
         // следующей записи задачи (на тёплом инстансе — надолго).
-        if (table.name === "tasks" && cursor.rowsWritten > 0) this.#taskCountsCache = null;
+        if (table.name === "tasks" && cursor.rowsWritten > 0) this.#invalidateCounts("tasks");
         // #575: тот же принцип для messages — чистка терминальных сообщений
         // меняет msgCounts.done/failed/ignored так же, как finish/reclaim.
-        if (table.name === "messages" && cursor.rowsWritten > 0) this.#msgCountsCache = null;
+        if (table.name === "messages" && cursor.rowsWritten > 0) this.#invalidateCounts("messages");
       } catch (error) {
         full = true; // сбой чистки — тоже «не успеваем», не тихий пропуск
         pruned[table.name] = -1; // -1 = попытка упала, не «нечего было чистить»
@@ -2023,7 +2072,7 @@ export class Harness extends DurableObject<Env> {
     const id = crypto.randomUUID();
     const now = Date.now();
     this.#sql.exec("INSERT INTO tasks (id, created_ts, status) VALUES (?, ?, 'queued')", id, now);
-    this.#taskCountsCache = null;
+    this.#invalidateCounts("tasks");
     this.#emitSystemEvent(id, "task_queued", { payload });
     this.#broadcastStatus();
 
@@ -2075,7 +2124,7 @@ export class Harness extends DurableObject<Env> {
     }
 
     this.#sql.exec("UPDATE tasks SET status = 'dispatched', dispatch_ts = ? WHERE id = ?", now, id);
-    this.#taskCountsCache = null;
+    this.#invalidateCounts("tasks");
     this.#emitSystemEvent(id, "task_dispatched", {});
     this.#broadcastStatus();
     return this.#json({ task_id: id, dispatched: true }, { status: 201 });
@@ -2451,7 +2500,7 @@ export class Harness extends DurableObject<Env> {
     // #processSingleMessage/#reclaimStuckMessages идут через неё), поэтому
     // единственная точка сброса msgCounts на терминальный переход (#575).
     if (Number(cursor.rowsWritten) > 0) {
-      this.#msgCountsCache = null;
+      this.#invalidateCounts("messages");
       return true;
     }
     return false;
@@ -2473,7 +2522,7 @@ export class Harness extends DurableObject<Env> {
     );
     if (claimed.rowsWritten === 0) return { action: "skipped" };
     // new → processing — msgCounts сдвигается тем же переходом (#575).
-    this.#msgCountsCache = null;
+    this.#invalidateCounts("messages");
     this.#groupMessages(messageId);
 
     // directive и doc_edit — оба получают issue-след: «у каждой директивы есть
@@ -2508,7 +2557,7 @@ export class Harness extends DurableObject<Env> {
       );
       if (Number(released.rowsWritten) === 0) return { action: "skipped" };
       // processing → new (повторяемая ошибка) — тот же переход, что и захват выше (#575).
-      this.#msgCountsCache = null;
+      this.#invalidateCounts("messages");
       return { action: "issue_retry", error: outcome.error, attempts };
     }
 
@@ -2624,7 +2673,7 @@ export class Harness extends DurableObject<Env> {
         Number(row.id),
       ).rowsWritten;
       // processing → new (ватчдог) — тот же переход, что ручной release выше (#575).
-      if (released > 0) this.#msgCountsCache = null;
+      if (released > 0) this.#invalidateCounts("messages");
       reclaimed += Number(released);
     }
     return reclaimed;
@@ -2644,7 +2693,7 @@ export class Harness extends DurableObject<Env> {
       );
       // failed → new (bulk retry) — та же msgCounts-инвалидация, что у
       // одиночных переходов выше (#575).
-      if (cursor.rowsWritten > 0) this.#msgCountsCache = null;
+      if (cursor.rowsWritten > 0) this.#invalidateCounts("messages");
     }
     const rows = this.#rows(
       this.#sql.exec(
@@ -2947,7 +2996,7 @@ export class Harness extends DurableObject<Env> {
     // ON CONFLICT DO NOTHING, а пречтение (`existing` выше) уже гарантирует,
     // что сюда доходит только настоящая новая строка — условие на негодном
     // сигнале защищало бы случай, которого здесь нет.
-    this.#msgCountsCache = null;
+    this.#invalidateCounts("messages");
     const row = this.#rows(
       this.#sql.exec("SELECT id FROM messages WHERE source = ? AND source_msg_id = ?", f.source, f.sourceMsgId),
     )[0];
