@@ -561,3 +561,108 @@ def test_sections_heading_inside_fence_does_not_start_section():
 if __name__ == "__main__":
     import sys
     raise SystemExit(pytest.main([__file__, "-q"] + sys.argv[1:]))
+
+
+# ── #1436: паттерн «Класс закрыт» — ERE, а не PCRE ───────────────────────────
+#
+# Две ловушки, и они лечатся по-разному (замер живым `git grep` 2026-09-22,
+# временный репозиторий — не документация и не пересказ):
+#   громкая — git падает rc=128 текстом, который не называет ни причину, ни
+#             лечение («Invalid preceding regular expression»);
+#   тихая   — git НЕ падает и считает не то, а гейт «подтверждает» заявление,
+#             которого автор не делал.
+
+
+def test_noncapturing_group_is_named_before_git_grep_runs():
+    """Громкая ловушка. Живой случай PR #1434 (прогон 35674153855): автор
+    написал `(?:…)`, получил ретрансляцию текста git и пошёл править
+    экранирование — то есть гадать. Цена: полный цикл CI плюс лишний коммит,
+    потому что одна правка тела PR прогон не перезапускает."""
+    problems = mutation_claim.ere_pattern_problems(r'if "(?:HTTP 404|session-not-found)" in str\(')
+
+    assert len(problems) == 1
+    assert "(?:" in problems[0]
+    assert "ERE" in problems[0]
+    assert "(…)" in problems[0], "сообщение обязано назвать замену, а не только диагноз"
+
+
+def test_digit_class_is_silently_wrong_and_is_named_as_such():
+    """ТИХАЯ ловушка, и она опаснее громкой. `\\d` в `git grep -nE` матчит
+    БУКВУ «d», не цифру — замер: файл со строкой «5» не совпал, файл со
+    строкой «d» совпал. Заявление «совпадений 3» проходит гейт и не значит
+    ничего.
+
+    Задача #1436 ставила `\\d` в один ряд с `(?:` как «тоже падает». Замер
+    показал обратное — и именно поэтому проверка нужна: падения-то и нет."""
+    problems = mutation_claim.ere_pattern_problems(r"worker run \d+")
+
+    assert len(problems) == 1
+    assert "НЕ падает" in problems[0]
+    assert "[0-9]" in problems[0]
+
+
+def test_lazy_quantifier_is_silently_greedy():
+    """Вторая тихая ловушка, задачей #1436 не названная вовсе. `q+?xyz`
+    совпал со строкой «xyz», где ни одного `q` нет: `?` прочитан как
+    «предыдущее необязательно». `<.*?>` на «<a><b>» вернул строку целиком."""
+    problems = mutation_claim.ere_pattern_problems(r"<.*?>")
+
+    assert len(problems) == 1
+    assert "ленивый" in problems[0]
+    assert "[^>]" in problems[0], "сообщение обязано показать выразимую в ERE замену"
+
+
+def test_gnu_extensions_that_actually_work_are_not_rejected():
+    """Газ: `\\w`, `\\s`, `\\b` в `git grep -nE` работают как ожидается
+    (GNU-расширения, проверено тем же замером). Отвергать их — тормоз без
+    причины, и он выгнал бы автора переписывать рабочий паттерн."""
+    assert mutation_claim.ere_pattern_problems(r"\bdef\s+\w+") == []
+
+
+def test_escaped_metacharacters_are_not_false_positives():
+    """`\\(` — литеральная скобка (в паттернах этого репозитория встречается
+    постоянно), `\\*?` — литеральная звёздочка, сделанная необязательной,
+    `\\\\d` — литеральный слэш плюс буква. Ни одно из трёх не PCRE-ловушка;
+    различает их только чётность слэшей слева, поэтому проверка обходит
+    паттерн посимвольно, а не регуляркой по нему."""
+    assert mutation_claim.ere_pattern_problems(r"^def active_worker_run_for_task\(") == []
+    assert mutation_claim.ere_pattern_problems(r"a\*?b") == []
+    assert mutation_claim.ere_pattern_problems(r"\\d") == []
+
+
+def test_claim_with_pcre_cannot_be_constructed_at_all():
+    """Проверка живёт в `__post_init__`, а не в `run_class_closed_check`:
+    объект с ловушкой физически не существует, и обойти её, собрав claim
+    руками, нельзя. «Нарушить невозможно», а не «написано» (AGENTS.md)."""
+    with pytest.raises(mutation_claim.MutationClaimFormatError) as error:
+        mutation_claim.ClassClosedClaim(pattern=r"(?:a|b)", expected_count=0)
+
+    assert "POSIX ERE" in str(error.value)
+
+
+def test_body_with_pcre_pattern_fails_parsing_not_the_grep():
+    """Сквозь разбор тела PR: ошибка приходит на этапе формата, рядом с
+    остальными ошибками контракта, а не из недр git."""
+    body = (
+        "## Класс закрыт\n\n"
+        "Grep: `worker run (?:\\d+)`\n"
+        "Ожидается совпадений: 1\n"
+    )
+
+    with pytest.raises(mutation_claim.MutationClaimFormatError):
+        mutation_claim.parse_class_closed_claims(body)
+
+
+def test_valid_ere_claim_still_parses_unchanged():
+    """Регрессия: честный ERE-паттерн проходит ровно как раньше."""
+    body = (
+        "## Класс закрыт\n\n"
+        "Grep: `^def active_worker_run_for_task`\n"
+        "Ожидается совпадений: 1\n"
+    )
+
+    claims = mutation_claim.parse_class_closed_claims(body)
+
+    assert len(claims) == 1
+    assert claims[0].pattern == "^def active_worker_run_for_task"
+    assert claims[0].expected_count == 1

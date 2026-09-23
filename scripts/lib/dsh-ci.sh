@@ -280,6 +280,36 @@ dsh_verify_resolved_deps() {
     return 1
   fi
   echo "dsh_install: транзитивный пин держит — @deepseek-ai/cordis $got (--before=$DSH_RESOLVE_BEFORE)"
+  # Что РЕАЛЬНО встало, а не что мы просили (#1467, второй заход). Первый
+  # диагноз назвал виновником cordis по совпадению дат — пин его закрепил,
+  # а dsh продолжил падать тем же «user patch-layer watching requires the
+  # Cordis HMR service». Значит уехал кто-то другой, и гадать, кто именно,
+  # нельзя: список версий печатается целиком, один раз, и следующий разбор
+  # начинается с факта, а не с гипотезы.
+  local root_dir
+  root_dir=$(npm root -g 2>/dev/null || true)
+  if [ -n "$root_dir" ]; then
+    echo "dsh_install: что установилось (@deepseek-ai/*):"
+    node -e '
+      const fs = require("fs"), path = require("path");
+      const roots = [process.argv[1] + "/@deepseek-ai",
+                     process.argv[1] + "/@deepseek-ai/dsh/node_modules/@deepseek-ai"];
+      const seen = new Map();
+      for (const dir of roots) {
+        let names = [];
+        try { names = fs.readdirSync(dir); } catch { continue; }
+        for (const name of names) {
+          const manifest = path.join(dir, name, "package.json");
+          try {
+            const version = JSON.parse(fs.readFileSync(manifest, "utf8")).version;
+            if (!seen.has(name)) seen.set(name, version);
+          } catch {}
+        }
+      }
+      for (const name of [...seen.keys()].sort())
+        console.log("  @deepseek-ai/" + name + " " + seen.get(name));
+    ' "$root_dir" || echo "  (перечислить не удалось)"
+  fi
 }
 
 # Скачивание и проверка целостности suite ротации учёток (#215). Единственное
