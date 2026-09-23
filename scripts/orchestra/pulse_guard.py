@@ -53,6 +53,7 @@ PAUSE_MARKER ставится только сигнальным коммента
 импортирует их вместе с gh()/parse_time().
 """
 
+import contextlib
 import hashlib
 import html
 import importlib.util
@@ -751,6 +752,10 @@ def announce_write_mode() -> str:
 # добавленный в одну, молча не попал бы во вторую).
 _gh_call_is_write = review_labels.is_write_call
 
+#: Часовой «в кэше нет» — отличает отсутствие ключа от закэшированного None
+#: (ответ 204 без тела — это валидный None, а не промах).
+_MISS = object()
+
 
 class WriteGateSkipped(RuntimeError):
     """Гейт прод-записи (prod_writes_allowed) отказал: вызов НЕ ушёл в сеть
@@ -763,8 +768,79 @@ class WriteGateSkipped(RuntimeError):
     их нельзя терять за одним сообщением."""
 
 
+#: Кэш ответов на читающие вызовы, ВЫКЛЮЧЕННЫЙ по умолчанию (#1483). None —
+#: выключен, dict — включён на этот процесс.
+#:
+#: Класс одной фразой: один и тот же GET к GitHub API выполняется несколько
+#: раз за один прогон — бюджет installation-токена тратится на ответы, которые
+#: уже получены. Замер инспектора состояния (repo_invariants) на живом
+#: репозитории: 204 вызова за прогон, 55 из них повторы, один URL — 23 раза
+#: подряд. При лимите 5000/час и запуске инспектора каждые 15 минут ПЛЮС на
+#: каждый push/PR это выжигало бюджет, и 2026-09-23 обязательные `contract` и
+#: `mutation-claim` падали на 403 на PR #1480/#1464/#1482 подряд.
+#:
+#: Выключен по умолчанию сознательно: тот же помощник зовут МУТИРУЮЩИЕ потоки
+#: (scheduler), где чтение после записи обязано видеть новое состояние.
+#: Включает его вызывающий, который знает, что читает один согласованный
+#: снимок (repo_invariants.main). Вторая защита — на случай, если включит и
+#: мутирующий: ЛЮБОЙ изменяющий вызов сбрасывает кэш целиком (см. ниже), так
+#: что «прочитал устаревшее после собственной записи» невозможно
+#: конструктивно, а не по договорённости.
+_READ_CACHE: dict[tuple[str, ...], object] | None = None
+
+
+def enable_read_cache() -> None:
+    """Включить кэш читающих вызовов на этот процесс и очистить его."""
+    global _READ_CACHE
+    _READ_CACHE = {}
+
+
+def disable_read_cache() -> None:
+    """Вернуть поведение по умолчанию (кэша нет)."""
+    global _READ_CACHE
+    _READ_CACHE = None
+
+
+@contextlib.contextmanager
+def read_cache():
+    """Кэш на время блока — и ни секундой дольше.
+
+    Парные enable/disable были первой редакцией и протекли в первом же полном
+    прогоне тестов (#1483): `repo_invariants.main()` включал кэш и не выключал,
+    процесс pytest жил дальше, и два теста планировщика в ДРУГОМ файле получили
+    ответы из чужого снимка. В проде процесс завершается сразу и течь не видно —
+    ровно тот случай, когда область видимости обязана быть конструкцией, а не
+    дисциплиной. Вложенность допустима: внутренний блок восстанавливает
+    состояние внешнего, а не выключает кэш насовсем."""
+    global _READ_CACHE
+    previous = _READ_CACHE
+    _READ_CACHE = {}
+    try:
+        yield
+    finally:
+        _READ_CACHE = previous
+
+
+def read_cache_size() -> int:
+    """Сколько ответов лежит в кэше. Нужен гвардии и отчётам — иначе «кэш
+    работает» проверялось бы прозой."""
+    return 0 if _READ_CACHE is None else len(_READ_CACHE)
+
+
 def gh(*args: str) -> dict | list | None:
-    if _gh_call_is_write(args) and not prod_writes_allowed():
+    write = _gh_call_is_write(args)
+    if _READ_CACHE is not None:
+        if write:
+            # Состояние на сервере только что изменилось — всё, что мы о нём
+            # знали, устарело. Сбрасываем целиком: точечная инвалидация по
+            # URL требовала бы знать, какие чтения затронула запись, а это
+            # второе место правды про семантику маршрутов.
+            _READ_CACHE.clear()
+        else:
+            cached = _READ_CACHE.get(tuple(args), _MISS)
+            if cached is not _MISS:
+                return cached  # type: ignore[return-value]
+    if write and not prod_writes_allowed():
         print(
             f"::warning::DRY-RUN (вне GitHub Actions — {ALLOW_PROD_WRITES_ENV} больше не "
             f"снимает этот запрет, issue #1074) — изменяющий вызов пропущен: "
@@ -781,7 +857,12 @@ def gh(*args: str) -> dict | list | None:
         raise RuntimeError(f"gh api {' '.join(args[:2])}: {result.stderr.strip()}")
     # Часть успешных вызовов (например, POST .../dispatches) отвечает 204 без
     # тела — отсутствие JSON это успех, а не ошибка разбора.
-    return json.loads(result.stdout) if result.stdout.strip() else None
+    payload = json.loads(result.stdout) if result.stdout.strip() else None
+    # В кэш кладётся ТОЛЬКО удачное чтение: отказ (RuntimeError выше) сюда не
+    # доходит, и «запомнить ошибку на весь прогон» невозможно.
+    if _READ_CACHE is not None and not write:
+        _READ_CACHE[tuple(args)] = payload
+    return payload
 
 
 def parse_time(raw: str) -> datetime:
