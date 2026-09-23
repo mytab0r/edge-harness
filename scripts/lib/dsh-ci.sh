@@ -1710,17 +1710,22 @@ dsh_chain_head_max_tokens() { # chain_json -> потолок ответа для
 # Отказ привязан к ID МОДЕЛИ, а не к аккаунту (#1309). Разделение осей: пока
 # провайдер отвечает «такой модели нет / она снята / её параметры не те» —
 # аккаунт жив, и правильный следующий шаг это ДРУГАЯ МОДЕЛЬ того же
-# аккаунта, а не следующий аккаунт. Прод-формы (все четыре — дословно из
-# живых прогонов, не пересказ):
+# аккаунта, а не следующий аккаунт. Прод-формы (все три — дословно из живых
+# прогонов, не пересказ):
 #   dsh: HTTP_410: DeepSeek API error (HTTP 410)      — id снят провайдером
 #                                                       (worker.yml 35010410097)
-#   dsh: HTTP_404: modelCode does not exist           — id не существует
-#                                                       (прогон 33572445063, PR #190)
 #   dsh: INVALID_REQUEST: max_tokens (131072) exceeds model's maximum output
 #     tokens (65536) for model nemotron-3-ultra       — потолок ЭТОЙ модели
 #                                                       (worker.yml 34730173870)
 #   UNKNOWN_MODEL                                     — id не принят каталогом
 #                                                       (worker.yml 34753001158, #1130)
+#
+# ЧЕТВЁРТАЯ форма, `dsh: HTTP_404: …`, отсюда УБРАНА (#1494): она попала в
+# список как «id не существует» по прогону 33572445063, но 404 этого не
+# доказывает — см. _dsh_failure_is_model_ambiguous ниже и замер
+# docs/research/28-provider-chain-truth-table.md. Список правится здесь, а не
+# только у функции, ровно потому, что две копии одного правила расходятся и
+# правят не ту (CLAUDE.md).
 #
 # Функция НЕ решает, переключаться ли на следующего ПРОВАЙДЕРА — это
 # по-прежнему dsh_chain_should_advance, и её решение не меняется ни для
@@ -1737,8 +1742,8 @@ _dsh_failure_is_model_scoped() { # err_file
 # 404 сюда НЕ входит (#1494): он не различает «такой модели нет» и «такого
 # маршрута нет». Замер 2026-09-23 (docs/research/28-provider-chain-truth-table.md):
 # GLM отдал `HTTP_404/EMPTY_RESPONSE` через цепочку и HTTP 200 прямым вызовом
-# `<base_url>/chat/completions` — тот же id, тот же ключ, тот же раннер, 20
-# минут спустя. Вердикт `dead_model` отправлял следующего агента «узнать
+# `<base_url>/chat/completions` — тот же id, тот же секрет, тот же день (03:51
+# UTC против 13:03 UTC, раннеры разные). Вердикт `dead_model` отправлял следующего агента «узнать
 # точный id модели», то есть чинить то, что не сломано.
 #
 # Поведение не меняется — следующая модель ТОГО ЖЕ провайдера пробуется, это
@@ -1850,7 +1855,7 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
   local count i=0 stop=0 entry name base_url secret_env key reset_hint cap_note
   local quota_state_json
   local candidates cand_count ci cand model max_tokens
-  local confirmed_any model_scoped_last provider_outcome provider_rl_used
+  local confirmed_any model_scoped_last model_ambiguous_last provider_outcome provider_rl_used
   count=$(jq 'length' <<<"$DSH_PROVIDER_CHAIN")
   DSH_CHAIN_PROVIDER=""
   DSH_CHAIN_MODEL=""
@@ -2004,7 +2009,11 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
         provider_outcome="dead_model"
       elif [ "$model_ambiguous_last" = 1 ]; then
         # Отдельный класс, а не «dead_model» и не «transient»: первый утверждал
-        # бы недоказанное, второй советовал бы бессмысленный повтор (#1494).
+        # бы недоказанное («id мёртв»), второй — что повтор поможет. Поможет ли
+        # повтор, этим замером НЕ установлено (#1494): 404 у NVIDIA NIM уже
+        # наблюдался перемежающимся, то есть повторяемым, а у GLM тот же 404
+        # держался при живом 200 прямым вызовом. Поэтому повтор не объявляется
+        # ни полезным, ни бесполезным — называется неустановленным.
         provider_outcome="model_unclear"
       else
         case "$DSH_RUN_FAILURE_REASON" in
