@@ -320,7 +320,14 @@ def check_same_tick_age_branch(source: str, consumer_call: str, text_func: str) 
             "в этом тексте — проверка не выполнялась",
         )
     tick_var = same_tick.group(1)
-    consumer_body = extract_braced_source(source, rf"^\s*{re.escape(consumer_call)}\(")
+    # `async` перед именем метода допускается ровно так же, как у text_func
+    # ниже. Без этого пометка метода асинхронным ТИХО превращала проверку в
+    # not_applicable — «не проверяли» вместо «прошло», то есть гвардия
+    # переставала работать от правки, к её предмету отношения не имеющей
+    # (поймано живым прогоном на #1495, где #tickPulseAlert стал async).
+    consumer_body = extract_braced_source(
+        source, rf"^\s*(?:async\s+)?{re.escape(consumer_call)}\("
+    )
     if consumer_body is None:
         return SameTickVerdict(
             "not_applicable",
