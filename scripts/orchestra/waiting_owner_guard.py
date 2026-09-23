@@ -555,7 +555,7 @@ def waiting_owner_check(repo: str, now: datetime) -> list[str]:
             # options (#254, PR #486) непуст по построению: ветка «вариантов
             # нет» отработала выше и до сюда не доходит. Telegram-сообщение
             # уходит с инлайн-кнопками (webhook callback_query принят мордой).
-            delivered = escalate(repo, issue["number"], text, options=options)
+            delivered = escalate(repo, issue["number"], text, options=options, category="decision")
             lines.append(f"🚨 #{issue['number']}: нужен выбор владельца — сигнал ({delivered})")
         else:
             lines.append(f"🔇 #{issue['number']}: нужен выбор владельца "

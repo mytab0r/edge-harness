@@ -163,7 +163,7 @@ def escalate_rollback(
         repo, run_id, rollback_confirmed, post_rollback_ok, canary_ran, server_url,
         backend_down,
     )
-    return escalate(repo, WATCHDOG_ISSUE, text)
+    return escalate(repo, WATCHDOG_ISSUE, text, category="breakage")
 
 
 def verdict_is_backend_down(canary_verdict: str | None) -> bool:

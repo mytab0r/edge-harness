@@ -929,7 +929,7 @@ def test_gate_main_throttles_when_measured_recently(monkeypatch, tmp_path):
     monkeypatch.setattr(qw, "scan_measurement_history",
                          lambda *a, **k: qw.MeasurementScan(3.0, 3.0, True, qw.SCAN_EXACT, 1))
     escalated = []
-    monkeypatch.setattr(qw.pulse_guard, "escalate", lambda *a: escalated.append(a) or "x")
+    monkeypatch.setattr(qw.pulse_guard, "escalate", lambda *a, **_: escalated.append(a) or "x")
     closed = []
     monkeypatch.setattr(qw, "close_stale_episode_if_needed", lambda repo: closed.append(repo))
 
@@ -951,7 +951,7 @@ def test_gate_main_failure_attempt_throttles_and_fresh_success_closes_episode(mo
     monkeypatch.setattr(qw, "scan_measurement_history",
                          lambda *a, **k: qw.MeasurementScan(3.0, 12.0, True, qw.SCAN_EXACT, 2))
     escalated = []
-    monkeypatch.setattr(qw.pulse_guard, "escalate", lambda *a: escalated.append(a) or "x")
+    monkeypatch.setattr(qw.pulse_guard, "escalate", lambda *a, **_: escalated.append(a) or "x")
     closed = []
     monkeypatch.setattr(qw, "close_stale_episode_if_needed", lambda repo: closed.append(repo))
 
@@ -1280,7 +1280,7 @@ def test_stale_alert_escalates_on_first_observation(monkeypatch):
     monkeypatch.setattr(qw.pulse_guard, "issue_marker_times", lambda repo, issue, marker, **_kw: [])
     escalated = []
     monkeypatch.setattr(qw.pulse_guard, "escalate",
-                         lambda repo, issue, text: escalated.append(text) or "Telegram: доставлен; след в #120: оставлен")
+                         lambda repo, issue, text, **_: escalated.append(text) or "Telegram: доставлен; след в #120: оставлен")
 
     result = qw.stale_alert(REPO, datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc), 60.0,
                              "шаг 'Замер квоты (Cloudflare)' самого свежего завершённого прогона упал (failure)")
@@ -1301,7 +1301,7 @@ def test_stale_alert_text_names_version_check_failure_as_fact(monkeypatch):
     monkeypatch.setattr(qw.pulse_guard, "issue_marker_times", lambda repo, issue, marker, **_kw: [])
     escalated = []
     monkeypatch.setattr(qw.pulse_guard, "escalate",
-                         lambda repo, issue, text: escalated.append(text) or "Telegram: доставлен; след в #120: оставлен")
+                         lambda repo, issue, text, **_: escalated.append(text) or "Telegram: доставлен; след в #120: оставлен")
 
     reason = ("шаг упал (failure); кроме того, версию исполняемого workflow подтвердить не удалось: "
               "dial tcp: timeout")
@@ -1321,7 +1321,7 @@ def test_stale_alert_dedupes_within_same_open_episode(monkeypatch):
         return [open_time] if marker == qw.STALE_MARKER else []
     monkeypatch.setattr(qw.pulse_guard, "issue_marker_times", fake_marker_times)
     escalated = []
-    monkeypatch.setattr(qw.pulse_guard, "escalate", lambda repo, issue, text: escalated.append(text) or "x")
+    monkeypatch.setattr(qw.pulse_guard, "escalate", lambda repo, issue, text, **_: escalated.append(text) or "x")
 
     result = qw.stale_alert(REPO, datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc), 60.0, "прогонов не найдено вовсе")
 
@@ -1341,7 +1341,7 @@ def test_stale_alert_dedupes_repeated_version_check_network_failure(monkeypatch)
         return [open_time] if marker == qw.STALE_MARKER else []
     monkeypatch.setattr(qw.pulse_guard, "issue_marker_times", fake_marker_times)
     escalated = []
-    monkeypatch.setattr(qw.pulse_guard, "escalate", lambda repo, issue, text: escalated.append(text) or "x")
+    monkeypatch.setattr(qw.pulse_guard, "escalate", lambda repo, issue, text, **_: escalated.append(text) or "x")
 
     reason = ("шаг упал (failure); кроме того, версию исполняемого workflow подтвердить не удалось: "
               "dial tcp: timeout")
@@ -1365,7 +1365,7 @@ def test_stale_alert_dedup_skip_note_travels_in_escalation_text(monkeypatch):
     monkeypatch.setattr(qw.pulse_guard, "issue_marker_times", broken_markers)
     escalated = []
     monkeypatch.setattr(qw.pulse_guard, "escalate",
-                         lambda repo, issue, text: escalated.append(text)
+                         lambda repo, issue, text, **_: escalated.append(text)
                          or "Telegram: доставлен; след в #120: оставлен")
 
     result = qw.stale_alert(REPO, datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc), 60.0, "прогонов не найдено вовсе")
@@ -1385,7 +1385,7 @@ def test_stale_alert_reopens_after_episode_closed(monkeypatch):
         return [datetime(2026, 9, 7, 10, 0, tzinfo=timezone.utc)]
     monkeypatch.setattr(qw.pulse_guard, "issue_marker_times", fake_marker_times)
     escalated = []
-    monkeypatch.setattr(qw.pulse_guard, "escalate", lambda repo, issue, text: escalated.append(text) or "x")
+    monkeypatch.setattr(qw.pulse_guard, "escalate", lambda repo, issue, text, **_: escalated.append(text) or "x")
 
     result = qw.stale_alert(REPO, datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc), 60.0, "прогонов не найдено вовсе")
 
@@ -1627,7 +1627,7 @@ def test_stale_alert_reads_only_fresh_page_of_watchdog_history(monkeypatch):
     monkeypatch.setattr(qw.pulse_guard, "gh", fake_gh)
     escalated = []
     monkeypatch.setattr(qw.pulse_guard, "escalate",
-                         lambda repo, issue, text: escalated.append(text) or "Telegram: доставлен")
+                         lambda repo, issue, text, **_: escalated.append(text) or "Telegram: доставлен")
 
     result = qw.stale_alert(REPO, datetime.now(timezone.utc), 60.0, "шаг упал (failure)")
 

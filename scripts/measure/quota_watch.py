@@ -1251,11 +1251,11 @@ def stale_alert(repo: str, now: datetime, age_minutes: float, reason: str,
                  "повтор может означать дедуп-пропуск, а не новый эпизод.")
         print(f"::warning::quota_watch: история #{pulse_guard.WATCHDOG_ISSUE} недоступна, "
               f"дедуп эпизода простоя пропущен, сигнал уходит как есть: {error}", file=sys.stderr)
-        result = pulse_guard.escalate(repo, pulse_guard.WATCHDOG_ISSUE, text)
+        result = pulse_guard.escalate(repo, pulse_guard.WATCHDOG_ISSUE, text, category="breakage")
         return f"замер простаивал — {result} (дедуп пропущен: история #{pulse_guard.WATCHDOG_ISSUE} недоступна)"
     if not pulse_guard.episode_reopened(open_times, close_times):
         return "замер простаивал — уже сообщено в этом эпизоде (дедуп)"
-    result = pulse_guard.escalate(repo, pulse_guard.WATCHDOG_ISSUE, text)
+    result = pulse_guard.escalate(repo, pulse_guard.WATCHDOG_ISSUE, text, category="breakage")
     return f"замер простаивал — {result}"
 
 

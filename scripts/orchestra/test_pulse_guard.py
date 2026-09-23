@@ -516,7 +516,7 @@ def test_escalate_without_options_keeps_old_signature_behaviour(monkeypatch):
     sent = []
     monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
     monkeypatch.setattr(pg, "send_telegram", lambda text, reply_markup=None, **_kw: sent.append(reply_markup) or True)
-    result = pg.escalate("o/r", 120, "обычная эскалация")
+    result = pg.escalate("o/r", 120, "обычная эскалация", category="breakage")
     assert sent == [None]  # старые вызовы (без options) не порождают клавиатуру
     assert "доставлен" in result
 
@@ -525,7 +525,8 @@ def test_escalate_with_options_sends_decision_keyboard(monkeypatch):
     monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: None)
     sent = []
     monkeypatch.setattr(pg, "send_telegram", lambda text, reply_markup=None, **_kw: sent.append(reply_markup) or True)
-    pg.escalate("o/r", 471, "Нужно решение владельца", options=["Вариант А", "Вариант Б"])
+    pg.escalate("o/r", 471, "Нужно решение владельца", options=["Вариант А", "Вариант Б"],
+                category="decision")
     assert sent[0] == pg.build_decision_keyboard(471, ["Вариант А", "Вариант Б"])
 
 
@@ -540,7 +541,7 @@ def test_escalate_reports_comment_skipped_not_left_when_write_gated(monkeypatch)
     monkeypatch.setattr(pg, "subprocess", SimpleNamespace(
         run=lambda *a, **k: (_ for _ in ()).throw(AssertionError("subprocess.run не должен вызываться"))))
     monkeypatch.setattr(pg, "send_telegram", lambda *a, **k: False)
-    result = pg.escalate("o/r", 120, "текст эскалации")
+    result = pg.escalate("o/r", 120, "текст эскалации", category="breakage")
     assert result == "Telegram: НЕ доставлен; след в #120: пропущен (DRY-RUN)"
 
 
@@ -3325,3 +3326,157 @@ def test_failure_watch_task_body_passes_declared_dependency_gate():
     body_arg = next(a for a in calls[0] if a.startswith("body="))
     assert body_arg.rstrip().endswith("БЛОКИРУЕТСЯ: ничем")
     assert "failure-fingerprint: check:red:test" in body_arg  # дедуп по отпечатку жив
+
+
+# ── Кэш читающих вызовов на прогон (#1483) ──────────────────────────────────
+#
+# Класс одной фразой: один и тот же GET к GitHub API выполняется несколько раз
+# за один прогон — бюджет installation-токена тратится на ответы, которые уже
+# получены. Замер инспектора состояния: 204 вызова, 55 повторов, один URL —
+# 23 раза подряд; после фикса 149 вызовов и ни одного повтора.
+#
+# Стенд считает РЕАЛЬНЫЕ обращения к транспорту (подменён subprocess.run —
+# единственная граница с сетью), а не факт наличия кэша в исходнике: вырезанное
+# тело проверки прошло бы структурный тест молча.
+
+def _counting_transport(monkeypatch, answers=None):
+    """Подменяет границу с сетью и считает обращения. Возвращает список
+    аргументов каждого реального вызова."""
+    seen = []
+    answers = answers or {}
+
+    def fake_run(args, **kwargs):
+        seen.append(tuple(args))
+        key = tuple(args)
+        body = answers.get(key, '{"n": 1}')
+        return SimpleNamespace(returncode=0, stdout=body, stderr="")
+
+    monkeypatch.setattr(pg, "subprocess", SimpleNamespace(run=fake_run))
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_RUN_ID", "1")
+    return seen
+
+
+def test_read_cache_is_off_by_default(monkeypatch):
+    """Мутирующие потоки (scheduler) обязаны читать настоящее состояние —
+    умолчание «кэша нет» и есть та гарантия."""
+    seen = _counting_transport(monkeypatch)
+    pg.gh("repos/o/r/issues/1")
+    pg.gh("repos/o/r/issues/1")
+    assert len(seen) == 2, "кэш оказался включён по умолчанию"
+
+
+def test_enabled_cache_pays_for_the_same_read_once(monkeypatch):
+    """Ровно то, ради чего всё: 23 одинаковых запроса превращаются в один."""
+    with pg.read_cache():
+        seen = _counting_transport(monkeypatch)
+        for _ in range(23):
+            pg.gh("repos/o/r/actions/workflows/ai-review.yml/runs?per_page=100")
+        assert len(seen) == 1, f"реальных обращений {len(seen)}, а должно быть одно"
+        assert pg.read_cache_size() == 1
+
+
+def test_a_write_invalidates_everything_so_reads_after_it_are_real(monkeypatch):
+    """Вторая защита: если кэш включит мутирующий поток, «прочитал устаревшее
+    после собственной записи» обязано быть невозможно конструктивно."""
+    with pg.read_cache():
+        seen = _counting_transport(monkeypatch)
+        pg.gh("repos/o/r/issues/1")
+        pg.gh("-X", "POST", "repos/o/r/issues/1/comments", "-f", "body=x")
+        pg.gh("repos/o/r/issues/1")
+        reads = [call for call in seen if "-X" not in call]
+        assert len(reads) == 2, "чтение после записи отдано из кэша — это silent-wrong"
+
+
+def test_a_write_is_never_served_from_cache(monkeypatch):
+    """Повтор изменяющего вызова обязан уйти в сеть: «уже делали» не значит
+    «сделано снова»."""
+    with pg.read_cache():
+        seen = _counting_transport(monkeypatch)
+        pg.gh("-X", "POST", "repos/o/r/issues/1/comments", "-f", "body=x")
+        pg.gh("-X", "POST", "repos/o/r/issues/1/comments", "-f", "body=x")
+        assert len(seen) == 2
+
+
+def test_empty_body_answer_is_cached_not_treated_as_a_miss(monkeypatch):
+    """204 без тела — валидный ответ None. Если считать его промахом, кэш
+    молча перестанет работать ровно на таких маршрутах."""
+    with pg.read_cache():
+        seen = _counting_transport(monkeypatch, {("gh", "api", "repos/o/r/quiet"): ""})
+        assert pg.gh("repos/o/r/quiet") is None
+        assert pg.gh("repos/o/r/quiet") is None
+        assert len(seen) == 1
+
+
+def test_a_failed_read_is_not_remembered(monkeypatch):
+    """Запомнить отказ на весь прогон — значит превратить одну сетевую
+    неудачу в неудачу всех инвариантов, читающих тот же URL."""
+    with pg.read_cache():
+        calls = []
+
+        def flaky(args, **kwargs):
+            calls.append(tuple(args))
+            if len(calls) == 1:
+                return SimpleNamespace(returncode=1, stdout="", stderr="HTTP 403")
+            return SimpleNamespace(returncode=0, stdout='{"n": 1}', stderr="")
+
+        monkeypatch.setattr(pg, "subprocess", SimpleNamespace(run=flaky))
+        monkeypatch.setenv("GITHUB_ACTIONS", "true")
+        monkeypatch.setenv("GITHUB_RUN_ID", "1")
+        with pytest.raises(RuntimeError):
+            pg.gh("repos/o/r/issues/1")
+        assert pg.gh("repos/o/r/issues/1") == {"n": 1}
+        assert len(calls) == 2
+
+
+def test_cache_scope_does_not_outlive_the_block(monkeypatch):
+    """Первая редакция была парной (enable/disable) и протекла в ДРУГОЙ файл
+    тестов: `repo_invariants.main()` включал кэш и не выключал. Область
+    видимости обязана быть конструкцией, а не дисциплиной вызывающего."""
+    seen = _counting_transport(monkeypatch)
+    with pg.read_cache():
+        pg.gh("repos/o/r/issues/1")
+        pg.gh("repos/o/r/issues/1")
+    assert len(seen) == 1
+    pg.gh("repos/o/r/issues/1")
+    pg.gh("repos/o/r/issues/1")
+    assert len(seen) == 3, "кэш пережил блок — чужой прогон получит наш снимок"
+
+
+# ── Тема решений содержит ТОЛЬКО сообщения с кнопками (#1490) ───────────────
+#
+# Живой случай: владелец открыл «🟣 Решения владельца» и увидел там алерт о
+# квоте DO и сообщение предохранителя конвейера — без единой кнопки. Причина:
+# категория была зашита ВНУТРЬ общего канала escalate(), а его зовут сорок
+# мест по любому поводу. Здесь эта ошибка становится невозможной.
+
+def test_decision_category_without_buttons_is_a_loud_refusal(monkeypatch):
+    """Без вариантов решения категория decision запрещена: это и есть то, что
+    владелец увидел в теме."""
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a, **k: None)
+    monkeypatch.setattr(pg, "send_telegram",
+                        lambda *a, **k: pytest.fail("сигнал не должен уйти вовсе"))
+    with pytest.raises(ValueError) as caught:
+        pg.escalate("o/r", 120, "алерт без кнопок", category="decision")
+    assert "кнопками" in str(caught.value)
+
+
+def test_buttons_without_the_decision_category_are_a_loud_refusal(monkeypatch):
+    """Обратная сторона: вопрос с кнопками, уехавший в тему шума, владелец не
+    найдёт. Инвариант двусторонний, иначе он закрывает половину класса."""
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a, **k: None)
+    monkeypatch.setattr(pg, "send_telegram",
+                        lambda *a, **k: pytest.fail("сигнал не должен уйти вовсе"))
+    with pytest.raises(ValueError):
+        pg.escalate("o/r", 471, "вопрос", options=["А", "Б"], category="pipeline")
+
+
+def test_matching_pairs_pass(monkeypatch):
+    """Положительная сторона обоих: правильные сочетания проходят."""
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a, **k: None)
+    sent = []
+    monkeypatch.setattr(pg, "send_telegram",
+                        lambda text, reply_markup=None, **kw: sent.append(kw.get("category")) or True)
+    pg.escalate("o/r", 120, "поломка", category="breakage")
+    pg.escalate("o/r", 471, "вопрос", options=["А"], category="decision")
+    assert sent == ["breakage", "decision"]

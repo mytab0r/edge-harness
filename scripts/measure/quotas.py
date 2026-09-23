@@ -487,7 +487,7 @@ def main() -> int:
         print(text)
         print(f"::warning::квота харнеса перевалила за {THRESHOLD_PCT}%: "
               + ", ".join(r.resource for r in breached))
-        result = pulse_guard.escalate(repo, pulse_guard.WATCHDOG_ISSUE, text)
+        result = pulse_guard.escalate(repo, pulse_guard.WATCHDOG_ISSUE, text, category="breakage")
         print(result)
         # Находка ревью PR #327: escalate() — best-effort по обоим каналам
         # (Telegram, след в issue), возврат печатался, но не проверялся, и

@@ -31,11 +31,20 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HARNESS_TS = REPO_ROOT / "cf-worker" / "src" / "harness.ts"
 
-# Единственные санкционированные владельцы прямого GROUP BY — каждый обязан
-# быть гейтед своим кэш-полем (см. test_cached_getters_are_actually_gated).
+# Единственные санкционированные владельцы прямого GROUP BY. Значение — ключ
+# ВИДА агрегата в таблице `counts_cache`, которым геттер обязан и читать, и
+# писать (см. test_cached_getters_are_actually_gated).
+#
+# До #1487 здесь стояло имя ПОЛЯ ОБЪЕКТА (`#taskCountsCache`), и это оказалось
+# проверкой не того: поле живёт в памяти, а DO выгружается через ~10 с простоя,
+# поэтому кэш был холодным почти на каждом запросе — гвардия была зелёной, пока
+# счётчики пересчитывались полным GROUP BY по 6 900 строк на вызов. Хранилище
+# переехало в SQL (`counts_cache`, рядом с `pulse`/`retention_state`/
+# `storage_probe`, которые живут там по этой же причине), и проверяется теперь
+# именно оно.
 ALLOWED_GETTERS = {
-    "#taskCounts": "#taskCountsCache",
-    "#msgCounts": "#msgCountsCache",
+    "#taskCounts": "tasks",
+    "#msgCounts": "messages",
 }
 
 
@@ -142,15 +151,32 @@ def test_status_body_has_no_inline_group_by():
 
 
 def test_cached_getters_are_actually_gated():
-    """Каждый санкционированный геттер и правда кэширован (`if (cache === null)`),
-    не просто содержит GROUP BY без защиты — иначе он ничем не лучше инлайна."""
+    """Каждый санкционированный геттер и правда кэширован, причём кэшем,
+    ПЕРЕЖИВАЮЩИМ выгрузку DO из памяти: читает `#cachedCounts(<вид>)` и пишет
+    `#storeCounts(<вид>, …)`, то есть строку в SQL, а не поле объекта.
+
+    Обе половины обязательны. Только чтение без записи — кэш, который никогда
+    не наполнится; только запись без чтения — GROUP BY на каждый вызов при
+    исправно растущей таблице. Ровно это и был #1487: поле-кэш существовало и
+    присваивалось, но между запросами объект успевал выгрузиться (~10 с
+    простоя, #329), и защита не срабатывала НИ РАЗУ при зелёной гвардии.
+
+    Гвардия структурная, и это названо вслух: она утверждает «в геттере есть
+    обе операции», а не «кэш реально попадает». Поведенческая половина живёт
+    в `cf-worker/test/harness.spec.ts` — там через `runInDurableObject` читается
+    НАСТОЯЩАЯ строка `counts_cache` после запроса; «результат совпал» совпадает
+    и на полностью холодном кэше, поэтому проверять надо факт в хранилище."""
     text = harness_text()
-    for getter, cache_field in ALLOWED_GETTERS.items():
+    for getter, kind in ALLOWED_GETTERS.items():
         body = extract_method_body(text, rf"{re.escape(getter)}\([^)]*\):[^{{]*\{{")
         assert "GROUP BY" in body, f"{getter}() больше не содержит GROUP BY — обнови ALLOWED_GETTERS"
-        assert f"{cache_field} === null" in body, (
-            f"{getter}() потерял проверку `{cache_field} === null` — GROUP BY внутри него "
-            "выполняется на каждый вызов, кэш существует только по имени (класс #320/#575)"
+        assert f'#cachedCounts("{kind}")' in body, (
+            f'{getter}() не читает #cachedCounts("{kind}") — GROUP BY внутри него выполняется '
+            "на каждый вызов, кэш существует только по имени (класс #320/#575/#1487)"
+        )
+        assert f'#storeCounts("{kind}"' in body, (
+            f'{getter}() не пишет #storeCounts("{kind}", …) — посчитанный агрегат никуда не '
+            "сохраняется, следующий вызов считает заново (класс #1487)"
         )
 
 

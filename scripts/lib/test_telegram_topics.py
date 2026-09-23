@@ -363,10 +363,23 @@ def _origin_env(origin, monkeypatch):
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
+#: Функции, вызов которых = отправка сигнала владельцу. `escalate` попал сюда
+#: не сразу, и это стоило живого случая (#1490): первая редакция гвардии
+#: разбирала ТОЛЬКО `send_telegram`, а `escalate` — один такой вызов, и
+#: категорию он называл. Проверялась не та граница: настоящие отправители —
+#: сорок вызывающих `escalate`, а не он сам. Владелец увидел в теме «Решения
+#: владельца» алерт о квоте и сообщение предохранителя конвейера.
+SENDER_FUNCTIONS = ("send_telegram", "escalate")
+
+
 def _sender_calls() -> list[tuple[str, int, ast.Call]]:
-    """Все вызовы `send_telegram(...)` в scripts/, кроме самих тестов.
+    """Все вызовы отправителей сигнала в scripts/, кроме самих тестов.
+
     Разбор AST, а не grep: `grep 'category='` прошёл бы и на упоминании в
-    комментарии, и на переносе строки внутри вызова."""
+    комментарии, и на переносе строки внутри вызова. Учитываются обе формы —
+    прямая (`escalate(...)`) и через атрибут (`pulse_guard.escalate(...)`):
+    половина вызывающих пользуется второй, и пропустить её значило бы
+    повторить ту же ошибку границы."""
     import ast as _ast
     found = []
     for path in sorted((REPO_ROOT / "scripts").rglob("*.py")):
@@ -374,18 +387,64 @@ def _sender_calls() -> list[tuple[str, int, ast.Call]]:
             continue
         tree = _ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in _ast.walk(tree):
-            if isinstance(node, _ast.Call) and getattr(node.func, "id", None) == "send_telegram":
+            if not isinstance(node, _ast.Call):
+                continue
+            name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+            if name in SENDER_FUNCTIONS:
                 found.append((str(path.relative_to(REPO_ROOT)), node.lineno, node))
     return found
+
+
+def _forwarding_functions() -> set[tuple[str, int]]:
+    """(файл, строка вызова) тех вызовов, что ПРОБРАСЫВАЮТ категорию своего
+    вызывающего, а не называют её сами.
+
+    Такой вызов существует ровно один — `escalate` передаёт категорию дальше в
+    `send_telegram`. Разрешается он не по имени функции, а по двум условиям
+    сразу: значение аргумента — голое имя `category`, И объемлющая функция
+    сама требует `category` как keyword-only БЕЗ умолчания. Второе условие
+    обязательно: проброс из функции с умолчанием — это та же зашитая
+    категория, только через переменную, то есть ровно дефект #1490 в обход
+    гвардии."""
+    import ast as _ast
+    allowed: set[tuple[str, int]] = set()
+    for path in sorted((REPO_ROOT / "scripts").rglob("*.py")):
+        if path.name.startswith("test_"):
+            continue
+        rel = str(path.relative_to(REPO_ROOT))
+        tree = _ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for func in _ast.walk(tree):
+            if not isinstance(func, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                continue
+            names = [a.arg for a in func.args.kwonlyargs]
+            if "category" not in names:
+                continue
+            if func.args.kw_defaults[names.index("category")] is not None:
+                continue  # есть умолчание — проброс не считается
+            for node in _ast.walk(func):
+                if not isinstance(node, _ast.Call):
+                    continue
+                inner = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+                if inner not in SENDER_FUNCTIONS:
+                    continue
+                kw = next((k for k in node.keywords if k.arg == "category"), None)
+                if isinstance(kw.value if kw else None, _ast.Name) and kw.value.id == "category":
+                    allowed.add((rel, node.lineno))
+    return allowed
 
 
 def test_every_sender_names_a_known_category():
     """Сигнал без категории — это возврат к одному потоку, а узнать об этом из
     прода дороже, чем из CI. Проверяется ФАКТ вызова, не наличие подстроки."""
     calls = _sender_calls()
-    assert calls, "ни одного вызова send_telegram не найдено — гвардия смотрит не туда"
+    assert len(calls) > 30, (
+        f"найдено всего {len(calls)} вызовов отправителей — гвардия смотрит не туда; "
+        "на момент #1490 их было сорок с лишним")
+    forwarding = _forwarding_functions()
     problems = []
     for rel, line, node in calls:
+        if (rel, line) in forwarding:
+            continue  # проброс категории вызывающего — проверяется у него
         keyword = next((k for k in node.keywords if k.arg == "category"), None)
         if keyword is None:
             problems.append(f"{rel}:{line}: вызов без category=")
