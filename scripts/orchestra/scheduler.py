@@ -3760,6 +3760,7 @@ def after_merge(
         if send_telegram(
             merge_telegram_text(repo, pull["number"], tg_task_number, tg_task_title),
             as_html=True,
+            category="pipeline",
         ):
             actions.append(f"📣 Telegram: «#{tg_task_number} выполнена — слито в main» доставлено")
         else:

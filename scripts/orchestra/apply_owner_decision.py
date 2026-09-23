@@ -389,7 +389,8 @@ def notify_refusal(repo: str, issue_number: int, option: int,
         print(f"::warning::apply_owner_decision: след отказа в #{issue_number} НЕ записан "
               f"({error}) — причина осталась только в этом логе", file=sys.stderr)
 
-    if send_telegram(refusal_telegram_text(repo, issue_number, option, refusal)):
+    if send_telegram(refusal_telegram_text(repo, issue_number, option, refusal),
+                     category="decision"):
         print("apply_owner_decision: владельцу отправлено уведомление об отказе")
     else:
         print("::warning::apply_owner_decision: уведомление владельцу НЕ отправлено — "

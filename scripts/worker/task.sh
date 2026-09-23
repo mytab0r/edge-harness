@@ -243,10 +243,22 @@ fi
 # parse_mode=HTML — всегда (#170): без него Telegram рендерит plain text и
 # кликабельных ссылок не бывает. Второй отправитель репозитория —
 # pulse_guard.send_telegram; новых отправителей заводить нельзя, формат один.
-telegram_report() { # $1 — текст (динамические части — уже через tg_html)
+telegram_report() { # $1 — текст (уже через tg_html); $2 — категория (#1461/#1465)
   if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
     echo "::warning::TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID не заданы — Telegram-отчёт не отправлен"
     return 1
+  fi
+  # Категория обязательна и здесь: умолчание «всё остальное» и есть то
+  # состояние (один поток), из которого уходим. Реестр и карта тем — в
+  # scripts/lib/telegram_topics.py, второй копии логики в bash нет.
+  if [ -z "${2:-}" ]; then
+    echo "::error::telegram_report вызван без категории — см. scripts/lib/telegram_topics.py"
+    return 1
+  fi
+  local thread_args=() thread_id=""
+  thread_id=$(python3 "$SCRIPT_DIR/../lib/telegram_topics.py" resolve "$2" || true)
+  if [ -n "$thread_id" ]; then
+    thread_args=(--data-urlencode "message_thread_id=$thread_id")
   fi
   # Уровень warning: комментарий в задаче остаётся местом правды, отказ
   # Telegram не фатален (см. сообщение ниже). Тело ответа при этом печатается:
@@ -259,6 +271,7 @@ telegram_report() { # $1 — текст (динамические части —
       "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
       --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
       --data-urlencode "parse_mode=HTML" \
+      "${thread_args[@]}" \
       --data-urlencode "text=$1" >/dev/null; then
     echo "::warning::Telegram не принял отчёт — комментарий в задаче остаётся местом правды"
     return 1
@@ -892,7 +905,7 @@ COMMENT
   # (parse_mode=HTML в telegram_report), заголовок — первые 6 слов,
   # экранированные tg_html.
   pr_number=${pr_url##*/}
-  telegram_report "🤖 worker: PR ${verb} — <a href=\"${pr_url}\">#${pr_number}</a> по задаче <a href=\"https://github.com/${GITHUB_REPOSITORY}/issues/${number}\">#${number}</a> «$(tg_html "$(short_title "$title")")»" || true
+  telegram_report "🤖 worker: PR ${verb} — <a href=\"${pr_url}\">#${pr_number}</a> по задаче <a href=\"https://github.com/${GITHUB_REPOSITORY}/issues/${number}\">#${number}</a> «$(tg_html "$(short_title "$title")")»" "pipeline" || true
   echo "PR $verb: $pr_url — job зелёный"
   exit 0
 fi
@@ -921,7 +934,7 @@ $ANSWER_TAIL
 COMMENT
   )
   gh issue comment "$number" --body "$comment" >/dev/null
-  telegram_report "worker: задача #$number — эскалация владельцу (метка blocked)" || true
+  telegram_report "worker: задача #$number — эскалация владельцу (метка blocked)" "decision" || true
   echo "Эскалация оформлена (blocked) — job зелёный, ждём владельца"
   exit 0
 fi
@@ -1051,7 +1064,7 @@ $ANSWER_TAIL
 COMMENT
   )
   gh issue comment "$number" --body "$comment" >/dev/null
-  telegram_report "worker: задача #$number — $failure_kind ($reason). Задача возвращена в пул" || true
+  telegram_report "worker: задача #$number — $failure_kind ($reason). Задача возвращена в пул" "pipeline" || true
   if [ "$job_exit" != "green" ]; then
     die "$failure_kind: $reason"
   fi
@@ -1119,5 +1132,5 @@ $ANSWER_TAIL
 COMMENT
   )
 gh issue comment "$number" --body "$comment" >/dev/null
-telegram_report "worker: задача #$number — ПРОВАЛ ($reason). Детали в задаче" || true
+telegram_report "worker: задача #$number — ПРОВАЛ ($reason). Детали в задаче" "breakage" || true
 die "Воркер не справился: $reason"
