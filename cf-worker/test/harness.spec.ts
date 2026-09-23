@@ -426,6 +426,92 @@ describe("watchdog зависших задач", () => {
 // не заводится. Докажи мутацией: убери `LIMIT ?`/подмени на `LIMIT 100000` в
 // RETENTION_TABLES[…].sql (src/harness.ts) — тест «пачка ограничена
 // RETENTION.batchSize» ниже покраснеет (останется 0 старых вместо остатка).
+// ── Кэш агрегатов переживает выгрузку DO (#1487) ────────────────────────────
+//
+// Класс одной фразой: счётчики задач и сообщений кэшировались в ПОЛЕ ОБЪЕКТА,
+// а DO выгружается из памяти через ~10 с простоя (см. комментарий у alarm()
+// в harness.ts) — кэш был холодным почти всегда, и каждый вызов #status()
+// делал полный GROUP BY по обеим таблицам.
+//
+// Замер, ради которого это чинится (2026-09-23, два среза quotas.yml в тихое
+// окно): 325 запросов к морде за сутки и 3,3 млн прочитанных строк, то есть
+// ~6 900 строк на ОДИН запрос; за 10 минут тишины +27 запросов, +185 097
+// строк. Квота rows_read общая на аккаунт; при её исчерпании DO отдаёт 500.
+//
+// Проверяется ФАКТ в хранилище (runInDurableObject -> state.storage.sql), а
+// не «результат совпал»: совпасть он может и при полностью холодном кэше —
+// ровно поэтому дефект и прожил незамеченным.
+describe("агрегаты статуса переживают выгрузку объекта (#1487)", () => {
+  const readCache = async (kind: string): Promise<string | null> => {
+    const stub = env.HARNESS.get(env.HARNESS.idFromName("owner"));
+    return runInDurableObject(stub, async (_instance, state) => {
+      const rows = state.storage.sql
+        .exec("SELECT json FROM counts_cache WHERE kind = ?", kind)
+        .toArray() as { json: string }[];
+      return rows.length ? String(rows[0].json) : null;
+    });
+  };
+
+  it("после /api/status агрегат ЛЕЖИТ В SQL, а не только в памяти объекта", async () => {
+    await postJson("/api/tasks", { task_id: uniqueTaskId("counts-persist"), prompt: "x" });
+    const status = await getJson<{ tasks: Record<string, number> }>("/api/status");
+
+    const cached = await readCache("tasks");
+    expect(cached).not.toBeNull();
+    // Кэш обязан нести РОВНО то, что ушло наружу: разойдись они — /api/status
+    // отдавал бы одно, а следующий вызов другое, и никто бы не заметил.
+    expect(JSON.parse(cached as string)).toEqual(status.tasks);
+  });
+
+  // Кэш проверяется на СВЕЖЕСТЬ, а не на «стал null»: создание задачи внутри
+  // того же запроса зовёт broadcastStatus(), и тот сразу пересчитывает
+  // агрегат. Первая редакция теста ждала null и краснела на исправном коде —
+  // поймано исполнением. Важно ровно одно: сохранённое значение обязано
+  // УЧИТЫВАТЬ новую запись, иначе инвалидация не сработала.
+  it("запись в tasks обновляет сохранённый агрегат, а не оставляет старый", async () => {
+    await getJson("/api/status");
+    const before = JSON.parse((await readCache("tasks")) as string) as Record<string, number>;
+
+    await postJson("/api/tasks", { task_id: uniqueTaskId("counts-invalidate"), prompt: "x" });
+
+    const after = JSON.parse((await readCache("tasks")) as string) as Record<string, number>;
+    expect(after.queued).toBe((before.queued ?? 0) + 1);
+
+    // И то, что отдаётся наружу, совпадает с сохранённым — иначе /api/status
+    // и кэш разошлись бы, и заметить это было бы нечем.
+    const status = await getJson<{ tasks: Record<string, number> }>("/api/status");
+    expect(status.tasks).toEqual(after);
+  });
+
+  it("агрегат сообщений живёт там же и обновляется приёмом сообщения", async () => {
+    await getJson("/api/status");
+    const before = JSON.parse((await readCache("messages")) as string) as Record<string, number>;
+
+    await postJson("/api/messages", {
+      source_msg_id: uniqueTaskId("counts-msg"),
+      text: "сообщение владельца",
+    });
+
+    const after = JSON.parse((await readCache("messages")) as string) as Record<string, number>;
+    expect(after.new).toBe((before.new ?? 0) + 1);
+  });
+
+  it("битый JSON в кэше — пересчёт, а не выдача мусора наружу", async () => {
+    await getJson("/api/status");
+    const stub = env.HARNESS.get(env.HARNESS.idFromName("owner"));
+    await runInDurableObject(stub, async (_instance, state) => {
+      state.storage.sql.exec(
+        "INSERT INTO counts_cache (kind, json) VALUES ('tasks', 'не json') " +
+        "ON CONFLICT(kind) DO UPDATE SET json = excluded.json",
+      );
+    });
+
+    const status = await getJson<{ tasks: Record<string, number> }>("/api/status");
+    expect(typeof status.tasks.queued).toBe("number");
+    expect(JSON.parse((await readCache("tasks")) as string)).toEqual(status.tasks);
+  });
+});
+
 describe("ретеншн DO SQLite (#306/#305)", () => {
   const HARNESS_ID = () => env.HARNESS.get(env.HARNESS.idFromName("owner"));
 
