@@ -17,6 +17,18 @@ name: telegram-webhook
 
 on:
   workflow_dispatch:
+  # Носитель инварианта «канал владельца жив» (#1477, AGENTS.md — «Инцидент
+  # оставляет инвариант»). До этого здоровье вебхука мерилось ТОЛЬКО по поводу
+  # деплоя морды и вручную — и поэтому канал простоял сломанным не меньше
+  # суток незамеченным: прогоны 35678303883 (2026-09-22 02:07) и 35801215616
+  # (2026-09-23 00:15) оба красные с одним и тем же
+  # last_error_message = "Wrong response from the webhook: 400 Bad Request",
+  # а между ними никто не спрашивал. Теперь спрашивает расписание: скрипт
+  # идемпотентен (нет ошибки — setWebhook не зовётся), стоит один прогон
+  # раннера раз в два часа, и падает он ровно тогда, когда очередь Telegram
+  # стоит, то есть когда нажатия кнопок владельца не доходят.
+  schedule:
+    - cron: "17 */2 * * *"
   # Смена HARNESS_URL или ротация TELEGRAM_WEBHOOK_SECRET требуют
   # перерегистрации — deploy-worker уже синхронизирует секрет в воркер
   # (#254), здесь синхронизируем его же в Telegram тем же поводом.
@@ -26,7 +38,14 @@ on:
 
 jobs:
   register:
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    # Расписание (#1477) обязано попадать сюда наравне с ручным запуском:
+    # без него job молча пропускался бы на каждом плановом прогоне, и
+    # «инвариант» был бы зелёным ничегонеделанием — ровно silent-wrong,
+    # который этот PR и закрывает.
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || github.event_name == 'schedule'
+      || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -45,5 +64,9 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
           HARNESS_URL: ${{ vars.HARNESS_URL }}
-          FAIL_ON_NOT_READY: ${{ github.event_name == 'workflow_dispatch' && 'true' || 'false' }}
+          # schedule — такой же явный вопрос «канал жив?», как ручной запуск:
+          # «не готово» на плановой проверке обязано быть громким. Тихий
+          # выход оставлен только автозапуску после deploy-worker, где
+          # «не готово» — ожидаемое переходное состояние выката.
+          FAIL_ON_NOT_READY: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && 'true' || 'false' }}
         run: python scripts/telegram/register_webhook.py

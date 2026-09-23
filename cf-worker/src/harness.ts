@@ -776,11 +776,18 @@ export function storageReadyAlertDecision(
 // ── Ошибки API ──────────────────────────────────────────────────────────────────────
 
 class ApiError extends Response {
+  /** Код отказа отдельным полем, а не только внутри тела JSON: читателю тела
+   *  пришлось бы его разбирать (и потратить единственное чтение стрима), а
+   *  #absorbForTelegramWebhook (#1477) называет причину в логе на каждом
+   *  отброшенном апдейте. */
+  readonly code: string;
+
   constructor(status: number, code: Parameters<typeof msg>[0], params: Record<string, string | number> = {}) {
     super(JSON.stringify({ error: { code, message: msg(code, params) } }), {
       status,
       headers: { "content-type": "application/json" },
     });
+    this.code = code;
   }
 }
 
@@ -959,7 +966,12 @@ export class Harness extends DurableObject<Env> {
       return this.#dropSession();
     }
     if (route.name === "messagesIngest") {
-      return this.#postMessageIngest(request, telegramAuthorized);
+      const handled = this.#postMessageIngest(request, telegramAuthorized);
+      // Единственная развилка «кто вызвал» для исхода ingest (#1477): вебхуку
+      // Telegram любой не-2xx запрещён, вызывающему по Bearer/куке прежние
+      // коды сохраняются. Ровно здесь — потому что `telegramAuthorized`
+      // вычисляется здесь же, и второго места, знающего транспорт, нет.
+      return telegramAuthorized ? this.#absorbForTelegramWebhook(handled) : handled;
     }
     if (route.name === "messages" && request.method === "GET") {
       return this.#getMessages(url);
@@ -2676,6 +2688,64 @@ export class Harness extends DurableObject<Env> {
    * апдейт из чужого чата ляжет в инбокс как «сообщение владельца». Вызывающий
    * по Bearer/куке уже доверен внутренним токеном — chat_id ему не навязываем.
    */
+  /**
+   * Исход обработки апдейта, пришедшего ЧЕРЕЗ ВЕБХУК Telegram, превращается в
+   * ответ вебхуку (#1477). Правило одно и без исключений: **не-2xx вебхуку
+   * Telegram не уходит никогда.**
+   *
+   * Почему это не вкусовщина. Telegram доставляет апдейты одного чата строго
+   * по порядку и на любой не-2xx ретраит ТОТ ЖЕ апдейт, а следующие держит за
+   * ним. Значит один апдейт, которому ретраи не помогут — фото без подписи
+   * (`need_text`), слишком длинный текст (`message_too_large`), сообщение из
+   * чужого чата (`unauthorized`), неразобранное тело (`bad_json`) — затыкает
+   * канал владельца ЦЕЛИКОМ, включая нажатия инлайн-кнопок решений. Живой
+   * случай: прогон `telegram-webhook` 35801215616 (2026-09-23),
+   * `getWebhookInfo.last_error_message = "Wrong response from the webhook:
+   * 400 Bad Request"`, владелец жмёт кнопку — клавиатура не снимается.
+   *
+   * Докстринг #postOwnerDecisionCallback знал это правило дословно, но
+   * применял его к одному исходу из семи (кривой `callback_data`). Здесь оно
+   * применено к исходу вообще — одним местом, а не семью правками мест
+   * броска: седьмое место добавят завтра, и оно будет прикрыто тем же кодом.
+   *
+   * НЕ silent-wrong: отброшенный апдейт громко виден в НАШЕМ логе
+   * (`console.error` с кодом и HTTP-статусом), а 200 уходит Telegram'у —
+   * это разные адресаты. Тело ответа тоже несёт причину машиночитаемо
+   * (`status: "ignored"`, `reason`, `http_status`), чтобы зонд маршрута и
+   * тесты различали «принято» и «отброшено» без разбора логов.
+   *
+   * Отмена решения PR #486 названа вслух: там 401 на чужой чат сочли
+   * оправданным, потому что «это фактически неавторизованный вызов». Отказ
+   * от обслуживания остаётся (апдейт не сохраняется, dispatch не уходит) —
+   * меняется только КОД ответа, и меняется потому, что 4xx у Telegram
+   * означает не «отклонено», а «повтори то же самое снова». В прежней
+   * редакции любой посторонний, написавший боту, навсегда глушил канал
+   * владельца одним сообщением.
+   *
+   * Путь по Bearer/куке сюда не заходит (см. развилку в #route): там ретраев
+   * нет, и 400 на кривой запрос — правильный ответ.
+   */
+  async #absorbForTelegramWebhook(handled: Promise<Response>): Promise<Response> {
+    let status: number;
+    let reason: string;
+    try {
+      const response = await handled;
+      if (response.status < 400) return response;
+      status = response.status;
+      reason = response instanceof ApiError ? response.code : "http_error";
+    } catch (error) {
+      if (error instanceof ApiError) {
+        status = error.status;
+        reason = error.code;
+      } else {
+        status = 500;
+        reason = error instanceof Error ? error.message : String(error);
+      }
+    }
+    console.error(`telegram_webhook: апдейт отброшен (${reason}), Telegram'у отвечаем 200 — иначе он ретраит и затыкает очередь (HTTP, который получил бы вызывающий по Bearer: ${status})`);
+    return this.#json({ status: "ignored", reason, http_status: status });
+  }
+
   #postMessageIngest(request: Request, viaTelegramWebhook: boolean): Promise<Response> {
     return this.#readJson(request).then((body) => {
       const callbackQuery = asObject(body.callback_query);
