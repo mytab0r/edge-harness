@@ -62,7 +62,9 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta
+from typing import NamedTuple
 from pathlib import Path
 
 # Заведение issue пула — одно место правды (pool_issue.create_pool_issue,
@@ -1801,7 +1803,80 @@ def edit_issue_comment(repo: str, comment_id: int, text: str) -> None:
     gh("-X", "PATCH", f"repos/{repo}/issues/comments/{comment_id}", "-f", "body=" + text)
 
 
-def send_telegram(text: str, as_html: bool = False, reply_markup: dict | None = None) -> bool:
+_telegram_topics_spec = importlib.util.spec_from_file_location(
+    "telegram_topics", Path(__file__).resolve().parent.parent / "lib" / "telegram_topics.py")
+telegram_topics = importlib.util.module_from_spec(_telegram_topics_spec)
+_telegram_topics_spec.loader.exec_module(telegram_topics)
+
+
+class TelegramSendResult(NamedTuple):
+    """Исход ОДНОЙ попытки sendMessage. `description` — то, что сказал сам
+    Telegram: по нему отличают «темы больше нет» от «сломалась отправка», и
+    лечатся эти два случая по-разному."""
+    ok: bool
+    description: str
+
+
+def _telegram_send_message(token: str, chat: str, payload_text: str,
+                           reply_markup: dict | None, thread_id: int | None) -> TelegramSendResult:
+    """Один вызов sendMessage.
+
+    `-sS` без `-f` намеренно (#1465): с `-f` curl отдаёт только код возврата, а
+    ТЕЛО ответа — единственное место, где Telegram называет причину
+    (`description`). Без причины «тему удалили» неотличимо от «сломалась сеть»,
+    и мы заводили бы тему заново на каждом таймауте."""
+    args = ["curl", "-sS", "--max-time", "30", "-X", "POST",
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            "--data-urlencode", f"chat_id={chat}",
+            "--data-urlencode", "parse_mode=HTML",
+            "--data-urlencode", f"text={payload_text}"]
+    if thread_id is not None:
+        args += ["--data-urlencode", f"message_thread_id={thread_id}"]
+    if reply_markup is not None:
+        args += ["--data-urlencode", f"reply_markup={json.dumps(reply_markup)}"]
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, encoding="utf-8")
+    except OSError as error:
+        return TelegramSendResult(False, f"curl недоступен: {error}")
+    if result.returncode != 0:
+        return TelegramSendResult(False, f"curl rc={result.returncode}: {result.stderr.strip()}")
+    try:
+        answer = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return TelegramSendResult(False, f"ответ Telegram не разобран: {result.stdout.strip()[:200]}")
+    if answer.get("ok"):
+        return TelegramSendResult(True, "")
+    return TelegramSendResult(False, str(answer.get("description") or "<без описания>"))
+
+
+def resolve_signal_topic(category: str, repo: str, token: str,
+                         chat: str) -> tuple[int | None, str]:
+    """`(message_thread_id, пометка)`. Пометка непустая ровно тогда, когда темы
+    не будет: она уходит В ТЕКСТ сигнала, чтобы владелец видел причину, а не
+    гадал, почему всё опять в одном потоке."""
+    if not repo:
+        # Вне CI (локальный прогон) репозиторий не задан — это НАШЕ состояние,
+        # не владельца: громко в лог job'а, но без строки в его сообщении.
+        print("::warning::GITHUB_REPOSITORY не задан — тему определить нечем, "
+              "сигнал в общем потоке", file=sys.stderr)
+        return None, ""
+    try:
+        return telegram_topics.resolve_thread_id(category, repo, token, chat, int(time.time())), ""
+    except telegram_topics.TopicUnavailable as error:
+        # Чат не форум, у бота нет прав — это СЛОМАННАЯ настройка, которую
+        # чинит владелец. Строка повторится на каждом сигнале, и это правильно:
+        # молчаливый общий поток и есть то состояние, из которого уходим.
+        print(f"::warning::тема не получена: {error}", file=sys.stderr)
+        return None, f"⚠️ сигнал в общем потоке: {error}"
+    except KeyError as error:
+        # Неизвестная категория — дефект кода отправителя, а не среды.
+        # Сигнал всё равно уходит: потерять его хуже, чем показать не там.
+        print(f"::warning::{error}", file=sys.stderr)
+        return None, f"⚠️ сигнал в общем потоке: {error}"
+
+
+def send_telegram(text: str, as_html: bool = False, reply_markup: dict | None = None,
+                  *, category: str) -> bool:
     """Best-effort: место правды — комментарий в задаче #120, Telegram — активный
     канал. Промах кричит warning'ом в лог, не молчит (см. WORKER-PLAYBOOK).
 
@@ -1816,8 +1891,19 @@ def send_telegram(text: str, as_html: bool = False, reply_markup: dict | None = 
     у сборщика, повторное экранирование убило бы ссылки.
 
     reply_markup (#254) — инлайн-клавиатура решения владельца (см.
-    build_decision_keyboard); необязательна, обычные алерты её не передают —
-    сигнатура обратно совместима, поведение существующих вызовов не меняется."""
+    build_decision_keyboard); необязательна, обычные алерты её не передают.
+
+    category (#1461/#1465) — ОБЯЗАТЕЛЬНА и только по имени. Умолчания нет
+    сознательно: умолчание «всё остальное» и есть то состояние, из которого
+    уходим — решение владельца вперемешку с шумом конвейера в одном потоке.
+    Значение обязано быть ключом telegram_topics.CATEGORIES; неизвестное —
+    громкий отказ (и гвардия по исходнику ловит его ещё до прогона, см.
+    scripts/lib/test_telegram_topics.py::test_every_sender_names_a_known_category).
+
+    Тема — не обязательство: если её не удалось получить (чат не форум, нет
+    прав, сеть, исчерпан бюджет), сигнал уходит В ОБЩИЙ ПОТОК с явной
+    пометкой, ПОЧЕМУ он не в теме. Потерять сигнал дороже, чем показать его
+    не там (AGENTS.md, fail loud вместо silent-wrong)."""
     if not prod_writes_allowed():
         # Тот же класс, что gh() -X POST/PUT/PATCH/DELETE (2026-09-11, закрыт
         # безусловно issue #1074): вне GitHub Actions реальный алерт владельцу
@@ -1832,23 +1918,33 @@ def send_telegram(text: str, as_html: bool = False, reply_markup: dict | None = 
         print("::warning::TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID не заданы — сигнал не отправлен",
               file=sys.stderr)
         return False
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    thread_id, topic_note = resolve_signal_topic(category, repo, token, chat)
     payload_text = text if as_html else tg_html(text)
-    args = ["curl", "-fsS", "--max-time", "30", "-X", "POST",
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            "--data-urlencode", f"chat_id={chat}",
-            "--data-urlencode", "parse_mode=HTML",
-            "--data-urlencode", f"text={payload_text}"]
-    if reply_markup is not None:
-        args += ["--data-urlencode", f"reply_markup={json.dumps(reply_markup)}"]
-    try:
-        result = subprocess.run(args, capture_output=True, text=True, encoding="utf-8")
-    except OSError as error:
-        print(f"::warning::curl недоступен, сигнал не отправлен: {error}", file=sys.stderr)
-        return False
-    if result.returncode != 0:
-        print(f"::warning::Telegram не принял сигнал: {result.stderr.strip()}", file=sys.stderr)
-        return False
-    return True
+    if topic_note:
+        payload_text = f"{payload_text}\n\n{tg_html(topic_note)}"
+
+    sent = _telegram_send_message(token, chat, payload_text, reply_markup, thread_id)
+    if sent.ok:
+        return True
+
+    # Тему удалили руками. Сигнал не теряем: забываем её (следующий прогон
+    # заведёт заново) и шлём в общий поток, назвав причину — иначе читатель
+    # решит, что тема просто не настроена.
+    if thread_id is not None and telegram_topics.topic_is_gone(sent.description):
+        telegram_topics.forget_topic(repo, category, int(time.time()))
+        fallback_note = (f"⚠️ тема «{telegram_topics.CATEGORIES[category]}» исчезла "
+                         f"({sent.description}) — сигнал в общем потоке, тема будет "
+                         "заведена заново")
+        print(f"::warning::{fallback_note}", file=sys.stderr)
+        retry = _telegram_send_message(
+            token, chat, f"{payload_text}\n\n{tg_html(fallback_note)}", reply_markup, None)
+        if retry.ok:
+            return True
+        sent = retry
+
+    print(f"::warning::Telegram не принял сигнал: {sent.description}", file=sys.stderr)
+    return False
 
 
 # Префикс комментария-решения — то же значение, что cf-worker/src/config.ts::
@@ -1919,8 +2015,9 @@ def escalate(repo: str, issue_number: int, text: str, options: list[str] | None 
         posted = False
         skipped = False
     delivered = (
-        send_telegram(text, reply_markup=build_decision_keyboard(issue_number, options))
-        if options else send_telegram(text)
+        send_telegram(text, reply_markup=build_decision_keyboard(issue_number, options),
+                      category="decision")
+        if options else send_telegram(text, category="decision")
     )
     comment_note = "оставлен" if posted else ("пропущен (DRY-RUN)" if skipped else "НЕ оставлен")
     return (f"Telegram: {'доставлен' if delivered else 'НЕ доставлен'}; "
@@ -2006,7 +2103,7 @@ def heartbeat_check(repo: str, now: datetime) -> list[str]:
                 f"Успешных прогонов {ORCHESTRA_WORKFLOW} (schedule/workflow_dispatch) "
                 "не найдено за последние 100 прогонов каждого события — пульс не "
                 "подтверждён, возможен отключённый workflow (docs/research/21).")
-        delivered = send_telegram(text)
+        delivered = send_telegram(text, category="breakage")
         # posted/attempted — находка AI-ревью PR #318, третий раунд: строка
         # отчёта раньше безусловно утверждала «след в #120», даже если
         # post_issue_comment упал (RuntimeError уходил только в warning) —
@@ -2053,7 +2150,7 @@ def heartbeat_check(repo: str, now: datetime) -> list[str]:
                    f"(порог {HEARTBEAT_MAX_AGE_MINUTES})"]
         return healthy + ([cadence_line] if cadence_line else [])
     text = heartbeat_alert_text(age, last_ok)
-    delivered = send_telegram(text)
+    delivered = send_telegram(text, category="breakage")
     # posted/attempted — тот же класс, что и в ветке HEARTBEAT_NO_TICKS выше
     # (находка AI-ревью PR #318, третий раунд): безусловное «след в #120» в
     # тексте отчёта было неверно, если post_issue_comment упал.
@@ -2352,7 +2449,7 @@ def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], list[str], bool]
                 post_issue_comment(repo, WATCHDOG_ISSUE, text)
             except RuntimeError as err:
                 print(f"::warning::напоминание в #{WATCHDOG_ISSUE} не доставлено: {err}", file=sys.stderr)
-            delivered = send_telegram(text)
+            delivered = send_telegram(text, category="pipeline")
             return ([line], [f"⏳ напоминание о длящейся паузе: следующая проба через "
                      f"{int(remaining)} мин (Telegram: "
                      f"{'доставлен' if delivered else 'НЕ доставлен'}; след в #{WATCHDOG_ISSUE})"],
@@ -2368,7 +2465,7 @@ def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], list[str], bool]
             post_issue_comment(repo, WATCHDOG_ISSUE, text)
         except RuntimeError as err:
             print(f"::warning::сигнал в #{WATCHDOG_ISSUE} не доставлен: {err}", file=sys.stderr)
-        delivered = send_telegram(text)
+        delivered = send_telegram(text, category="pipeline")
         return ([], [f"🔎 пробный диспатч после паузы {int(backoff)} мин (попытка {attempt}) — "
                  f"{failures} красных {WORKER_WORKFLOW} подряд (Telegram: "
                  f"{'доставлен' if delivered else 'НЕ доставлен'}; сигнал в #{WATCHDOG_ISSUE})"],
@@ -2382,7 +2479,7 @@ def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], list[str], bool]
         post_issue_comment(repo, WATCHDOG_ISSUE, text)
     except RuntimeError as err:
         print(f"::warning::сигнал в #{WATCHDOG_ISSUE} не доставлен: {err}", file=sys.stderr)
-    delivered = send_telegram(text)
+    delivered = send_telegram(text, category="breakage")
     return ([], [f"🚨 конвейер на паузе: {failures} красных прогонов {WORKER_WORKFLOW} "
              f"подряд — диспатч остановлен (Telegram: "
              f"{'доставлен' if delivered else 'НЕ доставлен'}; сигнал в #{WATCHDOG_ISSUE})"],
