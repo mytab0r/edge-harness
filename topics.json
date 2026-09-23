@@ -1,6 +1,11 @@
 {
   "schema": 1,
   "topics": {
+    "decision": {
+      "created_ts": 1790130707,
+      "message_thread_id": 1681511,
+      "title": "🟣 Решения владельца"
+    },
     "pipeline": {
       "created_ts": 1790130521,
       "message_thread_id": 1681509,
