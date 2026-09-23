@@ -56,6 +56,25 @@ def test_probe_route_ready_on_need_source_msg_id():
         assert rw.probe_route("https://harness.example", "s3cr3t") == "ready"
 
 
+def test_probe_route_ready_on_200_ignored_need_source_msg_id():
+    """Вторая редакция того же факта (#1477): после выката морда отвечает
+    вебхуку 200 и называет причину в теле. Зонд обязан читать обе — морда и
+    репозиторий выкатываются разными событиями, и между ними живы обе формы."""
+    with patch(
+        "urllib.request.urlopen",
+        return_value=FakeResponse(200, {"status": "ignored", "reason": "need_source_msg_id", "http_status": 400}),
+    ):
+        assert rw.probe_route("https://harness.example", "s3cr3t") == "ready"
+
+
+def test_probe_route_unexpected_on_200_accepted():
+    """200 «принято» зондом за готовность НЕ считается: зонд шлёт пустой
+    объект без побочных эффектов, и принять его морда не может — такой ответ
+    означает, что контракт разошёлся, и это разбирают руками, а не гадают."""
+    with patch("urllib.request.urlopen", return_value=FakeResponse(200, {"status": "accepted", "message_id": 1})):
+        assert rw.probe_route("https://harness.example", "s3cr3t") == "unexpected:200"
+
+
 def test_probe_route_not_ready_on_401_missing_pr486():
     with patch("urllib.request.urlopen", side_effect=_http_error(401, _api_error_body("unauthorized"))):
         assert rw.probe_route("https://harness.example", "s3cr3t") == "not_ready"
@@ -201,16 +220,58 @@ def test_verify_raises_on_missing_pending_update_count():
         raise AssertionError("ожидалось RuntimeError")
 
 
-def test_verify_raises_on_last_error_message():
+# `last_error_message` — это ПОСЛЕДНЯЯ ошибка за всё время, а не текущее
+# состояние: Telegram держит её в getWebhookInfo и после того, как доставка
+# починилась, пока не пройдёт следующая успешная. Поэтому два состояния
+# различает `pending_update_count`, а не сам факт непустого текста (#1477,
+# правило «Алерт не гадает»).
+
+
+def test_verify_raises_when_queue_is_stuck():
+    """Очередь стоит — это ровно тот случай, когда владелец жмёт кнопку и
+    ничего не происходит. Текст отказа обязан нести число, а не намёк."""
+    info = {
+        "url": "https://harness.example/api/messages/ingest",
+        "pending_update_count": 17,
+        "last_error_message": "Wrong response from the webhook: 400 Bad Request",
+        "last_error_date": 1758585300,
+    }
+    try:
+        rw.verify(info, "https://harness.example/api/messages/ingest")
+    except RuntimeError as error:
+        assert "pending_update_count=17" in str(error), str(error)
+        assert "400 Bad Request" in str(error), str(error)
+    else:
+        raise AssertionError("ожидалось RuntimeError")
+
+
+def test_verify_warns_when_error_is_historical(capsys):
+    """Очередь пуста — доставлять нечего, отметка историческая. Красный job
+    здесь означал бы «чини то, что уже починено»."""
     info = {
         "url": "https://harness.example/api/messages/ingest",
         "pending_update_count": 0,
         "last_error_message": "SSL error",
+        "last_error_date": 1758585300,
+    }
+    rw.verify(info, "https://harness.example/api/messages/ingest")
+    printed = capsys.readouterr().err
+    assert "::warning::" in printed, printed
+    assert "pending_update_count=0" in printed, printed
+
+
+def test_verify_raises_when_pending_is_not_a_number():
+    """Отличить стоящую очередь от протухшей отметки нечем — молча
+    засчитывать это за «всё хорошо» нельзя (fail loud)."""
+    info = {
+        "url": "https://harness.example/api/messages/ingest",
+        "pending_update_count": None,
+        "last_error_message": "SSL error",
     }
     try:
         rw.verify(info, "https://harness.example/api/messages/ingest")
-    except RuntimeError:
-        pass
+    except RuntimeError as error:
+        assert "pending_update_count" in str(error), str(error)
     else:
         raise AssertionError("ожидалось RuntimeError")
 

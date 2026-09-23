@@ -278,8 +278,15 @@ def persist_topic(repo: str, category: str, thread_id: int, title: str, now_ts: 
                   workdir: str | None = None) -> bool:
     """Записать пару в `topics.json` на data-ветке. True — записали, False —
     там уже лежала та же пара (гонку выиграл другой job)."""
-    origin = f"https://x-access-token:{os.environ.get('GH_TOKEN', '')}@github.com/{repo}.git" \
-        if os.environ.get("GH_TOKEN") else f"https://github.com/{repo}.git"
+    # Адрес origin — у единственного места правды (#1486). Своя копия здесь
+    # была и убрана: она вшивала токен прямо в URL, а тот попадает в
+    # `.git/config` клона и в текст ошибок git (git печатает remote при
+    # отказе). Репозиторий публичный, и GitHub маскирует в логах только
+    # ТОЧНОЕ совпадение со значением секрета — производное не маскируется
+    # (AGENTS.md, «Секреты»). Аутентификацию ставит `gh auth setup-git`
+    # (credential helper), как у соседних писателей data-веток.
+    del repo  # адрес берётся из GITHUB_REPOSITORY тем же способом, что у соседей
+    origin = data_branch_writer.origin_url()
     temp = workdir or tempfile.mkdtemp(prefix="telegram-topics-")
     data_branch_writer.clone_data_branch(origin, temp, DATA_BRANCH)
 
