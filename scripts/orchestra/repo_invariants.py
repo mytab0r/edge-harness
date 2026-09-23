@@ -3950,7 +3950,7 @@ def escalate_if_new(repo: str, invariant_id: int, marker_key: str, text: str) ->
     except RuntimeError as error:
         print(f"::warning::не удалось прочитать маркеры #{WATCHDOG_ISSUE}: {error}", file=sys.stderr)
         return None
-    return escalate(repo, WATCHDOG_ISSUE, f"{marker}\n{text}")
+    return escalate(repo, WATCHDOG_ISSUE, f"{marker}\n{text}", category="breakage")
 
 
 def pipeline_status_marker_key(violations: list[dict]) -> str:

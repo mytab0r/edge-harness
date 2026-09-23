@@ -88,8 +88,13 @@ _data_branch_spec.loader.exec_module(data_branch_writer)
 #: проза, а гвардия (`test_every_registered_category_is_actually_used`) на
 #: первом же прогоне. Появится сигнал об инфраструктуре — строка вернётся
 #: вместе с ним, одним изменением.
+#: Категория решений владельца — вынесена именем, а не литералом по коду
+#: (#1490): инвариант «в этой теме только сообщения с кнопками» живёт в
+#: pulse_guard.escalate и обязан сверяться с ТЕМ ЖЕ значением, что реестр.
+DECISION_CATEGORY = "decision"
+
 CATEGORIES: dict[str, str] = {
-    "decision": "🟣 Решения владельца",
+    DECISION_CATEGORY: "🟣 Решения владельца",
     "breakage": "🔴 Поломки",
     "pipeline": "⚙️ Конвейер",
 }

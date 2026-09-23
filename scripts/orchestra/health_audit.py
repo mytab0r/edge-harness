@@ -188,7 +188,7 @@ def _escalate_cap_once(repo: str, now: datetime, fp: str) -> str:
         "Что дальше: посмотреть открытые задачи с меткой self-audit, решить "
         "руками по непринятому отпечатку."
     )
-    return pulse_guard.escalate(repo, pulse_guard.WATCHDOG_ISSUE, text)
+    return pulse_guard.escalate(repo, pulse_guard.WATCHDOG_ISSUE, text, category="breakage")
 
 
 def run_self_audit(repo: str, classifications: list[health_regression.Classification],
@@ -216,7 +216,7 @@ def run_self_audit(repo: str, classifications: list[health_regression.Classifica
             text = (f"{marker}\nПродолжает деградировать: {c.today} "
                     f"(отклонение {c.deviation_pct}%, держится {c.streak_days} дн.)")
             if c.status == "fire":
-                result = pulse_guard.escalate(repo, existing["number"], f"🚨 {text}")
+                result = pulse_guard.escalate(repo, existing["number"], f"🚨 {text}", category="breakage")
                 report.append(f"🚨 #{existing['number']}: пожар подтверждён повторно ({result})")
             else:
                 pulse_guard.post_issue_comment(repo, existing["number"], text)
@@ -245,7 +245,7 @@ def run_self_audit(repo: str, classifications: list[health_regression.Classifica
                 f"{c.deviation_pct}% (порог пожара {health_regression.ESCALATION_THRESHOLD_PCT}%) "
                 f"— задача #{number} заведена."
             )
-            esc_result = pulse_guard.escalate(repo, number, text)
+            esc_result = pulse_guard.escalate(repo, number, text, category="breakage")
             report.append(f"🚨 #{number}: эскалация пожара ({esc_result})")
 
     return report

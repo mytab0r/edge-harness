@@ -1987,7 +1987,8 @@ def build_decision_keyboard(issue_number: int, options: list[str]) -> dict:
     return {"inline_keyboard": keyboard}
 
 
-def escalate(repo: str, issue_number: int, text: str, options: list[str] | None = None) -> str:
+def escalate(repo: str, issue_number: int, text: str, options: list[str] | None = None,
+             *, category: str) -> str:
     """Канал эскалации поломок — общий с предохранителем конвейера: комментарий
     в задачу-статус + Telegram, best-effort по каждому (см. send_telegram).
     Переиспользуется вне пары «предохранитель/пульс» (scheduler.archive_runner_sessions,
@@ -2001,7 +2002,27 @@ def escalate(repo: str, issue_number: int, text: str, options: list[str] | None 
     вызывающий с `options` больше не передаёт пустой список: с #1413 вопрос
     без кнопочных вариантов владельцу не адресуется вовсе (гвардия оставляет
     пометку агенту), так что текстовый путь здесь — для будущих вызывающих
-    вне waiting:owner, не для задач без вариантов."""
+    вне waiting:owner, не для задач без вариантов.
+
+    category (#1490) — ОБЯЗАТЕЛЬНА и приходит ОТ ВЫЗЫВАЮЩЕГО. Зашитый здесь
+    литерал (первая редакция #1465) отправлял в тему решений владельца всё,
+    что вообще проходит через этот общий канал: алерт о квоте, предохранитель
+    конвейера, инварианты, откат деплоя. Владелец открыл тему «Решения
+    владельца» и увидел там сообщения без единой кнопки — тема, заведённая
+    ради одного вида сигналов, наполнилась всем подряд.
+
+    Инвариант ниже — механизм, а не договорённость: тема решений по
+    определению содержит только то, под чем есть кнопки. Несовпадение —
+    громкий отказ, а не тихая отправка не в ту тему."""
+    decision_asked = bool(options)
+    if decision_asked != (category == telegram_topics.DECISION_CATEGORY):
+        raise ValueError(
+            f"escalate: category={category!r} и "
+            f"{'есть' if decision_asked else 'нет'} вариантов решения — "
+            f"несовместимы. Тема «{telegram_topics.CATEGORIES[telegram_topics.DECISION_CATEGORY]}» "
+            "содержит ТОЛЬКО сообщения с кнопками (#1490): либо передай options, "
+            f"либо назови категорию по существу сигнала ({', '.join(sorted(telegram_topics.CATEGORIES))})."
+        )
     try:
         post_issue_comment(repo, issue_number, text)
         posted = True
@@ -2016,8 +2037,8 @@ def escalate(repo: str, issue_number: int, text: str, options: list[str] | None 
         skipped = False
     delivered = (
         send_telegram(text, reply_markup=build_decision_keyboard(issue_number, options),
-                      category="decision")
-        if options else send_telegram(text, category="decision")
+                      category=category)
+        if options else send_telegram(text, category=category)
     )
     comment_note = "оставлен" if posted else ("пропущен (DRY-RUN)" if skipped else "НЕ оставлен")
     return (f"Telegram: {'доставлен' if delivered else 'НЕ доставлен'}; "
@@ -2276,7 +2297,7 @@ def independent_pulse_check(repo: str, now: datetime) -> list[str]:
     if not episode_reopened(open_times, close_times):
         return [f"🚨 независимый DO-пульс не приходил ({int(age)} мин назад, эпизод уже оповещён)"]
     text = independent_pulse_alert_text(age, exact)
-    result = escalate(repo, WATCHDOG_ISSUE, text)
+    result = escalate(repo, WATCHDOG_ISSUE, text, category="breakage")
     return [f"🚨 независимый DO-пульс не приходил {age / 60:.1f} ч ({result})"]
 
 
@@ -2972,7 +2993,7 @@ def failure_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
             already_escalated_today = True  # не гадаем повторно на этом же пульсе
         if not already_escalated_today:
             text = failure_watch_cap_alert_text(cap_marker, ci_created_today, cap_skipped_this_pulse)
-            result = escalate(repo, WATCHDOG_ISSUE, text)
+            result = escalate(repo, WATCHDOG_ISSUE, text, category="breakage")
             actions.append(
                 f"🚨 failure-watch: эскалация потолка автозаведения {FAILURE_WATCH_LABEL} ({result})")
 

@@ -383,7 +383,7 @@ def test_run_watch_fire_creates_task_and_escalates(monkeypatch):
                         lambda repo, num, text: posted_comments.append((num, text)))
     escalated = []
     monkeypatch.setattr(mhw.pulse_guard, "escalate",
-                        lambda repo, num, text, options=None: escalated.append((num, text)) or "ok")
+                        lambda repo, num, text, options=None, **_: escalated.append((num, text)) or "ok")
 
     report = mhw.run_watch("mytab0r/edge-harness", now)
 
@@ -460,7 +460,7 @@ def test_run_watch_fire_daily_cap_exhausted_escalates_without_new_task(monkeypat
                         lambda *a, **k: created.append(1) or {"number": 1})
     escalated = []
     monkeypatch.setattr(mhw.pulse_guard, "escalate",
-                        lambda repo, num, text, options=None: escalated.append(text) or "ok")
+                        lambda repo, num, text, options=None, **_: escalated.append(text) or "ok")
 
     report = mhw.run_watch("mytab0r/edge-harness", now)
 

@@ -943,7 +943,7 @@ def test_main_exits_nonzero_and_escalates_on_archive_hard_failure(monkeypatch):
     monkeypatch.setattr(sch, "escalate_stale_auto_tasks", lambda repo, now: [])
     monkeypatch.setattr(sch, "groom_auto_tasks", lambda repo, now, lines: [])
     escalated = []
-    monkeypatch.setattr(sch, "escalate", lambda repo, issue, text: escalated.append((repo, issue, text)) or "ок")
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue, text, **_: escalated.append((repo, issue, text)) or "ок")
     code = sch.main()
     assert code == 1  # прогон окрашен красным — мерж уже состоялся, но поломка не молчит
     assert escalated and escalated[0][0] == "o/r" and escalated[0][1] == sch.WATCHDOG_ISSUE
@@ -995,7 +995,7 @@ def test_merge_tail_failure_does_not_speak_about_the_archive_queue(monkeypatch):
     monkeypatch.setattr(sch, "groom_auto_tasks", lambda repo, now, lines: [])
     monkeypatch.setattr(sch, "retry_pending_session_archives", lambda repo, now: ([], (False, None)))
     escalated = []
-    monkeypatch.setattr(sch, "escalate", lambda repo, issue, text: escalated.append(text) or "ок")
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue, text, **_: escalated.append(text) or "ок")
 
     assert sch.main() == 1, "сбой хвоста мержа обязан красить прогон — он реальный"
     assert escalated, "и обязан быть назван владельцу"
@@ -1051,7 +1051,7 @@ def test_main_exits_nonzero_and_escalates_on_stall_hard_failure(monkeypatch):
     monkeypatch.setattr(sch, "groom_auto_tasks", lambda repo, now, lines: pytest.fail(
         "не должен вызываться — detect_and_act уже упал"))
     escalated = []
-    monkeypatch.setattr(sch, "escalate", lambda repo, issue, text: escalated.append((repo, issue, text)) or "ок")
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue, text, **_: escalated.append((repo, issue, text)) or "ок")
     saved = []
     monkeypatch.setattr(sch, "summary", lambda lines: saved.append(list(lines)))
 
@@ -1091,7 +1091,7 @@ def test_main_stays_green_when_archive_ok(monkeypatch):
     monkeypatch.setattr(sch, "detect_and_act", lambda repo, now, lines, run_url=None: [])
     monkeypatch.setattr(sch, "escalate_stale_auto_tasks", lambda repo, now: [])
     monkeypatch.setattr(sch, "groom_auto_tasks", lambda repo, now, lines: [])
-    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("не должен эскалировать — сбоя не было"))
+    monkeypatch.setattr(sch, "escalate", lambda *a, **_: pytest.fail("не должен эскалировать — сбоя не было"))
     assert sch.main() == 0
 
 
@@ -1124,7 +1124,7 @@ def test_main_exits_nonzero_when_acceptance_hard_failure(monkeypatch):
     monkeypatch.setattr(sch, "detect_and_act", lambda repo, now, lines, run_url=None: [])
     monkeypatch.setattr(sch, "escalate_stale_auto_tasks", lambda repo, now: [])
     monkeypatch.setattr(sch, "groom_auto_tasks", lambda repo, now, lines: [])
-    monkeypatch.setattr(sch, "escalate", lambda *a: "ок")
+    monkeypatch.setattr(sch, "escalate", lambda *a, **_: "ок")
     assert sch.main() == 1
 
 
@@ -1787,7 +1787,7 @@ def test_trigger_ai_review_stops_after_max_attempts_and_escalates(monkeypatch):
     patch_gh(monkeypatch, fake)
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("лимит попыток исчерпан — не пишем в PR"))
     escalated = []
-    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text, **_: escalated.append((repo, issue_n, text)) or "ок")
 
     now = utc(2026, 9, 2, 12, 0)
     observations, actions = sch.trigger_ai_review(REPO, now, [p])
@@ -1818,7 +1818,7 @@ def test_trigger_ai_review_exhausted_escalation_is_idempotent_per_epoch(monkeypa
     })
     patch_gh(monkeypatch, fake)
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("не пишем в PR"))
-    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("уже эскалировано в этой эпохе — не дублируем"))
+    monkeypatch.setattr(sch, "escalate", lambda *a, **_: pytest.fail("уже эскалировано в этой эпохе — не дублируем"))
 
     now = utc(2026, 9, 2, 12, 0)
     observations, actions = sch.trigger_ai_review(REPO, now, [p])
@@ -1848,7 +1848,7 @@ def test_trigger_ai_review_resets_attempt_budget_on_new_epoch(monkeypatch):
     patch_gh(monkeypatch, fake)
     posted = []
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
-    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("бюджет этой эпохи не исчерпан — эскалации нет"))
+    monkeypatch.setattr(sch, "escalate", lambda *a, **_: pytest.fail("бюджет этой эпохи не исчерпан — эскалации нет"))
 
     now = utc(2026, 9, 2, 15, 45)  # 45 мин > порог 30 с якоря 15:00
     sch.trigger_ai_review(REPO, now, [p])
@@ -1874,7 +1874,7 @@ def test_trigger_ai_review_dispatches_on_ai_failed_without_reason_fact_backward_
     })
     patch_gh(monkeypatch, fake)
     patch_post_issue_comment(monkeypatch, lambda *a: None)
-    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("причина неизвестна — не наш класс, обычный путь"))
+    monkeypatch.setattr(sch, "escalate", lambda *a, **_: pytest.fail("причина неизвестна — не наш класс, обычный путь"))
 
     now = utc(2026, 9, 1, 23, 30)
     sch.trigger_ai_review(REPO, now, [p])
@@ -1903,7 +1903,7 @@ def test_trigger_ai_review_quota_exhausted_escalates_without_spending_attempt(mo
     patch_gh(monkeypatch, fake)
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("не пишем в PR — эскалация, не ретрай"))
     escalated = []
-    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text, **_: escalated.append((repo, issue_n, text)) or "ок")
 
     now = utc(2026, 9, 2, 12, 0)
     observations, actions = sch.trigger_ai_review(REPO, now, [p])
@@ -1939,7 +1939,7 @@ def test_trigger_ai_review_quota_exhausted_escalation_is_idempotent_per_epoch(mo
     })
     patch_gh(monkeypatch, fake)
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("не пишем в PR"))
-    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("уже эскалировано в этой эпохе — не дублируем"))
+    monkeypatch.setattr(sch, "escalate", lambda *a, **_: pytest.fail("уже эскалировано в этой эпохе — не дублируем"))
 
     now = utc(2026, 9, 2, 12, 0)
     observations, actions = sch.trigger_ai_review(REPO, now, [p])
@@ -1977,7 +1977,7 @@ def test_trigger_ai_review_quota_reason_from_prior_epoch_is_not_used(monkeypatch
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
     monkeypatch.setattr(
         sch, "escalate",
-        lambda *a: pytest.fail("причина из прошлой эпохи не должна закрывать автоповтор новой"))
+        lambda *a, **_: pytest.fail("причина из прошлой эпохи не должна закрывать автоповтор новой"))
 
     now = utc(2026, 9, 2, 15, 45)  # 45 мин > порог 30 с якоря 15:00
     observations, actions = sch.trigger_ai_review(REPO, now, [p])
@@ -3699,7 +3699,7 @@ def test_dispatch_conflict_rework_escalates_after_budget_exhausted(monkeypatch):
     })
     patch_gh(monkeypatch, fake)
     escalated = []
-    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text, **_: escalated.append((repo, issue_n, text)) or "ок")
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("эскалация — не обычный комментарий в PR"))
     monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("бюджет исчерпан — задачу не трогаем"))
 
@@ -3754,7 +3754,7 @@ def test_dispatch_conflict_rework_dispatches_again_after_budget_reset_marker(mon
     posted = []
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
-    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("бюджет сброшен маркером — эскалации быть не должно"))
+    monkeypatch.setattr(sch, "escalate", lambda *a, **_: pytest.fail("бюджет сброшен маркером — эскалации быть не должно"))
 
     observations, actions, dispatched = sch.dispatch_conflict_rework(REPO, [p], pool=[task])
 
@@ -3816,7 +3816,7 @@ def test_dispatch_conflict_rework_retries_instead_of_escalating_after_infra_fail
     patch_gh(monkeypatch, fake)
     escalated = []
     posted = []
-    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text, **_: escalated.append((repo, issue_n, text)) or "ок")
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
 
@@ -3869,7 +3869,7 @@ def test_dispatch_conflict_rework_escalation_text_admits_unattributed_run(monkey
     })
     patch_gh(monkeypatch, fake)
     escalated = []
-    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text, **_: escalated.append((repo, issue_n, text)) or "ок")
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("эскалация — не обычный комментарий в PR"))
     monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("бюджет исчерпан — задачу не трогаем"))
 
@@ -3907,7 +3907,7 @@ def test_dispatch_conflict_rework_holds_escalation_when_mergeable_state_unconfir
         "pulls/560": {"mergeable_state": None},
     })
     patch_gh(monkeypatch, fake)
-    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("mergeable_state не подтверждён — рано эскалировать"))
+    monkeypatch.setattr(sch, "escalate", lambda *a, **_: pytest.fail("mergeable_state не подтверждён — рано эскалировать"))
 
     observations, actions, dispatched = sch.dispatch_conflict_rework(REPO, [p], pool=[task])
 
@@ -3946,7 +3946,7 @@ def test_dispatch_conflict_rework_defers_escalation_while_attempt_still_running(
     })
     patch_gh(monkeypatch, fake)
     assume_worker_not_stalled(monkeypatch)
-    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("прогон ещё идёт — рано эскалировать"))
+    monkeypatch.setattr(sch, "escalate", lambda *a, **_: pytest.fail("прогон ещё идёт — рано эскалировать"))
 
     observations, actions, dispatched = sch.dispatch_conflict_rework(REPO, [p], pool=[task])
 
@@ -3979,7 +3979,7 @@ def test_dispatch_conflict_rework_escalation_is_idempotent(monkeypatch):
         ],
     })
     patch_gh(monkeypatch, fake)
-    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("уже эскалировано — не должен слать снова"))
+    monkeypatch.setattr(sch, "escalate", lambda *a, **_: pytest.fail("уже эскалировано — не должен слать снова"))
 
     observations, actions, dispatched = sch.dispatch_conflict_rework(REPO, [p], pool=[task])
 
@@ -4161,7 +4161,7 @@ def test_dispatch_ai_review_rework_retries_instead_of_escalating_after_infra_fai
     patch_gh(monkeypatch, fake)
     escalated = []
     posted = []
-    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text, **_: escalated.append((repo, issue_n, text)) or "ок")
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
 
@@ -4256,7 +4256,7 @@ def test_dispatch_ai_review_rework_grants_second_chance_before_escalating_on_suc
     patch_gh(monkeypatch, fake)
     escalated = []
     posted = []
-    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text, **_: escalated.append((repo, issue_n, text)) or "ок")
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
 
@@ -4289,7 +4289,7 @@ def test_dispatch_ai_review_rework_escalates_after_second_success_names_the_fact
     fake = FakeGh(fixture)
     patch_gh(monkeypatch, fake)
     escalated = []
-    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text, **_: escalated.append((repo, issue_n, text)) or "ок")
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("эскалация — не обычный комментарий в PR"))
     monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("бюджет исчерпан — задачу не трогаем"))
 
@@ -4333,7 +4333,7 @@ def test_dispatch_ai_review_rework_provider_refusal_green_run_is_infra_retry(mon
     patch_gh(monkeypatch, fake)
     escalated = []
     posted = []
-    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text, **_: escalated.append((repo, issue_n, text)) or "ок")
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
 
@@ -4372,7 +4372,7 @@ def test_dispatch_ai_review_rework_refusal_marker_outside_run_window_still_escal
     fake = FakeGh(fixture)
     patch_gh(monkeypatch, fake)
     escalated = []
-    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text, **_: escalated.append((repo, issue_n, text)) or "ок")
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("эскалация — не обычный комментарий в PR"))
     monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("бюджет исчерпан — задачу не трогаем"))
 
@@ -4414,7 +4414,7 @@ def test_dispatch_ai_review_rework_second_success_escalation_surfaces_rebuttal(m
     fake = FakeGh(fixture)
     patch_gh(monkeypatch, fake)
     escalated = []
-    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text, **_: escalated.append((repo, issue_n, text)) or "ок")
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("эскалация — не обычный комментарий в PR"))
     monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("бюджет исчерпан — задачу не трогаем"))
 
@@ -4464,7 +4464,7 @@ def test_dispatch_ai_review_rework_escalation_names_attributed_non_success_concl
     fake = FakeGh(fixture)
     patch_gh(monkeypatch, fake)
     escalated = []
-    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text, **_: escalated.append((repo, issue_n, text)) or "ок")
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("эскалация — не обычный комментарий в PR"))
     monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("бюджет исчерпан — задачу не трогаем"))
 
@@ -4517,7 +4517,7 @@ def test_dispatch_ai_review_rework_defers_escalation_while_own_run_in_flight(mon
     fake = FakeGh(fixture)
     patch_gh(monkeypatch, fake)
     escalated = []
-    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("исход СВОЕГО прогона неизвестен — эскалация преждевременна"))
+    monkeypatch.setattr(sch, "escalate", lambda *a, **_: pytest.fail("исход СВОЕГО прогона неизвестен — эскалация преждевременна"))
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("бюджет исчерпан, исход не известен — редиспатч тоже преждевременен"))
     monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("исход не известен — задачу не трогаем"))
 
@@ -4544,7 +4544,7 @@ def test_dispatch_ai_review_rework_skips_escalation_when_pr_already_closed(monke
     fixture[f"pulls/1020"] = {"labels": [label(sch.review_labels.AI_CHANGES)], "state": "closed"}
     fake = FakeGh(fixture)
     patch_gh(monkeypatch, fake)
-    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("PR закрыт — эскалации быть не должно"))
+    monkeypatch.setattr(sch, "escalate", lambda *a, **_: pytest.fail("PR закрыт — эскалации быть не должно"))
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("PR закрыт — комментария быть не должно"))
     monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("PR закрыт — задачу не трогаем"))
 
@@ -4619,7 +4619,7 @@ def test_dispatch_ai_review_rework_extended_window_finds_run_outside_top10(monke
     patch_gh(monkeypatch, fake)
     escalated = []
     posted = []
-    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text, **_: escalated.append((repo, issue_n, text)) or "ок")
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
 
@@ -4680,7 +4680,7 @@ def test_dispatch_ai_review_rework_grants_free_retry_before_escalating_unattribu
     patch_gh(monkeypatch, fake)
     escalated = []
     posted = []
-    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text, **_: escalated.append((repo, issue_n, text)) or "ок")
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
 
@@ -4727,7 +4727,7 @@ def test_dispatch_ai_review_rework_escalates_second_unattributed_as_attribution_
     fake = FakeGh(fixture)
     patch_gh(monkeypatch, fake)
     escalated = []
-    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text, **_: escalated.append((repo, issue_n, text)) or "ок")
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("бюджет исчерпан — эскалация, не комментарий"))
     monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("эскалация не трогает задачу"))
 
@@ -4790,7 +4790,7 @@ def test_dispatch_ai_review_rework_defers_second_unattributed_while_retry_in_fli
     fake = FakeGh(fixture)
     patch_gh(monkeypatch, fake)
     escalated = []
-    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text, **_: escalated.append((repo, issue_n, text)) or "ок")
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("повтор ещё идёт — эскалация рано"))
     monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("повтор ещё идёт — задачу не трогаем"))
 
@@ -4846,7 +4846,7 @@ def test_dispatch_ai_review_rework_escalates_second_unattributed_after_retry_fin
     fake = FakeGh(fixture)
     patch_gh(monkeypatch, fake)
     escalated = []
-    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text, **_: escalated.append((repo, issue_n, text)) or "ок")
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("бюджет исчерпан — эскалация, не комментарий"))
     monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("эскалация не трогает задачу"))
 
@@ -4889,7 +4889,7 @@ def test_dispatch_ai_review_rework_escalates_while_worker_active(monkeypatch):
     patch_gh(monkeypatch, fake)
     assume_worker_not_stalled(monkeypatch)
     escalated = []
-    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text, **_: escalated.append((repo, issue_n, text)) or "ок")
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("эскалация — не обычный комментарий в PR"))
     monkeypatch.setattr(sch.claim_task, "release", lambda *a: pytest.fail("эскалация не трогает задачу"))
 
@@ -6237,7 +6237,7 @@ def test_after_merge_resume_skips_when_merge_predates_red_run(monkeypatch):
         f"repos/{REPO}/issues/217": {**issue(217, assignees=("mytab0r",)), "state": "open"},
     })
     patch_gh(monkeypatch, fake)
-    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("мерж старше красного прогона — сброса быть не должно"))
+    monkeypatch.setattr(sch, "escalate", lambda *a, **_: pytest.fail("мерж старше красного прогона — сброса быть не должно"))
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda repo, numbers: ([], False))
 
@@ -6265,7 +6265,7 @@ def test_after_merge_resume_skips_when_series_closed(monkeypatch):
         f"repos/{REPO}/issues/217": {**issue(217, assignees=("mytab0r",)), "state": "open"},
     })
     patch_gh(monkeypatch, fake)
-    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("серия закрыта зелёным — сброса быть не должно"))
+    monkeypatch.setattr(sch, "escalate", lambda *a, **_: pytest.fail("серия закрыта зелёным — сброса быть не должно"))
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda repo, numbers: ([], False))
 
@@ -6293,7 +6293,7 @@ def test_after_merge_resume_skips_without_claim_trace(monkeypatch):
         f"{REPO}/actions/workflows/worker.yml/runs": RESUME_RED_RUNS,
     })
     patch_gh(monkeypatch, fake)
-    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("следа аренды нет — сброса быть не должно"))
+    monkeypatch.setattr(sch, "escalate", lambda *a, **_: pytest.fail("следа аренды нет — сброса быть не должно"))
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda repo, numbers: ([], False))
 
@@ -6322,7 +6322,7 @@ def test_after_merge_resume_dedupes_by_pr_marker(monkeypatch):
         f"{REPO}/actions/workflows/worker.yml/runs": RESUME_RED_RUNS,
     })
     patch_gh(monkeypatch, fake)
-    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("сброс этим мержем уже сигналился"))
+    monkeypatch.setattr(sch, "escalate", lambda *a, **_: pytest.fail("сброс этим мержем уже сигналился"))
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     monkeypatch.setattr(sch, "archive_runner_sessions", lambda repo, numbers: ([], False))
 
@@ -8053,7 +8053,7 @@ def test_wip_gate_escalates_when_episode_older_than_stuck_threshold(monkeypatch)
     fake = FakeGh({"issues/120/comments?per_page=100": comments})
     patch_gh(monkeypatch, fake)
     escalated = []
-    monkeypatch.setattr(sch, "escalate", lambda repo, issue, text: escalated.append(text) or "ок")
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue, text, **_: escalated.append(text) or "ок")
     pulls = [pull(n, labels=["ai:changes-requested"]) for n in range(1, sch.WIP_LIMIT + 1)]
     # Доводка доступна: свободная задача #89 объявлена открытым PR (ветка
     # agent/89-... в снимке pulls) — сигнал обязан назвать этот факт и адрес,
@@ -8083,7 +8083,7 @@ def test_wip_gate_stuck_escalation_states_nothing_to_rework_when_no_targets(monk
     fake = FakeGh({"issues/120/comments?per_page=100": comments})
     patch_gh(monkeypatch, fake)
     escalated = []
-    monkeypatch.setattr(sch, "escalate", lambda repo, issue, text: escalated.append(text) or "ок")
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue, text, **_: escalated.append(text) or "ок")
     pulls = [pull(n, labels=["ai:changes-requested"]) for n in range(1, sch.WIP_LIMIT + 1)]
     observations, actions, allowed = sch.wip_gate(REPO, utc(2026, 9, 6, 9, 5), pulls, pool=[], dispatch_allowed=True)
     assert allowed is False
@@ -8106,7 +8106,7 @@ def test_wip_gate_stays_silent_while_fuse_paused(monkeypatch):
         "-X POST repos/mytab0r/edge-harness/issues/120/comments": None,
     })
     patch_gh(monkeypatch, fake)
-    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail(
+    monkeypatch.setattr(sch, "escalate", lambda *a, **_: pytest.fail(
         "не должен эскалировать под предохранителем — тормоз уже назван"))
     pulls = [pull(n, labels=["ai:changes-requested"]) for n in range(1, sch.WIP_LIMIT + 3)]
     observations, actions, allowed = sch.wip_gate(
@@ -8129,7 +8129,7 @@ def test_wip_gate_closes_open_episode_when_fuse_takes_over(monkeypatch):
         "-X POST repos/mytab0r/edge-harness/issues/120/comments": None,
     })
     patch_gh(monkeypatch, fake)
-    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("не должен эскалировать под предохранителем"))
+    monkeypatch.setattr(sch, "escalate", lambda *a, **_: pytest.fail("не должен эскалировать под предохранителем"))
     pulls = [pull(n, labels=["ai:changes-requested"]) for n in range(1, sch.WIP_LIMIT + 1)]
     observations, actions, allowed = sch.wip_gate(
         REPO, utc(2026, 9, 6, 9, 0), pulls, pool=[], dispatch_allowed=False)
@@ -8151,7 +8151,7 @@ def test_wip_gate_stuck_names_conflict_cycle_when_only_conflict_targets(monkeypa
     fake = FakeGh({"issues/120/comments?per_page=100": comments})
     patch_gh(monkeypatch, fake)
     escalated = []
-    monkeypatch.setattr(sch, "escalate", lambda repo, issue, text: escalated.append(text) or "ок")
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue, text, **_: escalated.append(text) or "ок")
     pulls = [pull(n, labels=["ai:changes-requested"]) for n in range(1, sch.WIP_LIMIT + 1)]
     pulls.append(pull(500, labels=["conflict"], ref="agent/89-fix"))
     pool = [issue(89, assignees=())]
@@ -8194,7 +8194,7 @@ def test_wip_gate_does_not_escalate_twice_for_the_same_stuck_episode(monkeypatch
     ]
     fake = FakeGh({"issues/120/comments?per_page=100": comments})
     patch_gh(monkeypatch, fake)
-    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("не должен эскалировать повторно"))
+    monkeypatch.setattr(sch, "escalate", lambda *a, **_: pytest.fail("не должен эскалировать повторно"))
     pulls = [pull(n, labels=["ai:changes-requested"]) for n in range(1, sch.WIP_LIMIT + 1)]
     observations, actions, allowed = sch.wip_gate(REPO, utc(2026, 9, 6, 9, 5), pulls, pool=[], dispatch_allowed=True)
     assert allowed is False
@@ -8219,7 +8219,7 @@ def test_wip_gate_does_not_escalate_blindly_when_stuck_markers_unreadable(monkey
         return []  # WIP_GATE_CLOSE_MARKER — эпизод ещё не закрывался
 
     monkeypatch.setattr(sch, "issue_marker_times", fake_issue_marker_times)
-    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail(
+    monkeypatch.setattr(sch, "escalate", lambda *a, **_: pytest.fail(
         "не должен эскалировать вслепую при сбое чтения stuck-маркеров"))
     pulls = [pull(n, labels=["ai:changes-requested"]) for n in range(1, sch.WIP_LIMIT + 1)]
     observations, actions, allowed = sch.wip_gate(REPO, utc(2026, 9, 6, 9, 5), pulls, pool=[], dispatch_allowed=True)
@@ -8951,7 +8951,7 @@ def test_reject_reopened_tasks_first_attempt_does_not_escalate(monkeypatch):
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
     monkeypatch.setattr(sch.claim_task, "release", lambda repo, n: f"замок task-{n} снят")
     escalated = []
-    monkeypatch.setattr(sch, "escalate", lambda *a: escalated.append(a) or "не должно вызываться")
+    monkeypatch.setattr(sch, "escalate", lambda *a, **_: escalated.append(a) or "не должно вызываться")
 
     pool = [issue(518, assignees=(), state_reason="reopened")]
     lines = sch.reject_reopened_tasks(REPO, pool)
@@ -9033,7 +9033,7 @@ def test_main_closes_reopened_task_before_acceptance_sees_it(monkeypatch):
     monkeypatch.setattr(sch, "wip_gate", lambda repo, now, pulls, pool, dispatch_allowed: ([], [], True))
     monkeypatch.setattr(sch, "dispatch_worker", lambda repo, pool, *, wip_allowed, pulls: ([], []))
     monkeypatch.setattr(sch, "summary", lambda lines: None)
-    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("сбоя тут нет"))
+    monkeypatch.setattr(sch, "escalate", lambda *a, **_: pytest.fail("сбоя тут нет"))
     # Детектор устойчивого простоя (#201) — не предмет этого теста, гасим
     # (без мока main() дошёл бы до open_auto_tasks/escalate_stale_auto_tasks
     # с реальным списком auto-detected issues, которого нет в FakeGh ниже).
@@ -9498,7 +9498,7 @@ def test_accept_merged_tasks_health_timeout_is_hard_failure_not_a_crash(hanging_
     monkeypatch.setattr(sch, "DSH_EDGE_URL", f"http://127.0.0.1:{hanging_health_server}")
     monkeypatch.setattr(sch, "DSH_EDGE_HEALTH_TIMEOUT", 0.5)
     escalated = []
-    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text, **_: escalated.append((repo, issue_n, text)) or "ок")
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("жёсткий сбой не пишет обычный комментарий в задачу"))
 
     pool = [issue(21, assignees=("mytab0r",))]
@@ -9771,7 +9771,7 @@ def test_accept_merged_tasks_docs_missing_escalates_on_non_404_error(monkeypatch
     })
     patch_gh(monkeypatch, fake)
     escalated = []
-    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text, **_: escalated.append((repo, issue_n, text)) or "ок")
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("сбой инструмента не пишет обычный комментарий"))
 
     pool = [issue(78, assignees=("mytab0r",))]
@@ -9798,7 +9798,7 @@ def test_accept_merged_tasks_escalates_hard_failure_without_touching_task(monkey
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(sch, "DSH_EDGE_URL", "")  # не задан — деплой-джоб есть, health не проверить
     escalated = []
-    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text, **_: escalated.append((repo, issue_n, text)) or "ок")
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("жёсткий сбой не пишет обычный комментарий в задачу"))
 
     pool = [issue(21, assignees=("mytab0r",))]
@@ -9828,7 +9828,7 @@ def test_accept_merged_tasks_hard_failure_escalation_is_idempotent(monkeypatch):
     })
     patch_gh(monkeypatch, fake)
     monkeypatch.setattr(sch, "DSH_EDGE_URL", "")  # не задан — деплой-джоб есть, health не проверить
-    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("уже эскалировано — не должен слать снова"))
+    monkeypatch.setattr(sch, "escalate", lambda *a, **_: pytest.fail("уже эскалировано — не должен слать снова"))
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("жёсткий сбой не пишет обычный комментарий в задачу"))
 
     pool = [issue(21, assignees=("mytab0r",))]
@@ -9848,7 +9848,7 @@ def test_accept_merged_tasks_stays_quiet_when_pending_within_threshold(monkeypat
         "actions/workflows/deploy-worker.yml/runs?per_page=10": {"workflow_runs": []},
     })
     patch_gh(monkeypatch, fake)
-    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("рано эскалировать — порог не прошёл"))
+    monkeypatch.setattr(sch, "escalate", lambda *a, **_: pytest.fail("рано эскалировать — порог не прошёл"))
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("рано писать — порог не прошёл"))
 
     merged_at = datetime(2026, 9, 3, 10, 0, 0, tzinfo=timezone.utc)
@@ -9876,7 +9876,7 @@ def test_accept_merged_tasks_escalates_when_pending_past_threshold(monkeypatch):
     })
     patch_gh(monkeypatch, fake)
     escalated = []
-    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text: escalated.append((repo, issue_n, text)) or "ок")
+    monkeypatch.setattr(sch, "escalate", lambda repo, issue_n, text, **_: escalated.append((repo, issue_n, text)) or "ок")
     posted = []
     patch_post_issue_comment(monkeypatch, lambda repo, n, text: posted.append((n, text)))
 
@@ -9903,7 +9903,7 @@ def test_accept_merged_tasks_pending_escalation_is_idempotent(monkeypatch):
         "actions/workflows/deploy-worker.yml/runs?per_page=10": {"workflow_runs": []},
     })
     patch_gh(monkeypatch, fake)
-    monkeypatch.setattr(sch, "escalate", lambda *a: pytest.fail("уже эскалировано — не должен слать снова"))
+    monkeypatch.setattr(sch, "escalate", lambda *a, **_: pytest.fail("уже эскалировано — не должен слать снова"))
     patch_post_issue_comment(monkeypatch, lambda *a: pytest.fail("уже эскалировано — не должен писать снова"))
 
     merged_at = datetime(2026, 9, 3, 10, 0, 0, tzinfo=timezone.utc)
@@ -11034,7 +11034,7 @@ def _main_stand_for_stale_queue(monkeypatch, *, episode_new: bool, escalated: li
                         lambda repo, now: (["🚨 #7: висит в очереди 5.0 ч"], (True, now)))
     monkeypatch.setattr(sch, "archive_stale_episode_is_new", lambda repo, since: episode_new)
     monkeypatch.setattr(sch, "escalate",
-                        lambda repo, issue, text: escalated.append(text) or "ок")
+                        lambda repo, issue, text, **_: escalated.append(text) or "ок")
 
 
 def test_new_stale_episode_alerts_and_carries_the_marker(monkeypatch):
@@ -11392,7 +11392,7 @@ def test_main_reddens_when_the_catch_up_pass_itself_is_broken(monkeypatch):
                         lambda repo, now: (["🚨 очередь архива сессий: морда недоступна"], (True, None)))
     escalated = []
     monkeypatch.setattr(sch, "escalate",
-                        lambda repo, issue, text: escalated.append(text) or "ок")
+                        lambda repo, issue, text, **_: escalated.append(text) or "ок")
 
     assert sch.main() == 1
     assert escalated and "Очередь архива сессий раннера НЕ тает" in escalated[0], escalated

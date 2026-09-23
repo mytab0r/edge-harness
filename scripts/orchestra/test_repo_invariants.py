@@ -2323,7 +2323,7 @@ def test_run_escalations_pipeline_health_dedupes_by_last_date(monkeypatch):
     def fake_issue_marker_times(repo, issue, marker):
         return [utc(2026, 9, 10, 0, 0)] if "2026-09-05" in marker else []
 
-    def fake_escalate(repo, issue, text):
+    def fake_escalate(repo, issue, text, **_):
         calls.append(text)
         return "отправлено"
 
@@ -3093,7 +3093,7 @@ def test_run_escalations_wires_invariant_15_with_fact_not_guess(monkeypatch):
     def fake_issue_marker_times(repo, issue_number, marker):
         return []
 
-    def fake_escalate(repo, issue_number, text):
+    def fake_escalate(repo, issue_number, text, **_):
         calls.append(text)
         return "отправлено"
 
@@ -3428,7 +3428,7 @@ def _wire_escalation_recorder(monkeypatch):
     def fake_issue_marker_times(repo, issue, marker):
         return [utc(2026, 9, 1)] if marker in already_escalated_markers else []
 
-    def fake_escalate(repo, issue, text):
+    def fake_escalate(repo, issue, text, **_):
         calls.append(text)
         already_escalated_markers.add(text.splitlines()[0])  # маркер — первая строка
         return "отправлено"
@@ -4483,7 +4483,7 @@ def test_run_escalations_invariant_18_dedupes_by_id_set(monkeypatch):
         expected = f"[инвариант 18: {ri.pipeline_status_marker_key([known])}]"
         return [utc(2026, 9, 13, 0, 0)] if marker == expected else []
 
-    def fake_escalate(repo, issue, text):
+    def fake_escalate(repo, issue, text, **_):
         calls.append((issue, text))
         return "отправлено"
 
@@ -4529,7 +4529,7 @@ def test_run_escalations_invariant_18_key_stays_compact(monkeypatch):
 
     sent = []
 
-    def fake_escalate(repo, issue, text):
+    def fake_escalate(repo, issue, text, **_):
         sent.append((repo, issue, text))
         return "отправлено"
 
