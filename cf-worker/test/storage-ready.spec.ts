@@ -23,6 +23,16 @@ async function getReady(): Promise<Response> {
   return WORKER.fetch("https://example.com/api/ready", { headers: AUTH });
 }
 
+// Алерты владельцу с #1495 идут В ТЕМУ категории, поэтому перед первым
+// sendMessage воркер зовёт createForumTopic (один раз на категорию —
+// message_thread_id кэшируется в SQL и переживает выгрузку DO). Тесты ниже
+// про ДЕДУП АЛЕРТОВ, а не про темы: заводится тема один раз или каждый раз —
+// отдельный вопрос с отдельным тестом («тема заводится один раз…» в этом же
+// файле). Поэтому здесь сравнивается только поток sendMessage.
+function alertsOnly(calls: string[]): string[] {
+  return calls.filter((method) => method === "sendMessage");
+}
+
 function telegramApiMethod(input: string | URL | Request): string | null {
   try {
     const url = new URL(String(input));
@@ -149,19 +159,19 @@ describe("пульс: готовность хранилища замечаетс
           | undefined;
         expect(Number(row!.ok)).toBe(0);
         expect(Number(row!.alerted)).toBe(1);
-        expect(telegramCalls).toEqual(["sendMessage"]);
+        expect(alertsOnly(telegramCalls)).toEqual(["sendMessage"]);
         // Второй тик подряд: хранилище всё ещё сломано — флаг уже 1, условный
         // UPDATE не переворачивает ничего (rowsWritten 0) — второй алерт не
         // шлём, иначе спам раз в 15 минут до сброса квоты в 00:00 UTC.
         await instance.alarm();
-        expect(telegramCalls).toEqual(["sendMessage"]);
+        expect(alertsOnly(telegramCalls)).toEqual(["sendMessage"]);
         // Восстановление: таблица вернулась — флаг 1→0 (rowsWritten 1),
         // переход unhealthy→healthy шлёт ровно один алерт о восстановлении.
         state.storage.sql.exec(
           "CREATE TABLE IF NOT EXISTS heartbeat (id INTEGER PRIMARY KEY CHECK (id = 1), ts INTEGER NOT NULL, job_id TEXT NOT NULL)",
         );
         await instance.alarm();
-        expect(telegramCalls).toEqual(["sendMessage", "sendMessage"]);
+        expect(alertsOnly(telegramCalls)).toEqual(["sendMessage", "sendMessage"]);
         const rowAfter = state.storage.sql.exec("SELECT alerted FROM storage_probe WHERE id = 1").toArray()[0] as
           | { alerted: number }
           | undefined;
@@ -203,7 +213,7 @@ describe("пульс: готовность хранилища замечаетс
         state.storage.sql.exec("DROP TABLE heartbeat");
         await expect(instance.alarm()).resolves.toBeUndefined();
         await expect(instance.alarm()).resolves.toBeUndefined();
-        expect(telegramCalls).toEqual([]);
+        expect(alertsOnly(telegramCalls)).toEqual([]);
         // Сценарий самовосстанавливается: SCHEMA пересоздаёт таблицу при
         // пересоздании DO; здесь доказываем обрыв класса — вернули таблицу,
         // и первый же тик с записавшимся флагом шлёт алерт ОДИН раз.
@@ -211,9 +221,9 @@ describe("пульс: готовность хранилища замечаетс
           "CREATE TABLE IF NOT EXISTS storage_probe (id INTEGER PRIMARY KEY CHECK (id = 1), ts INTEGER NOT NULL, ok INTEGER NOT NULL, detail TEXT, alerted INTEGER NOT NULL DEFAULT 0)",
         );
         await instance.alarm();
-        expect(telegramCalls).toEqual(["sendMessage"]);
+        expect(alertsOnly(telegramCalls)).toEqual(["sendMessage"]);
         await instance.alarm();
-        expect(telegramCalls).toEqual(["sendMessage"]);
+        expect(alertsOnly(telegramCalls)).toEqual(["sendMessage"]);
       });
     } finally {
       vi.unstubAllGlobals();
@@ -245,6 +255,104 @@ describe("пульс: готовность хранилища замечаетс
       vi.unstubAllGlobals();
       env.TELEGRAM_BOT_TOKEN = "";
       env.TELEGRAM_CHAT_ID = savedChatId;
+    }
+  });
+});
+
+describe("алерты воркера уходят в тему категории, а не в общую кучу (#1495)", () => {
+  // Проверяется ФАКТ В ХРАНИЛИЩЕ и ФАКТ В ПАЙЛОАДЕ, а не то, что вызов
+  // случился: «sendMessage был» совпадает и когда message_thread_id нет —
+  // ровно так дефект и прожил незамеченным при зелёных тестах.
+  const THREAD_ID = 4242;
+
+  function topicStub(realFetch: typeof fetch, calls: string[], payloads: Record<string, unknown>[],
+                     topicWorks = true) {
+    return (async (input: string | URL | Request, init?: RequestInit) => {
+      const method = telegramApiMethod(input);
+      if (!method) return realFetch(input as RequestInfo, init);
+      calls.push(method);
+      if (typeof init?.body === "string") payloads.push(JSON.parse(init.body) as Record<string, unknown>);
+      if (method === "createForumTopic") {
+        // Прод-форма ответа Bot API: результат создания темы несёт
+        // message_thread_id. Отказ воспроизводится ответом Telegram с ok:false
+        // и description — тем же, что приходит при выключенных темах.
+        return new Response(
+          JSON.stringify(
+            topicWorks
+              ? { ok: true, result: { message_thread_id: THREAD_ID, name: "🔴 Поломки" } }
+              : { ok: false, error_code: 400, description: "Bad Request: the chat is not a forum" },
+          ),
+          { status: topicWorks ? 200 : 400, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify({ ok: true, result: {} }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+  }
+
+  it("тема заводится один раз, id лежит в SQL, второй алерт её переиспользует", async () => {
+    const stub = env.HARNESS.get(env.HARNESS.idFromName("worker-alert-topic-reuse"));
+    const realFetch = globalThis.fetch;
+    env.TELEGRAM_BOT_TOKEN = "test-bot-token";
+    const calls: string[] = [];
+    const payloads: Record<string, unknown>[] = [];
+    vi.stubGlobal("fetch", topicStub(realFetch, calls, payloads));
+    try {
+      await runInDurableObject(stub, async (instance, state) => {
+        state.storage.sql.exec("DROP TABLE heartbeat");
+        await instance.alarm(); // incident
+        const row = state.storage.sql
+          .exec("SELECT thread_id FROM telegram_topics WHERE category = ?", "breakage")
+          .toArray()[0] as { thread_id: number } | undefined;
+        expect(Number(row?.thread_id)).toBe(THREAD_ID);
+        expect(payloads.find((p) => p.text)?.message_thread_id).toBe(THREAD_ID);
+
+        // Восстановление: второй алерт. Тема уже известна — createForumTopic
+        // больше НЕ зовётся. Без этого в чате владельца копилась бы свалка
+        // одноразовых тем одной категории, по одной на алерт.
+        state.storage.sql.exec(
+          "CREATE TABLE IF NOT EXISTS heartbeat (id INTEGER PRIMARY KEY CHECK (id = 1), ts INTEGER NOT NULL, job_id TEXT NOT NULL)",
+        );
+        await instance.alarm(); // recovery
+        expect(calls.filter((m) => m === "createForumTopic")).toHaveLength(1);
+        expect(calls.filter((m) => m === "sendMessage")).toHaveLength(2);
+        expect(payloads.filter((p) => p.text).every((p) => p.message_thread_id === THREAD_ID)).toBe(true);
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("тему получить не удалось — алерт всё равно уходит, но с названной причиной", async () => {
+    const stub = env.HARNESS.get(env.HARNESS.idFromName("worker-alert-topic-unavailable"));
+    const realFetch = globalThis.fetch;
+    env.TELEGRAM_BOT_TOKEN = "test-bot-token";
+    const calls: string[] = [];
+    const payloads: Record<string, unknown>[] = [];
+    vi.stubGlobal("fetch", topicStub(realFetch, calls, payloads, false));
+    try {
+      await runInDurableObject(stub, async (instance, state) => {
+        state.storage.sql.exec("DROP TABLE heartbeat");
+        await instance.alarm();
+        const alert = payloads.find((p) => p.text) as { text: string; message_thread_id?: number } | undefined;
+        // Потерять алерт дороже, чем показать его не там (ADR 0028) — но
+        // МОЛЧА показать не там это silent-wrong: владелец не отличит
+        // «тема не досталась» от «так и задумано».
+        expect(alert).toBeDefined();
+        expect(alert!.message_thread_id).toBeUndefined();
+        expect(alert!.text).toContain("Хранилище журнала не отвечает");
+        expect(alert!.text).toContain("в общем потоке");
+        // Ничего не сохранили: следующий тик попробует завести тему снова,
+        // иначе один отказ Telegram выключил бы темы навсегда.
+        const rows = state.storage.sql
+          .exec("SELECT thread_id FROM telegram_topics WHERE category = ?", "breakage")
+          .toArray();
+        expect(rows).toHaveLength(0);
+      });
+    } finally {
+      vi.unstubAllGlobals();
     }
   });
 });

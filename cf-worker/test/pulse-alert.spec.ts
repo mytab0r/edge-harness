@@ -15,6 +15,16 @@ import { DSH_EDGE_UPDATE, HEARTBEAT } from "../src/config";
 
 const WORKER = { fetch: (input: string, init?: RequestInit) => exports.default.fetch(input, init) };
 
+// Алерты владельцу с #1495 идут В ТЕМУ категории, поэтому перед первым
+// sendMessage воркер зовёт createForumTopic (один раз на категорию —
+// message_thread_id кэшируется в SQL и переживает выгрузку DO). Тесты ниже
+// про ДЕДУП АЛЕРТОВ, а не про темы: заводится тема один раз или каждый раз —
+// отдельный вопрос с отдельным тестом («тема заводится один раз…» в этом же
+// файле). Поэтому здесь сравнивается только поток sendMessage.
+function alertsOnly(calls: string[]): string[] {
+  return calls.filter((method) => method === "sendMessage");
+}
+
 function telegramApiMethod(input: string | URL | Request): string | null {
   try {
     const url = new URL(String(input));
@@ -116,7 +126,10 @@ describe("живость пульса владельцу: серия падаю�
       const tgMethod = telegramApiMethod(input);
       if (tgMethod) {
         telegramCalls.push(tgMethod);
-        if (typeof init?.body === "string") telegramTexts.push((JSON.parse(init.body) as { text: string }).text);
+        // Только тексты САМИХ алертов: createForumTopic (#1495) несёт `name`
+        // темы, не `text`, и попав сюда сдвинул бы индексы проверок ниже.
+        if (tgMethod === "sendMessage" && typeof init?.body === "string")
+          telegramTexts.push((JSON.parse(init.body) as { text: string }).text);
         return new Response(JSON.stringify({ ok: true, result: {} }), {
           status: 200,
           headers: { "content-type": "application/json" },
@@ -150,7 +163,7 @@ describe("живость пульса владельцу: серия падаю�
           await instance.alarm();
         }
       });
-      expect(telegramCalls).toEqual(["sendMessage"]);
+      expect(alertsOnly(telegramCalls)).toEqual(["sendMessage"]);
       const status = await getJson<{ last_pulse: { dispatch_ok: boolean; detail: string | null } | null }>(
         "/api/status",
       );
@@ -170,13 +183,13 @@ describe("живость пульса владельцу: серия падаю�
       await runInDurableObject(stub, async (instance) => {
         await instance.alarm();
       });
-      expect(telegramCalls).toEqual(["sendMessage", "sendMessage"]);
+      expect(alertsOnly(telegramCalls)).toEqual(["sendMessage", "sendMessage"]);
 
       // Ещё один здоровый тик подряд — второй recovery не шлём (флаг уже 0).
       await runInDurableObject(stub, async (instance) => {
         await instance.alarm();
       });
-      expect(telegramCalls).toEqual(["sendMessage", "sendMessage"]);
+      expect(alertsOnly(telegramCalls)).toEqual(["sendMessage", "sendMessage"]);
     } finally {
       vi.unstubAllGlobals();
       env.GH_DISPATCH_TOKEN = "";
@@ -202,7 +215,10 @@ describe("живость пульса владельцу: серия падаю�
       const tgMethod = telegramApiMethod(input);
       if (tgMethod) {
         telegramCalls.push(tgMethod);
-        if (typeof init?.body === "string") telegramTexts.push((JSON.parse(init.body) as { text: string }).text);
+        // Только тексты САМИХ алертов: createForumTopic (#1495) несёт `name`
+        // темы, не `text`, и попав сюда сдвинул бы индексы проверок ниже.
+        if (tgMethod === "sendMessage" && typeof init?.body === "string")
+          telegramTexts.push((JSON.parse(init.body) as { text: string }).text);
         return new Response(JSON.stringify({ ok: true, result: {} }), {
           status: 200,
           headers: { "content-type": "application/json" },
@@ -225,7 +241,7 @@ describe("живость пульса владельцу: серия падаю�
       // не «тик давно не обновлялся» (pulseStale здесь не участвует, см.
       // докстринг pulseAlertText, находка ревью PR #1104): текст несёт
       // причину ИМЕННО этого тика, не общую фразу.
-      expect(telegramCalls).toEqual(["sendMessage"]);
+      expect(alertsOnly(telegramCalls)).toEqual(["sendMessage"]);
       expect(telegramTexts[0]).toContain("403");
       expect(telegramTexts[0]).not.toContain("null");
     } finally {
@@ -294,12 +310,12 @@ describe("живость пульса владельцу: серия падаю�
       await runInDurableObject(stub, async (instance, state) => {
         state.storage.sql.exec("DROP TABLE pulse_alert");
         await expect(instance.alarm()).resolves.toBeUndefined();
-        expect(telegramCalls).toEqual([]);
+        expect(alertsOnly(telegramCalls)).toEqual([]);
         state.storage.sql.exec(
           "CREATE TABLE IF NOT EXISTS pulse_alert (id INTEGER PRIMARY KEY CHECK (id = 1), alerted INTEGER NOT NULL DEFAULT 0)",
         );
         await instance.alarm();
-        expect(telegramCalls).toEqual(["sendMessage"]);
+        expect(alertsOnly(telegramCalls)).toEqual(["sendMessage"]);
       });
     } finally {
       vi.unstubAllGlobals();

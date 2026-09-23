@@ -186,6 +186,22 @@ const SCHEMA = [
      kind  TEXT PRIMARY KEY,
      json  TEXT NOT NULL
    )`,
+  // Карта «категория → message_thread_id» чата владельца (#1495). В SQL по
+  // той же причине, что counts_cache выше: поле объекта не переживает
+  // выгрузку DO (~10 с простоя, #329), а заводить тему заново на каждый
+  // алерт — это свалка одноразовых тем в чате владельца.
+  //
+  // Вторая карта рядом с Python-ской (ветка data/telegram-topics) заведена
+  // не по недосмотру: у воркера нет доступа к веткам репозитория, а общий
+  // источник правды у обеих сторон один и тот же — САМ TELEGRAM, где тема
+  // ищется и заводится по заголовку. Поэтому синхронизируются не карты, а
+  // заголовки (TELEGRAM.topicTitles ↔ telegram_topics.CATEGORIES, гвардия
+  // scripts/lib/test_telegram_topics.py). Расхождение заголовков даёт две
+  // темы одной категории — это и есть дефект, который гвардия закрывает.
+  `CREATE TABLE IF NOT EXISTS telegram_topics (
+     category  TEXT PRIMARY KEY,
+     thread_id INTEGER NOT NULL
+   )`,
   `CREATE TABLE IF NOT EXISTS storage_probe (
      id      INTEGER PRIMARY KEY CHECK (id = 1),
      ts      INTEGER NOT NULL,
@@ -1531,7 +1547,7 @@ export class Harness extends DurableObject<Env> {
     // тик, а не вторая копия у каждого вызывающего. lastPulse строим из уже
     // посчитанных значений ЭТОГО тика (не второй SQL-раундтрип через
     // #getStoredPulse — #recordPulse выше уже записала ровно это).
-    this.#tickPulseAlert(now, { ts: now, dispatch_ok: result.ok, detail, run_confirmed: runConfirmed });
+    await this.#tickPulseAlert(now, { ts: now, dispatch_ok: result.ok, detail, run_confirmed: runConfirmed });
   }
 
   /**
@@ -1645,7 +1661,7 @@ export class Harness extends DurableObject<Env> {
     // в этом DO не должен зависеть ни от GH_DISPATCH_TOKEN/GH_REPO, ни от
     // TELEGRAM_BOT_TOKEN — при их отсутствии тик обязан продолжать замечать
     // недоступность хранилища, а не молча пропускать эту гарантию.
-    this.#tickStorageReadyAlert();
+    await this.#tickStorageReadyAlert();
 
     // Инбокс владельца (#20): тот же пульс — ватчдог зависших и водитель разбора.
     // ДО раннего возврата по конфигурации dispatch: разбор не зависит ни от
@@ -1975,7 +1991,7 @@ export class Harness extends DurableObject<Env> {
    * логом: без записанного флага «шлём/не шлём» решать не по чему, и молча
    * пропустить один тик честнее, чем спамить; первый удавшийся тик догонит.
    */
-  #tickStorageReadyAlert(): void {
+  async #tickStorageReadyAlert(): Promise<void> {
     const result = this.#checkStorageReady();
     let dedupRowsWritten: number | null = null;
     try {
@@ -1990,15 +2006,9 @@ export class Harness extends DurableObject<Env> {
     if (!this.env.TELEGRAM_CHAT_ID) return; // «возможности нет» — алерту некуда идти
     const decision = storageReadyAlertDecision(result.ok, dedupRowsWritten);
     if (decision === "incident") {
-      void this.#telegramApi("sendMessage", {
-        chat_id: this.env.TELEGRAM_CHAT_ID,
-        text: `⚠️ Хранилище журнала не отвечает: ${result.detail}`,
-      });
+      await this.#alertOwner(`⚠️ Хранилище журнала не отвечает: ${result.detail}`);
     } else if (decision === "recovery") {
-      void this.#telegramApi("sendMessage", {
-        chat_id: this.env.TELEGRAM_CHAT_ID,
-        text: "✅ Хранилище журнала снова отвечает",
-      });
+      await this.#alertOwner("✅ Хранилище журнала снова отвечает");
     }
   }
 
@@ -2044,7 +2054,7 @@ export class Harness extends DurableObject<Env> {
    * исправленное (свежее, успешное) состояние — incident не пишется вовсе,
    * хотя пульс реально молчал 20+ минут до этого. Не закрыто этим change'ом.
    */
-  #tickPulseAlert(now: number, lastPulse: PulseStatus): void {
+  async #tickPulseAlert(now: number, lastPulse: PulseStatus): Promise<void> {
     const healthy = pulseHealthy(now, lastPulse);
     let dedupRowsWritten: number | null = null;
     try {
@@ -2060,15 +2070,9 @@ export class Harness extends DurableObject<Env> {
     if (!this.env.TELEGRAM_CHAT_ID) return; // «возможности нет» — алерту некуда идти
     const decision = storageReadyAlertDecision(healthy, dedupRowsWritten);
     if (decision === "incident") {
-      void this.#telegramApi("sendMessage", {
-        chat_id: this.env.TELEGRAM_CHAT_ID,
-        text: pulseAlertText(lastPulse),
-      });
+      await this.#alertOwner(pulseAlertText(lastPulse));
     } else if (decision === "recovery") {
-      void this.#telegramApi("sendMessage", {
-        chat_id: this.env.TELEGRAM_CHAT_ID,
-        text: "✅ edge-harness: пульс оркестратора снова в норме",
-      });
+      await this.#alertOwner("✅ edge-harness: пульс оркестратора снова в норме");
     }
   }
 
@@ -2953,6 +2957,132 @@ export class Harness extends DurableObject<Env> {
    *  секрет не задан или сеть недоступна — громкий console.error, не throw
    *  (ответ владельцу важнее, чем падение всего запроса из-за необязательного
    *  внешнего звонка). */
+  /**
+   * message_thread_id темы категории в чате владельца, или null (#1495).
+   *
+   * Тормоз с названным газом: темы — не обязательство. Не удалось (чат не
+   * форум, у бота нет `can_manage_topics`, сеть, Telegram ответил ошибкой) —
+   * возвращается null, и вызывающий уходит В ОБЩИЙ ПОТОК с пометкой ПОЧЕМУ.
+   * Потерять алерт дороже, чем показать его не там, — ровно тот же выбор, что
+   * на Python-стороне (ADR 0028).
+   *
+   * Кэш в SQL, не в поле: DO выгружается через ~10 с простоя (#329), поле
+   * было бы холодным почти всегда, и каждый алерт заводил бы новую тему.
+   */
+  async #ownerThreadId(category: string): Promise<number | null> {
+    const title = TELEGRAM.topicTitles[category];
+    if (!title) {
+      console.error(
+        `ownerThreadId: категории «${category}» нет в TELEGRAM.topicTitles — ` +
+          "сигнал уйдёт в общий поток; реестр категорий один на оба языка " +
+          "(scripts/lib/telegram_topics.py::CATEGORIES)",
+      );
+      return null;
+    }
+    try {
+      const row = this.#rows(
+        this.#sql.exec("SELECT thread_id FROM telegram_topics WHERE category = ?", category),
+      )[0];
+      if (row) return Number(row.thread_id);
+    } catch (error) {
+      console.error(
+        `ownerThreadId: чтение карты тем упало (${error instanceof Error ? error.message : error}) — ` +
+          "пробую завести тему заново",
+      );
+    }
+    const created = await this.#telegramApiResult("createForumTopic", {
+      chat_id: this.env.TELEGRAM_CHAT_ID,
+      name: title,
+    });
+    const threadId = Number(
+      (created?.result as Record<string, unknown> | undefined)?.message_thread_id,
+    );
+    if (!Number.isFinite(threadId) || threadId <= 0) {
+      console.error(
+        `ownerThreadId: тема «${title}» не заведена (${created?.description ?? "ответ без message_thread_id"}) — ` +
+          "сигнал уйдёт в общий поток с пометкой",
+      );
+      return null;
+    }
+    try {
+      this.#sql.exec(
+        "INSERT INTO telegram_topics (category, thread_id) VALUES (?, ?) " +
+          "ON CONFLICT(category) DO UPDATE SET thread_id = excluded.thread_id",
+        category,
+        threadId,
+      );
+    } catch (error) {
+      console.error(
+        `ownerThreadId: тема «${title}» заведена (${threadId}), но не сохранена ` +
+          `(${error instanceof Error ? error.message : error}) — следующий алерт заведёт ещё одну`,
+      );
+    }
+    return threadId;
+  }
+
+  /**
+   * Алерт владельцу В ТЕМУ своей категории (#1495). Единственная дверь для
+   * сообщений воркера: четыре прежних вызова `sendMessage` уходили без
+   * `message_thread_id` вовсе, и в чате владельца это была общая куча —
+   * притом ровно те сообщения, что переживают смерть GitHub Actions (#1103)
+   * и которые он обязан увидеть первыми.
+   *
+   * Тема не досталась — текст уходит С ПРИЧИНОЙ в общем потоке: «возможности
+   * нет» и «возможность есть, но сломана» лечатся по-разному, и читатель
+   * обязан различать их по самому сообщению.
+   */
+  async #alertOwner(text: string): Promise<void> {
+    const threadId = await this.#ownerThreadId(TELEGRAM.workerAlertCategory);
+    if (threadId === null) {
+      await this.#telegramApi("sendMessage", {
+        chat_id: this.env.TELEGRAM_CHAT_ID,
+        text: `${text}\n\n(в общем потоке: тему «${TELEGRAM.topicTitles[TELEGRAM.workerAlertCategory]}» получить не удалось — причина в логах воркера)`,
+      });
+      return;
+    }
+    await this.#telegramApi("sendMessage", {
+      chat_id: this.env.TELEGRAM_CHAT_ID,
+      message_thread_id: threadId,
+      text,
+    });
+  }
+
+  /** Тот же вызов Bot API, что #telegramApi, но с РАЗОБРАННЫМ ответом:
+   *  createForumTopic нужен ради `message_thread_id`, а #telegramApi ответ
+   *  выбрасывает. Ошибки обрабатываются так же (лог + null), чтобы не
+   *  появилось второго мнения о том, что считать отказом. */
+  async #telegramApiResult(
+    method: string,
+    payload: Record<string, unknown>,
+  ): Promise<{ ok?: boolean; result?: unknown; description?: string } | null> {
+    const token = this.env.TELEGRAM_BOT_TOKEN;
+    if (!token) {
+      console.error(`telegramApiResult(${method}): TELEGRAM_BOT_TOKEN не задан — вызов не сделан`);
+      return null;
+    }
+    try {
+      const res = await fetch(`${TELEGRAM.apiBase}/bot${token}/${method}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "User-Agent": EGRESS_USER_AGENT },
+        body: JSON.stringify(payload),
+      });
+      const body = (await res.json().catch(() => null)) as
+        | { ok?: boolean; result?: unknown; description?: string }
+        | null;
+      if (!res.ok) {
+        console.error(
+          `telegramApiResult(${method}): Telegram ответил ${res.status}: ${body?.description ?? "тело не разобрано"}`,
+        );
+      }
+      return body;
+    } catch (error) {
+      console.error(
+        `telegramApiResult(${method}): сеть недоступна: ${error instanceof Error ? error.message : error}`,
+      );
+      return null;
+    }
+  }
+
   async #telegramApi(method: string, payload: Record<string, unknown>): Promise<void> {
     const token = this.env.TELEGRAM_BOT_TOKEN;
     if (!token) {
