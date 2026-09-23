@@ -440,6 +440,29 @@ _console_utf8_spec = importlib.util.spec_from_file_location(
 _console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))
 # --- конец console_utf8 bootstrap ---
 
+# --- rate_guard: исчерпанный бюджет API — предупреждение, не красный required-гейт ---
+# Отличие от гейтов contract/review (#1466) существенное и названо здесь, а не
+# подразумевается. Те проверяют ЭТОТ PR: их зелёный означает «контракт PR↔задача
+# проверен», «дифф отревьюен», и пропуск по чужой квоте был бы silent-wrong —
+# слияние непроверенного.
+#
+# Этот скрипт проверяет ЖИВОЕ СОСТОЯНИЕ РЕПОЗИТОРИЯ, а не содержимое PR. Его
+# вывод не про дифф вовсе, и он по построению повторяем: тот же список
+# инвариантов бежит в orchestra.yml каждые 15 минут (AGENTS.md, «Инцидент
+# оставляет инвариант»). Значит пропуск здесь не создаёт дыры — он лишь
+# откладывает проверку до ближайшего планового прогона, и это НАЗВАННЫЙ газ, а
+# не умолчание.
+#
+# Цена обратного выбора измерена: 2026-09-22 исчерпанный бюджет уронил
+# обязательную проверку на PR #1474/#1472/#1473 подряд (403 на
+# issues/120/comments), ни один из них к квоте отношения не имел, и конвейер
+# встал вторично — уже не из-за поломки, а из-за чужого счётчика.
+_rate_guard_spec = importlib.util.spec_from_file_location(
+    "rate_guard", Path(__file__).resolve().parents[1] / "lib" / "rate_guard.py")
+_rate_guard = importlib.util.module_from_spec(_rate_guard_spec)
+_rate_guard_spec.loader.exec_module(_rate_guard)
+# --- конец rate_guard ---
+
 import argparse
 import hashlib
 import importlib.util
@@ -4178,9 +4201,22 @@ def main() -> int:
     return 0
 
 
-if __name__ == "__main__":
+def _main_reporting_runtime_errors() -> int:
+    """main с прежним разбором RuntimeError — обёртка квоты снаружи.
+
+    Порядок важен: сначала свой разбор (RuntimeError печатается как ::error::
+    и красит прогон), и только отказ формы «бюджет исчерпан» перехватывает
+    rate_guard уровнем выше. Поменять их местами значило бы гасить ЛЮБУЮ
+    RuntimeError, а не только квотную."""
     try:
-        sys.exit(main())
+        return main()
     except RuntimeError as error:
+        if _rate_guard.is_rate_limit_refusal(str(error)):
+            raise
         print(f"::error::repo_invariants: {error}")
-        sys.exit(1)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(_rate_guard.run_guard_main(
+        _main_reporting_runtime_errors, guard="repo_invariants"))

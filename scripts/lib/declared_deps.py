@@ -82,6 +82,18 @@ _console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_u
 # --- конец console_utf8 bootstrap ---
 
 import importlib.util
+# --- rate_guard: исчерпанный бюджет API — предупреждение, не красный required-гейт (#1004) ---
+# Замер 2026-09-22 (исполнен, не вспомнен): под заглушкой `gh`, отвечающей
+# `HTTP 403 rate limit exceeded`, `python scripts/lib/declared_deps.py check
+# <repo>` — ровно та команда, которую запускает гвардия — падает трейсбеком
+# `task_deps.TaskDepsError`, EXIT=1. Это НАСТОЯЩИЙ потребитель бюджета, а не
+# осторожность: путь `fetch_pool` → `gh_graphql` → `gh api graphql`.
+_rate_guard_spec = importlib.util.spec_from_file_location(
+    "rate_guard", Path(__file__).resolve().parent / "rate_guard.py")
+_rate_guard = importlib.util.module_from_spec(_rate_guard_spec)
+_rate_guard_spec.loader.exec_module(_rate_guard)
+# --- конец rate_guard ---
+
 import json
 import re
 import sys
@@ -437,4 +449,5 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(_rate_guard.run_guard_main(
+        lambda: main(sys.argv[1:]), guard="declared-deps-guard"))

@@ -276,3 +276,186 @@ def test_the_repo_ci_test_job_reads_no_api_beside_the_gate():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+# ── #1004: вторая поверхность класса — гвардии каталога scripts/ci/guards ────
+
+
+def _catalogue(tmp_path: Path, guard_name: str, script: str, modules: dict[str, str]) -> tuple[Path, Path]:
+    """Настоящий каталог гвардий + настоящие модули на диске: гвардия
+    разбирает их своим обычным путём (поведенческий стенд, не пересказ)."""
+    root = tmp_path / "repo"
+    guards = root / "scripts" / "ci" / "guards"
+    guards.mkdir(parents=True, exist_ok=True)
+    (guards / f"{guard_name}.sh").write_text(script, encoding="utf-8")
+    for rel, text in modules.items():
+        module = root / rel
+        module.parent.mkdir(parents=True, exist_ok=True)
+        module.write_text(text, encoding="utf-8")
+    return guards, root
+
+
+READS_API_NO_WRAPPER = '''
+import review_labels
+def main() -> int:
+    pulls = review_labels.list_pages("repos/o/r/pulls?state=open&per_page=100", gh)
+    return 0
+sys.exit(main())
+'''
+
+READS_API_WRAPPED = READS_API_NO_WRAPPER.replace(
+    "sys.exit(main())", 'sys.exit(_rate_guard.run_guard_main(main, guard="x"))')
+
+NO_API = '''
+def main() -> int:
+    return 0
+sys.exit(main())
+'''
+
+
+def test_catalogue_guard_reading_api_without_the_wrapper_is_a_violation(tmp_path):
+    """Живой случай #1004: прогон 35727716021 (PR #1458). Гейт квоты корректно
+    пропустил дорогие шаги, а шаг «Каталог гвардий» всё равно свалил
+    обязательную проверку — `decision-doc-numbering-guard` упал трейсбеком на
+    `HTTP 403: API rate limit exceeded for installation`."""
+    guards, root = _catalogue(
+        tmp_path, "reader", "python scripts/lib/reader.py\n",
+        {"scripts/lib/reader.py": READS_API_NO_WRAPPER})
+
+    problems = guard.catalogue_problems(guards, root)
+
+    assert len(problems) == 1
+    assert "scripts/lib/reader.py" in problems[0]
+    assert "run_guard_main" in problems[0]
+
+
+def test_catalogue_guard_with_the_wrapper_passes(tmp_path):
+    guards, root = _catalogue(
+        tmp_path, "reader", "python scripts/lib/reader.py\n",
+        {"scripts/lib/reader.py": READS_API_WRAPPED})
+
+    assert guard.catalogue_problems(guards, root) == []
+
+
+def test_wrapper_mentioned_only_in_prose_is_still_a_violation(tmp_path):
+    """Поймано исполнением мутации: обёртка снята до вызова в `__main__`,
+    а проверка `_QUOTA_WRAPPER in text` находила имя обёртки в ДОКСТРИНГЕ
+    модуля — `catalogue_problems` молчал на ровно том состоянии, ради
+    которого заведён. Тот же класс «проза вместо кода», что и у маркеров
+    чтения API: упоминание `run_guard_main` в докстринге/комментарии
+    обёрткой не является, использование ищется в коде (AST)."""
+    reader = ('"""Выход идёт через rate_guard.run_guard_main (#1004)."""\n'
+              + READS_API_NO_WRAPPER)
+    guards, root = _catalogue(
+        tmp_path, "reader", "python scripts/lib/reader.py\n",
+        {"scripts/lib/reader.py": reader})
+
+    problems = guard.catalogue_problems(guards, root)
+
+    assert len(problems) == 1
+    assert "scripts/lib/reader.py" in problems[0]
+
+
+def test_catalogue_guard_that_does_not_touch_the_api_is_not_asked_for_a_wrapper(tmp_path):
+    """Газ: обёртка требуется только от тех, кто реально ходит в API.
+    Требовать её от всех — тормоз без причины на десятках гвардий."""
+    guards, root = _catalogue(
+        tmp_path, "pure", "python scripts/lib/pure.py\n",
+        {"scripts/lib/pure.py": NO_API})
+
+    assert guard.catalogue_modules_reading_api(guards, root) == {}
+    assert guard.catalogue_problems(guards, root) == []
+
+
+def test_tests_of_a_guard_are_not_counted_as_api_readers(tmp_path):
+    """Тест гвардии ходит по заглушкам и бюджет не тратит — требовать от него
+    обёртки значило бы считать потребителем того, кто не потребляет."""
+    guards, root = _catalogue(
+        tmp_path, "tested",
+        "python -m pytest scripts/lib/test_reader.py -q\npython scripts/lib/pure.py\n",
+        {"scripts/lib/test_reader.py": READS_API_NO_WRAPPER,
+         "scripts/lib/pure.py": NO_API})
+
+    assert guard.catalogue_modules_reading_api(guards, root) == {}
+
+
+def test_live_catalogue_has_exactly_the_six_measured_readers():
+    """Замер 2026-09-22, переделанный после ревью PR #1460 и зафиксированный
+    числом и поимённо.
+
+    История числа — она же и есть содержание этого теста. Обоснование «ни одна
+    гвардия каталога не читает gh api» (run_guards.sh, repo-ci.yml) было ложным,
+    issue #1004 называла ОДНОГО потребителя, первая версия этого PR насчитала
+    четырёх — и все три числа были пересказом, а не замером:
+
+      * текстовый маркер `gh(` совпал с прозой комментария в
+        `ci_guard_registration_guard.py` — гвардия, не ходящая наружу вовсе,
+        попала в список (завышение, найдено ревью);
+      * `invariant_numbering.py` ходит в API ТРАНЗИТИВНО, своих маркеров не
+        имеет — и в список не попал (занижение, найдено ревью, исполнено
+        мутацией: под заглушкой `gh` с 403 он падал трейсбеком);
+      * точный набор имён пропускал `_gh_api(...)`
+        (`pr_mutation_claim_check.py`) и `subprocess.run(["gh", "api", …])`
+        (`plugin_manager_roster_guard.py`) — занижение, найденное уже мной
+        при переделке на AST.
+
+    Тест падает и когда появится седьмой (его надо обернуть и назвать здесь), и
+    когда исчезнет один из шести — реестр не имеет права врать в обе стороны."""
+    readers = guard.catalogue_modules_reading_api()
+
+    assert sorted(readers) == [
+        "decision-doc-numbering-guard",
+        "declared-deps-guard",
+        "deploy-workflow-registry-guard",
+        "invariant-numbering-guard",
+        "mutation-claim-guard",
+        "plugin-manager-roster-guard",
+    ], readers
+
+
+def test_prose_mentioning_gh_is_not_counted_as_a_call():
+    """Находка ревью PR #1460 дословно: комментарий «Оркестрация без
+    keyword-аргументов gh()» делал модуль потребителем API. AST комментария
+    не видит — и это проверяется, а не подразумевается."""
+    assert not guard._calls_api_directly(
+        "# Оркестрация без keyword-аргументов gh()\n"
+        'TEXT = "list_pages и gh api — про них тут только написано"\n'
+        "def main():\n    return 0\n")
+
+
+def test_subprocess_gh_argv_counts_as_an_api_call():
+    """Второй способ сходить в API: зовут `subprocess.run`, а «gh» лежит
+    первым элементом списка. Именем функции это не ловится."""
+    assert guard._calls_api_directly(
+        "import subprocess\n"
+        'def main():\n    return subprocess.run(["gh", "api", "repos/x/y"])\n')
+
+
+def test_private_gh_api_helper_counts_as_an_api_call():
+    """`_gh_api` — то же самое под своим именем; точный набор имён его
+    пропускал."""
+    assert guard._calls_api_directly(
+        "def _gh_api(*a):\n    ...\n"
+        "def main():\n    return _gh_api('repos/x/y/pulls')\n")
+
+
+def test_defining_the_primitive_is_not_consuming_it():
+    """`def gh(...)` вызовом не является: модуль, предоставляющий примитив,
+    не становится его потребителем."""
+    assert not guard._calls_api_directly(
+        "def gh(*args):\n    return None\n")
+
+
+def test_the_wrapper_module_itself_is_not_a_consumer():
+    """Замкнутый круг, всплывший при переделке: модуль подключает
+    `rate_guard`, `rate_guard` зондирует бюджет своим `gh api` — и модуль
+    становится «потребителем» ровно оттого, что его уже починили."""
+    assert guard._WRAPPER_MODULE == "scripts/lib/rate_guard.py"
+    readers = guard.catalogue_modules_reading_api()
+    for entries in readers.values():
+        for reachable in entries.values():
+            assert guard._WRAPPER_MODULE not in reachable
+
+
+def test_live_catalogue_readers_all_carry_the_wrapper():
+    assert guard.catalogue_problems() == []
