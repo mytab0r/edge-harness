@@ -92,6 +92,7 @@
 - [0025. Классификация классов дефектов — в источнике, не постфактум-кластеризацией](decisions/0025-defect-class-source-classification.md)
 - [0026. Заявления агента о своей работе — машинная проверка исполнения, не критик-прочтение](decisions/0026-verify-agent-claims-machine-check.md)
 - [0027. Немигрируемая сессия изолируется, а не роняет морду](decisions/0027-quarantine-unmigratable-session.md)
+- [0028. Соответствие «категория сигнала → тема Telegram» живёт на data-ветке](decisions/0028-telegram-topics-map-on-data-branch.md)
 
 ## Операционные процедуры
 
