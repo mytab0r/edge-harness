@@ -2302,7 +2302,14 @@ describe("Telegram: кнопки решения владельца (#254)", () =
   // владельца», а чужой callback увёл бы repository_dispatch в произвольную
   // задачу — ниже гвардируется оба пути.
   describe("привязка вебхука к владельцу по chat_id (находка ревью PR #486)", () => {
-    it("callback_query из чужого чата — 401, dispatch и ответ Telegram не уходят", async () => {
+    // Код ответа здесь 200, а НЕ 401 (#1477): 4xx у Telegram означает не
+    // «отклонено», а «повтори тот же апдейт снова», и он держит за ним все
+    // следующие апдейты того же чата — то есть прежняя редакция позволяла
+    // любому постороннему одним сообщением навсегда заглушить канал кнопок
+    // владельца. Отказ в обслуживании остался прежним и проверяется тем, что
+    // проверять и надо: dispatch не ушёл, Telegram не вызван, строки в инбоксе
+    // нет. Код ответа гвардией быть перестал — им он и не был.
+    it("callback_query из чужого чата — 200 ignored/unauthorized, dispatch и ответ Telegram не уходят", async () => {
       const realFetch = globalThis.fetch;
       env.GH_DISPATCH_TOKEN = "test-dispatch-token";
       env.TELEGRAM_BOT_TOKEN = "test-bot-token";
@@ -2313,8 +2320,11 @@ describe("Telegram: кнопки решения владельца (#254)", () =
       }) as typeof fetch);
       try {
         const res = await postTelegramWebhook(callbackUpdate({ data: "wo:471:1", chatId: -999 }));
-        expect(res.status).toBe(401);
-        expect((await res.json<{ error: { code: string } }>()).error.code).toBe("unauthorized");
+        expect(res.status).toBe(200);
+        const body = await res.json<{ status: string; reason: string; http_status: number }>();
+        expect(body.status).toBe("ignored");
+        expect(body.reason).toBe("unauthorized");
+        expect(body.http_status).toBe(401);
       } finally {
         vi.unstubAllGlobals();
         env.GH_DISPATCH_TOKEN = "";
@@ -2322,7 +2332,8 @@ describe("Telegram: кнопки решения владельца (#254)", () =
       }
     });
 
-    it("сообщение (не callback) через вебхук из чужого чата — 401, в инбокс не попадает", async () => {
+    it("сообщение (не callback) через вебхук из чужого чата — 200 ignored, в инбокс не попадает", async () => {
+      const text = `я не владелец ${uniqueTaskId("stranger")}`;
       const res = await postTelegramWebhook({
         update_id: updateId(),
         message: {
@@ -2330,11 +2341,18 @@ describe("Telegram: кнопки решения владельца (#254)", () =
           from: { id: 1, is_bot: false, first_name: "Чужой" },
           chat: { id: -999, type: "private" },
           date: 1756400000,
-          text: "я не владелец",
+          text,
         },
       });
-      expect(res.status).toBe(401);
-      expect((await res.json<{ error: { code: string } }>()).error.code).toBe("unauthorized");
+      expect(res.status).toBe(200);
+      const body = await res.json<{ status: string; reason: string; http_status: number }>();
+      expect(body.status).toBe("ignored");
+      expect(body.reason).toBe("unauthorized");
+      expect(body.http_status).toBe(401);
+
+      // Собственно защита: 200 — это «Telegram, не ретрай», а не «принято».
+      const inbox = await getJson<{ messages: { text: string }[] }>("/api/messages?limit=200");
+      expect(inbox.messages.some((m) => m.text === text)).toBe(false);
     });
 
     it("сообщение через вебхук из чата владельца — принято (положительная проверка того же пути)", async () => {
@@ -2357,10 +2375,102 @@ describe("Telegram: кнопки решения владельца (#254)", () =
       env.TELEGRAM_CHAT_ID = "";
       try {
         const res = await postTelegramWebhook(callbackUpdate({ data: "wo:471:1" }));
-        expect(res.status).toBe(401);
+        expect(res.status).toBe(200);
+        const body = await res.json<{ status: string; reason: string; http_status: number }>();
+        expect(body.status).toBe("ignored");
+        expect(body.reason).toBe("unauthorized");
+        expect(body.http_status).toBe(401); // «возможности нет» не превратилось в тихую дыру — только код ответа другой
       } finally {
         env.TELEGRAM_CHAT_ID = saved;
       }
+    });
+  });
+
+  // #1477. Класс одной фразой: морда отвечает Telegram'у 4xx на апдейт,
+  // которому ретраи не помогут, — и канал владельца встаёт колом целиком,
+  // потому что Telegram доставляет апдейты одного чата строго по порядку и
+  // ретраит отвергнутый. Живой случай: прогон telegram-webhook 35801215616,
+  // getWebhookInfo.last_error_message = "Wrong response from the webhook:
+  // 400 Bad Request"; владелец жмёт инлайн-кнопку — клавиатура не снимается.
+  //
+  // Тела апдейтов ниже — прод-форма Bot API (фото без подписи приходит с
+  // полем photo и БЕЗ text; см. docs/research/26-telegram-bot-api-threads.md),
+  // а не наш пересказ того, как это могло бы выглядеть.
+  describe("вебхуку Telegram не уходит не-2xx никогда (#1477)", () => {
+    const ownerChat = { id: -1001234567890, type: "supergroup" };
+    const sender = { id: 777000, is_bot: false, first_name: "Владелец" };
+
+    it("фото без подписи от владельца — 200 ignored/need_text, а не 400", async () => {
+      const res = await postTelegramWebhook({
+        update_id: updateId(),
+        message: {
+          message_id: 10,
+          from: sender,
+          chat: ownerChat,
+          date: 1756400000,
+          photo: [{ file_id: "AgACAgIAAx0", file_unique_id: "AQADqq", width: 90, height: 67, file_size: 1421 }],
+        },
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json<{ status: string; reason: string; http_status: number }>();
+      expect(body).toEqual({ status: "ignored", reason: "need_text", http_status: 400 });
+    });
+
+    it("слишком длинный текст — 200 ignored/message_too_large, а не 413", async () => {
+      const res = await postTelegramWebhook({
+        update_id: updateId(),
+        message: { message_id: 11, from: sender, chat: ownerChat, date: 1756400000, text: "я".repeat(100000) },
+      });
+      expect(res.status).toBe(200);
+      expect((await res.json<{ reason: string; http_status: number }>()).reason).toBe("message_too_large");
+    });
+
+    it("тело апдейта не разобралось — 200 ignored/bad_json, а не 400", async () => {
+      const res = await WORKER.fetch("https://example.com/api/messages/ingest", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "X-Telegram-Bot-Api-Secret-Token": "test-webhook-secret",
+        },
+        body: "{не json",
+      });
+      expect(res.status).toBe(200);
+      expect((await res.json<{ status: string; reason: string }>()).status).toBe("ignored");
+    });
+
+    it("апдейт без единого идентификатора — 200 ignored/need_source_msg_id (на этот ответ опирается probe_route)", async () => {
+      const res = await postTelegramWebhook({});
+      expect(res.status).toBe(200);
+      const body = await res.json<{ status: string; reason: string }>();
+      expect(body.status).toBe("ignored");
+      expect(body.reason).toBe("need_source_msg_id");
+    });
+
+    it("тот же кривой апдейт по Bearer — прежние 4xx: там ретраев нет и 400 корректен", async () => {
+      const noText = await postJson("/api/messages/ingest", { update_id: updateId(), message: { message_id: 12 } });
+      expect(noText.status).toBe(400);
+      expect((await noText.json<{ error: { code: string } }>()).error.code).toBe("need_text");
+
+      const tooLong = await postJson("/api/messages/ingest", {
+        source_msg_id: uniqueTaskId("long"),
+        text: "я".repeat(100000),
+      });
+      expect(tooLong.status).toBe(413);
+    });
+
+    it("исправный апдейт владельца через вебхук по-прежнему 201 accepted — поглощение не съело успех", async () => {
+      const res = await postTelegramWebhook({
+        update_id: updateId(),
+        message: {
+          message_id: 13,
+          from: sender,
+          chat: ownerChat,
+          date: 1756400000,
+          text: `исправное сообщение ${uniqueTaskId("ok")}`,
+        },
+      });
+      expect(res.status).toBe(201);
+      expect((await res.json<{ status: string }>()).status).toBe("accepted");
     });
   });
 
