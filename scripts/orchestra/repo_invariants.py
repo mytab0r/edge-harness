@@ -482,7 +482,36 @@ _PG_SPEC = importlib.util.spec_from_file_location(
 pulse_guard = importlib.util.module_from_spec(_PG_SPEC)
 _PG_SPEC.loader.exec_module(pulse_guard)  # type: ignore[union-attr]
 
-gh = pulse_guard.gh
+# ── Один прогон — один ответ на один URL (#1483) ────────────────────────────
+#
+# Класс одной фразой: **один и тот же GET к GitHub API выполняется несколько
+# раз за ОДИН прогон инспектора — бюджет installation-токена тратится на
+# ответы, которые уже получены.**
+#
+# Замер на живом репозитории (обёртка над `gh` в PATH, считающая вызовы):
+# 204 вызова за прогон, из них 55 — повторы; один и тот же
+# `actions/workflows/ai-review.yml/runs?per_page=100` уходил 23 РАЗА подряд
+# (по разу на каждый открытый PR, см. ai_review_runs_after ниже).
+#
+# Механизм — pulse_guard.enable_read_cache(), включается в main(). Он живёт
+# ТАМ, а не здесь, потому что читатели состояния приходят и из соседних
+# модулей (review_labels, scheduler-хелперы) и зовут pulse_guard.gh напрямую:
+# кэш в обёртке этого модуля ловил бы только часть (замер: 204 → 180, повторы
+# остались). Одно место, через которое проходят все, — сам pulse_guard.gh.
+#
+# Этот модуль read-only по построению: он ЧИТАЕТ один согласованный снимок и
+# ничего не меняет, поэтому повторный запрос того же URL в пределах прогона не
+# может дать другого ответа, ради которого стоило бы платить.
+
+
+def gh(*args: str) -> dict | list | None:
+    """`pulse_guard.gh` берётся в МОМЕНТ ВЫЗОВА, а не защёлкивается при
+    импорте: тесты подменяют именно `pulse_guard.gh`, и прежнее
+    `gh = pulse_guard.gh` ловило подмену только по счастливому порядку
+    импортов (см. докстринг ai_review_runs_after про `gh_func`)."""
+    return pulse_guard.gh(*args)
+
+
 parse_time = pulse_guard.parse_time
 minutes_between = pulse_guard.minutes_between
 escalate = pulse_guard.escalate
@@ -4144,6 +4173,17 @@ def run_escalations(repo: str, findings: dict[int, list]) -> list[str]:
 
 
 def main() -> int:
+    """Снимок состояния — свой на каждый прогон и ТОЛЬКО на него (#1483).
+
+    Инспектор read-only, поэтому один и тот же URL внутри прогона обязан
+    стоить один запрос. Область видимости — блок `with`, а не парные
+    включить/выключить: первая редакция была парной и протекла в другой файл
+    тестов, потому что `main()` включал кэш и не выключал."""
+    with pulse_guard.read_cache():
+        return _run_checks()
+
+
+def _run_checks() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--orchestra", action="store_true",
                          help="периодический режим: report + escalate (инварианты из ESCALATING_INVARIANTS)")
