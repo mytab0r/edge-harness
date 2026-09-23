@@ -516,7 +516,7 @@ def test_escalate_without_options_keeps_old_signature_behaviour(monkeypatch):
     sent = []
     monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
     monkeypatch.setattr(pg, "send_telegram", lambda text, reply_markup=None, **_kw: sent.append(reply_markup) or True)
-    result = pg.escalate("o/r", 120, "обычная эскалация")
+    result = pg.escalate("o/r", 120, "обычная эскалация", category="breakage")
     assert sent == [None]  # старые вызовы (без options) не порождают клавиатуру
     assert "доставлен" in result
 
@@ -525,7 +525,8 @@ def test_escalate_with_options_sends_decision_keyboard(monkeypatch):
     monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: None)
     sent = []
     monkeypatch.setattr(pg, "send_telegram", lambda text, reply_markup=None, **_kw: sent.append(reply_markup) or True)
-    pg.escalate("o/r", 471, "Нужно решение владельца", options=["Вариант А", "Вариант Б"])
+    pg.escalate("o/r", 471, "Нужно решение владельца", options=["Вариант А", "Вариант Б"],
+                category="decision")
     assert sent[0] == pg.build_decision_keyboard(471, ["Вариант А", "Вариант Б"])
 
 
@@ -540,7 +541,7 @@ def test_escalate_reports_comment_skipped_not_left_when_write_gated(monkeypatch)
     monkeypatch.setattr(pg, "subprocess", SimpleNamespace(
         run=lambda *a, **k: (_ for _ in ()).throw(AssertionError("subprocess.run не должен вызываться"))))
     monkeypatch.setattr(pg, "send_telegram", lambda *a, **k: False)
-    result = pg.escalate("o/r", 120, "текст эскалации")
+    result = pg.escalate("o/r", 120, "текст эскалации", category="breakage")
     assert result == "Telegram: НЕ доставлен; след в #120: пропущен (DRY-RUN)"
 
 
@@ -3440,3 +3441,42 @@ def test_cache_scope_does_not_outlive_the_block(monkeypatch):
     pg.gh("repos/o/r/issues/1")
     pg.gh("repos/o/r/issues/1")
     assert len(seen) == 3, "кэш пережил блок — чужой прогон получит наш снимок"
+
+
+# ── Тема решений содержит ТОЛЬКО сообщения с кнопками (#1490) ───────────────
+#
+# Живой случай: владелец открыл «🟣 Решения владельца» и увидел там алерт о
+# квоте DO и сообщение предохранителя конвейера — без единой кнопки. Причина:
+# категория была зашита ВНУТРЬ общего канала escalate(), а его зовут сорок
+# мест по любому поводу. Здесь эта ошибка становится невозможной.
+
+def test_decision_category_without_buttons_is_a_loud_refusal(monkeypatch):
+    """Без вариантов решения категория decision запрещена: это и есть то, что
+    владелец увидел в теме."""
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a, **k: None)
+    monkeypatch.setattr(pg, "send_telegram",
+                        lambda *a, **k: pytest.fail("сигнал не должен уйти вовсе"))
+    with pytest.raises(ValueError) as caught:
+        pg.escalate("o/r", 120, "алерт без кнопок", category="decision")
+    assert "кнопками" in str(caught.value)
+
+
+def test_buttons_without_the_decision_category_are_a_loud_refusal(monkeypatch):
+    """Обратная сторона: вопрос с кнопками, уехавший в тему шума, владелец не
+    найдёт. Инвариант двусторонний, иначе он закрывает половину класса."""
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a, **k: None)
+    monkeypatch.setattr(pg, "send_telegram",
+                        lambda *a, **k: pytest.fail("сигнал не должен уйти вовсе"))
+    with pytest.raises(ValueError):
+        pg.escalate("o/r", 471, "вопрос", options=["А", "Б"], category="pipeline")
+
+
+def test_matching_pairs_pass(monkeypatch):
+    """Положительная сторона обоих: правильные сочетания проходят."""
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a, **k: None)
+    sent = []
+    monkeypatch.setattr(pg, "send_telegram",
+                        lambda text, reply_markup=None, **kw: sent.append(kw.get("category")) or True)
+    pg.escalate("o/r", 120, "поломка", category="breakage")
+    pg.escalate("o/r", 471, "вопрос", options=["А"], category="decision")
+    assert sent == ["breakage", "decision"]

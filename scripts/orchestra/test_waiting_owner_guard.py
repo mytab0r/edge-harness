@@ -535,7 +535,7 @@ def test_waiting_owner_check_passes_variant_labels_as_escalate_options(monkeypat
     monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: None)
     monkeypatch.setattr(
         wog, "escalate",
-        lambda repo, number, text, options=None: calls.append(options) or "мок",
+        lambda repo, number, text, options=None, **_: calls.append(options) or "мок",
     )
     wog.waiting_owner_check(REPO, utc(12, 0))
     assert calls == [["Секрет с правами администратора", "Оставить ручной инструмент"]]
@@ -567,7 +567,7 @@ def test_waiting_owner_check_does_not_ping_the_owner_without_variants(monkeypatc
                         lambda repo, n, text: notes.append((n, text)))
     monkeypatch.setattr(
         wog, "escalate",
-        lambda repo, number, text, options=None: calls.append(options) or "мок",
+        lambda repo, number, text, options=None, **_: calls.append(options) or "мок",
     )
     lines = wog.waiting_owner_check(REPO, utc(12, 0))
 
@@ -604,7 +604,7 @@ def test_missing_variants_note_is_left_once_not_every_pulse(monkeypatch):
                         lambda repo, n, text: notes.append((n, text)))
     monkeypatch.setattr(
         wog, "escalate",
-        lambda repo, number, text, options=None: calls.append(options) or "мок",
+        lambda repo, number, text, options=None, **_: calls.append(options) or "мок",
     )
     lines = wog.waiting_owner_check(REPO, utc(12, 0))
 
@@ -639,7 +639,7 @@ def test_waiting_owner_check_non_sequential_block_notifies_agent_not_owner(monke
                         lambda repo, n, text: notes.append((n, text)))
     monkeypatch.setattr(
         wog, "escalate",
-        lambda repo, number, text, options=None: calls.append(options) or "мок",
+        lambda repo, number, text, options=None, **_: calls.append(options) or "мок",
     )
     lines = wog.waiting_owner_check(REPO, utc(12, 0))
 
@@ -675,7 +675,7 @@ def test_numbering_note_is_left_once_not_every_pulse(monkeypatch):
                         lambda repo, n, text: notes.append((n, text)))
     monkeypatch.setattr(
         wog, "escalate",
-        lambda repo, number, text, options=None: calls.append(options) or "мок",
+        lambda repo, number, text, options=None, **_: calls.append(options) or "мок",
     )
     lines = wog.waiting_owner_check(REPO, utc(12, 0))
 
@@ -710,7 +710,7 @@ def test_new_state_after_note_gets_its_own_promise_not_silence(monkeypatch):
                         lambda repo, n, text: notes.append((n, text)))
     monkeypatch.setattr(
         wog, "escalate",
-        lambda repo, number, text, options=None: calls.append(options) or "мок",
+        lambda repo, number, text, options=None, **_: calls.append(options) or "мок",
     )
     lines = wog.waiting_owner_check(REPO, utc(12, 0))
 
@@ -750,7 +750,7 @@ def test_two_fixture_bodies_reach_different_recipients(monkeypatch):
                             lambda repo, n, text: notes.append(text))
         monkeypatch.setattr(
             wog, "escalate",
-            lambda repo, number, text, options=None: calls.append(options) or "мок",
+            lambda repo, number, text, options=None, **_: calls.append(options) or "мок",
         )
         wog.waiting_owner_check(REPO, utc(12, 0))
         recipients[label] = "владелец" if calls else ("агент" if notes else "никто")

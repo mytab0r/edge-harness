@@ -902,7 +902,7 @@ def test_unlabeled_stale_check_escalates_when_comment_delivery_fails(monkeypatch
     patch_gh(monkeypatch, fake)
     escalations: list[tuple] = []
     monkeypatch.setattr(sbg, "escalate",
-                        lambda repo, number, text: escalations.append((number, text))
+                        lambda repo, number, text, **_: escalations.append((number, text))
                         or "Telegram: доставлен; след в #1016: оставлен")
     patch_task_deps_pool(monkeypatch, [
         {"number": 1016, "labels": [{"name": "task"}], "body": ISSUE_1016_BODY},

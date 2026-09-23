@@ -518,7 +518,7 @@ def test_idle_conveyor_makes_zero_calls(monkeypatch):
 def test_idle_escalation_when_no_auto_tasks_makes_no_mutating_call(monkeypatch):
     fake = FakeGh({"issues?state=open&labels=auto-detected": []})
     patch_gh(monkeypatch, fake)
-    monkeypatch.setattr(sd, "escalate", lambda *a: pytest.fail("эскалировать нечего"))
+    monkeypatch.setattr(sd, "escalate", lambda *a, **_: pytest.fail("эскалировать нечего"))
     result = sd.escalate_stale_auto_tasks(REPO, NOW)
     assert result == []
     # единственный вызов — чтение списка автозадач, ни одного изменяющего
@@ -536,7 +536,7 @@ def test_escalate_stale_auto_task_once(monkeypatch):
     })
     patch_gh(monkeypatch, fake)
     calls = []
-    monkeypatch.setattr(sd, "escalate", lambda repo, n, text: calls.append((n, text)) or "ok")
+    monkeypatch.setattr(sd, "escalate", lambda repo, n, text, **_: calls.append((n, text)) or "ok")
 
     result = sd.escalate_stale_auto_tasks(REPO, NOW)
     assert len(calls) == 1 and calls[0][0] == 555
@@ -554,7 +554,7 @@ def test_escalate_stale_auto_task_not_repeated(monkeypatch):
         ],
     })
     patch_gh(monkeypatch, fake)
-    monkeypatch.setattr(sd, "escalate", lambda *a: pytest.fail("уже эскалирована — второй раз не нужно"))
+    monkeypatch.setattr(sd, "escalate", lambda *a, **_: pytest.fail("уже эскалирована — второй раз не нужно"))
 
     result = sd.escalate_stale_auto_tasks(REPO, NOW)
     assert result == []
@@ -798,7 +798,7 @@ def test_groom_runs_before_escalation_so_resolved_task_never_escalates(monkeypat
     monkeypatch.setattr(sd, "post_issue_comment", record_comment)
     monkeypatch.setattr(pg, "post_issue_comment", record_comment)
     escalate_calls = []
-    monkeypatch.setattr(sd, "escalate", lambda repo, n, text: escalate_calls.append(n) or "ok")
+    monkeypatch.setattr(sd, "escalate", lambda repo, n, text, **_: escalate_calls.append(n) or "ok")
 
     groom_result = sd.groom_auto_tasks(REPO, NOW, [])          # порядок как в scheduler.py:
     escalate_result = sd.escalate_stale_auto_tasks(REPO, NOW)  # groom_auto_tasks ПЕРЕД escalate

@@ -244,7 +244,7 @@ def test_daily_cap_blocks_new_task_creation_and_escalates_once(monkeypatch):
     })
     patch_gh(monkeypatch, fake)
     escalated = []
-    monkeypatch.setattr(daw, "escalate", lambda repo, n, text: escalated.append(text) or "posted")
+    monkeypatch.setattr(daw, "escalate", lambda repo, n, text, **_: escalated.append(text) or "posted")
 
     observations, actions = daw.dependabot_alert_watch(REPO, NOW)
 
@@ -267,7 +267,7 @@ def test_daily_cap_escalation_not_repeated_same_day(monkeypatch):
         ],
     })
     patch_gh(monkeypatch, fake)
-    monkeypatch.setattr(daw, "escalate", lambda *a: pytest.fail("уже сигналили сегодня — повтор не нужен"))
+    monkeypatch.setattr(daw, "escalate", lambda *a, **_: pytest.fail("уже сигналили сегодня — повтор не нужен"))
 
     observations, actions = daw.dependabot_alert_watch(REPO, NOW)
 
@@ -389,7 +389,7 @@ def test_cap_counter_failure_skips_creation_in_this_pulse(monkeypatch):
     })
     patch_gh(monkeypatch, fake)
     escalated = []
-    monkeypatch.setattr(daw, "escalate", lambda *a: escalated.append(a) or "posted")
+    monkeypatch.setattr(daw, "escalate", lambda *a, **_: escalated.append(a) or "posted")
 
     observations, actions = daw.dependabot_alert_watch(REPO, NOW)
 

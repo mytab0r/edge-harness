@@ -584,11 +584,11 @@ def check_and_alert(repo: str, resource_key: str, resource_label: str,
             # НЕ пишем: следующий прогон обязан снова увидеть переход
             # (prev_state ≠ "breach") и повторить попытку, а не замолчать
             # по дедупу до случайного breach→ok (found: ревью PR #607).
-            result = pulse_guard.escalate(repo, WATCHDOG_ISSUE, text)
+            result = pulse_guard.escalate(repo, WATCHDOG_ISSUE, text, category="breakage")
             return (f"{resource_key}: breach — {result}; {note}; маркер состояния НЕ записан "
                      "(действие не состоялось) — следующий прогон повторит попытку")
         text += "\n" + state_marker(resource_key, STATE_BREACH, issue_number)
-        result = pulse_guard.escalate(repo, WATCHDOG_ISSUE, text)
+        result = pulse_guard.escalate(repo, WATCHDOG_ISSUE, text, category="breakage")
         return f"{resource_key}: breach — {result}; {note}"
 
     if new_state == STATE_APPROACHING:
@@ -610,7 +610,7 @@ def check_and_alert(repo: str, resource_key: str, resource_label: str,
             f"{_fmt(current)} / {_fmt(limit)} ({pct}%). {trend_note}\n"
             + state_marker(resource_key, STATE_APPROACHING, prev_issue)
         )
-        result = pulse_guard.escalate(repo, WATCHDOG_ISSUE, text)
+        result = pulse_guard.escalate(repo, WATCHDOG_ISSUE, text, category="breakage")
         return f"{resource_key}: approaching — {result}"
 
     # new_state == STATE_OK и prev_state не None — настоящий возврат в норму,
@@ -637,7 +637,7 @@ def check_and_alert(repo: str, resource_key: str, resource_label: str,
             "задачу, см. докстринг check_and_alert)."
         )
     text += "\n" + state_marker(resource_key, STATE_OK, prev_issue)
-    result = pulse_guard.escalate(repo, WATCHDOG_ISSUE, text)
+    result = pulse_guard.escalate(repo, WATCHDOG_ISSUE, text, category="breakage")
     return f"{resource_key}: recovery — {result}"
 
 
