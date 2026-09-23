@@ -4849,3 +4849,24 @@ def test_build_report_invariant_24_healthy_line_carries_numbers(monkeypatch):
     healthy = [line for line in lines if "[24]" in line and "💚" in line]
     assert healthy and "total=0" in healthy[0], \
         "здоровая строка обязана различать «деревьев нет» от общего «здорово»"
+
+
+def test_inspector_runs_its_checks_inside_the_read_cache(monkeypatch):
+    """Механизм без включения — это выключенный механизм (#1483). Проверяется
+    ФАКТ: во время работы проверок кэш включён, а после возврата из main() —
+    нет. Вырезанное включение прошло бы текстовый разбор молча.
+
+    `_run_checks` подменён — здесь проверяется обвязка main(), а не сами
+    инварианты: их поведение держат 249 соседних тестов."""
+    inside = []
+    monkeypatch.setattr(ri, "_run_checks",
+                        lambda: inside.append(ri.pulse_guard.read_cache_size() == 0
+                                              and _cache_is_on()) or 0)
+
+    def _cache_is_on() -> bool:
+        # Пустой словарь — кэш включён и ещё ничего не прочитал; None — выключен.
+        return ri.pulse_guard._READ_CACHE is not None
+
+    assert ri.main() == 0
+    assert inside == [True], "проверки бежали вне кэша — бюджет тратится на повторы"
+    assert ri.pulse_guard._READ_CACHE is None, "кэш пережил main() — утечёт в чужой прогон"
