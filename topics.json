@@ -1,6 +1,11 @@
 {
   "schema": 1,
   "topics": {
+    "breakage": {
+      "created_ts": 1790139842,
+      "message_thread_id": 1681529,
+      "title": "🔴 Поломки"
+    },
     "decision": {
       "created_ts": 1790130707,
       "message_thread_id": 1681511,
