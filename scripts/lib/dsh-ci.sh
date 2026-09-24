@@ -766,6 +766,29 @@ _dsh_patch_profile_plain() { # $1 — профиль
 - id: llm-deepseek
   config:
     maxTokens: $DSH_MAX_TOKENS
+    # Рассуждение выключено вынужденно (#1533). Плагин сериализует
+    # \`thinking: {type: effort === "off" ? "disabled" : "enabled"}\` и НИКОГДА
+    # не шлёт \`budget_tokens\` (git grep по dsh-llm-deepseek 0.1.7-alpha.2 —
+    # ноль совпадений), а Anthropic Messages требует его числом при
+    # \`enabled\`. Умолчание усилия — \`high\`, поэтому БЕЗ этой строки каждый
+    # вызов невалиден. Провайдер называет это дословно (перехват #1525,
+    # прогон 36010507733):
+    #   {"path":["thinking","budget_tokens"],
+    #    "message":"Invalid input: expected number, received undefined"}
+    #
+    # Почему \`reasoningEffort\`, а не \`thinking: disabled\`: политика
+    # \`disabled\` при заданном и не равном \`off\` усилии заставляет плагин
+    # бросить UNSUPPORTED_REASONING_EFFORT (resolveThinking) — а усилие
+    # задано умолчанием. Одной строки \`thinking: disabled\` мало.
+    #
+    # Газ: вернуть рассуждение можно, когда апстрим научится слать
+    # \`budget_tokens\`; это правка плагина, не наша. Признак — появление
+    # \`budget_tokens\` в сериализаторе при поднятии пина.
+    # Кавычки обязательны: YAML 1.1 читает голый off как булево false, а
+    # схема плагина ждёт строку из набора off/low/high/max — молча неверное
+    # значение здесь не упало бы, а вернуло бы thinking enabled тем же путём,
+    # который и чинится.
+    reasoningEffort: "off"
 PATCH
 }
 
