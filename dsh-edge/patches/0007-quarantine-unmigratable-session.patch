@@ -82,12 +82,38 @@ index 1adbb33..6443b33 100644
 +  } {
 +    let legacy = 0
 +    const quarantined: QuarantinedSession[] = []
++    // HARNESS (#1514): вердикт по уже изолированной сессии переиспользуется, а
++    // не выносится заново на КАЖДОМ старте. Карантинная сессия по замыслу не
++    // мигрируется никогда ("left exactly as stored"), поэтому её version
++    // остаётся старым, она остаётся в `outdated` навсегда — и без этой памяти
++    // её история декодируется целиком при каждом пробуждении Durable Object.
++    // Замер цены (issue #1514): 165 изолированных сессий, часть по 500+
++    // событий; объект выгружается через ~10 с простоя, то есть «старт» — это
++    // десятки раз за прогон, а не раз в сутки. Namespace dsh-edge выбирал
++    // 5 700 194 строки в сутки при лимите 5 000 000 НА АККАУНТ, и вместе с ним
++    // ложилась морда, читающая 198 строк.
++    const known = this.knownQuarantine()
++    const now = Date.now()
 +    for (const row of outdated) {
++      // Газ назван и автоматический: вердикт протухает сам через
++      // QUARANTINE_RECHECK_MS, и сборка с починенным мигратором подхватывается
++      // без ручного снятия. Смена целевой версии формата сбрасывает вердикт
++      // немедленно — это и есть случай «сессия снова читается».
++      const seen = known.get(row.id)
++      if (seen !== undefined
++        && seen.storedVersion === row.version
++        && seen.formatTarget === SESSION_FORMAT_VERSION
++        && now - seen.observedAt < QUARANTINE_RECHECK_MS) {
++        quarantined.push({ id: row.id, storedVersion: row.version, reason: seen.reason,
++          observedAt: seen.observedAt })
++        continue
++      }
 +      try {
 +        legacy += this.prepareMigration(row.id as SessionId, row)?.physicalRows ?? 0
 +      } catch (error) {
 +        if (!(error instanceof SessionFormatUnsupportedMigrationError)) throw error
-+        quarantined.push({ id: row.id, storedVersion: row.version, reason: error.message })
++        quarantined.push({ id: row.id, storedVersion: row.version, reason: error.message,
++          observedAt: now })
 +        console.error(
 +          `dsh-edge: session ${row.id} (stored format v${row.version}) cannot be migrated `
 +          + `to v${SESSION_FORMAT_VERSION} and is quarantined as-is: ${error.message}`,
@@ -95,6 +121,41 @@ index 1adbb33..6443b33 100644
 +      }
 +    }
 +    return { legacy, quarantined }
++  }
++
++  /**
++   * HARNESS (#1514): вердикты прошлых стартов. Читается ДО перезаписи таблицы
++   * ниже — иначе память стиралась бы раньше, чем её прочли.
++   *
++   * Таблицы может не быть (первый старт этой сборки) или она может быть старой
++   * схемы без `format_target` — оба случая дают пустую память, то есть полный
++   * preflight один раз. Это «возможности нет», а не «карантин пуст»: пустая
++   * память честно приводит к повторной проверке, а не к молчаливому пропуску.
++   */
++  private knownQuarantine(): Map<string, {
++    storedVersion: number; formatTarget: number; reason: string; observedAt: number
++  }> {
++    const known = new Map<string, {
++      storedVersion: number; formatTarget: number; reason: string; observedAt: number
++    }>()
++    try {
++      const rows = this.storage.sql.exec(
++        `SELECT id, stored_version, format_target, reason, observed_at
++         FROM dsh_edge_quarantined_sessions`,
++      ).toArray()
++      for (const row of rows) {
++        known.set(String(row.id), {
++          storedVersion: Number(row.stored_version),
++          formatTarget: Number(row.format_target),
++          reason: String(row.reason),
++          observedAt: Number(row.observed_at),
++        })
++      }
++    } catch {
++      // Нет таблицы или нет колонки format_target — память пуста, preflight
++      // пройдёт полностью и перезапишет таблицу в новой схеме.
++    }
++    return known
 +  }
 +
 +  /**
@@ -110,19 +171,31 @@ index 1adbb33..6443b33 100644
 +   * cause.
 +   */
 +  private recordQuarantinedSessions(entries: readonly QuarantinedSession[]): void {
-+    this.storage.sql.exec(`CREATE TABLE IF NOT EXISTS dsh_edge_quarantined_sessions (
++    // HARNESS (#1514): схема расширена колонкой format_target, поэтому старая
++    // таблица сносится целиком, а не доращивается ALTER'ом. Память уже прочитана
++    // выше (knownQuarantine), так что снос ничего не теряет, а `CREATE TABLE IF
++    // NOT EXISTS` поверх старой схемы молча оставил бы её без новой колонки —
++    // и вердикт никогда не переиспользовался бы, то есть фикс выключился бы
++    // молча (silent-wrong).
++    this.storage.sql.exec('DROP TABLE IF EXISTS dsh_edge_quarantined_sessions')
++    this.storage.sql.exec(`CREATE TABLE dsh_edge_quarantined_sessions (
 +      id TEXT PRIMARY KEY,
 +      stored_version INTEGER NOT NULL,
++      format_target INTEGER NOT NULL,
 +      reason TEXT NOT NULL,
 +      observed_at INTEGER NOT NULL
 +    ) STRICT`)
-+    this.storage.sql.exec('DELETE FROM dsh_edge_quarantined_sessions')
 +    const now = Date.now()
 +    for (const entry of entries) {
++      // observed_at — момент ПЕРВОГО вердикта, не текущего старта: иначе
++      // отметка обновлялась бы на каждом пропуске и вердикт не протухал бы
++      // никогда, то есть газ (перепроверка) не сработал бы ни разу.
 +      this.storage.sql.exec(
-+        `INSERT INTO dsh_edge_quarantined_sessions (id, stored_version, reason, observed_at)
-+         VALUES (?, ?, ?, ?)`,
-+        entry.id, entry.storedVersion, entry.reason, now,
++        `INSERT INTO dsh_edge_quarantined_sessions
++           (id, stored_version, format_target, reason, observed_at)
++         VALUES (?, ?, ?, ?, ?)`,
++        entry.id, entry.storedVersion, SESSION_FORMAT_VERSION, entry.reason,
++        entry.observedAt ?? now,
 +      )
 +    }
    }
@@ -132,12 +205,23 @@ index 1adbb33..6443b33 100644
  
  type EventTable = 'dsh_session_events' | 'dsh_session_events_migrating'
  
-+/** HARNESS (#1376): one session this build refused to migrate, and why. */
++/** HARNESS (#1376): one session this build refused to migrate, and why.
++ *  `observedAt` (#1514) — когда вердикт вынесен ВПЕРВЫЕ: по нему он протухает
++ *  и перепроверяется, и он же не даёт отметке обновляться на каждом пропуске. */
 +interface QuarantinedSession {
 +  readonly id: string
 +  readonly storedVersion: number
 +  readonly reason: string
++  readonly observedAt?: number
 +}
++
++/** HARNESS (#1514): как часто вердикт по изолированной сессии перевыносится
++ *  заново. Час, а не «каждый старт»: старт случается десятки раз за прогон
++ *  (Durable Object выгружается через ~10 с простоя), и перевынос стоит полного
++ *  декодирования истории КАЖДОЙ изолированной сессии. Цена задержки названа
++ *  прямо: сборка с починенным мигратором подхватит сессию не мгновенно, а в
++ *  пределах часа. */
++const QUARANTINE_RECHECK_MS = 60 * 60 * 1000
 +
  function revisionOf(storeIdentity: string, row: HeaderRow): PersistenceRevision {
    return SessionPersistenceRevision(
