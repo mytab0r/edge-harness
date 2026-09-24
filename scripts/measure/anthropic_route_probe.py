@@ -146,6 +146,21 @@ DSH_EXTRA_FIELDS = {
 }
 
 
+#: Объёмы тела для развёртки. Не круглые числа ради красоты: 162 КБ — точный
+#: вес запроса dsh на промпт «ping» (замер записью, см. докстринг модуля), то
+#: есть НИЖНЯЯ граница живого запроса; в ai-review туда едет ещё и дифф PR.
+#: Меньшие и большие значения рядом нужны, чтобы отказ назвал порог, а не
+#: только факт («отвергает» без числа не говорит, до чего резать промпт).
+BODY_SIZE_SWEEP = (64 * 1024, 162 * 1024, 512 * 1024, 2 * 1024 * 1024)
+
+
+def padded_body(size_bytes: int) -> dict:
+    """Тело заявленного объёма — добиваем тем же полем, которым его добивает
+    прод (`dsh_session_log`), а не отдельным «мусорным» ключом: провайдер
+    вправе судить по имени поля, и подмена сделала бы замер про другое."""
+    return {"dsh_session_log": {"version": 1, "pad": "x" * max(0, size_bytes - 64)}}
+
+
 def dsh_shaped_body() -> dict:
     """Тело ровно той формы, что снята с живого запроса dsh, целиком.
 
@@ -267,6 +282,15 @@ def main() -> int:
                       extra=dsh_shaped_body(), label="форма dsh целиком")
             r["body"] = redact(r["body"], secrets)
             results.append(r)
+            for size in BODY_SIZE_SWEEP:
+                r = probe(entry, model, max_tokens=caps[-1],
+                          extra=padded_body(size), label=f"объём {size // 1024} КБ")
+                r["body"] = redact(r["body"], secrets)
+                results.append(r)
+                if r["status"] != 200:
+                    # Дальше по развёртке смысла нет: порог найден, а каждый
+                    # следующий вызов — реальный расход чужой квоты.
+                    break
     print(format_report(results))
     answered = [r for r in results if r["status"] == 200]
     print("")
@@ -279,6 +303,15 @@ def main() -> int:
             print(f"СОЧЕТАНИЕ: {r['name']}/{r['model']} — каждое поле по "
                   f"отдельности принято (200), а снятая с dsh форма целиком "
                   f"даёт {r['status']}: отвергает не одно поле, а их сочетание.")
+    for r in results:
+        if r.get("label", "").startswith("объём ") and r["status"] != 200:
+            ok = [o for o in results if o["name"] == r["name"]
+                  and o.get("label", "").startswith("объём ")
+                  and o["status"] == 200]
+            last_ok = ok[-1]["label"] if ok else "ни одного"
+            print(f"ПОРОГ ОБЪЁМА: {r['name']}/{r['model']} — принят {last_ok}, "
+                  f"отвергнут «{r['label']}» с кодом {r['status']}. Форма тела "
+                  f"та же, различается только размер.")
     for r in results:
         if r.get("label", "").startswith("+") and r["status"] != 200:
             print(f"ПОЛЕ ОТВЕРГНУТО: {r['name']}/{r['model']} — та же запись "
