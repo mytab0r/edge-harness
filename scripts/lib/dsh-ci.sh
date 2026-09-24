@@ -1532,12 +1532,32 @@ dsh_require_provider_chain() { # [consumer_id]
 # отвечали 401, а сводка прогон за прогоном советовала «повторить прогон».
 dsh_chain_outcome_for_class() { # class_id
   case "$1" in
+    # Эти три id до отображения НЕ доходят в обычном прогоне (quota и
+    # rate_limit решаются по DSH_RUN_FAILURE_REASON раньше, prompt_too_long
+    # даёт provider_outcome="stop"), но ветки явные, а не падение в *):
+    # молчаливое «причина не установлена» для класса, чей исход решён иначе,
+    # — тот же silent-wrong, только в сводке (находка ai-review PR #1537).
+    quota_exhausted) printf 'quota\n' ;;
+    rate_limit_retry_budget_exceeded) printf 'our_budget\n' ;;
+    prompt_too_long) printf 'stop\n' ;;
     dead_credential) printf 'dead_credential\n' ;;
     bad_request) printf 'bad_request\n' ;;
     # Эти три названы транзиентными ЗАМЕРОМ, а не умолчанием: обрыв SSE
     # наблюдался у разных провайдеров (#1084), таймаут — наш нож (#880),
     # превышение потолка модели лечится другой записью цепочки (#1062).
     stream_closed|our_timeout|max_tokens_over_model) printf 'transient\n' ;;
+    # HTTP_404/EMPTY_RESPONSE — ЗАМЕРЕННО повторяемый класс
+    # (docs/research/28-provider-chain-truth-table.md): у обеих записей
+    # OpenRouter прямым вызовом <base_url>/chat/completions тем же id и тем
+    # же секретом — HTTP 200, запись цепочки исправна, а 404 у NVIDIA NIM
+    # наблюдался перемежающимся. Отдельная строка, а не ветка выше: класс
+    # общий для двух маркеров (HTTP_404: и EMPTY_RESPONSE:), и мутация
+    # «убрать строку» обязана краснить гвардю на ОБЕИХ (находка ai-review
+    # PR #1537: без неё EMPTY_RESPONSE-прогон тихо терял совет повтора).
+    http_404) printf 'transient\n' ;;
+    # ЯВНОЕ решение, не падение в *): stderr пуст — диагностики нет, и
+    # утверждать «повтор поможет» основанием не было, честный пробел.
+    empty_stderr) printf 'cause_unknown\n' ;;
     *) printf 'cause_unknown\n' ;;
   esac
 }

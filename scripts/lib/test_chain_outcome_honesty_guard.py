@@ -24,6 +24,7 @@ _console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_u
 # --- конец console_utf8 bootstrap ---
 
 import subprocess
+import tempfile
 
 import pytest
 
@@ -42,6 +43,11 @@ LIVE_STDERR = [
      "thinking.budget_tokens дословно"),
     ("dsh: HTTP_404: DeepSeek Messages request failed (404)", "http_404",
      "GLM/NVIDIA, ai-review 35994901504"),
+    ("dsh: EMPTY_RESPONSE: провайдер вернул пустой ответ", "http_404",
+     "тот же класс http_404, второй маркер: EMPTY_RESPONSE проходит ветку "
+     "HTTP_404:|EMPTY_RESPONSE: — и обязан попадать в замеренно-транзиентный "
+     "исход, а не в пробел (находка ai-review PR #1537: без этого прогона "
+     "мутация «http_404 -> cause_unknown» гвардией не ловилась)"),
     ("dsh: STREAM_CLOSED: DeepSeek Messages stream ended before message_stop",
      "stream_closed", "#1084, worker.yml 2026-09-13T09:39Z"),
     ("dsh: INVALID_REQUEST: max_tokens (131072) exceeds model's maximum output"
@@ -184,6 +190,12 @@ CLASS_TO_OUTCOME = [
     ("our_timeout", "transient", "наш нож по времени (#880)"),
     ("max_tokens_over_model", "transient",
      "потолок ОДНОЙ записи — следующая может быть верной (#1062)"),
+    ("http_404", "transient",
+     "HTTP_404/EMPTY_RESPONSE замеренно повторяемы: HTTP 200 прямым вызовом "
+     "при живой записи цепочки (docs/research/28-provider-chain-truth-table.md)"),
+    ("empty_stderr", "cause_unknown",
+     "stderr пуст — ЯВНОЕ решение «причина не установлена», не падение в *; "
+     "утверждать «повтор поможет» основанием не было"),
     ("unrecognised", "cause_unknown", "умолчание обязано быть пробелом, не вердиктом"),
     ("", "cause_unknown", "класс не выставлен вовсе — тот же честный пробел"),
     ("какой-то-новый-класс", "cause_unknown",
@@ -195,6 +207,26 @@ CLASS_TO_OUTCOME = [
                          ids=[c[0] or "(пусто)" for c in CLASS_TO_OUTCOME])
 def test_class_maps_to_an_honest_outcome(class_id, expected, why):
     assert outcome_for(class_id) == expected, why
+
+
+@pytest.mark.parametrize("stderr_text,expected_class,expected_outcome,why", [
+    ("dsh: HTTP_404: DeepSeek Messages request failed (404)", "http_404",
+     "transient", "замер docs/research/28: запись цепочки жива (HTTP 200)"),
+    ("dsh: EMPTY_RESPONSE: провайдер вернул пустой ответ", "http_404",
+     "transient",
+     "живой класс, названный повторяемым доками репозитория — обязан "
+     "сохранить совет повтора (находка ai-review PR #1537)"),
+], ids=["HTTP_404", "EMPTY_RESPONSE"])
+def test_full_path_stderr_to_outcome(stderr_text, expected_class,
+                                     expected_outcome, why):
+    """Весь путь боевого прогона: stderr -> класс -> исход.
+
+    Каждая половина по отдельности зелёная и при разорванном стыке: класс
+    ставится верно, отображение возвращает что-то правдоподобное — а стык
+    молча ронял EMPTY_RESPONSE в cause_unknown. Проверяется склейка."""
+    got_class = classify(stderr_text)
+    assert got_class == expected_class, why
+    assert outcome_for(got_class) == expected_outcome, why
 
 
 def test_no_class_maps_to_transient_by_default():
