@@ -71,4 +71,7 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # Читает ТОЛЬКО /api/status (счётчики по статусам) — размеры таблиц,
+          # без которых «кто жрёт квоту» остаётся гаданием (#1503).
+          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
         run: python scripts/measure/worker_error_probe.py

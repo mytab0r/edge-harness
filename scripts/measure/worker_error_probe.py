@@ -66,6 +66,38 @@ def _post(token: str, url: str, payload: dict) -> tuple[int, str]:
         return 0, f"сеть недоступна: {error}"
 
 
+def status_counts() -> None:
+    """Размеры таблиц с прода — числа, без которых «кто жрёт квоту» не считается.
+
+    `/api/status` отдаёт счётчики задач и сообщений по статусам. Это ЕДИНСТВЕННЫЙ
+    доступный отсюда способ узнать, сколько строк реально лежит в таблицах: сам
+    SQL наружу не торчит, а гадать по коду — то, чем уже потрачены часы (#1503).
+    Токен — HANDS_TOKEN, тот же, которым ходит job «рук».
+    """
+    token = os.environ.get("HANDS_TOKEN", "")
+    if not token:
+        print("HANDS_TOKEN не задан — счётчики таблиц не прочитаны; это «возможности нет», "
+              "а не «таблицы пусты»")
+        return
+    req = urllib.request.Request(
+        "https://edge-harness.mytab0r.workers.dev/api/status",
+        headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = json.loads(resp.read().decode("utf-8", "replace"))
+    except (OSError, ValueError) as error:
+        print(f"::warning::/api/status не прочитан: {error}")
+        return
+    print("── размеры таблиц (прод, /api/status)")
+    print(json.dumps({
+        "tasks": body.get("tasks"),
+        "messages": body.get("messages"),
+        "last_event_id": body.get("last_event_id"),
+        "retention": body.get("retention"),
+    }, ensure_ascii=False))
+    print()
+
+
 def main() -> int:
     token = os.environ.get("CLOUDFLARE_API_TOKEN", "")
     account = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
@@ -74,6 +106,8 @@ def main() -> int:
               "зонд не может спросить логи; это «возможности нет», а не «ошибок нет»",
               file=sys.stderr)
         return 1
+
+    status_counts()
 
     now_ms = int(time.time() * 1000)
     since_ms = now_ms - 6 * 60 * 60 * 1000  # шесть часов: 1101 держится с прошлых суток
