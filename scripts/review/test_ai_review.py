@@ -905,13 +905,17 @@ def test_error_reason_rate_limit_variants_differ_from_each_other(failure_reason)
 
 
 def test_error_reason_all_providers_exhausted_names_reset_date():
-    # #727: цепочка провайдеров (vars.DSH_PROVIDER_CHAIN) исчерпана целиком —
-    # сообщение обязано отличаться от одиночного quota_exhausted (другое
-    # действие: не «сменить провайдера», действие уже применено, следующий
-    # шаг — ждать или добавить ещё одного) и называть дату, а не гадать.
+    # #727: цепочка провайдеров (vars.DSH_PROVIDER_CHAIN) — сообщение обязано
+    # отличаться от одиночного quota_exhausted и называть дату, а не гадать.
+    # #1500: при retry_useful=False текст больше НЕ утверждает «все провайдеры
+    # исчерпаны/недоступны» — ноль флага значит также «ключи отвергнуты»,
+    # «форма отвергнута», «причина не установлена»; текст называет сводку
+    # разбора по классам и названный сброс, а не квоту.
     reason = ai.error_reason("", "1", "all_providers_exhausted", "GLM: 2026-09-10 08:51:55")
-    assert "все провайдеры" in reason
     assert "2026-09-10 08:51:55" in reason
+    assert "повтор НЕ объявлен полезным" in reason
+    assert "все провайдеры" not in reason, (
+        "при retry_useful=0 утверждение про «все исчерпаны» недоказуемо (#1500)")
     assert "ошибка провайдера/транспорта DSH" not in reason
 
 

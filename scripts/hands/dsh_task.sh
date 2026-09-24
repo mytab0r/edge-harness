@@ -571,7 +571,10 @@ else
       if [ "${HANDS_CHAIN_RETRY_USEFUL:-0}" = "1" ]; then
         echo "::error::ни один провайдер цепочки не ответил, но цепочка НЕ исчерпана квотой (опробованы: ${HANDS_CHAIN_TRIED:-?}) — ${HANDS_CHAIN_OUTCOME_SUMMARY:-разбор по классам недоступен}${HANDS_CHAIN_RESET_HINT:+; названный сброс: $HANDS_CHAIN_RESET_HINT}. Повтор ИМЕЕТ смысл: часть провайдеров не получила настоящей попытки (#1307, docs/runbooks/switch-llm-provider.md)" >&2
       else
-        echo "::error::цепочка провайдеров исчерпана целиком (опробованы: ${HANDS_CHAIN_TRIED:-?})${HANDS_CHAIN_RESET_HINT:+, ближайший названный сброс: $HANDS_CHAIN_RESET_HINT} — все реально без квоты, повтор внутри этого прогона не поможет (docs/runbooks/switch-llm-provider.md, #727)" >&2
+        # #1500: RETRY_USEFUL=0 больше не означает «все реально без квоты» —
+        # текст называет сводку разбора по классам, а не утверждает про квоту
+        # (см. тот же разбор в scripts/worker/task.sh).
+        echo "::error::цепочка провайдеров отказала без повторопригодных классов (опробованы: ${HANDS_CHAIN_TRIED:-?})${HANDS_CHAIN_RESET_HINT:+, ближайший названный сброс: $HANDS_CHAIN_RESET_HINT} — ${HANDS_CHAIN_OUTCOME_SUMMARY:-разбор по классам недоступен}. Повтор внутри этого прогона НЕ объявлен полезным: ни одна корзина сводки его не называет; разбор выше называет, что чинить (docs/runbooks/switch-llm-provider.md, #1307/#1500)" >&2
       fi
       ;;
     *)

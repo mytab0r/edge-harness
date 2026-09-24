@@ -86,21 +86,25 @@ def summarize(outcomes: list[tuple[str, str]]) -> tuple[str, str, str]:
     Возвращает (сводка, действие, DSH_CHAIN_RETRY_USEFUL) — ровно то, что
     читает человек и что читает код."""
     rows = "\\n".join(f"{name}\\t{cls}\\t" for name, cls in outcomes)
-    script = (
-        f'source "{DSH_CI}" >/dev/null 2>&1; '
-        f'DSH_CHAIN_OUTCOMES=$(printf "{rows}\\n"); '
-        'DSH_CHAIN_TRIED="прогон"; '
-        f'_dsh_chain_report_exhausted {len(outcomes)} 2>"$0.err"; '
-        'printf "SUMMARY:%s\\n" "$DSH_CHAIN_OUTCOME_SUMMARY"; '
-        'printf "RETRY:%s\\n" "$DSH_CHAIN_RETRY_USEFUL"; '
-        'printf "ACTION:%s\\n" "$(cat "$0.err" | tr "\\n" " ")"')
-    result = subprocess.run(["bash", "-c", script, str(REPO / "chain-report")],
-                            cwd=REPO, capture_output=True, text=True, encoding="utf-8")
+    # Временный файл — в TemporaryDirectory, не в корне репозитория под
+    # фиксированным именем: падение bash-части между созданием и unlink
+    # оставляло бы мусор в рабочем дереве (находка ai-review PR #1537).
+    with tempfile.TemporaryDirectory() as tmp:
+        err_file = f"{tmp}/chain-report.err"
+        script = (
+            f'source "{DSH_CI}" >/dev/null 2>&1; '
+            f'DSH_CHAIN_OUTCOMES=$(printf "{rows}\\n"); '
+            'DSH_CHAIN_TRIED="прогон"; '
+            f'_dsh_chain_report_exhausted {len(outcomes)} 2>"{err_file}"; '
+            'printf "SUMMARY:%s\\n" "$DSH_CHAIN_OUTCOME_SUMMARY"; '
+            'printf "RETRY:%s\\n" "$DSH_CHAIN_RETRY_USEFUL"; '
+            f'printf "ACTION:%s\\n" "$(cat "{err_file}" | tr "\\n" " ")"')
+        result = subprocess.run(["bash", "-c", script], cwd=REPO,
+                                capture_output=True, text=True, encoding="utf-8")
     out = {}
     for key in ("SUMMARY", "RETRY", "ACTION"):
         line = next((l for l in result.stdout.splitlines() if l.startswith(key + ":")), "")
         out[key] = line[len(key) + 1:]
-    Path(str(REPO / "chain-report") + ".err").unlink(missing_ok=True)
     return out["SUMMARY"], out["ACTION"], out["RETRY"]
 
 

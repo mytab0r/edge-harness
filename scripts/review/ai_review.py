@@ -572,10 +572,19 @@ def error_reason(answer: str, dsh_rc: str, failure_reason: str = "",
                     "смысл — часть провайдеров не получила настоящей попытки "
                     "(наш бюджет ожидания/транзиент), см. разбор выше и "
                     "docs/runbooks/switch-llm-provider.md (#1307)")
-        return (f"{REVIEW_NEVER_HAPPENED_PREFIX} — все провайдеры цепочки исчерпаны/недоступны "
-                f"(код возврата {dsh_rc}), ближайший сброс: {when} — действие: "
-                "ждать сброса вне CI, либо добавить нового провайдера в "
-                "vars.DSH_PROVIDER_CHAIN (docs/runbooks/switch-llm-provider.md)")
+        # #1500: retry_useful=0 больше НЕ означает «все реально без квоты» —
+        # ноль значит также «все ключи отвергнуты», «все отказы по форме»,
+        # «причина не установлена». Текст называет сводку разбора по классам
+        # (DSH_CHAIN_OUTCOME_SUMMARY), а не утверждает про квоту и сброс,
+        # которых в этой ветке могло не быть (AGENTS.md, «Алерт не гадает»).
+        detail = outcome_summary.strip() or (
+            "разбор по классам недоступен — сводка не доехала из ai_dsh.sh")
+        return (f"{REVIEW_NEVER_HAPPENED_PREFIX} — ни один провайдер цепочки не ответил "
+                f"(код возврата {dsh_rc}), повтор НЕ объявлен полезным ни одной "
+                f"корзиной разбора: {detail}. Названный сброс: {when}. Действие: "
+                "чинить по разбору выше; если в нём нет ни квоты, ни "
+                "транзиента — повтор внутри прогона не поможет "
+                "(docs/runbooks/switch-llm-provider.md, #1307/#1500)")
     # Оставшаяся ось (quota/rate-limit/transport/contract) — ЕДИНСТВЕННО
     # через review_labels.reason_tag (находка ревью #439, см. докстринг выше).
     tag = review_labels.reason_tag(dsh_rc, failure_reason)
