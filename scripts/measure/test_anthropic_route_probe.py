@@ -243,4 +243,4 @@ def test_extra_fields_are_the_ones_dsh_actually_sends():
     которых нет, и молчать о тех, что есть. Поэтому состав зафиксирован здесь
     и меняется тем же коммитом, что поднимает пин плагина."""
     assert set(mod.DSH_EXTRA_FIELDS) == {
-        "thinking", "dsh_plugin_packages", "dsh_session_log"}
+        "thinking", "dsh_plugin_packages", "dsh_session_log", "stream", "system"}

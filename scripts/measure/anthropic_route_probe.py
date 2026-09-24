@@ -141,7 +141,24 @@ DSH_EXTRA_FIELDS = {
     "thinking": {"type": "disabled"},
     "dsh_plugin_packages": {"version": 1, "packages": []},
     "dsh_session_log": {"version": 1, "sessionFormatVersion": 4},
+    "stream": True,
+    "system": "Ты ассистент.",
 }
+
+
+def dsh_shaped_body() -> dict:
+    """Тело ровно той формы, что снята с живого запроса dsh, целиком.
+
+    Нужна отдельно от полей по одному: отказ может давать не поле, а их
+    сочетание (стриминг плюс многоблочный `content`, например). Ни один
+    одиночный опыт такого не покажет, и вывод «ни одно поле не отвергнуто»
+    без этой строки читался бы как «тело ни при чём»."""
+    body = {k: v for k, v in DSH_EXTRA_FIELDS.items()}
+    body["messages"] = [{"role": "user", "content": [
+        {"type": "text", "text": "ping"},
+        {"type": "text", "text": "<system-reminder>\nвторой текстовый блок\n</system-reminder>"},
+    ]}]
+    return body
 
 
 def probe(entry: dict, model: str, max_tokens: int = 16,
@@ -171,6 +188,10 @@ def probe(entry: dict, model: str, max_tokens: int = 16,
         headers={
             "content-type": "application/json",
             "anthropic-version": ANTHROPIC_VERSION,
+            # Прод стримит, и `accept` у него соответствующий. Отправить
+            # stream:true с `accept: application/json` — это третья форма,
+            # которой не ходит никто, и мерить её бессмысленно.
+            **({"accept": "text/event-stream"} if payload.get("stream") else {}),
             "x-api-key": secret,
             "accept": "application/json",
         })
@@ -242,10 +263,22 @@ def main() -> int:
                           extra={field: value}, label=f"+{field}")
                 r["body"] = redact(r["body"], secrets)
                 results.append(r)
+            r = probe(entry, model, max_tokens=caps[-1],
+                      extra=dsh_shaped_body(), label="форма dsh целиком")
+            r["body"] = redact(r["body"], secrets)
+            results.append(r)
     print(format_report(results))
     answered = [r for r in results if r["status"] == 200]
     print("")
     print(f"Ответили 200 на Anthropic-маршруте: {len(answered)} из {len(results)}")
+    for r in results:
+        if (r.get("label", "") == "форма dsh целиком" and r["status"] != 200
+                and all(o["status"] == 200 for o in results
+                        if o["name"] == r["name"] and o["model"] == r["model"]
+                        and o.get("label") != "форма dsh целиком")):
+            print(f"СОЧЕТАНИЕ: {r['name']}/{r['model']} — каждое поле по "
+                  f"отдельности принято (200), а снятая с dsh форма целиком "
+                  f"даёт {r['status']}: отвергает не одно поле, а их сочетание.")
     for r in results:
         if r.get("label", "").startswith("+") and r["status"] != 200:
             print(f"ПОЛЕ ОТВЕРГНУТО: {r['name']}/{r['model']} — та же запись "
