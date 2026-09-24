@@ -81,26 +81,29 @@ def main() -> int:
 
     # Формы пробуются по возрастанию специфичности. Первая, что вернёт 200,
     # и есть верная; при всех неудачах дословный вывод назовёт, чего не хватает.
+    # Форма взята НЕ из доки, а из ответа самого API: ZodError первой попытки
+    # назвал оба варианта фильтра — либо группа
+    # (`kind: "group"`, `filterCombination`, `filters`), либо лист, у которого
+    # ОБЯЗАТЕЛЕН `type` из {string, number, boolean}. Первая попытка отдельно
+    # показала, что произвольный `queryId` не годится: «Query not found» —
+    # значит это ссылка на сохранённый запрос, а не свободная метка.
+    leaf = lambda key, value: {
+        "key": key, "operation": "eq", "value": value, "type": "string",
+    }
+    base = {"timeframe": {"from": since_ms, "to": now_ms}, "limit": 20}
     attempts = [
-        ("минимальная", {
-            "queryId": "probe", "timeframe": {"from": since_ms, "to": now_ms},
-            "limit": 20,
+        ("лист с type, без queryId", {
+            **base,
+            "parameters": {"filters": [leaf("$metadata.service", WORKER)]},
         }),
-        ("с фильтром по скрипту", {
-            "queryId": "probe", "timeframe": {"from": since_ms, "to": now_ms},
-            "limit": 20,
-            "parameters": {"filters": [
-                {"key": "$metadata.service", "operation": "eq", "value": WORKER},
-            ]},
+        ("группа and", {
+            **base,
+            "parameters": {"filters": [{
+                "kind": "group", "filterCombination": "and",
+                "filters": [leaf("$metadata.service", WORKER)],
+            }]},
         }),
-        ("только события с ошибкой", {
-            "queryId": "probe", "timeframe": {"from": since_ms, "to": now_ms},
-            "limit": 20,
-            "parameters": {"filters": [
-                {"key": "$metadata.service", "operation": "eq", "value": WORKER},
-                {"key": "$metadata.error", "operation": "exists"},
-            ]},
-        }),
+        ("без фильтров вовсе", {**base, "parameters": {}}),
     ]
 
     ok = False
