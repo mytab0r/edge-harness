@@ -200,3 +200,25 @@ def test_hop_by_hop_headers_are_not_forwarded(upstream):
     assert "gzip" not in (seen[0]["headers"].get("Accept-Encoding") or ""), (
         "сжатый ответ пришлось бы распаковывать, чтобы показать дословно — "
         "проще не просить сжатия")
+
+
+def test_placeholder_key_fits_an_http_header():
+    """Подставной ключ обязан влезать в HTTP-заголовок.
+
+    Живой отказ (прогон 36004997980): значение было написано кириллицей —
+    понятнее для читателя, но `dsh` проверяет ключ ДО запроса и отверг его
+    дословно «the API key resolved from DEEPSEEK_API_KEY contains characters
+    no HTTP header can carry». Перехват не сделал НИ ОДНОГО запроса, то есть
+    инструмент молчал ровно там, где должен был работать.
+
+    Класс шире одного значения: заголовки кодируются latin-1, и ЛЮБАЯ строка,
+    которую этот скрипт кладёт в заголовок или в переменную, читаемую как
+    заголовок, обязана в него влезать."""
+    import re
+
+    source = Path(mod.__file__).read_text(encoding="utf-8")
+    assigned = re.findall(r'DEEPSEEK_API_KEY="([^"]*)"', source)
+
+    assert assigned, "подставной ключ пропал из скрипта — перехват не запустится"
+    for value in assigned:
+        value.encode("latin-1")  # падает ровно на том, на чём упал dsh

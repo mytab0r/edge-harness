@@ -126,6 +126,7 @@ class Recorder(BaseHTTPRequestHandler):
         record["response_body"] = text
         record["is_answer"] = probe.classify_answer(record["status"], text)
         record["error_type"] = probe.answer_error_type({"body": text})
+        record["attempt"] = len(self.captures) + 1
         self.captures.append(record)
 
         self.send_response(record["status"] or 502)
@@ -151,7 +152,14 @@ def run_dsh(prompt: str, port: int, model: str, timeout: int) -> tuple[int, str]
     env.update(
         DEEPSEEK_BASE_URL=f"http://127.0.0.1:{port}/v1",
         DEEPSEEK_MODEL=model,
-        DEEPSEEK_API_KEY="перехват-локальный-адрес-не-секрет",
+        # ASCII и ничего больше: dsh проверяет ключ ДО запроса и отвергает
+        # всё, что не влезает в HTTP-заголовок (живой отказ, прогон
+        # 36004997980: «the API key resolved from DEEPSEEK_API_KEY contains
+        # characters no HTTP header can carry»). Кириллица тут выглядела
+        # понятнее, но перехват из-за неё не сделал НИ ОДНОГО запроса.
+        # Значение подставное: локальный адрес секрета не требует, а
+        # настоящий ключ рекордер подставляет сам при пересылке.
+        DEEPSEEK_API_KEY="local-recorder-placeholder-not-a-secret",
         NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost",
     )
     patch = subprocess.run(
@@ -167,7 +175,8 @@ def run_dsh(prompt: str, port: int, model: str, timeout: int) -> tuple[int, str]
 
 
 def format_capture(record: dict, secrets: list[str]) -> str:
-    lines = [f"── запрос на {record['path']} → переслан на {record['forwarded_to']}"]
+    lines = [f"── попытка {record.get('attempt', 1)}: запрос на {record['path']} "
+             f"→ переслан на {record['forwarded_to']}"]
     for key, value in sorted(record["request_headers"].items()):
         lines.append(f"    {key}: {value}")
     lines.append("")
