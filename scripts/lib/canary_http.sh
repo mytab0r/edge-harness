@@ -38,6 +38,46 @@ CANARY_BODY_LIMIT_BYTES="${CANARY_BODY_LIMIT_BYTES:-2000}"
 # после `source`.
 _canary_level() { printf '%s' "${CANARY_ERROR_LEVEL:-error}"; }
 
+# Последний НЕ-2xx код, увиденный канарейкой, — в файл `CANARY_LAST_CODE_FILE`
+# (#1426). Нужен вызывающему, чтобы отличить «деплой плохой» от «бэкенд лежит
+# по посторонней причине»: у второго откат не просто бесполезен, он ВРЕДЕН —
+# возвращает прод на версию без фикса ровно тогда, когда фикс нужнее всего.
+#
+# Живой случай, ради которого это написано (issue #1426, прогон deploy-dsh-edge
+# 35989178639 от 2026-09-24): исчерпана суточная квота rows_read Durable
+# Objects, `workspace.create` отвечает
+# `HTTP 500 {"error":"Internal runtime error.","detail":"Error: Exceeded allowed
+# rows read in Durable Objects free tier."}`, канарейка краснеет, автооткат
+# возвращает прод — и откатывает ИМЕННО ТОТ деплой, который нёс фикс расхода
+# квоты. Кольцо: фикс исчерпанной квоты нельзя выкатить, потому что квота
+# исчерпана.
+#
+# Пишется ТОЛЬКО код, без тела: файл читает `if:`-условие шага, а не человек.
+# Переменная не задана — функция молчит и ничего не создаёт (вызывающие, кому
+# вердикт не нужен, не меняются).
+_canary_record_code() { # КОД
+  [ -n "${CANARY_LAST_CODE_FILE:-}" ] || return 0
+  printf '%s\n' "$1" >"$CANARY_LAST_CODE_FILE" 2>/dev/null || true
+}
+
+# Вердикт по записанному коду: `backend-down` — посторонний отказ бэкенда,
+# откатывать НЕЛЬЗЯ; `deploy` — всё остальное, включая «кода нет вовсе»
+# (сетевой отказ, DNS, TLS: там про здоровье бэкенда ничего не известно, и
+# молчаливый «не откатывать» был бы silent-wrong в обратную сторону).
+#
+# Правило то же, что у deploy-worker.yml (#1426): ЛЮБОЙ 5xx от API при живой
+# раздаче — посторонняя поломка. Одно правило, две реализации по языку шага
+# (там Node, здесь bash), и это named-оговорка, а не забытая копия: сверяет их
+# гвардия scripts/lib/test_canary_backend_down_guard.py.
+canary_rollback_verdict() {
+  local code=""
+  [ -n "${CANARY_LAST_CODE_FILE:-}" ] && code=$(cat "$CANARY_LAST_CODE_FILE" 2>/dev/null || true)
+  case "$code" in
+    5??) printf 'backend-down\n' ;;
+    *) printf 'deploy\n' ;;
+  esac
+}
+
 # canary_http <метка> <curl-аргументы...>
 #
 # Выполняет запрос БЕЗ `-f` и сам решает по коду. Успех (2xx) — тело уходит в
@@ -67,6 +107,7 @@ canary_http() {
       return 0
       ;;
     *)
+      _canary_record_code "$code"
       echo "::$(_canary_level)::$label: HTTP $code" >&2
       _canary_print_body "$label" "$body_file"
       rm -f "$body_file"
@@ -104,6 +145,7 @@ canary_probe() {
     echo "::$(_canary_level)::$label: запрос не состоялся (curl rc=$curl_rc, HTTP-ответа нет)" >&2
     _canary_print_body "$label" "$body_file"
   elif [ "$code" != "$expected" ]; then
+    _canary_record_code "$code"
     echo "::$(_canary_level)::$label: HTTP $code, ожидался $expected" >&2
     _canary_print_body "$label" "$body_file"
   fi
