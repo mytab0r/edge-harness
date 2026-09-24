@@ -76,6 +76,13 @@ EXPECTED_WORKFLOWS = frozenset({
     # — в репозиторий не пишет вовсе (permissions: contents: read), поэтому не
     # входит ни в DISPATCH_CONSUMER, ни в PIPELINE_CONSUMERS.
     "seed-provider-registry.yml",
+    # #1463: живой замер тредов в личке. Читает TELEGRAM_BOT_TOKEN/
+    # TELEGRAM_CHAT_ID (иначе это не замер, а пересказ документации) и
+    # НИ GH_DISPATCH_TOKEN, НИ GH_PIPELINE_PAT — в репозиторий не пишет
+    # вовсе (permissions: contents: read), поэтому не входит ни в
+    # DISPATCH_CONSUMER, ни в PIPELINE_CONSUMERS; тот же класс, что
+    # branch-protection-watch.yml выше.
+    "telegram-thread-probe.yml",
     # Сирота A аудита 2026-09-11 (scripts/orchestra/checklist_tail_labels.py):
     # читает только github.token (issues: write, pull-requests: read) — тот
     # же класс, что dependabot-alert-watch.yml ниже, ни GH_DISPATCH_TOKEN, ни
@@ -95,6 +102,13 @@ EXPECTED_WORKFLOWS = frozenset({
     "deploy-dsh-edge.yml",
     "deploy-worker.yml",
     "dispatch-latency-probe.yml",
+    # #1525: перехват отвергнутого запроса dsh пересылающим рекордером,
+    # только ручной запуск. Из репо-секретов читает ТОЛЬКО ключи провайдера
+    # (OPENROUTER_*) — ни GH_DISPATCH_TOKEN, ни GH_PIPELINE_PAT: рекордер
+    # разговаривает с LLM, а не с GitHub (permissions: contents: read),
+    # поэтому не входит ни в DISPATCH_CONSUMER, ни в PIPELINE_CONSUMERS —
+    # тот же класс, что seed-provider-registry.yml.
+    "dsh-capture.yml",
     # #600: e2e-смоук морды dsh-edge на PR, до мержа. Репо-секретов не читает
     # вовсе (ADR 0017) — сборка и локальный unstable_dev не обращаются к
     # Cloudflare/GitHub ни с одним репо-секретом, `gh release download` идёт

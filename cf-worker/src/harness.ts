@@ -158,6 +158,14 @@ const SCHEMA = [
   // фильтрует по (status, processed_ts) — без индекса это была бы полная
   // история инбокса на каждый тик, тот же класс, что подпалил квоту здесь.
   `CREATE INDEX IF NOT EXISTS messages_status_processed ON messages(status, processed_ts)`,
+  // Ватчдог застрявших сообщений (#1503) ищет `status='processing' AND
+  // processing_ts < порог`. Без ведущей пары (status, processing_ts) SQLite
+  // отбирает по одному status и проверяет порог уже построчно — то есть
+  // читает ВСЮ очередь processing каждый тик. Это не догадка: гвардия
+  // `цена ватчдога застрявших сообщений` в journal-rows-read.spec.ts
+  // покраснела ровно на этом — 801 прочитанная строка на 800 свежих
+  // сообщений, при батче 50.
+  `CREATE INDEX IF NOT EXISTS messages_status_processing ON messages(status, processing_ts)`,
   // Готовность хранилища (#575, вторая половина «зелёный health при мёртвой
   // морде»): одна строка (id=1) — исход ПОСЛЕДНЕГО живого SQL-раундтрипа,
   // сделанного пульсом (см. #checkStorageReady/#tickStorageReadyAlert), и
@@ -166,6 +174,42 @@ const SCHEMA = [
   // между тиками alarm чаще, чем сами тики случаются — счётчик «была ли уже
   // эта авария замечена» обязан пережить пересоздание инстанса, иначе
   // Telegram-алерт бил бы на каждый тик заново.
+  // Кэш агрегатов «сколько задач/сообщений в каждом статусе» (#1487). Лежит
+  // в SQL по той же причине, что pulse/retention_state/storage_probe выше:
+  // DO выгружается из памяти через ~10 с простоя, а запросы приходят реже —
+  // кэш в ПОЛЕ ОБЪЕКТА до этой таблицы был холодным почти всегда, и каждый
+  // вызов #status() делал полный GROUP BY по обеим таблицам.
+  //
+  // Замер, ради которого таблица заведена (2026-09-23, два среза quotas.yml
+  // в тихое окно): 325 запросов к морде за сутки — 0.3% лимита — и при этом
+  // 3,3 млн прочитанных строк, то есть ~6 900 строк НА ОДИН ЗАПРОС; за 10
+  // минут тишины +27 запросов и +185 097 строк. Квота rows_read общая на
+  // аккаунт, и при её исчерпании DO отдаёт 500: морда перестаёт отвечать,
+  // канарейка деплоя краснеет, кнопки владельца в Telegram умирают.
+  //
+  // Семантика инвалидации НЕ меняется: ровно те же места, что раньше писали
+  // `#taskCountsCache = null`, теперь зовут #invalidateCounts(...). Значение
+  // хранится как JSON одной строкой — форма ответа /api/status прежняя.
+  `CREATE TABLE IF NOT EXISTS counts_cache (
+     kind  TEXT PRIMARY KEY,
+     json  TEXT NOT NULL
+   )`,
+  // Карта «категория → message_thread_id» чата владельца (#1495). В SQL по
+  // той же причине, что counts_cache выше: поле объекта не переживает
+  // выгрузку DO (~10 с простоя, #329), а заводить тему заново на каждый
+  // алерт — это свалка одноразовых тем в чате владельца.
+  //
+  // Вторая карта рядом с Python-ской (ветка data/telegram-topics) заведена
+  // не по недосмотру: у воркера нет доступа к веткам репозитория, а общий
+  // источник правды у обеих сторон один и тот же — САМ TELEGRAM, где тема
+  // ищется и заводится по заголовку. Поэтому синхронизируются не карты, а
+  // заголовки (TELEGRAM.topicTitles ↔ telegram_topics.CATEGORIES, гвардия
+  // scripts/lib/test_telegram_topics.py). Расхождение заголовков даёт две
+  // темы одной категории — это и есть дефект, который гвардия закрывает.
+  `CREATE TABLE IF NOT EXISTS telegram_topics (
+     category  TEXT PRIMARY KEY,
+     thread_id INTEGER NOT NULL
+   )`,
   `CREATE TABLE IF NOT EXISTS storage_probe (
      id      INTEGER PRIMARY KEY CHECK (id = 1),
      ts      INTEGER NOT NULL,
@@ -776,11 +820,18 @@ export function storageReadyAlertDecision(
 // ── Ошибки API ──────────────────────────────────────────────────────────────────────
 
 class ApiError extends Response {
+  /** Код отказа отдельным полем, а не только внутри тела JSON: читателю тела
+   *  пришлось бы его разбирать (и потратить единственное чтение стрима), а
+   *  #absorbForTelegramWebhook (#1477) называет причину в логе на каждом
+   *  отброшенном апдейте. */
+  readonly code: string;
+
   constructor(status: number, code: Parameters<typeof msg>[0], params: Record<string, string | number> = {}) {
     super(JSON.stringify({ error: { code, message: msg(code, params) } }), {
       status,
       headers: { "content-type": "application/json" },
     });
+    this.code = code;
   }
 }
 
@@ -802,18 +853,15 @@ export function storageErrorResponse(detail: string): Response {
 export class Harness extends DurableObject<Env> {
   #sql: SqlStorage;
 
-  // Кэш агрегата «сколько задач в каждом статусе» (#320, рецепт rows_read).
-  // Не зависит от времени — меняется ТОЛЬКО записью в tasks, поэтому
+  // Кэш агрегатов «сколько задач/сообщений в каждом статусе» (#320/#575)
+  // живёт в таблице counts_cache, а НЕ в полях объекта (#1487): DO
+  // выгружается из памяти через ~10 с простоя, запросы приходят реже, и
+  // поле-кэш было холодным почти всегда — полный GROUP BY уходил на каждый
+  // вызов #status(). Отсутствие строки = «грязно», как раньше null.
+  //
+  // Не зависят от времени — меняются ТОЛЬКО записью в свою таблицу, поэтому
   // инвалидация по месту записи корректна (в отличие от stale_dispatch,
-  // который зависит от текущего момента и обязан читаться заново). null —
-  // «грязно», следующий #taskCounts() пересчитает одним GROUP BY.
-  #taskCountsCache: Record<TaskRow["status"], number> | null = null;
-
-  // Тот же рецепт для messages (#575: инцидент #321 закрыл tasks, messages
-  // осталась с полным GROUP BY на каждый #status()). Ключ — реальный статус
-  // ('new'/'processing'/'done'/'failed'/'ignored'), не фиксированный набор
-  // как у tasks — форма ответа /api/status.messages не менялась этим фиксом.
-  #msgCountsCache: Record<string, number> | null = null;
+  // который зависит от текущего момента и обязан читаться заново).
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -959,7 +1007,12 @@ export class Harness extends DurableObject<Env> {
       return this.#dropSession();
     }
     if (route.name === "messagesIngest") {
-      return this.#postMessageIngest(request, telegramAuthorized);
+      const handled = this.#postMessageIngest(request, telegramAuthorized);
+      // Единственная развилка «кто вызвал» для исхода ingest (#1477): вебхуку
+      // Telegram любой не-2xx запрещён, вызывающему по Bearer/куке прежние
+      // коды сохраняются. Ровно здесь — потому что `telegramAuthorized`
+      // вычисляется здесь же, и второго места, знающего транспорт, нет.
+      return telegramAuthorized ? this.#absorbForTelegramWebhook(handled) : handled;
     }
     if (route.name === "messages" && request.method === "GET") {
       return this.#getMessages(url);
@@ -1137,41 +1190,73 @@ export class Harness extends DurableObject<Env> {
 
   // ── Состояние ─────────────────────────────────────────────────────────────────────
 
-  /** #taskCountsCache лениво: пересчёт — единственное место, где GROUP BY по
-   *  ВСЕЙ таблице tasks вообще выполняется, и то не чаще, чем реально меняется
-   *  состав задач (создание/переход статуса), а не каждый heartbeat. */
-  #taskCounts(): Record<TaskRow["status"], number> {
-    if (this.#taskCountsCache === null) {
-      const counts: Record<TaskRow["status"], number> = {
-        queued: 0,
-        dispatched: 0,
-        running: 0,
-        done: 0,
-        failed: 0,
-      };
-      for (const row of this.#rows(this.#sql.exec("SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"))) {
-        counts[String(row.status) as TaskRow["status"]] = Number(row.n);
-      }
-      this.#taskCountsCache = counts;
+  /** Прочитать кэш агрегата из SQL. Отсутствие строки — «грязно» (#1487,
+   *  ровно тот же смысл, что прежний `null` в поле объекта). Битый JSON тоже
+   *  «грязно»: пересчёт дешевле, чем отдать наружу неразобранное. */
+  #cachedCounts(kind: string): Record<string, number> | null {
+    const row = this.#rows(this.#sql.exec("SELECT json FROM counts_cache WHERE kind = ?", kind))[0];
+    if (!row) return null;
+    try {
+      const parsed = JSON.parse(String(row.json));
+      return parsed && typeof parsed === "object" ? (parsed as Record<string, number>) : null;
+    } catch {
+      return null;
     }
-    return this.#taskCountsCache;
   }
 
-  /** #msgCountsCache лениво (#575, тот же рецепт, что #taskCounts выше, #320):
-   *  GROUP BY по ВСЕЙ таблице messages — единственное место, где он вообще
-   *  выполняется, и то не чаще, чем реально меняется состав сообщений
-   *  (приём/захват в обработку/финал/ватчдог), а не каждый вызов #status().
-   *  До этой правки счётчик читался тут же инлайном на каждый вызов —
-   *  ровно тот класс, что #321 уже закрыл для tasks. */
-  #msgCounts(): Record<string, number> {
-    if (this.#msgCountsCache === null) {
-      const counts: Record<string, number> = {};
-      for (const row of this.#rows(this.#sql.exec("SELECT status, COUNT(*) AS n FROM messages GROUP BY status"))) {
-        counts[String(row.status)] = Number(row.n);
-      }
-      this.#msgCountsCache = counts;
+  #storeCounts(kind: string, counts: Record<string, number>): void {
+    this.#sql.exec(
+      "INSERT INTO counts_cache (kind, json) VALUES (?, ?) ON CONFLICT(kind) DO UPDATE SET json = excluded.json",
+      kind,
+      JSON.stringify(counts),
+    );
+  }
+
+  /** Пометить агрегат грязным. Зовётся ровно в тех местах, где раньше стояло
+   *  `#taskCountsCache = null` — список мест этим фиксом не менялся. */
+  #invalidateCounts(kind: string): void {
+    this.#sql.exec("DELETE FROM counts_cache WHERE kind = ?", kind);
+  }
+
+  /** Пересчёт — единственное место, где GROUP BY по ВСЕЙ таблице tasks вообще
+   *  выполняется, и то не чаще, чем реально меняется состав задач
+   *  (создание/переход статуса).
+   *
+   *  #1487: раньше это утверждение было НЕВЕРНО. Кэш лежал в поле объекта, а
+   *  соседний комментарий в этом же файле (см. alarm()) фиксирует, что DO
+   *  выгружается из памяти через ~10 с простоя — то есть между запросами поле
+   *  обнулялось, и «не чаще, чем меняется состав» превращалось в «на каждый
+   *  вызов». Теперь кэш в SQL и переживает выгрузку. */
+  #taskCounts(): Record<TaskRow["status"], number> {
+    const cached = this.#cachedCounts("tasks");
+    if (cached) return cached as Record<TaskRow["status"], number>;
+    const counts: Record<TaskRow["status"], number> = {
+      queued: 0,
+      dispatched: 0,
+      running: 0,
+      done: 0,
+      failed: 0,
+    };
+    for (const row of this.#rows(this.#sql.exec("SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"))) {
+      counts[String(row.status) as TaskRow["status"]] = Number(row.n);
     }
-    return this.#msgCountsCache;
+    this.#storeCounts("tasks", counts);
+    return counts;
+  }
+
+  /** Тот же рецепт для messages (#575, #320) и та же поправка #1487: кэш
+   *  живёт в SQL, а не в поле объекта. Ключ — реальный статус
+   *  ('new'/'processing'/'done'/'failed'/'ignored'), не фиксированный набор
+   *  как у tasks — форма ответа /api/status.messages не менялась. */
+  #msgCounts(): Record<string, number> {
+    const cached = this.#cachedCounts("messages");
+    if (cached) return cached;
+    const counts: Record<string, number> = {};
+    for (const row of this.#rows(this.#sql.exec("SELECT status, COUNT(*) AS n FROM messages GROUP BY status"))) {
+      counts[String(row.status)] = Number(row.n);
+    }
+    this.#storeCounts("messages", counts);
+    return counts;
   }
 
   #status(): Status {
@@ -1348,14 +1433,14 @@ export class Harness extends DurableObject<Env> {
         row.task_id,
       );
       if (cursor.rowsWritten > 0) {
-        this.#taskCountsCache = null;
+        this.#invalidateCounts("tasks");
         changed = true;
       }
     }
     if (row.kind === "job_end") {
       const failed = (row.data as { result?: string } | null)?.result === "fail";
       this.#sql.exec("UPDATE tasks SET status = ? WHERE id = ?", failed ? "failed" : "done", row.task_id);
-      this.#taskCountsCache = null;
+      this.#invalidateCounts("tasks");
       // Руки закончили — «руки живы» уходит сразу, а не через порог свежести.
       this.#sql.exec("DELETE FROM heartbeat WHERE id = 1");
       changed = true;
@@ -1470,7 +1555,7 @@ export class Harness extends DurableObject<Env> {
     // тик, а не вторая копия у каждого вызывающего. lastPulse строим из уже
     // посчитанных значений ЭТОГО тика (не второй SQL-раундтрип через
     // #getStoredPulse — #recordPulse выше уже записала ровно это).
-    this.#tickPulseAlert(now, { ts: now, dispatch_ok: result.ok, detail, run_confirmed: runConfirmed });
+    await this.#tickPulseAlert(now, { ts: now, dispatch_ok: result.ok, detail, run_confirmed: runConfirmed });
   }
 
   /**
@@ -1584,7 +1669,7 @@ export class Harness extends DurableObject<Env> {
     // в этом DO не должен зависеть ни от GH_DISPATCH_TOKEN/GH_REPO, ни от
     // TELEGRAM_BOT_TOKEN — при их отсутствии тик обязан продолжать замечать
     // недоступность хранилища, а не молча пропускать эту гарантию.
-    this.#tickStorageReadyAlert();
+    await this.#tickStorageReadyAlert();
 
     // Инбокс владельца (#20): тот же пульс — ватчдог зависших и водитель разбора.
     // ДО раннего возврата по конфигурации dispatch: разбор не зависит ни от
@@ -1674,10 +1759,10 @@ export class Harness extends DurableObject<Env> {
         // так же, как dispatch/job_start/job_end — те места кэш сбрасывают,
         // а чистка нет. Без сброса /api/status завышает done/failed до
         // следующей записи задачи (на тёплом инстансе — надолго).
-        if (table.name === "tasks" && cursor.rowsWritten > 0) this.#taskCountsCache = null;
+        if (table.name === "tasks" && cursor.rowsWritten > 0) this.#invalidateCounts("tasks");
         // #575: тот же принцип для messages — чистка терминальных сообщений
         // меняет msgCounts.done/failed/ignored так же, как finish/reclaim.
-        if (table.name === "messages" && cursor.rowsWritten > 0) this.#msgCountsCache = null;
+        if (table.name === "messages" && cursor.rowsWritten > 0) this.#invalidateCounts("messages");
       } catch (error) {
         full = true; // сбой чистки — тоже «не успеваем», не тихий пропуск
         pruned[table.name] = -1; // -1 = попытка упала, не «нечего было чистить»
@@ -1914,7 +1999,7 @@ export class Harness extends DurableObject<Env> {
    * логом: без записанного флага «шлём/не шлём» решать не по чему, и молча
    * пропустить один тик честнее, чем спамить; первый удавшийся тик догонит.
    */
-  #tickStorageReadyAlert(): void {
+  async #tickStorageReadyAlert(): Promise<void> {
     const result = this.#checkStorageReady();
     let dedupRowsWritten: number | null = null;
     try {
@@ -1929,15 +2014,9 @@ export class Harness extends DurableObject<Env> {
     if (!this.env.TELEGRAM_CHAT_ID) return; // «возможности нет» — алерту некуда идти
     const decision = storageReadyAlertDecision(result.ok, dedupRowsWritten);
     if (decision === "incident") {
-      void this.#telegramApi("sendMessage", {
-        chat_id: this.env.TELEGRAM_CHAT_ID,
-        text: `⚠️ Хранилище журнала не отвечает: ${result.detail}`,
-      });
+      await this.#alertOwner(`⚠️ Хранилище журнала не отвечает: ${result.detail}`);
     } else if (decision === "recovery") {
-      void this.#telegramApi("sendMessage", {
-        chat_id: this.env.TELEGRAM_CHAT_ID,
-        text: "✅ Хранилище журнала снова отвечает",
-      });
+      await this.#alertOwner("✅ Хранилище журнала снова отвечает");
     }
   }
 
@@ -1983,7 +2062,7 @@ export class Harness extends DurableObject<Env> {
    * исправленное (свежее, успешное) состояние — incident не пишется вовсе,
    * хотя пульс реально молчал 20+ минут до этого. Не закрыто этим change'ом.
    */
-  #tickPulseAlert(now: number, lastPulse: PulseStatus): void {
+  async #tickPulseAlert(now: number, lastPulse: PulseStatus): Promise<void> {
     const healthy = pulseHealthy(now, lastPulse);
     let dedupRowsWritten: number | null = null;
     try {
@@ -1999,15 +2078,9 @@ export class Harness extends DurableObject<Env> {
     if (!this.env.TELEGRAM_CHAT_ID) return; // «возможности нет» — алерту некуда идти
     const decision = storageReadyAlertDecision(healthy, dedupRowsWritten);
     if (decision === "incident") {
-      void this.#telegramApi("sendMessage", {
-        chat_id: this.env.TELEGRAM_CHAT_ID,
-        text: pulseAlertText(lastPulse),
-      });
+      await this.#alertOwner(pulseAlertText(lastPulse));
     } else if (decision === "recovery") {
-      void this.#telegramApi("sendMessage", {
-        chat_id: this.env.TELEGRAM_CHAT_ID,
-        text: "✅ edge-harness: пульс оркестратора снова в норме",
-      });
+      await this.#alertOwner("✅ edge-harness: пульс оркестратора снова в норме");
     }
   }
 
@@ -2023,7 +2096,7 @@ export class Harness extends DurableObject<Env> {
     const id = crypto.randomUUID();
     const now = Date.now();
     this.#sql.exec("INSERT INTO tasks (id, created_ts, status) VALUES (?, ?, 'queued')", id, now);
-    this.#taskCountsCache = null;
+    this.#invalidateCounts("tasks");
     this.#emitSystemEvent(id, "task_queued", { payload });
     this.#broadcastStatus();
 
@@ -2075,7 +2148,7 @@ export class Harness extends DurableObject<Env> {
     }
 
     this.#sql.exec("UPDATE tasks SET status = 'dispatched', dispatch_ts = ? WHERE id = ?", now, id);
-    this.#taskCountsCache = null;
+    this.#invalidateCounts("tasks");
     this.#emitSystemEvent(id, "task_dispatched", {});
     this.#broadcastStatus();
     return this.#json({ task_id: id, dispatched: true }, { status: 201 });
@@ -2451,7 +2524,7 @@ export class Harness extends DurableObject<Env> {
     // #processSingleMessage/#reclaimStuckMessages идут через неё), поэтому
     // единственная точка сброса msgCounts на терминальный переход (#575).
     if (Number(cursor.rowsWritten) > 0) {
-      this.#msgCountsCache = null;
+      this.#invalidateCounts("messages");
       return true;
     }
     return false;
@@ -2473,7 +2546,7 @@ export class Harness extends DurableObject<Env> {
     );
     if (claimed.rowsWritten === 0) return { action: "skipped" };
     // new → processing — msgCounts сдвигается тем же переходом (#575).
-    this.#msgCountsCache = null;
+    this.#invalidateCounts("messages");
     this.#groupMessages(messageId);
 
     // directive и doc_edit — оба получают issue-след: «у каждой директивы есть
@@ -2508,7 +2581,7 @@ export class Harness extends DurableObject<Env> {
       );
       if (Number(released.rowsWritten) === 0) return { action: "skipped" };
       // processing → new (повторяемая ошибка) — тот же переход, что и захват выше (#575).
-      this.#msgCountsCache = null;
+      this.#invalidateCounts("messages");
       return { action: "issue_retry", error: outcome.error, attempts };
     }
 
@@ -2608,8 +2681,26 @@ export class Harness extends DurableObject<Env> {
    *  сквозным тестом alarm ниже). */
   #reclaimStuckMessages(): number {
     const now = Date.now();
+    // Порог — В ЗАПРОСЕ, батч — тоже (#1503). Раньше выборка была безлимитной,
+    // а messageStuck() отсеивал уже в JS: каждый тик читал ВСЕ сообщения в
+    // processing, включая свежие, которым до порога ещё минуты. Живой замер
+    // 2026-09-24: 1 837 397 строк за 85 минут, лимит rows_read (5 млн/сутки)
+    // выжигался за несколько часов — морда падала с «Exceeded allowed rows
+    // read in Durable Objects free tier», кнопки владельца умирали. Отказ шёл
+    // по кругу: чем больше застряло, тем дороже тик.
+    //
+    // `now - messageStuckProcessingMs` — та же граница, что у messageStuck;
+    // одно место правды сохранено тем, что ниже КАЖДЫЙ отобранный ряд всё
+    // равно проходит через messageStuck(): SQL сужает выборку, решает по
+    // прежнему она. Разойтись они не могут — это проверяет тест.
     const candidates = this.#rows(
-      this.#sql.exec("SELECT id, attempts, processing_ts FROM messages WHERE status = 'processing' AND processing_ts IS NOT NULL"),
+      this.#sql.exec(
+        `SELECT id, attempts, processing_ts FROM messages
+         WHERE status = 'processing' AND processing_ts IS NOT NULL AND processing_ts < ?
+         ORDER BY processing_ts ASC LIMIT ?`,
+        now - LIMITS.messageStuckProcessingMs,
+        LIMITS.messageReclaimBatch,
+      ),
     );
     let reclaimed = 0;
     for (const row of candidates) {
@@ -2624,7 +2715,7 @@ export class Harness extends DurableObject<Env> {
         Number(row.id),
       ).rowsWritten;
       // processing → new (ватчдог) — тот же переход, что ручной release выше (#575).
-      if (released > 0) this.#msgCountsCache = null;
+      if (released > 0) this.#invalidateCounts("messages");
       reclaimed += Number(released);
     }
     return reclaimed;
@@ -2644,7 +2735,7 @@ export class Harness extends DurableObject<Env> {
       );
       // failed → new (bulk retry) — та же msgCounts-инвалидация, что у
       // одиночных переходов выше (#575).
-      if (cursor.rowsWritten > 0) this.#msgCountsCache = null;
+      if (cursor.rowsWritten > 0) this.#invalidateCounts("messages");
     }
     const rows = this.#rows(
       this.#sql.exec(
@@ -2676,6 +2767,64 @@ export class Harness extends DurableObject<Env> {
    * апдейт из чужого чата ляжет в инбокс как «сообщение владельца». Вызывающий
    * по Bearer/куке уже доверен внутренним токеном — chat_id ему не навязываем.
    */
+  /**
+   * Исход обработки апдейта, пришедшего ЧЕРЕЗ ВЕБХУК Telegram, превращается в
+   * ответ вебхуку (#1477). Правило одно и без исключений: **не-2xx вебхуку
+   * Telegram не уходит никогда.**
+   *
+   * Почему это не вкусовщина. Telegram доставляет апдейты одного чата строго
+   * по порядку и на любой не-2xx ретраит ТОТ ЖЕ апдейт, а следующие держит за
+   * ним. Значит один апдейт, которому ретраи не помогут — фото без подписи
+   * (`need_text`), слишком длинный текст (`message_too_large`), сообщение из
+   * чужого чата (`unauthorized`), неразобранное тело (`bad_json`) — затыкает
+   * канал владельца ЦЕЛИКОМ, включая нажатия инлайн-кнопок решений. Живой
+   * случай: прогон `telegram-webhook` 35801215616 (2026-09-23),
+   * `getWebhookInfo.last_error_message = "Wrong response from the webhook:
+   * 400 Bad Request"`, владелец жмёт кнопку — клавиатура не снимается.
+   *
+   * Докстринг #postOwnerDecisionCallback знал это правило дословно, но
+   * применял его к одному исходу из семи (кривой `callback_data`). Здесь оно
+   * применено к исходу вообще — одним местом, а не семью правками мест
+   * броска: седьмое место добавят завтра, и оно будет прикрыто тем же кодом.
+   *
+   * НЕ silent-wrong: отброшенный апдейт громко виден в НАШЕМ логе
+   * (`console.error` с кодом и HTTP-статусом), а 200 уходит Telegram'у —
+   * это разные адресаты. Тело ответа тоже несёт причину машиночитаемо
+   * (`status: "ignored"`, `reason`, `http_status`), чтобы зонд маршрута и
+   * тесты различали «принято» и «отброшено» без разбора логов.
+   *
+   * Отмена решения PR #486 названа вслух: там 401 на чужой чат сочли
+   * оправданным, потому что «это фактически неавторизованный вызов». Отказ
+   * от обслуживания остаётся (апдейт не сохраняется, dispatch не уходит) —
+   * меняется только КОД ответа, и меняется потому, что 4xx у Telegram
+   * означает не «отклонено», а «повтори то же самое снова». В прежней
+   * редакции любой посторонний, написавший боту, навсегда глушил канал
+   * владельца одним сообщением.
+   *
+   * Путь по Bearer/куке сюда не заходит (см. развилку в #route): там ретраев
+   * нет, и 400 на кривой запрос — правильный ответ.
+   */
+  async #absorbForTelegramWebhook(handled: Promise<Response>): Promise<Response> {
+    let status: number;
+    let reason: string;
+    try {
+      const response = await handled;
+      if (response.status < 400) return response;
+      status = response.status;
+      reason = response instanceof ApiError ? response.code : "http_error";
+    } catch (error) {
+      if (error instanceof ApiError) {
+        status = error.status;
+        reason = error.code;
+      } else {
+        status = 500;
+        reason = error instanceof Error ? error.message : String(error);
+      }
+    }
+    console.error(`telegram_webhook: апдейт отброшен (${reason}), Telegram'у отвечаем 200 — иначе он ретраит и затыкает очередь (HTTP, который получил бы вызывающий по Bearer: ${status})`);
+    return this.#json({ status: "ignored", reason, http_status: status });
+  }
+
   #postMessageIngest(request: Request, viaTelegramWebhook: boolean): Promise<Response> {
     return this.#readJson(request).then((body) => {
       const callbackQuery = asObject(body.callback_query);
@@ -2834,6 +2983,132 @@ export class Harness extends DurableObject<Env> {
    *  секрет не задан или сеть недоступна — громкий console.error, не throw
    *  (ответ владельцу важнее, чем падение всего запроса из-за необязательного
    *  внешнего звонка). */
+  /**
+   * message_thread_id темы категории в чате владельца, или null (#1495).
+   *
+   * Тормоз с названным газом: темы — не обязательство. Не удалось (чат не
+   * форум, у бота нет `can_manage_topics`, сеть, Telegram ответил ошибкой) —
+   * возвращается null, и вызывающий уходит В ОБЩИЙ ПОТОК с пометкой ПОЧЕМУ.
+   * Потерять алерт дороже, чем показать его не там, — ровно тот же выбор, что
+   * на Python-стороне (ADR 0028).
+   *
+   * Кэш в SQL, не в поле: DO выгружается через ~10 с простоя (#329), поле
+   * было бы холодным почти всегда, и каждый алерт заводил бы новую тему.
+   */
+  async #ownerThreadId(category: string): Promise<number | null> {
+    const title = TELEGRAM.topicTitles[category];
+    if (!title) {
+      console.error(
+        `ownerThreadId: категории «${category}» нет в TELEGRAM.topicTitles — ` +
+          "сигнал уйдёт в общий поток; реестр категорий один на оба языка " +
+          "(scripts/lib/telegram_topics.py::CATEGORIES)",
+      );
+      return null;
+    }
+    try {
+      const row = this.#rows(
+        this.#sql.exec("SELECT thread_id FROM telegram_topics WHERE category = ?", category),
+      )[0];
+      if (row) return Number(row.thread_id);
+    } catch (error) {
+      console.error(
+        `ownerThreadId: чтение карты тем упало (${error instanceof Error ? error.message : error}) — ` +
+          "пробую завести тему заново",
+      );
+    }
+    const created = await this.#telegramApiResult("createForumTopic", {
+      chat_id: this.env.TELEGRAM_CHAT_ID,
+      name: title,
+    });
+    const threadId = Number(
+      (created?.result as Record<string, unknown> | undefined)?.message_thread_id,
+    );
+    if (!Number.isFinite(threadId) || threadId <= 0) {
+      console.error(
+        `ownerThreadId: тема «${title}» не заведена (${created?.description ?? "ответ без message_thread_id"}) — ` +
+          "сигнал уйдёт в общий поток с пометкой",
+      );
+      return null;
+    }
+    try {
+      this.#sql.exec(
+        "INSERT INTO telegram_topics (category, thread_id) VALUES (?, ?) " +
+          "ON CONFLICT(category) DO UPDATE SET thread_id = excluded.thread_id",
+        category,
+        threadId,
+      );
+    } catch (error) {
+      console.error(
+        `ownerThreadId: тема «${title}» заведена (${threadId}), но не сохранена ` +
+          `(${error instanceof Error ? error.message : error}) — следующий алерт заведёт ещё одну`,
+      );
+    }
+    return threadId;
+  }
+
+  /**
+   * Алерт владельцу В ТЕМУ своей категории (#1495). Единственная дверь для
+   * сообщений воркера: четыре прежних вызова `sendMessage` уходили без
+   * `message_thread_id` вовсе, и в чате владельца это была общая куча —
+   * притом ровно те сообщения, что переживают смерть GitHub Actions (#1103)
+   * и которые он обязан увидеть первыми.
+   *
+   * Тема не досталась — текст уходит С ПРИЧИНОЙ в общем потоке: «возможности
+   * нет» и «возможность есть, но сломана» лечатся по-разному, и читатель
+   * обязан различать их по самому сообщению.
+   */
+  async #alertOwner(text: string): Promise<void> {
+    const threadId = await this.#ownerThreadId(TELEGRAM.workerAlertCategory);
+    if (threadId === null) {
+      await this.#telegramApi("sendMessage", {
+        chat_id: this.env.TELEGRAM_CHAT_ID,
+        text: `${text}\n\n(в общем потоке: тему «${TELEGRAM.topicTitles[TELEGRAM.workerAlertCategory]}» получить не удалось — причина в логах воркера)`,
+      });
+      return;
+    }
+    await this.#telegramApi("sendMessage", {
+      chat_id: this.env.TELEGRAM_CHAT_ID,
+      message_thread_id: threadId,
+      text,
+    });
+  }
+
+  /** Тот же вызов Bot API, что #telegramApi, но с РАЗОБРАННЫМ ответом:
+   *  createForumTopic нужен ради `message_thread_id`, а #telegramApi ответ
+   *  выбрасывает. Ошибки обрабатываются так же (лог + null), чтобы не
+   *  появилось второго мнения о том, что считать отказом. */
+  async #telegramApiResult(
+    method: string,
+    payload: Record<string, unknown>,
+  ): Promise<{ ok?: boolean; result?: unknown; description?: string } | null> {
+    const token = this.env.TELEGRAM_BOT_TOKEN;
+    if (!token) {
+      console.error(`telegramApiResult(${method}): TELEGRAM_BOT_TOKEN не задан — вызов не сделан`);
+      return null;
+    }
+    try {
+      const res = await fetch(`${TELEGRAM.apiBase}/bot${token}/${method}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "User-Agent": EGRESS_USER_AGENT },
+        body: JSON.stringify(payload),
+      });
+      const body = (await res.json().catch(() => null)) as
+        | { ok?: boolean; result?: unknown; description?: string }
+        | null;
+      if (!res.ok) {
+        console.error(
+          `telegramApiResult(${method}): Telegram ответил ${res.status}: ${body?.description ?? "тело не разобрано"}`,
+        );
+      }
+      return body;
+    } catch (error) {
+      console.error(
+        `telegramApiResult(${method}): сеть недоступна: ${error instanceof Error ? error.message : error}`,
+      );
+      return null;
+    }
+  }
+
   async #telegramApi(method: string, payload: Record<string, unknown>): Promise<void> {
     const token = this.env.TELEGRAM_BOT_TOKEN;
     if (!token) {
@@ -2947,7 +3222,7 @@ export class Harness extends DurableObject<Env> {
     // ON CONFLICT DO NOTHING, а пречтение (`existing` выше) уже гарантирует,
     // что сюда доходит только настоящая новая строка — условие на негодном
     // сигнале защищало бы случай, которого здесь нет.
-    this.#msgCountsCache = null;
+    this.#invalidateCounts("messages");
     const row = this.#rows(
       this.#sql.exec("SELECT id FROM messages WHERE source = ? AND source_msg_id = ?", f.source, f.sourceMsgId),
     )[0];

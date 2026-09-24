@@ -489,7 +489,7 @@ def run_watch(repo: str, now: datetime) -> list[str]:
                 f"🚨 edge-harness: суточный потолок задач merge-health ({MERGE_HEALTH_DAILY_CAP}) "
                 f"исчерпан — новый `fire` НЕ заведён отдельной задачей.\n\n{full_report}"
             )
-            esc_result = pulse_guard.escalate(repo, pulse_guard.WATCHDOG_ISSUE, text)
+            esc_result = pulse_guard.escalate(repo, pulse_guard.WATCHDOG_ISSUE, text, category="pipeline")
             report.append(f"🚨 потолок исчерпан ({created_today}/{MERGE_HEALTH_DAILY_CAP}) — {esc_result}")
             return report
         title = f"Регрессия worker_success_rate после слияния ({now.strftime('%Y-%m-%d %H:%M')} UTC)"
@@ -500,7 +500,7 @@ def run_watch(repo: str, now: datetime) -> list[str]:
         report.append(f"🆕 задача #{number} заведена")
 
     escalate_text = f"🚨 edge-harness: регрессия worker_success_rate (fire) — {full_report}"
-    esc_result = pulse_guard.escalate(repo, pulse_guard.WATCHDOG_ISSUE, escalate_text)
+    esc_result = pulse_guard.escalate(repo, pulse_guard.WATCHDOG_ISSUE, escalate_text, category="pipeline")
     report.append(f"🚨 эскалация #{pulse_guard.WATCHDOG_ISSUE}: {esc_result}")
     return report
 

@@ -430,3 +430,85 @@ def test_today_rows_read_sums_multiple_rows_of_the_same_day(monkeypatch):
         {"sum": {"rowsRead": 250}, "dimensions": {"datetimeHour": "2026-09-06T01:00:00Z"}},
     ])
     assert mod.today_rows_read("tok", "acct") == 350
+
+
+# ── Разбивка по objectId (#1513): 92% расхода не было атрибутировано ────────
+# Прод-форма строк взята из живого ответа прогона 35947416918 (те же ключи
+# `dimensions`/`sum`, что печатала интроспекция живой схемы) — не пересказ
+# формата своими словами (AGENTS.md, «Тест кормит прод-форму данных»).
+
+_PROD_SHAPE_ROWS = [
+    # namespace dsh-edge (a59c…) — два объекта, один жрёт почти всё
+    {"dimensions": {"date": "2026-09-24", "datetimeHour": "2026-09-24T01:00:00Z",
+                    "namespaceId": "a59c9e7e4ef541878ab82100923cf4e4",
+                    "objectId": "0000000000000000000000000000000000000000000000000000000000000001"},
+     "sum": {"rowsRead": 1_600_000, "rowsWritten": 4000}},
+    {"dimensions": {"date": "2026-09-24", "datetimeHour": "2026-09-24T02:00:00Z",
+                    "namespaceId": "a59c9e7e4ef541878ab82100923cf4e4",
+                    "objectId": "0000000000000000000000000000000000000000000000000000000000000002"},
+     "sum": {"rowsRead": 40_000, "rowsWritten": 300}},
+    # namespace edge-harness (646b…) — сама морда, копейки
+    {"dimensions": {"date": "2026-09-24", "datetimeHour": "2026-09-24T02:00:00Z",
+                    "namespaceId": "646b270ee51f4ca3bcb6badd9de63a98",
+                    "objectId": "0000000000000000000000000000000000000000000000000000000000000003"},
+     "sum": {"rowsRead": 2_780, "rowsWritten": 81}},
+]
+_DIMS_WITH_OBJECT = {"date", "datetimeHour", "namespaceId", "objectId"}
+
+
+def test_by_object_splits_inside_one_namespace():
+    """Главное, ради чего задача: namespaceId отвечает «какой воркер», а
+    objectId — «какой именно объект». Живой замер 2026-09-24 показал 4 047 032
+    строки в ОДНОМ namespace, и без этой разбивки нельзя отличить «расход
+    размазан по сотне сессий» от «сидит в одной»."""
+    summary = mod.daily_totals_from_rows(
+        _PROD_SHAPE_ROWS, {"rowsRead", "rowsWritten"}, _DIMS_WITH_OBJECT)
+    by_object = summary["by_object"]
+    assert len(by_object) == 3, f"объекты не разделились: {by_object}"
+    top = max(by_object.items(), key=lambda kv: kv[1]["rows_read"])
+    assert top[0].startswith("a59c9e7e4ef541878ab82100923cf4e4/"), (
+        "самый дорогой объект обязан нести СВОЙ namespace в ключе — иначе два "
+        "объекта разных воркеров с одинаковым objectId слипнутся в один")
+    assert top[1]["rows_read"] == 1_600_000
+    # Сумма разбивки сходится с суточным итогом: разбивка, не сходящаяся с
+    # итогом, — это не разбивка, а второе мнение рядом.
+    assert sum(v["rows_read"] for v in by_object.values()) == summary["rows_read"]
+
+
+def test_by_object_is_empty_when_dimension_not_requested():
+    """Без objectId в измерениях разбивки нет — и это не «объектов нет».
+    Запрос дороже (строки множатся на число объектов), поэтому измерение
+    берётся только по флагу."""
+    summary = mod.daily_totals_from_rows(
+        _PROD_SHAPE_ROWS, {"rowsRead", "rowsWritten"},
+        {"date", "datetimeHour", "namespaceId"})
+    assert summary["by_object"] == {}
+
+
+def test_object_breakdown_says_not_asked_instead_of_zero():
+    """Fail loud, не silent-wrong: «не спрашивали» и «расход ничему не
+    принадлежит» лечатся по-разному, и текст обязан их различать."""
+    from datetime import date as _date
+    text = mod.format_object_breakdown([(_date(2026, 9, 24), {"rows_read": 0, "by_object": {}})], 10)
+    assert "--objects" in text, text
+    assert "не снята" in text, text
+
+
+def test_object_breakdown_names_the_tail_it_cut():
+    """Топ-N без хвоста врёт формой: «топ-2 дал 30%» нельзя отличить от
+    «остальное — длинный хвост» без числа оставшихся."""
+    from datetime import date as _date
+    summary = mod.daily_totals_from_rows(
+        _PROD_SHAPE_ROWS, {"rowsRead", "rowsWritten"}, _DIMS_WITH_OBJECT)
+    text = mod.format_object_breakdown([(_date(2026, 9, 24), summary)], 1)
+    assert "…ещё 2 объект(ов)" in text, text
+    assert "42,780" in text, f"хвост обязан нести своё число строк: {text}"
+
+
+def test_objects_flag_defaults_to_off_and_has_a_top():
+    """Умолчание проверяется ПОВЕДЕНИЕМ парсера, а не чтением литерала в
+    исходнике (#1411, находка ai-review PR #1425)."""
+    parser = mod.build_arg_parser()
+    assert parser.parse_args([]).objects == 0, "разбивка по объектам обязана быть выключена по умолчанию"
+    assert parser.parse_args(["--objects"]).objects == 10, "без числа флаг обязан дать разумный топ"
+    assert parser.parse_args(["--objects", "3"]).objects == 3

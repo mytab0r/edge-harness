@@ -440,6 +440,29 @@ _console_utf8_spec = importlib.util.spec_from_file_location(
 _console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))
 # --- конец console_utf8 bootstrap ---
 
+# --- rate_guard: исчерпанный бюджет API — предупреждение, не красный required-гейт ---
+# Отличие от гейтов contract/review (#1466) существенное и названо здесь, а не
+# подразумевается. Те проверяют ЭТОТ PR: их зелёный означает «контракт PR↔задача
+# проверен», «дифф отревьюен», и пропуск по чужой квоте был бы silent-wrong —
+# слияние непроверенного.
+#
+# Этот скрипт проверяет ЖИВОЕ СОСТОЯНИЕ РЕПОЗИТОРИЯ, а не содержимое PR. Его
+# вывод не про дифф вовсе, и он по построению повторяем: тот же список
+# инвариантов бежит в orchestra.yml каждые 15 минут (AGENTS.md, «Инцидент
+# оставляет инвариант»). Значит пропуск здесь не создаёт дыры — он лишь
+# откладывает проверку до ближайшего планового прогона, и это НАЗВАННЫЙ газ, а
+# не умолчание.
+#
+# Цена обратного выбора измерена: 2026-09-22 исчерпанный бюджет уронил
+# обязательную проверку на PR #1474/#1472/#1473 подряд (403 на
+# issues/120/comments), ни один из них к квоте отношения не имел, и конвейер
+# встал вторично — уже не из-за поломки, а из-за чужого счётчика.
+_rate_guard_spec = importlib.util.spec_from_file_location(
+    "rate_guard", Path(__file__).resolve().parents[1] / "lib" / "rate_guard.py")
+_rate_guard = importlib.util.module_from_spec(_rate_guard_spec)
+_rate_guard_spec.loader.exec_module(_rate_guard)
+# --- конец rate_guard ---
+
 import argparse
 import hashlib
 import importlib.util
@@ -459,7 +482,36 @@ _PG_SPEC = importlib.util.spec_from_file_location(
 pulse_guard = importlib.util.module_from_spec(_PG_SPEC)
 _PG_SPEC.loader.exec_module(pulse_guard)  # type: ignore[union-attr]
 
-gh = pulse_guard.gh
+# ── Один прогон — один ответ на один URL (#1483) ────────────────────────────
+#
+# Класс одной фразой: **один и тот же GET к GitHub API выполняется несколько
+# раз за ОДИН прогон инспектора — бюджет installation-токена тратится на
+# ответы, которые уже получены.**
+#
+# Замер на живом репозитории (обёртка над `gh` в PATH, считающая вызовы):
+# 204 вызова за прогон, из них 55 — повторы; один и тот же
+# `actions/workflows/ai-review.yml/runs?per_page=100` уходил 23 РАЗА подряд
+# (по разу на каждый открытый PR, см. ai_review_runs_after ниже).
+#
+# Механизм — pulse_guard.enable_read_cache(), включается в main(). Он живёт
+# ТАМ, а не здесь, потому что читатели состояния приходят и из соседних
+# модулей (review_labels, scheduler-хелперы) и зовут pulse_guard.gh напрямую:
+# кэш в обёртке этого модуля ловил бы только часть (замер: 204 → 180, повторы
+# остались). Одно место, через которое проходят все, — сам pulse_guard.gh.
+#
+# Этот модуль read-only по построению: он ЧИТАЕТ один согласованный снимок и
+# ничего не меняет, поэтому повторный запрос того же URL в пределах прогона не
+# может дать другого ответа, ради которого стоило бы платить.
+
+
+def gh(*args: str) -> dict | list | None:
+    """`pulse_guard.gh` берётся в МОМЕНТ ВЫЗОВА, а не защёлкивается при
+    импорте: тесты подменяют именно `pulse_guard.gh`, и прежнее
+    `gh = pulse_guard.gh` ловило подмену только по счастливому порядку
+    импортов (см. докстринг ai_review_runs_after про `gh_func`)."""
+    return pulse_guard.gh(*args)
+
+
 parse_time = pulse_guard.parse_time
 minutes_between = pulse_guard.minutes_between
 escalate = pulse_guard.escalate
@@ -3898,7 +3950,7 @@ def escalate_if_new(repo: str, invariant_id: int, marker_key: str, text: str) ->
     except RuntimeError as error:
         print(f"::warning::не удалось прочитать маркеры #{WATCHDOG_ISSUE}: {error}", file=sys.stderr)
         return None
-    return escalate(repo, WATCHDOG_ISSUE, f"{marker}\n{text}")
+    return escalate(repo, WATCHDOG_ISSUE, f"{marker}\n{text}", category="breakage")
 
 
 def pipeline_status_marker_key(violations: list[dict]) -> str:
@@ -4121,6 +4173,17 @@ def run_escalations(repo: str, findings: dict[int, list]) -> list[str]:
 
 
 def main() -> int:
+    """Снимок состояния — свой на каждый прогон и ТОЛЬКО на него (#1483).
+
+    Инспектор read-only, поэтому один и тот же URL внутри прогона обязан
+    стоить один запрос. Область видимости — блок `with`, а не парные
+    включить/выключить: первая редакция была парной и протекла в другой файл
+    тестов, потому что `main()` включал кэш и не выключал."""
+    with pulse_guard.read_cache():
+        return _run_checks()
+
+
+def _run_checks() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--orchestra", action="store_true",
                          help="периодический режим: report + escalate (инварианты из ESCALATING_INVARIANTS)")
@@ -4178,9 +4241,22 @@ def main() -> int:
     return 0
 
 
-if __name__ == "__main__":
+def _main_reporting_runtime_errors() -> int:
+    """main с прежним разбором RuntimeError — обёртка квоты снаружи.
+
+    Порядок важен: сначала свой разбор (RuntimeError печатается как ::error::
+    и красит прогон), и только отказ формы «бюджет исчерпан» перехватывает
+    rate_guard уровнем выше. Поменять их местами значило бы гасить ЛЮБУЮ
+    RuntimeError, а не только квотную."""
     try:
-        sys.exit(main())
+        return main()
     except RuntimeError as error:
+        if _rate_guard.is_rate_limit_refusal(str(error)):
+            raise
         print(f"::error::repo_invariants: {error}")
-        sys.exit(1)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(_rate_guard.run_guard_main(
+        _main_reporting_runtime_errors, guard="repo_invariants"))

@@ -613,7 +613,7 @@ def test_run_infra_failure_escalates_to_watchdog_with_dedup(monkeypatch):
     escalated = []
     posted_markers = []
 
-    def fake_escalate(repo, number, text, options=None):
+    def fake_escalate(repo, number, text, options=None, **_):
         escalated.append((number, text))
         return "доставлен"
 

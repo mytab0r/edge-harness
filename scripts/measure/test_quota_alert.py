@@ -145,7 +145,7 @@ def test_first_observation_breach_alerts_and_creates_task(monkeypatch):
     monkeypatch.setattr(qa, "create_or_note_task", lambda *a: (1234, "задача заведена"))
     escalated = []
     monkeypatch.setattr(qa.pulse_guard, "escalate",
-                         lambda repo, issue, text: escalated.append(text) or "Telegram: доставлен; след в #120: оставлен")
+                         lambda repo, issue, text, **_: escalated.append(text) or "Telegram: доставлен; след в #120: оставлен")
 
     result = qa.check_and_alert(REPO, "cf_do_rows_read_day", "DO rows_read/сутки",
                                  7_487_640, 5_000_000, 149.8)
@@ -162,7 +162,7 @@ def test_mutation_guard_breach_boundary_is_inclusive(monkeypatch):
     порога сигнал обязан сработать (>=, не >)."""
     _no_prior_state(monkeypatch)
     monkeypatch.setattr(qa, "create_or_note_task", lambda *a: (1, "ok"))
-    monkeypatch.setattr(qa.pulse_guard, "escalate", lambda repo, issue, text: "escalated")
+    monkeypatch.setattr(qa.pulse_guard, "escalate", lambda repo, issue, text, **_: "escalated")
     result = qa.check_and_alert(REPO, "k", "метка", 80, 100, 80.0, threshold=80.0)
     assert "breach" in result
 
@@ -172,7 +172,7 @@ def test_no_change_does_not_alert_again(monkeypatch):
     переходу, не по каждому прогону."""
     monkeypatch.setattr(qa, "last_state", lambda repo, key: ("breach", 1234))
     calls = []
-    monkeypatch.setattr(qa.pulse_guard, "escalate", lambda repo, issue, text: calls.append(text) or "x")
+    monkeypatch.setattr(qa.pulse_guard, "escalate", lambda repo, issue, text, **_: calls.append(text) or "x")
     create_calls = []
     monkeypatch.setattr(qa, "create_or_note_task", lambda *a: create_calls.append(1) or (None, "x"))
 
@@ -191,7 +191,7 @@ def test_recovery_transition_alerts_without_creating_task(monkeypatch):
     create_calls = []
     monkeypatch.setattr(qa, "create_or_note_task", lambda *a: create_calls.append(1) or (999, "не должно вызываться"))
     escalated = []
-    monkeypatch.setattr(qa.pulse_guard, "escalate", lambda repo, issue, text: escalated.append(text) or "ok")
+    monkeypatch.setattr(qa.pulse_guard, "escalate", lambda repo, issue, text, **_: escalated.append(text) or "ok")
 
     result = qa.check_and_alert(REPO, "cf_do_rows_read_day", "DO rows_read/сутки", 100, 5_000_000, 2.0)
 
@@ -205,7 +205,7 @@ def test_recovery_transition_alerts_without_creating_task(monkeypatch):
 
 def test_recovery_without_prior_issue_number_still_alerts(monkeypatch):
     monkeypatch.setattr(qa, "last_state", lambda repo, key: ("breach", None))
-    monkeypatch.setattr(qa.pulse_guard, "escalate", lambda repo, issue, text: "ok")
+    monkeypatch.setattr(qa.pulse_guard, "escalate", lambda repo, issue, text, **_: "ok")
     result = qa.check_and_alert(REPO, "k", "метка", 10, 100, 10.0)
     assert "recovery" in result
 
@@ -216,7 +216,7 @@ def test_first_observation_already_ok_does_not_send_false_recovery(monkeypatch):
     порога») быть не должно, только тихий маркер (found: ревью PR #607)."""
     _no_prior_state(monkeypatch)
     escalated = []
-    monkeypatch.setattr(qa.pulse_guard, "escalate", lambda repo, issue, text: escalated.append(text) or "x")
+    monkeypatch.setattr(qa.pulse_guard, "escalate", lambda repo, issue, text, **_: escalated.append(text) or "x")
     posted = []
     monkeypatch.setattr(qa.pulse_guard, "post_issue_comment",
                          lambda repo, issue, text: posted.append(text))
@@ -242,7 +242,7 @@ def test_first_observation_marker_write_failure_is_predicate_visible(monkeypatch
     краснеет."""
     _no_prior_state(monkeypatch)
     escalated = []
-    monkeypatch.setattr(qa.pulse_guard, "escalate", lambda repo, issue, text: escalated.append(text) or "x")
+    monkeypatch.setattr(qa.pulse_guard, "escalate", lambda repo, issue, text, **_: escalated.append(text) or "x")
 
     def broken_post(repo, issue, text):
         raise RuntimeError("HTTP 403: Not Have Write Access To Repository")
@@ -285,7 +285,7 @@ def test_lost_evidence_note_is_not_mistaken_for_broken_dedup_carrier(monkeypatch
                          lambda *a: (1234, "задача #1234 уже открыта, комментарий с уликой не добавлен: сеть"))
     escalated = []
     monkeypatch.setattr(qa.pulse_guard, "escalate",
-                         lambda repo, issue, text: escalated.append(text)
+                         lambda repo, issue, text, **_: escalated.append(text)
                          or "Telegram: доставлен; след в #120: оставлен")
 
     result = qa.check_and_alert(REPO, "cf_do_rows_read_day", "DO rows_read/сутки",
@@ -330,7 +330,7 @@ def test_breach_without_created_task_does_not_write_state_marker(monkeypatch):
     _no_prior_state(monkeypatch)
     monkeypatch.setattr(qa, "create_or_note_task", lambda *a: (None, "issue-create отказал: сеть"))
     escalated = []
-    monkeypatch.setattr(qa.pulse_guard, "escalate", lambda repo, issue, text: escalated.append(text) or "x")
+    monkeypatch.setattr(qa.pulse_guard, "escalate", lambda repo, issue, text, **_: escalated.append(text) or "x")
 
     result = qa.check_and_alert(REPO, "cf_do_rows_read_day", "DO rows_read/сутки",
                                  7_487_640, 5_000_000, 149.8)
@@ -533,7 +533,7 @@ def test_reading_carrier_falling_off_fresh_page_self_heals_next_tick(monkeypatch
                          lambda *a: (_ for _ in ()).throw(
                              AssertionError("comment_id неизвестен — обязан быть POST, не PATCH")))
     escalated = []
-    monkeypatch.setattr(qa.pulse_guard, "escalate", lambda repo, issue, text: escalated.append(text) or "x")
+    monkeypatch.setattr(qa.pulse_guard, "escalate", lambda repo, issue, text, **_: escalated.append(text) or "x")
 
     # pct=57% растёт быстро, но без прежнего показания тренд не посчитать —
     # classify_state обязан упасть на чистый порог (57% < 80%), не упасть
@@ -599,7 +599,7 @@ def test_approaching_transition_escalates_without_creating_task(monkeypatch):
     monkeypatch.setattr(qa, "create_or_note_task", lambda *a: create_calls.append(1) or (999, "не должно вызываться"))
     escalated = []
     monkeypatch.setattr(qa.pulse_guard, "escalate",
-                         lambda repo, issue, text: escalated.append(text) or "Telegram: доставлен; след в #120: оставлен")
+                         lambda repo, issue, text, **_: escalated.append(text) or "Telegram: доставлен; след в #120: оставлен")
 
     result = qa.check_and_alert(REPO, "gh_rest_rate_limit_hour", "GitHub REST rate limit (PAT/GITHUB_TOKEN)",
                                  400, 1000, 40.04, threshold=80.0, now=t2)
@@ -616,7 +616,7 @@ def test_approaching_dedup_no_repeat_while_still_approaching(monkeypatch):
     monkeypatch.setattr(qa, "last_state", lambda repo, key: (qa.STATE_APPROACHING, None))
     monkeypatch.setattr(qa, "last_reading", lambda repo, key: (40.04, datetime(2026, 9, 13, 7, 33, tzinfo=timezone.utc), 1))
     escalated = []
-    monkeypatch.setattr(qa.pulse_guard, "escalate", lambda repo, issue, text: escalated.append(text) or "x")
+    monkeypatch.setattr(qa.pulse_guard, "escalate", lambda repo, issue, text, **_: escalated.append(text) or "x")
 
     result = qa.check_and_alert(REPO, "gh_rest_rate_limit_hour", "GitHub REST rate limit (PAT/GITHUB_TOKEN)",
                                  570, 1000, 57.01, threshold=80.0,
@@ -634,7 +634,7 @@ def test_recovery_from_approaching_does_not_claim_threshold_was_crossed(monkeypa
     пороге, которого квота не касалась."""
     monkeypatch.setattr(qa, "last_state", lambda repo, key: (qa.STATE_APPROACHING, None))
     escalated = []
-    monkeypatch.setattr(qa.pulse_guard, "escalate", lambda repo, issue, text: escalated.append(text) or "x")
+    monkeypatch.setattr(qa.pulse_guard, "escalate", lambda repo, issue, text, **_: escalated.append(text) or "x")
 
     result = qa.check_and_alert(REPO, "gh_rest_rate_limit_hour", "GitHub REST rate limit (PAT/GITHUB_TOKEN)",
                                  300, 1000, 30.0, threshold=80.0)
@@ -651,7 +651,7 @@ def test_recovery_from_breach_still_mentions_the_task(monkeypatch):
     текст по-прежнему называет задачу на разбор."""
     monkeypatch.setattr(qa, "last_state", lambda repo, key: (qa.STATE_BREACH, 4242))
     escalated = []
-    monkeypatch.setattr(qa.pulse_guard, "escalate", lambda repo, issue, text: escalated.append(text) or "x")
+    monkeypatch.setattr(qa.pulse_guard, "escalate", lambda repo, issue, text, **_: escalated.append(text) or "x")
 
     result = qa.check_and_alert(REPO, "cf_do_rows_read_day", "DO rows_read/сутки", 100, 5_000_000, 2.0)
 
@@ -670,7 +670,7 @@ def test_first_observation_already_approaching_alerts(monkeypatch):
     monkeypatch.setattr(qa, "last_state", lambda repo, key: (None, None))
     monkeypatch.setattr(qa, "last_reading", lambda repo, key: (23.07, datetime(2026, 9, 13, 7, 18, tzinfo=timezone.utc), 1))
     escalated = []
-    monkeypatch.setattr(qa.pulse_guard, "escalate", lambda repo, issue, text: escalated.append(text) or "x")
+    monkeypatch.setattr(qa.pulse_guard, "escalate", lambda repo, issue, text, **_: escalated.append(text) or "x")
 
     result = qa.check_and_alert(REPO, "gh_rest_rate_limit_hour", "GitHub REST rate limit (PAT/GITHUB_TOKEN)",
                                  400, 1000, 40.04, threshold=80.0,
@@ -735,7 +735,7 @@ def test_reproduction_1100_trend_fires_before_exhaustion(monkeypatch):
                          lambda repo, key, pct, when, cid: carrier.__setitem__("reading", (pct, when, 1)))
     monkeypatch.setattr(qa.pulse_guard, "post_issue_comment", lambda *a: None)
     monkeypatch.setattr(qa.pulse_guard, "escalate",
-                         lambda repo, issue, text: escalated.append((text,)) or "Telegram: доставлен; след в #120: оставлен")
+                         lambda repo, issue, text, **_: escalated.append((text,)) or "Telegram: доставлен; след в #120: оставлен")
     monkeypatch.setattr(qa, "create_or_note_task", lambda *a: (0, "не должно вызываться в approaching"))
 
     fired_at = None
@@ -809,7 +809,7 @@ def test_trend_horizon_catches_1100_incident_before_exhaustion(monkeypatch):
                          lambda repo, key, pct, when, cid: carrier.__setitem__("reading", (pct, when, 1)))
     monkeypatch.setattr(qa.pulse_guard, "post_issue_comment", lambda *a: None)
     monkeypatch.setattr(qa.pulse_guard, "escalate",
-                         lambda repo, issue, text: escalated.append((text,)) or "Telegram: доставлен; след в #120: оставлен")
+                         lambda repo, issue, text, **_: escalated.append((text,)) or "Telegram: доставлен; след в #120: оставлен")
     monkeypatch.setattr(qa, "create_or_note_task", lambda *a: (0, "не должно вызываться в approaching"))
 
     fired_at = None

@@ -243,10 +243,22 @@ fi
 # parse_mode=HTML — всегда (#170): без него Telegram рендерит plain text и
 # кликабельных ссылок не бывает. Второй отправитель репозитория —
 # pulse_guard.send_telegram; новых отправителей заводить нельзя, формат один.
-telegram_report() { # $1 — текст (динамические части — уже через tg_html)
+telegram_report() { # $1 — текст (уже через tg_html); $2 — категория (#1461/#1465)
   if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
     echo "::warning::TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID не заданы — Telegram-отчёт не отправлен"
     return 1
+  fi
+  # Категория обязательна и здесь: умолчание «всё остальное» и есть то
+  # состояние (один поток), из которого уходим. Реестр и карта тем — в
+  # scripts/lib/telegram_topics.py, второй копии логики в bash нет.
+  if [ -z "${2:-}" ]; then
+    echo "::error::telegram_report вызван без категории — см. scripts/lib/telegram_topics.py"
+    return 1
+  fi
+  local thread_args=() thread_id=""
+  thread_id=$(python3 "$SCRIPT_DIR/../lib/telegram_topics.py" resolve "$2" || true)
+  if [ -n "$thread_id" ]; then
+    thread_args=(--data-urlencode "message_thread_id=$thread_id")
   fi
   # Уровень warning: комментарий в задаче остаётся местом правды, отказ
   # Telegram не фатален (см. сообщение ниже). Тело ответа при этом печатается:
@@ -259,6 +271,7 @@ telegram_report() { # $1 — текст (динамические части —
       "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
       --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
       --data-urlencode "parse_mode=HTML" \
+      "${thread_args[@]}" \
       --data-urlencode "text=$1" >/dev/null; then
     echo "::warning::Telegram не принял отчёт — комментарий в задаче остаётся местом правды"
     return 1
@@ -772,8 +785,35 @@ WORKER_BRANCH_END_SHA=$(git rev-parse HEAD)
 if [ "$rc" -eq 0 ]; then
   [ -f "$SPOOL_FILE" ] || echo "::warning::Спул стрима не создан при успешном прогоне — плагин не работал (#572)" >&2
 fi
+# Отказ ДО работы агента — транскрипт НЕ льём (#1510). Записывать ход работы,
+# которой не было, нечего, а стоит это аккаунтной квотой: приём транскрипта
+# идёт в Durable Object dsh-edge, и лимит rows_read (5 млн/сутки) — общий на
+# аккаунт с мордой. Живой замер 2026-09-23/24: цепочка провайдеров мертва
+# (#1502), каждый прогон worker.yml падает до агента за секунду и ВСЁ РАВНО
+# сливал транскрипт; 18 прогонов 23-го числа выбрали 5 700 194 строки (114%
+# суточного лимита), после чего морда начала отдавать 1101 на каждый /api/*,
+# и кнопка решения владельца в Telegram умерла вместе с ней — при том что сам
+# харнес прочитал за те сутки 198 строк из 5 700 392.
+#
+# Три класса ровно те, что ниже возвращают задачу в пул НЕМЕДЛЕННО и дают
+# зелёный прогон (блок провайдерного отказа, #1286): они и образуют цикл.
+# prompt_too_long сюда НЕ входит намеренно — он наш, красный, его серию
+# останавливает предохранитель диспатча, цикла нет.
+WORKER_SKIP_TRANSCRIPT=""
+case "$WORKER_TASK_FAILURE_REASON" in
+  quota_exhausted | rate_limit_retry_budget_exceeded | all_providers_exhausted)
+    WORKER_SKIP_TRANSCRIPT="1" ;;
+esac
+
 drained_lines=0
-if [ -n "$DSH_EDGE_MORDA_AVAILABLE" ]; then
+if [ -n "$WORKER_SKIP_TRANSCRIPT" ]; then
+  # Фоновый дрен глушим БЕЗ финального слива: он тикает раз в 30 с и мог уже
+  # отправить часть событий — это не повод досылать остаток. Молчать тут
+  # нельзя (fail loud, не silent-wrong): читатель лога обязан видеть, что
+  # транскрипта нет ПОТОМУ ЧТО его не лили, а не потому что морда отказала.
+  dsh_edge_stop_drain || true
+  echo "Транскрипт не отправлен намеренно: отказ до работы агента ($WORKER_TASK_FAILURE_REASON) — записывать нечего, а приём стоит аккаунтной квоты rows_read Durable Objects (#1510)"
+elif [ -n "$DSH_EDGE_MORDA_AVAILABLE" ]; then
   dsh_edge_stop_drain
   if dsh_edge_drain_spool hard; then
     drained_lines=$(cat "$DSH_EDGE_DRAIN_CURSOR" 2>/dev/null || echo 0)
@@ -892,7 +932,7 @@ COMMENT
   # (parse_mode=HTML в telegram_report), заголовок — первые 6 слов,
   # экранированные tg_html.
   pr_number=${pr_url##*/}
-  telegram_report "🤖 worker: PR ${verb} — <a href=\"${pr_url}\">#${pr_number}</a> по задаче <a href=\"https://github.com/${GITHUB_REPOSITORY}/issues/${number}\">#${number}</a> «$(tg_html "$(short_title "$title")")»" || true
+  telegram_report "🤖 worker: PR ${verb} — <a href=\"${pr_url}\">#${pr_number}</a> по задаче <a href=\"https://github.com/${GITHUB_REPOSITORY}/issues/${number}\">#${number}</a> «$(tg_html "$(short_title "$title")")»" "pipeline" || true
   echo "PR $verb: $pr_url — job зелёный"
   exit 0
 fi
@@ -921,7 +961,7 @@ $ANSWER_TAIL
 COMMENT
   )
   gh issue comment "$number" --body "$comment" >/dev/null
-  telegram_report "worker: задача #$number — эскалация владельцу (метка blocked)" || true
+  telegram_report "worker: задача #$number — эскалация владельцу (метка blocked)" "decision" || true
   echo "Эскалация оформлена (blocked) — job зелёный, ждём владельца"
   exit 0
 fi
@@ -984,7 +1024,13 @@ if [ "$WORKER_TASK_FAILURE_REASON" = "quota_exhausted" ] || \
       if [ "${WORKER_CHAIN_RETRY_USEFUL:-0}" = "1" ]; then
         reason="ни один провайдер цепочки не ответил, но цепочка НЕ исчерпана квотой (опробованы: ${WORKER_CHAIN_TRIED:-?}) — ${WORKER_CHAIN_OUTCOME_SUMMARY:-разбор по классам недоступен}${WORKER_CHAIN_RESET_HINT:+; названный сброс: $WORKER_CHAIN_RESET_HINT}. Повтор ИМЕЕТ смысл: часть провайдеров не получила настоящей попытки (#1307, docs/runbooks/switch-llm-provider.md)"
       else
-        reason="цепочка провайдеров исчерпана целиком (опробованы: ${WORKER_CHAIN_TRIED:-?})${WORKER_CHAIN_RESET_HINT:+, ближайший названный сброс: $WORKER_CHAIN_RESET_HINT} — все реально без квоты, повтор внутри этого прогона не поможет (docs/runbooks/switch-llm-provider.md, #727)"
+        # #1500: RETRY_USEFUL=0 больше НЕ означает «все реально без квоты» —
+        # ноль теперь значит и «все ключи отвергнуты», и «все отказы по форме»,
+        # и «причина не установлена» (нераспознанный класс больше не синоним
+        # транзиента). Единственный, кто знает фактический разбор, — сводка
+        # DSH_CHAIN_OUTCOME_SUMMARY: она различает корзины, поэтому текст
+        # называет ЕЁ, а не утверждает про квоту (AGENTS.md, «Алерт не гадает»).
+        reason="цепочка провайдеров отказала без повторопригодных классов (опробованы: ${WORKER_CHAIN_TRIED:-?})${WORKER_CHAIN_RESET_HINT:+, ближайший названный сброс: $WORKER_CHAIN_RESET_HINT} — ${WORKER_CHAIN_OUTCOME_SUMMARY:-разбор по классам недоступен}. Повтор внутри этого прогона НЕ объявлен полезным: ни одна корзина сводки его не называет; разбор выше называет, что чинить (docs/runbooks/switch-llm-provider.md, #1307/#1500)"
       fi ;;
   esac
   # #1286: исход job'а и машиночитаемый маркер в комментарии разделяют классы
@@ -1051,7 +1097,7 @@ $ANSWER_TAIL
 COMMENT
   )
   gh issue comment "$number" --body "$comment" >/dev/null
-  telegram_report "worker: задача #$number — $failure_kind ($reason). Задача возвращена в пул" || true
+  telegram_report "worker: задача #$number — $failure_kind ($reason). Задача возвращена в пул" "pipeline" || true
   if [ "$job_exit" != "green" ]; then
     die "$failure_kind: $reason"
   fi
@@ -1119,5 +1165,5 @@ $ANSWER_TAIL
 COMMENT
   )
 gh issue comment "$number" --body "$comment" >/dev/null
-telegram_report "worker: задача #$number — ПРОВАЛ ($reason). Детали в задаче" || true
+telegram_report "worker: задача #$number — ПРОВАЛ ($reason). Детали в задаче" "breakage" || true
 die "Воркер не справился: $reason"

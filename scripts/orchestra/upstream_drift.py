@@ -483,7 +483,7 @@ def upstream_drift_check(repo: str, pin_path: Path = PIN_PATH) -> list[str]:
         return [f"🔇 дрейф пина {drift_target(decision)} уже сигналился в #{DRIFT_ISSUE} — повтор не шлём"]
 
     _set_drift_label(repo)
-    delivered = escalate(repo, DRIFT_ISSUE, drift_alert_text(decision))
+    delivered = escalate(repo, DRIFT_ISSUE, drift_alert_text(decision), category="breakage")
     lines = [f"🚨 дрейф пина: пин на {decision['pinned_tag'] or decision['sha'][:12]}, "
              f"апстрим выпустил {decision['latest_tag']} — сигнал в #{DRIFT_ISSUE} "
              f"+ метка {DRIFT_LABEL} ({delivered})"]

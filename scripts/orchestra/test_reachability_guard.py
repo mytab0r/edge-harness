@@ -453,6 +453,34 @@ def test_case2_not_applicable_when_any_fact_missing():
     assert rg.check_same_tick_age_branch(same_tick_only, CASE2_CONSUMER, CASE2_TEXT_FUNC).status == "not_applicable"
 
 
+def test_case2_sees_the_consumer_even_when_it_is_async():
+    """Пометка метода `async` не имеет отношения к предмету проверки, но до
+    #1495 ТИХО выключала её: объявление искалось как `^\\s*#tickPulseAlert\\(`,
+    `async ` перед именем не совпадало, и вердикт становился `not_applicable` —
+    «не проверяли», неотличимое для читателя лога от «прошло».
+
+    Живой случай: алерты воркера стали ждать доставки (#1495), тик стал
+    асинхронным, и гвардия перестала работать от правки в соседнем файле.
+    Форма бага здесь воспроизведена целиком, значит вердикт обязан быть
+    `unreachable` — тем же, что и у неасинхронного близнеца выше."""
+    async_form = (
+        "  async #tickPulseAlert(now: number, lastPulse: PulseStatus): Promise<void> {\n"
+        "    const text = pulseAlertText(now, lastPulse);\n"
+        "    void text;\n"
+        "  }\n"
+        "  tick(): void {\n"
+        "    this.#tickPulseAlert(now, { ts: now, dispatch_ok: true });\n"
+        "  }\n"
+        "function pulseAlertText(now: number, pulse: PulseStatus): string {\n"
+        "  return `${Math.round((now - pulse.ts) / 60000)} мин назад`;\n"
+        "}\n"
+    )
+    verdict = rg.check_same_tick_age_branch(async_form, CASE2_CONSUMER, CASE2_TEXT_FUNC)
+    assert verdict.status == "unreachable", (
+        f"async-объявление потребителя выключило проверку: {verdict.status} — {verdict.detail}"
+    )
+
+
 def test_extract_braced_source_bounds_at_balanced_brace():
     source = "class A {\n  m(): void {\n    if (x) { y(); }\n  }\n  other(): void {}\n}\n"
     body = rg.extract_braced_source(source, r"^\s*m\(")

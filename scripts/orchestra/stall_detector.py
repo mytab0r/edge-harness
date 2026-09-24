@@ -505,7 +505,7 @@ def detect_and_act(repo: str, now: datetime, lines: list[str], run_url: str | No
                             "приоритизировать, завести задачу вручную (scripts/gh/issue-create) "
                             "или поднять STALL_DAILY_CAP, если объём временный."
                         )
-                        result = escalate(repo, WATCHDOG_ISSUE, text)
+                        result = escalate(repo, WATCHDOG_ISSUE, text, category="pipeline")
                         report.append(f"🚨 эскалация потолка автозаведения ({result})")
                         cap_escalated_today = True
             continue
@@ -544,7 +544,7 @@ def escalate_stale_auto_tasks(repo: str, now: datetime) -> list[str]:
             f"быстрее. Нужно участие владельца: посмотреть задачу #{number}, при "
             "необходимости приоритизировать её или решить руками."
         )
-        result = escalate(repo, number, text)
+        result = escalate(repo, number, text, category="pipeline")
         report.append(f"🚨 #{number}: эскалация по затянувшейся автозадаче ({result})")
     return report
 

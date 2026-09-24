@@ -1322,7 +1322,7 @@ def dispatch_conflict_rework(
                 f"прогона и разобраться. Файлы-кандидаты (пересечение изменений PR и main, "
                 f"не точные конфликтующие строки): {overlap_text}."
             )
-            escalation = escalate(repo, WATCHDOG_ISSUE, text)
+            escalation = escalate(repo, WATCHDOG_ISSUE, text, category="pipeline")
             actions.append(
                 f"🚨 PR #{number}: авто-расшивка конфликта исчерпана ({attempts}/"
                 f"{CONFLICT_REWORK_MAX_ATTEMPTS}) — эскалация владельцу ({escalation})"
@@ -1873,7 +1873,7 @@ def dispatch_ai_review_rework(
                         f"вообще прогон worker.yml по задаче #{task_number} за это время и "
                         "почему он не оставил следа."
                     )
-                    escalation = escalate(repo, WATCHDOG_ISSUE, text)
+                    escalation = escalate(repo, WATCHDOG_ISSUE, text, category="pipeline")
                     actions.append(
                         f"🚨 PR #{number}: авто-доводка исчерпана ({attempts}/"
                         f"{AI_REWORK_MAX_ATTEMPTS} на этом отпечатке) — два прогона подряд без "
@@ -1996,7 +1996,7 @@ def dispatch_ai_review_rework(
                             f"worker.yml — {reason}. Нужно решение владельца: посмотреть находки "
                             "ai-review (gh pr view --comments) и разобраться руками."
                         )
-                        escalation = escalate(repo, WATCHDOG_ISSUE, text)
+                        escalation = escalate(repo, WATCHDOG_ISSUE, text, category="pipeline")
                         actions.append(
                             f"🚨 PR #{number}: авто-доводка по находкам ai-review исчерпана "
                             f"({attempts}/{AI_REWORK_MAX_ATTEMPTS} на этом отпечатке, второй заход "
@@ -2024,7 +2024,7 @@ def dispatch_ai_review_rework(
                     f"worker.yml — {reason}. Нужно решение владельца: посмотреть находки "
                     "ai-review (gh pr view --comments) и разобраться руками."
                 )
-                escalation = escalate(repo, WATCHDOG_ISSUE, text)
+                escalation = escalate(repo, WATCHDOG_ISSUE, text, category="pipeline")
                 actions.append(
                     f"🚨 PR #{number}: авто-доводка по находкам ai-review исчерпана "
                     f"({attempts}/{AI_REWORK_MAX_ATTEMPTS} на этом отпечатке) — эскалация "
@@ -3602,7 +3602,7 @@ def resume_series_by_merge(repo: str, pull: dict, task_number: int) -> str | Non
     if issue_marker_times(repo, WATCHDOG_ISSUE, resume_token, require_job_token=True):
         return None  # сброс этим мержем уже сигналился — один сигнал на мерж
     text = resume_alert_text(pull["number"], task_number, last_red)
-    status = escalate(repo, WATCHDOG_ISSUE, text)
+    status = escalate(repo, WATCHDOG_ISSUE, text, category="pipeline")
     # Сброс ДОКАЗАН маркером в #120 — судим по факту (перечитываем #120), а не
     # по вызову escalate и не по его человеческой строке: канал best-effort и
     # глотает отказ постинга, а парсинг прозы статуса молча ломается от любой
@@ -3760,6 +3760,7 @@ def after_merge(
         if send_telegram(
             merge_telegram_text(repo, pull["number"], tg_task_number, tg_task_title),
             as_html=True,
+            category="pipeline",
         ):
             actions.append(f"📣 Telegram: «#{tg_task_number} выполнена — слито в main» доставлено")
         else:
@@ -4979,7 +4980,7 @@ def wip_gate(
                 f"{WIP_GATE_STUCK_HOURS}ч): {count} PR ждут доработки при лимите {WIP_LIMIT}. "
                 f"{rework_fact} — затор не в притоке новых задач, а в доработке существующих: "
                 "требует внимания владельца.",
-            )
+            category="pipeline")
             actions.append(
                 f"🚨 WIP-гейт держит взятие новых задач {int(stuck_hours)}ч > "
                 f"{WIP_GATE_STUCK_HOURS}ч ({escalation})")
@@ -5404,7 +5405,7 @@ def trigger_ai_review(repo: str, now: datetime, pulls: list[dict]) -> tuple[list
                         "- Ускорить: добавить провайдера в vars.DSH_PROVIDER_CHAIN "
                         "(docs/runbooks/switch-llm-provider.md)."
                     )
-                    escalation = escalate(repo, WATCHDOG_ISSUE, text)
+                    escalation = escalate(repo, WATCHDOG_ISSUE, text, category="pipeline")
                     post_issue_comment(repo, pull["number"], f"🤖 {marker}\n{text}\n({escalation})")
                     observations.append(
                         f"🚨 PR #{pull['number']}: цепочка исчерпана до {next_viable.isoformat()} "
@@ -5437,7 +5438,7 @@ def trigger_ai_review(repo: str, now: datetime, pulls: list[dict]) -> tuple[list
                     "Автоповтор не трачу: нужно сменить провайдера или дождаться сброса "
                     "квоты, затем новый пуш заведёт ревью заново."
                 )
-                result = escalate(repo, WATCHDOG_ISSUE, text)
+                result = escalate(repo, WATCHDOG_ISSUE, text, category="pipeline")
                 actions.append(
                     f"🚨 PR #{pull['number']}: квота провайдера исчерпана — эскалировано "
                     f"({result}), автоповтор не трачу"
@@ -5469,7 +5470,7 @@ def trigger_ai_review(repo: str, now: datetime, pulls: list[dict]) -> tuple[list
                 f"вердикта нет {int(age)} мин — дальше нужен человек (новый пуш заведёт "
                 "свежий бюджет, ручной `gh workflow run ai-review.yml -f pr=N` тоже работает)."
             )
-            result = escalate(repo, WATCHDOG_ISSUE, text)
+            result = escalate(repo, WATCHDOG_ISSUE, text, category="pipeline")
             actions.append(
                 f"🚨 PR #{pull['number']}: авто-повторы исчерпаны "
                 f"({attempts}/{AI_REVIEW_MAX_ATTEMPTS}) — эскалировано ({result})"
@@ -5806,7 +5807,7 @@ def stale_ready_pulls(repo: str, now: datetime, pulls: list[dict]) -> list[str]:
             f"{int(age)} мин — дольше {UNHEALTHY_PR_AFTER_MINUTES}, слияния не произошло. "
             "Проверь status.pulse_healthy (cf-worker) и последние прогоны orchestra.yml."
         )
-        result = escalate(repo, WATCHDOG_ISSUE, text)
+        result = escalate(repo, WATCHDOG_ISSUE, text, category="pipeline")
         lines.append(f"🚨 PR #{pull['number']}: готов {int(age)} мин, слияние не идёт ({result})")
     return lines
 
@@ -6593,7 +6594,7 @@ def reject_reopened_tasks(repo: str, pool: list[dict]) -> list[str]:
                 "вероятно, приёмка закрыла задачу ошибочно (мерж PR доказывает "
                 "PR, не готовность задачи; #494). Нужен ручной разбор: "
                 "проверить, достигнут ли результат в проде, и завести "
-                "задачу-замену, если работа не завершена.")
+                "задачу-замену, если работа не завершена.", category="pipeline")
             lines.append(f"🚨 #{number}: переоткрытие #{attempt} эскалировано владельцу ({escalation})")
     return lines
 
@@ -6796,7 +6797,7 @@ def accept_merged_tasks(
             if already_escalated:
                 actions.append(f"{text} (уже эскалировано, повторный Telegram не шлём)")
             else:
-                escalation = escalate(repo, WATCHDOG_ISSUE, f"{error_marker} {text}")
+                escalation = escalate(repo, WATCHDOG_ISSUE, f"{error_marker} {text}", category="pipeline")
                 actions.append(f"{text} ({escalation})")
             hard_failure = True
             continue
@@ -6820,7 +6821,7 @@ def accept_merged_tasks(
                     continue
                 text = (f"🚨 #{number}: приёмка PR #{pull['number']} ({category}) висит в "
                         f"pending дольше {ACCEPTANCE_PENDING_HOURS} ч после мержа — {detail}")
-                escalation = escalate(repo, WATCHDOG_ISSUE, text)
+                escalation = escalate(repo, WATCHDOG_ISSUE, text, category="pipeline")
                 post_issue_comment(repo, number, f"{pending_marker} {detail} ({escalation}).")
                 actions.append(text)
                 hard_failure = True
@@ -7275,7 +7276,7 @@ def main() -> int:
         escalation = escalate(
             repo, WATCHDOG_ISSUE,
             "🚨 edge-harness: [статус: " + " + ".join(titles) + "]\n" + "\n\n".join(broken),
-        )
+        category="pipeline")
         lines.append(f"🚨 прогон окрашен красным ({escalation})")
         summary(lines)
         return 1

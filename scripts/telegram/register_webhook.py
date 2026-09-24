@@ -48,6 +48,7 @@ _console_utf8_spec = importlib.util.spec_from_file_location(
 _console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_utf8_spec))
 # --- конец console_utf8 bootstrap ---
 
+import datetime
 import json
 import os
 import sys
@@ -91,14 +92,30 @@ def _request(
 
 def probe_route(harness_url: str, secret: str) -> str:
     """'ready' — маршрут принял секретный заголовок и дошёл до разбора тела:
-    пустой объект `{}` без побочных эффектов гарантированно даёт 400
+    пустой объект `{}` без побочных эффектов гарантированно упирается в
     need_source_msg_id (см. #postMessageIngest в cf-worker/src/harness.ts —
-    ошибка бросается ДО первой записи в БД). 'not_ready' — 401 unauthorized:
+    отказ происходит ДО первой записи в БД). 'not_ready' — 401 unauthorized:
     морда так отвечает и на несуществующий маршрут (PR #486 не слит), и на
     маршрут с разошедшимся секретом — оба случая означают «не регистрируем
     вебхук сейчас», различать их не обязательно, оба требуют человека.
     Что угодно ещё — 'unexpected:<status>', неожиданный ответ, разбираться
     вручную, а не гадать.
+
+    ДВЕ формы «ready», и это не двусмысленность, а один факт в двух
+    редакциях контракта (#1477). Морда и репозиторий выкатываются РАЗНЫМИ
+    событиями: слияние PR обновляет этот скрипт сразу, а воркер — только
+    после прогона deploy-worker. В окне между ними живы обе:
+
+      HTTP 400 {"error": {"code": "need_source_msg_id", …}}   — до выката
+      HTTP 200 {"status": "ignored", "reason": "need_source_msg_id"} — после
+
+    Обе отвечают на вопрос зонда («маршрут жив и секрет принят») одинаково.
+    Газ (когда ветку 400 убирать): после того, как deploy-worker выкатил
+    #1477 в прод и телеметрия зонда показала 200 — пост-мерж пункт PR.
+
+    Почему после #1477 вебхуку уходит 200, а не 400: Telegram ретраит любой
+    не-2xx и держит за ним следующие апдейты того же чата, поэтому апдейт,
+    которому ретраи не помогут, затыкал канал владельца целиком.
 
     Форма тела ошибки (issue #524, находка живого прогона) — `ApiError` в
     cf-worker/src/harness.ts всегда отдаёт `{"error": {"code": …, "message": …}}`,
@@ -117,6 +134,9 @@ def probe_route(harness_url: str, secret: str) -> str:
     code = error.get("code") if isinstance(error, dict) else None
     if status == 400 and code == "need_source_msg_id":
         return "ready"
+    if status == 200 and isinstance(parsed, dict):
+        if parsed.get("status") == "ignored" and parsed.get("reason") == "need_source_msg_id":
+            return "ready"
     if status == 401:
         return "not_ready"
     return f"unexpected:{status}"
@@ -157,18 +177,65 @@ def already_registered(info: dict, expected_url: str) -> bool:
     return info.get("url") == expected_url and not info.get("last_error_message")
 
 
+def describe_error_state(info: dict) -> str:
+    """Все три поля, которые различают «очередь стоит» и «отметка протухла», в
+    одной строке (#1477). Без них сообщение об отказе — намёк, а не факт:
+    `last_error_message` живёт в getWebhookInfo и ПОСЛЕ того, как причина
+    устранена, пока не случится следующая успешная доставка."""
+    pending = info.get("pending_update_count")
+    when = info.get("last_error_date")
+    when_text = "не сообщён"
+    if isinstance(when, int):
+        stamp = datetime.datetime.fromtimestamp(when, datetime.timezone.utc)
+        ago = int(datetime.datetime.now(datetime.timezone.utc).timestamp()) - when
+        when_text = f"{stamp.isoformat()} ({ago} с назад)"
+    return (
+        f"last_error_message={info.get('last_error_message')!r}, "
+        f"last_error_date={when_text}, pending_update_count={pending!r}"
+    )
+
+
 def verify(info: dict, expected_url: str) -> None:
     """Видимый результат (issue #490, п.2): проверяем ПОЛЯ getWebhookInfo,
-    не факт, что setWebhook вернул ok: true."""
+    не факт, что setWebhook вернул ok: true.
+
+    Отказ различает два состояния, а не валит оба в одно (#1477, правило
+    «Алерт не гадает»). `last_error_message` — это последняя ошибка ЗА ВСЁ
+    ВРЕМЯ, а не текущее состояние: Telegram держит её в ответе и после того,
+    как доставка починилась, пока не пройдёт следующая успешная. Поэтому
+    решает `pending_update_count`, а не сам факт непустого текста:
+
+      pending > 0  — очередь СТОИТ, апдейты не доставляются: отказ, красный
+                     job; это ровно тот случай, когда владелец жмёт кнопку и
+                     ничего не происходит;
+      pending == 0 — очередь пуста, доставлять нечего: отметка историческая,
+                     предупреждение с полным текстом, job зелёный.
+
+    Само число pending в сообщение попадает в обоих случаях — по нему видно,
+    расходится очередь или растёт."""
     if info.get("url") != expected_url:
         raise RuntimeError(
             f"getWebhookInfo.url не совпадает с ожидаемым адресом (см. HARNESS_URL): {info.get('url')!r}"
         )
-    if "pending_update_count" not in info:
-        raise RuntimeError("getWebhookInfo не вернул pending_update_count")
+    pending = info.get("pending_update_count")
+    if not isinstance(pending, int):
+        raise RuntimeError(
+            "getWebhookInfo не вернул pending_update_count числом — отличить стоящую "
+            f"очередь от протухшей отметки нечем: {describe_error_state(info)}"
+        )
     last_error = info.get("last_error_message")
+    if last_error and pending > 0:
+        raise RuntimeError(
+            "вебхук не доставляет: очередь Telegram стоит. Telegram отдаёт апдейты "
+            "одного чата по порядку и ретраит отвергнутый, поэтому нажатия кнопок "
+            f"владельца стоят за головой очереди. {describe_error_state(info)}"
+        )
     if last_error:
-        raise RuntimeError(f"getWebhookInfo.last_error_message не пуст: {last_error}")
+        print(
+            "::warning::last_error_message не пуст, но очередь пуста "
+            f"(pending_update_count=0) — отметка историческая, доставка идёт. {describe_error_state(info)}",
+            file=sys.stderr,
+        )
 
 
 def main() -> int:

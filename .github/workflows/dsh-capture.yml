@@ -1,0 +1,73 @@
+# Перехват отвергнутого запроса dsh (#1525).
+#
+# Отдельный workflow, а не шаг в quotas.yml, по одной причине: перехват зовёт
+# НАСТОЯЩИЙ `dsh`, а в quotas.yml его нет (живой отказ, прогон 36001802172:
+# `FileNotFoundError: No such file or directory: 'dsh'`). Ставить dsh ради
+# диагностики в замер квот — это тянуть в лёгкий шаг тяжёлую установку,
+# которая ему не нужна ни для чего другого.
+#
+# Только ручной запуск: перехват тратит реальный вызов провайдера и время
+# раннера, а вопрос, ради которого он написан, задаётся не на каждый PR.
+# Автоматизировать его можно будет тогда, когда он начнёт что-то стеречь, —
+# сейчас он отвечает на вопрос, а не охраняет инвариант.
+name: dsh-capture
+
+on:
+  workflow_dispatch:
+    inputs:
+      entry:
+        description: >-
+          Имя записи цепочки из config/provider-usage.json, к которой
+          пересылать. По умолчанию OpenRouter-1 — единственная запись, которая
+          отвечает МОДЕЛЬЮ на Anthropic-маршруте (замер #1520) и при этом
+          отказывает dsh; ровно это расхождение и расследуется.
+        required: false
+        default: OpenRouter-1
+      prompt:
+        description: >-
+          Промпт для dsh. Короткий по умолчанию — ловим отказ, а не меряем
+          длину. Длинный нужен, если окажется, что отказ приходит только на
+          промпте размера ai-review.
+        required: false
+        default: ping
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      # Та же версия node, что в ai-review.yml: перехват обязан воспроизводить
+      # прогон конвейера, а не соседнюю установку.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Установить dsh тем же путём, что конвейер
+        run: |
+          source scripts/lib/dsh-ci.sh
+          dsh_install "$RUNNER_TEMP/pkgs"
+          dsh --version
+
+      # Ключи только тех записей, к которым перехват может пересылать. Шире
+      # набор не берём: лишний секрет в env — лишняя поверхность, а вопрос
+      # задачи про OpenRouter (#1525).
+      - name: Перехват запроса dsh (#1525)
+        env:
+          OPENROUTER_1_API_KEY: ${{ secrets.OPENROUTER_1_API_KEY }}
+          OPENROUTER_2_API_KEY: ${{ secrets.OPENROUTER_2_API_KEY }}
+          ENTRY: ${{ inputs.entry }}
+          PROMPT: ${{ inputs.prompt }}
+        run: |
+          python scripts/measure/dsh_request_capture.py \
+            --entry "$ENTRY" --prompt "$PROMPT"

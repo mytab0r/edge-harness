@@ -539,7 +539,7 @@ def test_main_calls_escalate_when_threshold_breached(monkeypatch, capsys):
 
     calls = []
     monkeypatch.setattr(qz.pulse_guard, "escalate",
-                         lambda repo, issue, text: calls.append((repo, issue, text)) or "escalated")
+                         lambda repo, issue, text, **_: calls.append((repo, issue, text)) or "escalated")
 
     assert qz.main() == 0
     assert len(calls) == 1
@@ -556,7 +556,7 @@ def test_main_does_not_call_escalate_below_threshold(monkeypatch, capsys):
 
     calls = []
     monkeypatch.setattr(qz.pulse_guard, "escalate",
-                         lambda repo, issue, text: calls.append((repo, issue, text)) or "escalated")
+                         lambda repo, issue, text, **_: calls.append((repo, issue, text)) or "escalated")
 
     assert qz.main() == 0
     assert calls == []
@@ -573,7 +573,7 @@ def test_main_exits_nonzero_when_escalation_reaches_no_channel(monkeypatch, caps
     _patch_collectors(monkeypatch, breached_row)
     monkeypatch.setattr(
         qz.pulse_guard, "escalate",
-        lambda repo, issue, text: "Telegram: НЕ доставлен; след в #120: НЕ оставлен")
+        lambda repo, issue, text, **_: "Telegram: НЕ доставлен; след в #120: НЕ оставлен")
 
     assert qz.main() == 1
     assert "::error::" in capsys.readouterr().out
@@ -587,7 +587,7 @@ def test_main_stays_green_when_escalation_reaches_at_least_one_channel(monkeypat
     _patch_collectors(monkeypatch, breached_row)
     monkeypatch.setattr(
         qz.pulse_guard, "escalate",
-        lambda repo, issue, text: "Telegram: доставлен; след в #120: НЕ оставлен")
+        lambda repo, issue, text, **_: "Telegram: доставлен; след в #120: НЕ оставлен")
 
     assert qz.main() == 0
 

@@ -208,6 +208,16 @@ def collect_cloudflare(account_id: str, token: str) -> list[Row]:
     except (RuntimeError, KeyError, TypeError) as error:
         rows.append(no_data("Workers requests/сутки", source, LIMITS["cf_workers_requests_day"], "requests", str(error)))
 
+    # `filter` у durableObjectsStorageGroups ОБЯЗАТЕЛЕН (#1503). Без него CF
+    # отвечает `error parsing args for "durableObjectsStorageGroups": filter:
+    # not an object`, строка таблицы печаталась как «нет данных», и число,
+    # которым только и можно отличить «база переполнена» от «база в порядке»,
+    # отсутствовало молча — при том что соседние строки были зелёные. Живой
+    # случай: диагностика 1101 на морде 2026-09-24 уперлась ровно в этот
+    # пробел. Окно берётся с запасом (семь суток назад): storage-группы
+    # суточные, и в первые минуты новых суток строки за сегодня может ещё не
+    # быть — пустой ответ снова дал бы «нет данных» на исправном запросе.
+    since_date = (datetime.now(timezone.utc) - timedelta(days=7)).date().isoformat()
     # DO storage — поле storedBytes подтверждено доком дословно. limit: 1
     # (та же находка, что выше): storage-группы разбиты по namespaceId, на
     # аккаунте их несколько (#322) — limit: 1 брал бы один произвольный
@@ -217,15 +227,16 @@ def collect_cloudflare(account_id: str, token: str) -> list[Row]:
     try:
         data = cf_query(
             token,
-            """query($accountTag: string) {
+            """query($accountTag: string, $sinceDate: string) {
                 viewer { accounts(filter: {accountTag: $accountTag}) {
-                    durableObjectsStorageGroups(limit: 10000, orderBy: [date_DESC]) {
+                    durableObjectsStorageGroups(limit: 10000, orderBy: [date_DESC],
+                                                filter: {date_geq: $sinceDate}) {
                         dimensions { date }
                         max { storedBytes }
                     }
                 } }
             }""",
-            {"accountTag": account_id},
+            {"accountTag": account_id, "sinceDate": since_date},
         )
         accounts = do_rows_read.require_accounts(data["viewer"]["accounts"])
         items = [item for acc in accounts for item in acc["durableObjectsStorageGroups"]]
@@ -487,7 +498,7 @@ def main() -> int:
         print(text)
         print(f"::warning::квота харнеса перевалила за {THRESHOLD_PCT}%: "
               + ", ".join(r.resource for r in breached))
-        result = pulse_guard.escalate(repo, pulse_guard.WATCHDOG_ISSUE, text)
+        result = pulse_guard.escalate(repo, pulse_guard.WATCHDOG_ISSUE, text, category="breakage")
         print(result)
         # Находка ревью PR #327: escalate() — best-effort по обоим каналам
         # (Telegram, след в issue), возврат печатался, но не проверялся, и

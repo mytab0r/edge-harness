@@ -14,10 +14,43 @@
 # 0.0.1-rc.1 намеренно НЕ используется: тянет @deepseek-ai/dsh-code-runtime-worker,
 # который в публичном npm отсутствует (tarball 404); с 0.0.1-rc.3 зависимость —
 # dsh-code-runtime-worker-thread, она опубликована (проверено установкой, 475 пакетов).
-DSH_VERSION="0.1.1-rc.2"
-DSH_INTEGRITY="sha512-UP1UIh6q3Gme/yXRn/QL2P8IsVlv8Shpg22TRJIZPsCRWLm4CBiA1MUvXmJAfsOEETBMLAl+xWPtFw6ICsN3wg=="
-DSH_HEADLESS_VERSION="0.1.1-rc.2"
-DSH_HEADLESS_INTEGRITY="sha512-Pk50xwmUUehOxNe8DJ2/tThj7Aw1MmJQeUkfAQh9miF7Tm+WOOxiOOei/H4wjH9cf+FuqtbLDw6jrHmGotfhjw=="
+DSH_VERSION="0.1.7-alpha.2"
+DSH_INTEGRITY="sha512-uXuWobwmpNzqFOTFP61kgf0aH8IzU9LWPF9QWCUfv5DOtgtlm+6+zHvQMboEe0bCaitul61ySvUqd4mMNRedzw=="
+DSH_HEADLESS_VERSION="0.1.7-alpha.2"
+DSH_HEADLESS_INTEGRITY="sha512-kRaYTJ+U5z0IywMMpI77O0w8P+FDFepltMTaJKb+ZhIFtCdWwFcb/f1Ah156qOiRLvhJy+Y2OU+lEdnZq5/Riw=="
+
+# Пин ТРАНЗИТИВНЫХ зависимостей по дате (#1467). Пины выше держат только два
+# верхних пакета; их собственные зависимости объявлены ДИАПАЗОНАМИ, и каждый
+# прогон резолвит их заново — то есть публикация в чужом реестре меняет то,
+# что стоит в нашем job'е, без единого коммита у нас.
+#
+# ОПРОВЕРГНУТО (#1481). Первая редакция этого комментария называла виновником
+# `@deepseek-ai/cordis 4.0.4` по совпадению дат публикации. Пин реально
+# закрепил 4.0.3 — и dsh продолжил падать тем же «user patch-layer watching
+# requires the Cordis HMR service». Причина оказалась другой и установлена
+# локальным воспроизведением с инструментовкой, а не по датам:
+# `dsh-app-boot@0.1.1-rc.2` зовёт `hmr.registerConfig(...)`, которого нет НИ В
+# ОДНОЙ опубликованной версии `@deepseek-ai/cordis-plugin-hmr` (1.0.16…1.0.19),
+# то есть путь `watchUserPatches` не мог отработать ни при каком выборе
+# транзитивных версий. Лечится переходом на 0.1.7-alpha.2, где апстрим этот
+# путь выкинул, а строка hmr переехала на свой пакет `@deepseek-ai/dsh-hmr`.
+# Разбор целиком — закрытая #1467 и #1481.
+#
+# Сам механизм пина при этом остаётся нужным и ниже не отменяется: чужая
+# публикация по-прежнему меняет содержимое нашего job'а без коммита у нас.
+#
+# `npm --before` резолвит ВСЕ версии так, как реестр выглядел на указанный
+# момент, — это лечит класс (любая транзитивная зависимость), а не случай
+# (cordis). Дату двигают руками вместе с пинами версий выше: обновление
+# перестаёт быть событием чужого реестра и становится нашим коммитом.
+DSH_RESOLVE_BEFORE="2026-09-23T00:00:00Z"
+
+# Видимый результат установки, а не факт «шаг прошёл» (AGENTS.md). Ровно та
+# версия, что реально встаёт с пинами выше — замерено установкой
+# dsh@0.1.7-alpha.2 + dsh-headless@0.1.7-alpha.2 (#1481), а не взято из
+# диапазона. Расхождение — громкий отказ: молча уехавшая транзитивная
+# зависимость меняет наш job без коммита у нас.
+DSH_EXPECTED_CORDIS="4.0.4"
 
 # Ротация учёток — плагины владельца combo-router + anthropic-oauth-pool
 # (#215). Публикуются релизными ассетами ЭТОГО репозитория (как forge-плагины
@@ -220,16 +253,71 @@ dsh_install() { # $1 — рабочий каталог для tarball'ов (со
   mkdir -p "$pkgs"
   (
     cd "$pkgs" || exit 1
-    npm pack "@deepseek-ai/dsh@$DSH_VERSION" "@deepseek-ai/dsh-headless@$DSH_HEADLESS_VERSION"
+    npm pack --before="$DSH_RESOLVE_BEFORE" \
+      "@deepseek-ai/dsh@$DSH_VERSION" "@deepseek-ai/dsh-headless@$DSH_HEADLESS_VERSION"
     local dsh_tgz="deepseek-ai-dsh-$DSH_VERSION.tgz"
     local hl_tgz="deepseek-ai-dsh-headless-$DSH_HEADLESS_VERSION.tgz"
     [ -f "$dsh_tgz" ] || dsh_tgz=$(find . -maxdepth 1 -name "*dsh-$DSH_VERSION.tgz" | head -1)
     [ -f "$hl_tgz" ] || hl_tgz=$(find . -maxdepth 1 -name "*dsh-headless-$DSH_HEADLESS_VERSION.tgz" | head -1)
     dsh_verify_integrity "$dsh_tgz" "$DSH_INTEGRITY"
     dsh_verify_integrity "$hl_tgz" "$DSH_HEADLESS_INTEGRITY"
-    npm install -g ./*.tgz
+    npm install -g --before="$DSH_RESOLVE_BEFORE" ./*.tgz
   )
   command -v dsh >/dev/null
+  dsh_verify_resolved_deps
+}
+
+# Что РЕАЛЬНО установилось, а не что мы просили (#1467). Пин по дате — это
+# просьба к npm; доказательство — версия на диске.
+dsh_verify_resolved_deps() {
+  local root manifest got
+  root=$(npm root -g 2>/dev/null) || root=""
+  manifest="$root/@deepseek-ai/dsh/node_modules/@deepseek-ai/cordis/package.json"
+  if [ ! -f "$manifest" ]; then
+    # Вложенная копия может не появиться, если npm поднял cordis на верхний
+    # уровень — это нормальная дедупликация, не отказ. Ищем там.
+    manifest="$root/@deepseek-ai/cordis/package.json"
+  fi
+  if [ ! -f "$manifest" ]; then
+    echo "::error::dsh_install: не найден манифест @deepseek-ai/cordis под $root — проверить, ЧТО установилось, нечем (#1467)" >&2
+    return 1
+  fi
+  got=$(node -e "process.stdout.write(require('$manifest').version)")
+  if [ "$got" != "$DSH_EXPECTED_CORDIS" ]; then
+    echo "::error::dsh_install: @deepseek-ai/cordis $got вместо $DSH_EXPECTED_CORDIS — транзитивная зависимость уехала, несмотря на --before=$DSH_RESOLVE_BEFORE (#1467/#1481). Что именно сломается от этого расхождения — заранее не известно, поэтому отказ громкий, а не предсказание. Газ: сверить дату пина и ожидаемую версию здесь же, в scripts/lib/dsh-ci.sh" >&2
+    return 1
+  fi
+  echo "dsh_install: транзитивный пин держит — @deepseek-ai/cordis $got (--before=$DSH_RESOLVE_BEFORE)"
+  # Что РЕАЛЬНО встало, а не что мы просили (#1467, второй заход). Первый
+  # диагноз назвал виновником cordis по совпадению дат — пин его закрепил,
+  # а dsh продолжил падать тем же «user patch-layer watching requires the
+  # Cordis HMR service». Значит уехал кто-то другой, и гадать, кто именно,
+  # нельзя: список версий печатается целиком, один раз, и следующий разбор
+  # начинается с факта, а не с гипотезы.
+  local root_dir
+  root_dir=$(npm root -g 2>/dev/null || true)
+  if [ -n "$root_dir" ]; then
+    echo "dsh_install: что установилось (@deepseek-ai/*):"
+    node -e '
+      const fs = require("fs"), path = require("path");
+      const roots = [process.argv[1] + "/@deepseek-ai",
+                     process.argv[1] + "/@deepseek-ai/dsh/node_modules/@deepseek-ai"];
+      const seen = new Map();
+      for (const dir of roots) {
+        let names = [];
+        try { names = fs.readdirSync(dir); } catch { continue; }
+        for (const name of names) {
+          const manifest = path.join(dir, name, "package.json");
+          try {
+            const version = JSON.parse(fs.readFileSync(manifest, "utf8")).version;
+            if (!seen.has(name)) seen.set(name, version);
+          } catch {}
+        }
+      }
+      for (const name of [...seen.keys()].sort())
+        console.log("  @deepseek-ai/" + name + " " + seen.get(name));
+    ' "$root_dir" || echo "  (перечислить не удалось)"
+  fi
 }
 
 # Скачивание и проверка целостности suite ротации учёток (#215). Единственное
@@ -666,6 +754,43 @@ dsh_mount_anthropic_pool() { # $1 — профиль (headless)
 # suite смонтирован, но dump-config не подтвердил активацию (мягкий откат,
 # dsh_mount_plugins_suite). Не публичная функция первого выбора — дергать
 # напрямую нет смысла вне этих двух мест, но и не re-declare внутри каждого.
+# Конфиг плагина llm-deepseek — ОДНО место правды на оба писателя профиля
+# (_dsh_patch_profile_plain и ветка combo-router в dsh_patch_profile). Две
+# копии разошлись бы молча: первая правка #1533 легла только в плоскую ветку,
+# и вызовы через combo-router остались бы невалидными — ровно тот рецидив,
+# про который AGENTS.md говорит «три одинаковые копии проверки — отложенный
+# рецидив, а не осторожность».
+_dsh_llm_deepseek_config() {
+  cat <<CONFIG
+- id: llm-deepseek
+  config:
+    maxTokens: $DSH_MAX_TOKENS
+    # Рассуждение выключено вынужденно (#1533). Плагин сериализует
+    # \`thinking: {type: effort === "off" ? "disabled" : "enabled"}\` и НИКОГДА
+    # не шлёт \`budget_tokens\` (git grep по dsh-llm-deepseek 0.1.7-alpha.2 —
+    # ноль совпадений), а Anthropic Messages требует его числом при
+    # \`enabled\`. Умолчание усилия — \`high\`, поэтому БЕЗ этой строки каждый
+    # вызов невалиден. Провайдер называет это дословно (перехват #1525,
+    # прогон 36010507733):
+    #   {"path":["thinking","budget_tokens"],
+    #    "message":"Invalid input: expected number, received undefined"}
+    #
+    # Почему \`reasoningEffort\`, а не \`thinking: disabled\`: политика
+    # \`disabled\` при заданном и не равном \`off\` усилии заставляет плагин
+    # бросить UNSUPPORTED_REASONING_EFFORT (resolveThinking) — а усилие
+    # задано умолчанием. Одной строки \`thinking: disabled\` мало.
+    #
+    # Газ: вернуть рассуждение можно, когда апстрим научится слать
+    # \`budget_tokens\`; это правка плагина, не наша. Признак — появление
+    # \`budget_tokens\` в сериализаторе при поднятии пина.
+    # Кавычки обязательны: YAML 1.1 читает голый off как булево false, а
+    # схема плагина ждёт строку из набора off/low/high/max — молча неверное
+    # значение здесь не упало бы, а вернуло бы thinking enabled тем же путём,
+    # который и чинится.
+    reasoningEffort: "off"
+CONFIG
+}
+
 _dsh_patch_profile_plain() { # $1 — профиль
   local profile=$1
   local patch="$HOME/.dsh/profiles/$profile/cordis.patch.yml"
@@ -675,9 +800,7 @@ _dsh_patch_profile_plain() { # $1 — профиль
   config:
     provider: deepseek-official
     model: $DSH_MODEL
-- id: llm-deepseek
-  config:
-    maxTokens: $DSH_MAX_TOKENS
+$(_dsh_llm_deepseek_config)
 PATCH
 }
 
@@ -907,9 +1030,7 @@ dsh_patch_profile() { # $1 — имя профиля (обычно headless); в
   config:
     provider: combo
     model: auto
-- id: llm-deepseek
-  config:
-    maxTokens: $DSH_MAX_TOKENS
+$(_dsh_llm_deepseek_config)
 - id: llm-pi-ai
   config:
     providers:
@@ -1199,6 +1320,21 @@ dsh_load_provider_chain_from_manifest() { # consumer_id
     echo "::error::манифест $manifest: usage[\"$consumer\"] ссылается на несуществующую цепочку '$chain_name' в .chains" >&2
     return 1
   fi
+  # Записи, у которых Anthropic-маршрут ЗАМЕРЕН мёртвым (#1524), из цепочки
+  # выбрасываются здесь, а не удаляются из манифеста: манифест читают ещё и
+  # provider_latency.py (зовёт /chat/completions, где та же запись отвечает
+  # 200) и seed_provider_registry.py — удаление унесло бы живые данные
+  # заодно. Флаг ставится ТОЛЬКО по замеру, и в записи рядом стоит его номер.
+  # Имена берутся из самой цепочки, а не из списка рядом: переименуют
+  # запись в манифесте — сообщение доедет само, а вторая копия имён
+  # разошлась бы молча (AGENTS.md, «одно место правды»).
+  local skipped
+  skipped=$(jq -r '[.[] | select(.anthropic_route == false) | .name] | join(", ")' <<<"$chain")
+  if [ -n "$skipped" ]; then
+    # Газ назван: снять флаг, когда перебор кандидатов найдёт живую базу.
+    echo "манифест использования провайдеров: пропущены записи без Anthropic-маршрута (#1524): $skipped — каждая тратила бы попытку прогона на заведомый 404. Вернуть в строй: запусти python scripts/measure/anthropic_route_probe.py --candidates <имя>; если перебор найдёт живую базу — поставь её в config/provider-usage.json и сними там anthropic_route: false"
+    chain=$(jq -c '[.[] | select(.anthropic_route != false)]' <<<"$chain")
+  fi
   count=$(jq 'length' <<<"$chain" 2>/dev/null) || count=0
   if [ -z "$count" ] || [ "$count" -lt 1 ]; then
     echo "::error::манифест $manifest: цепочка '$chain_name' (потребитель '$consumer') пуста" >&2
@@ -1380,10 +1516,63 @@ dsh_require_provider_chain() { # [consumer_id]
 # читают уже замаскированную переменную, второй копии redact на каждую
 # точку вывода не нужно (то же место правды, что redact() выше в этом
 # файле).
+# Исход провайдера по классу отказа (#1500). Отдельной функцией, а не веткой
+# внутри цикла, по двум причинам. Первая — проверяемость: отображение «класс ->
+# исход» и есть то, что чинится этой задачей, и гвардия обязана исполнять
+# именно его; ветка внутри `dsh_run_with_provider_chain` исполняется только
+# полным прогоном цепочки, и тест, кормящий готовые исходы, покрасился бы
+# зелёным при любой правке отображения (живой случай: первая версия гвардии
+# #1500 пережила мутацию «вернуть transient» не заметив). Вторая — одно место
+# правды: класс устанавливает dsh_chain_should_advance, трактует его этот
+# список, и второго разбора stderr больше нет.
+#
+# Прежнее умолчание было `transient`, то есть УТВЕРЖДАЛО повторяемость для
+# любого текста, которого нет в списке признаков. «Класс не распознан» и
+# «повтор поможет» — разные утверждения; живой случай: три ключа Ollama
+# отвечали 401, а сводка прогон за прогоном советовала «повторить прогон».
+dsh_chain_outcome_for_class() { # class_id
+  case "$1" in
+    # Эти три id до отображения НЕ доходят в обычном прогоне (quota и
+    # rate_limit решаются по DSH_RUN_FAILURE_REASON раньше, prompt_too_long
+    # даёт provider_outcome="stop"), но ветки явные, а не падение в *):
+    # молчаливое «причина не установлена» для класса, чей исход решён иначе,
+    # — тот же silent-wrong, только в сводке (находка ai-review PR #1537).
+    quota_exhausted) printf 'quota\n' ;;
+    rate_limit_retry_budget_exceeded) printf 'our_budget\n' ;;
+    prompt_too_long) printf 'stop\n' ;;
+    dead_credential) printf 'dead_credential\n' ;;
+    bad_request) printf 'bad_request\n' ;;
+    # Эти три названы транзиентными ЗАМЕРОМ, а не умолчанием: обрыв SSE
+    # наблюдался у разных провайдеров (#1084), таймаут — наш нож (#880),
+    # превышение потолка модели лечится другой записью цепочки (#1062).
+    stream_closed|our_timeout|max_tokens_over_model) printf 'transient\n' ;;
+    # HTTP_404/EMPTY_RESPONSE — ЗАМЕРЕННО повторяемый класс
+    # (docs/research/28-provider-chain-truth-table.md): у обеих записей
+    # OpenRouter прямым вызовом <base_url>/chat/completions тем же id и тем
+    # же секретом — HTTP 200, запись цепочки исправна, а 404 у NVIDIA NIM
+    # наблюдался перемежающимся. Отдельная строка, а не ветка выше: класс
+    # общий для двух маркеров (HTTP_404: и EMPTY_RESPONSE:), и мутация
+    # «убрать строку» обязана краснить гвардию на ОБЕИХ (находка ai-review
+    # PR #1537: без неё EMPTY_RESPONSE-прогон тихо терял совет повтора).
+    http_404) printf 'transient\n' ;;
+    # ЯВНОЕ решение, не падение в *): stderr пуст — диагностики нет, и
+    # утверждать «повтор поможет» основанием не было, честный пробел.
+    empty_stderr) printf 'cause_unknown\n' ;;
+    *) printf 'cause_unknown\n' ;;
+  esac
+}
+
 dsh_chain_should_advance() { # err_file failure_reason rc
   local err_file=$1 reason=$2 rc=$3
+  # Класс отказа объявляется здесь ОДИН раз и в двух видах: машиночитаемый
+  # DSH_CHAIN_CLASS_ID для решений и человекочитаемая DSH_CHAIN_CLASS_NOTE для
+  # лога. Раньше решение об исходе перегрепывало stderr второй раз — две копии
+  # одного разбора, и они уже расходились: «класс не распознан» в ноте против
+  # «transient» в исходе (#1500).
+  DSH_CHAIN_CLASS_ID=""
   case "$reason" in
     quota_exhausted|rate_limit_retry_budget_exceeded)
+      DSH_CHAIN_CLASS_ID="$reason"
       DSH_CHAIN_CLASS_NOTE="$reason"
       return 0 ;;
     prompt_too_long)
@@ -1394,6 +1583,7 @@ dsh_chain_should_advance() { # err_file failure_reason rc
       # не дошла до сети). Единственная в этой функции ветка «стоп»: она про
       # НАС, не про провайдера, — именно то различие, которого #1084 не
       # находил среди провайдерских классов.
+      DSH_CHAIN_CLASS_ID="prompt_too_long"
       DSH_CHAIN_CLASS_NOTE="промпт не помещается в аргумент командной строки — отказ наш, одинаковый у всех провайдеров (#1315)"
       return 1 ;;
   esac
@@ -1401,6 +1591,7 @@ dsh_chain_should_advance() { # err_file failure_reason rc
   # сработала (промпт собран иначе, предел ядра другой), живая прод-форма
   # отказа execve видна в stderr дословно — не считаем её транзиентом.
   if grep -qE 'Argument list too long' "$err_file"; then
+    DSH_CHAIN_CLASS_ID="prompt_too_long"
     DSH_CHAIN_CLASS_NOTE="execve отверг аргументы (Argument list too long) — отказ наш, одинаковый у всех провайдеров (#1315)"
     return 1
   fi
@@ -1413,10 +1604,12 @@ dsh_chain_should_advance() { # err_file failure_reason rc
   # заданного ей таймаута, иначе rc=124 идёт в общую недиагностируемую
   # ветку ниже (не гадаем, AGENTS.md «Алерт не гадает»).
   if [ "$rc" = "124" ] && [ "${DSH_RUN_LAST_ATTEMPT_ELAPSED_SECS:-0}" -ge "${DSH_RUN_LAST_ATTEMPT_TIMEOUT_SECS:-999999999}" ]; then
+    DSH_CHAIN_CLASS_ID="our_timeout"
     DSH_CHAIN_CLASS_NOTE="наш таймаут (${DSH_RUN_LAST_ATTEMPT_TIMEOUT_SECS}с истекли, попытка длилась ${DSH_RUN_LAST_ATTEMPT_ELAPSED_SECS}с) — НЕ отказ провайдера, убит по времени (#877/#880)"
     return 0
   fi
   if grep -qE 'HTTP_404:|EMPTY_RESPONSE:' "$err_file"; then
+    DSH_CHAIN_CLASS_ID="http_404"
     DSH_CHAIN_CLASS_NOTE="HTTP_404/EMPTY_RESPONSE в stderr"
     return 0
   fi
@@ -1429,6 +1622,7 @@ dsh_chain_should_advance() { # err_file failure_reason rc
   # следующего, не повторяем у того же — см. развёрнутый довод в комментарии
   # над функцией.
   if grep -qE 'STREAM_CLOSED:' "$err_file"; then
+    DSH_CHAIN_CLASS_ID="stream_closed"
     DSH_CHAIN_CLASS_NOTE="STREAM_CLOSED (SSE-поток оборвался без [DONE]) в stderr — transient-обрыв соединения, не привязан к конкретному провайдеру (#1084)"
     return 0
   fi
@@ -1440,10 +1634,12 @@ dsh_chain_should_advance() { # err_file failure_reason rc
   # Cloud, прогон 34730173870): «dsh: INVALID_REQUEST: max_tokens (131072)
   # exceeds model's maximum output tokens (65536) for model nemotron-3-ultra».
   if grep -qE "INVALID_REQUEST:.*max_tokens \([0-9]+\) exceeds model.s maximum output tokens \([0-9]+\)" "$err_file"; then
+    DSH_CHAIN_CLASS_ID="max_tokens_over_model"
     DSH_CHAIN_CLASS_NOTE="конфиг ЭТОГО провайдера неверен — max_output_tokens в config/provider-usage.json превышает реальный потолок модели ($(tr '\n' ' ' <"$err_file" | cut -c1-200 | redact)); возможность у следующего провайдера не исключена (свой лимит) — пробую дальше, но эту запись стоит поправить (#1062)"
     return 0
   fi
   if [ ! -s "$err_file" ] || ! grep -qE '[^[:space:]]' "$err_file"; then
+    DSH_CHAIN_CLASS_ID="empty_stderr"
     DSH_CHAIN_CLASS_NOTE="stderr пуст — диагностику дать не может, класс не установить, консервативно пробую следующего"
     return 0
   fi
@@ -1460,6 +1656,32 @@ dsh_chain_should_advance() { # err_file failure_reason rc
   # ветки с `return 1`: quota/rate_limit в начале функции решены иначе
   # намеренно (advance, не stop), а не потому что стоп-класс существует и
   # просто не сработал здесь.
+  # #1500: отказ по УЧЁТНЫМ ДАННЫМ. Прод-форма снята замером, не пересказана:
+  # зонд #1520 (прогон 35998654827) получил от всех трёх записей Ollama
+  # HTTP 401 с телом
+  # {"type":"error","error":{"type":"authentication_error","message":"Unauthorized"}}
+  # — одинаково на всех опробованных телах запроса и потолках вывода. Ключ
+  # либо принят, либо нет; повтор того же ключа даст тот же ответ. Переход к
+  # следующему провайдеру осмыслен (у него свой ключ), но «повторить прогон»
+  # — нет.
+  if grep -qE '(^|[^A-Za-z_])AUTH:' "$err_file"; then
+    DSH_CHAIN_CLASS_ID="dead_credential"
+    DSH_CHAIN_CLASS_NOTE="учётные данные отвергнуты провайдером ($(tr '\n' ' ' <"$err_file" | cut -c1-200 | redact)) — ключ мёртв, повтор с тем же ключом даст то же; лечится ротацией, не повтором (#1500)"
+    return 0
+  fi
+  # #1500: наш запрос не принят провайдером по ФОРМЕ. Прод-форма снята
+  # перехватом (#1525, прогон 36010507733): провайдер назвал поле дословно —
+  # {"path":["thinking","budget_tokens"],
+  #  "message":"Invalid input: expected number, received undefined"}.
+  # Отказ детерминирован: тот же запрос даст тот же ответ, и повтор его не
+  # меняет. Ветка идёт ПОСЛЕ частного случая max_tokens выше — тот про конфиг
+  # ОДНОЙ записи, этот про форму запроса, общую для всех.
+  if grep -qE '(^|[^A-Za-z_])INVALID_REQUEST:' "$err_file"; then
+    DSH_CHAIN_CLASS_ID="bad_request"
+    DSH_CHAIN_CLASS_NOTE="провайдер отверг форму нашего запроса ($(tr '\n' ' ' <"$err_file" | cut -c1-200 | redact)) — отказ детерминирован, повтор того же запроса даст то же (#1500)"
+    return 0
+  fi
+  DSH_CHAIN_CLASS_ID="unrecognised"
   DSH_CHAIN_CLASS_NOTE="класс не распознан ($(tr '\n' ' ' <"$err_file" | cut -c1-200 | redact)) — консервативно пробую следующего (#1084)"
   return 0
 }
@@ -1622,24 +1844,47 @@ dsh_chain_head_max_tokens() { # chain_json -> потолок ответа для
 # Отказ привязан к ID МОДЕЛИ, а не к аккаунту (#1309). Разделение осей: пока
 # провайдер отвечает «такой модели нет / она снята / её параметры не те» —
 # аккаунт жив, и правильный следующий шаг это ДРУГАЯ МОДЕЛЬ того же
-# аккаунта, а не следующий аккаунт. Прод-формы (все четыре — дословно из
-# живых прогонов, не пересказ):
+# аккаунта, а не следующий аккаунт. Прод-формы (все три — дословно из живых
+# прогонов, не пересказ):
 #   dsh: HTTP_410: DeepSeek API error (HTTP 410)      — id снят провайдером
 #                                                       (worker.yml 35010410097)
-#   dsh: HTTP_404: modelCode does not exist           — id не существует
-#                                                       (прогон 33572445063, PR #190)
 #   dsh: INVALID_REQUEST: max_tokens (131072) exceeds model's maximum output
 #     tokens (65536) for model nemotron-3-ultra       — потолок ЭТОЙ модели
 #                                                       (worker.yml 34730173870)
 #   UNKNOWN_MODEL                                     — id не принят каталогом
 #                                                       (worker.yml 34753001158, #1130)
 #
+# ЧЕТВЁРТАЯ форма, `dsh: HTTP_404: …`, отсюда УБРАНА (#1494): она попала в
+# список как «id не существует» по прогону 33572445063, но 404 этого не
+# доказывает — см. _dsh_failure_is_model_ambiguous ниже и замер
+# docs/research/28-provider-chain-truth-table.md. Список правится здесь, а не
+# только у функции, ровно потому, что две копии одного правила расходятся и
+# правят не ту (CLAUDE.md).
+#
 # Функция НЕ решает, переключаться ли на следующего ПРОВАЙДЕРА — это
 # по-прежнему dsh_chain_should_advance, и её решение не меняется ни для
 # одного класса: при единственном кандидате (форма `model`, вся цепочка до
 # #1309) поведение побайтно прежнее — модельного шага просто нет.
+# Отказ ДОКАЗАННО привязан к id модели: 410 Gone — терминальный ответ именно
+# про ресурс (#1289), UNKNOWN_MODEL называет модель прямым текстом,
+# `INVALID_REQUEST: max_tokens` — наш конфиг против предела ЭТОЙ модели
+# (#1062). Каждый из трёх различает «эта модель» от «этот аккаунт» сам.
 _dsh_failure_is_model_scoped() { # err_file
-  grep -qE 'HTTP_410:|HTTP_404:|UNKNOWN_MODEL|INVALID_REQUEST: max_tokens' "$1" 2>/dev/null
+  grep -qE 'HTTP_410:|UNKNOWN_MODEL|INVALID_REQUEST: max_tokens' "$1" 2>/dev/null
+}
+
+# 404 сюда НЕ входит (#1494): он не различает «такой модели нет» и «такого
+# маршрута нет». Замер 2026-09-23 (docs/research/28-provider-chain-truth-table.md):
+# GLM отдал `HTTP_404/EMPTY_RESPONSE` через цепочку и HTTP 200 прямым вызовом
+# `<base_url>/chat/completions` — тот же id, тот же секрет, тот же день (03:51
+# UTC против 13:03 UTC, раннеры разные). Вердикт `dead_model` отправлял следующего агента «узнать
+# точный id модели», то есть чинить то, что не сломано.
+#
+# Поведение не меняется — следующая модель ТОГО ЖЕ провайдера пробуется, это
+# дёшево и аккаунт не расходует. Меняется ЗАЯВЛЕНИЕ: причина не установлена, и
+# так и сказано. AGENTS.md, «Алерт не гадает».
+_dsh_failure_is_model_ambiguous() { # err_file
+  grep -qE 'HTTP_404:' "$1" 2>/dev/null
 }
 
 # Исход ОДНОГО провайдера — машиночитаемая запись для итоговой сводки
@@ -1744,7 +1989,7 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
   local count i=0 stop=0 entry name base_url secret_env key reset_hint cap_note
   local quota_state_json
   local candidates cand_count ci cand model max_tokens
-  local confirmed_any model_scoped_last provider_outcome provider_rl_used
+  local confirmed_any model_scoped_last model_ambiguous_last provider_outcome provider_rl_used
   count=$(jq 'length' <<<"$DSH_PROVIDER_CHAIN")
   DSH_CHAIN_PROVIDER=""
   DSH_CHAIN_MODEL=""
@@ -1816,6 +2061,7 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
     cand_count=$(jq 'length' <<<"$candidates")
     confirmed_any=0
     model_scoped_last=0
+    model_ambiguous_last=0
     provider_outcome=""
     # #1309 + #1121: потолок доли считается на ПРОВАЙДЕРА, а не на кандидата
     # модели — иначе запись с тремя моделями получила бы три потолка подряд
@@ -1834,6 +2080,7 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
       fi
       confirmed_any=1
       model_scoped_last=0
+      model_ambiguous_last=0
       DSH_CHAIN_MODELS_TRIED="${DSH_CHAIN_MODELS_TRIED:+$DSH_CHAIN_MODELS_TRIED, }$name/$model"
       rl_true_remaining=$((chain_rl_budget - chain_rl_used))
       [ "$rl_true_remaining" -lt 0 ] && rl_true_remaining=0
@@ -1872,6 +2119,12 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
           echo "::warning::цепочка провайдеров: $name — модель '$model' отвергнута самим провайдером (rc=$DSH_RUN_RC, отказ привязан к id модели, не к аккаунту): пробую следующую модель ЭТОГО же провайдера, аккаунт не расходуется (#1309)" >&2
           continue
         fi
+      elif _dsh_failure_is_model_ambiguous "$err_file"; then
+        model_ambiguous_last=1
+        if [ "$ci" -lt "$cand_count" ]; then
+          echo "::warning::цепочка провайдеров: $name — модель '$model' дала 404 (rc=$DSH_RUN_RC). Причина НЕ установлена: 404 не различает «такой модели нет» и «такого маршрута нет» (#1494). Пробую следующую модель ЭТОГО же провайдера — это дёшево и аккаунт не расходует, но выводом о мёртвом id это не является" >&2
+          continue
+        fi
       fi
       if dsh_chain_should_advance "$err_file" "$DSH_RUN_FAILURE_REASON" "$DSH_RUN_RC"; then
         echo "::warning::цепочка провайдеров: $name — rc=$DSH_RUN_RC, класс отказа: $DSH_CHAIN_CLASS_NOTE — пробую следующего" >&2
@@ -1888,11 +2141,19 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
         provider_outcome="unconfirmed_model"
       elif [ "$model_scoped_last" = 1 ]; then
         provider_outcome="dead_model"
+      elif [ "$model_ambiguous_last" = 1 ]; then
+        # Отдельный класс, а не «dead_model» и не «transient»: первый утверждал
+        # бы недоказанное («id мёртв»), второй — что повтор поможет. Поможет ли
+        # повтор, этим замером НЕ установлено (#1494): 404 у NVIDIA NIM уже
+        # наблюдался перемежающимся, то есть повторяемым, а у GLM тот же 404
+        # держался при живом 200 прямым вызовом. Поэтому повтор не объявляется
+        # ни полезным, ни бесполезным — называется неустановленным.
+        provider_outcome="model_unclear"
       else
         case "$DSH_RUN_FAILURE_REASON" in
           quota_exhausted) provider_outcome="quota" ;;
           rate_limit_retry_budget_exceeded) provider_outcome="our_budget" ;;
-          *) provider_outcome="transient" ;;
+          *) provider_outcome=$(dsh_chain_outcome_for_class "${DSH_CHAIN_CLASS_ID:-}") ;;
         esac
       fi
     fi
@@ -1923,8 +2184,10 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
 # лежат в DSH_CHAIN_OUTCOMES — сообщение обязано их назвать, а не предлагать
 # читателю догадаться.
 _dsh_chain_report_exhausted() { # count
-  local total=$1 quota=0 budget=0 config=0 transient=0 other=0
-  local names_quota="" names_budget="" names_config="" names_transient=""
+  local total=$1 quota=0 budget=0 config=0 transient=0 unclear=0 other=0
+  local creds=0 badreq=0 unknown=0
+  local names_quota="" names_budget="" names_config="" names_transient="" names_unclear=""
+  local names_creds="" names_badreq="" names_unknown=""
   local cls nm
   while IFS=$'\t' read -r nm cls _; do
     [ -n "$nm" ] || continue
@@ -1935,13 +2198,21 @@ _dsh_chain_report_exhausted() { # count
         budget=$((budget + 1)); names_budget="${names_budget:+$names_budget, }$nm" ;;
       no_secret|unconfirmed_model|dead_model)
         config=$((config + 1)); names_config="${names_config:+$names_config, }$nm ($cls)" ;;
+      model_unclear)
+        unclear=$((unclear + 1)); names_unclear="${names_unclear:+$names_unclear, }$nm" ;;
+      dead_credential)
+        creds=$((creds + 1)); names_creds="${names_creds:+$names_creds, }$nm" ;;
+      bad_request)
+        badreq=$((badreq + 1)); names_badreq="${names_badreq:+$names_badreq, }$nm" ;;
+      cause_unknown)
+        unknown=$((unknown + 1)); names_unknown="${names_unknown:+$names_unknown, }$nm" ;;
       transient)
         transient=$((transient + 1)); names_transient="${names_transient:+$names_transient, }$nm" ;;
       *)
         other=$((other + 1)) ;;
     esac
   done <<<"$DSH_CHAIN_OUTCOMES"
-  DSH_CHAIN_OUTCOME_SUMMARY="реально без квоты: $quota из $total; не пробованы по-настоящему (наш бюджет ожидания исчерпан): $budget; мёртвая конфигурация (нет секрета/неподтверждённый id/снятая моделью): $config; транзиентных отказов: $transient"
+  DSH_CHAIN_OUTCOME_SUMMARY="реально без квоты: $quota из $total; не пробованы по-настоящему (наш бюджет ожидания исчерпан): $budget; мёртвая конфигурация (нет секрета/неподтверждённый id/снятая моделью): $config; ключ отвергнут провайдером: $creds; форма запроса отвергнута: $badreq; причина не установлена (404 — модель или маршрут, #1494): $unclear; причина не установлена (класс отказа не распознан, #1500): $unknown; транзиентных отказов: $transient"
   if [ "$((budget + transient))" -gt 0 ]; then
     DSH_CHAIN_RETRY_USEFUL=1
   else
@@ -1955,6 +2226,10 @@ _dsh_chain_report_exhausted() { # count
   local action=""
   [ "$budget" -gt 0 ] && action="${action:+$action; }освободить бюджет ожидания RATE_LIMIT (DSH_RATE_LIMIT_MAX_WAIT_SECS/DSH_RATE_LIMIT_PROVIDER_CAP_SECS) — у $budget провайдер(а/ов) ($names_budget) лимит не снялся в отведённой им доле бюджета: это НАШ тормоз, а не их квота"
   [ "$config" -gt 0 ] && action="${action:+$action; }починить конфигурацию: $names_config (docs/runbooks/switch-llm-provider.md, «Узнать точный id модели»)"
+  [ "$unclear" -gt 0 ] && action="${action:+$action; }установить причину у: $names_unclear — провайдер ответил 404, а 404 не различает «такой модели нет» и «такого маршрута нет» (#1494). Дешёвая проверка: scripts/measure/provider_latency.py зовёт ТУ ЖЕ запись цепочки (тот же base_url, id и секрет) прямым вызовом <base_url>/chat/completions — HTTP 200 там означает, что запись цепочки исправна и чинить надо путь вызова, а не id модели (живой случай: docs/research/28-provider-chain-truth-table.md)"
+  [ "$creds" -gt 0 ] && action="${action:+$action; }ротировать ключи: $names_creds — провайдер отверг учётные данные (AUTH), повтор с тем же ключом даст тот же отказ; кодом не лечится (#1500)"
+  [ "$badreq" -gt 0 ] && action="${action:+$action; }починить форму запроса: $names_badreq — провайдер отверг НАШ запрос (INVALID_REQUEST), отказ детерминирован, повтор его не меняет; текст провайдера в логе выше называет поле (#1500)"
+  [ "$unknown" -gt 0 ] && action="${action:+$action; }установить причину у: $names_unknown — класс отказа не распознан ни одним признаком. Повтор НЕ объявляется ни полезным, ни бесполезным: это честный пробел, а не транзиент (#1500). Дословный stderr — в логе выше; перехват запроса и ответа — python scripts/measure/dsh_request_capture.py --entry <имя> (#1525)"
   [ "$transient" -gt 0 ] && action="${action:+$action; }повторить прогон — $transient транзиентный(х) отказ(ов) ($names_transient)"
   [ "$quota" -gt 0 ] && action="${action:+$action; }дождаться сброса квоты у: $names_quota${DSH_CHAIN_RESET_HINT:+ ($DSH_CHAIN_RESET_HINT)}"
   echo "::error::цепочка провайдеров не дала ответа, но НЕ «исчерпана целиком»: $DSH_CHAIN_OUTCOME_SUMMARY. Опробованы: $DSH_CHAIN_TRIED. Действие: ${action:-причину установить не удалось — ни один класс исхода не распознан, см. лог выше}" >&2

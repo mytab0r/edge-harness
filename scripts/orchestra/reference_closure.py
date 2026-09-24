@@ -586,7 +586,7 @@ def run(repo: str) -> list[str]:
                 if already_escalated:
                     lines.append(f"{text} (уже эскалировано, повторно не шлём)")
                 else:
-                    delivered = escalate(repo, WATCHDOG_ISSUE, f"{error_marker} {text}")
+                    delivered = escalate(repo, WATCHDOG_ISSUE, f"{error_marker} {text}", category="pipeline")
                     lines.append(f"{text} ({delivered})")
                 continue
             decision = decide_with_evidence(

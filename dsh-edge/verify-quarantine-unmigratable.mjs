@@ -157,11 +157,17 @@ export async function runQuarantineScenario(opts) {
   const patch = opts.patch ?? readFileSync(patchPath, 'utf8')
   const preflight = extractPatchMethod(patch, 'private preflightOutdatedSessions(')
   const record = extractPatchMethod(patch, 'private recordQuarantinedSessions(')
+  // #1514: третий метод — память вердиктов. Без него сценарий исполнял бы
+  // preflight без той самой ветки, ради которой правка и сделана.
+  const known = extractPatchMethod(patch, 'private knownQuarantine(')
 
   const sql = []
   const errors = []
   const source = `
 const SESSION_FORMAT_VERSION = 3
+// #1514: то же значение, что в патче. Сценарий «вердикт протух» двигает не
+// часы, а observed_at сохранённой строки — так тест не зависит от таймеров.
+const QUARANTINE_RECHECK_MS = 60 * 60 * 1000
 // Тот же класс отказа, что ловит патч. Имя — единственное, по чему instanceof
 // различает изолируемый отказ формата и всё остальное; стаб обязан нести
 // РОВНО его, иначе сценарий проверял бы не ту ветку.
@@ -169,9 +175,28 @@ class SessionFormatUnsupportedMigrationError extends Error {
   constructor(message) { super(message); this.name = 'SessionFormatUnsupportedMigrationError' }
 }
 class Harness {
-  constructor(sessions, sql) {
+  constructor(sessions, sql, stored) {
     this.sessions = sessions
-    this.storage = { sql: { exec: (query, ...args) => { sql.push({ query, args }); return { toArray: () => [] } } } }
+    // #1514: минимальная модель таблицы карантина — ровно то, что знает
+    // knownQuarantine: SELECT отдаёт сохранённые строки, DROP/CREATE/INSERT
+    // их переписывают. Заглушкой «вечно пустой toArray» проверить
+    // переиспользование вердикта нельзя: память обязана быть настоящей.
+    this.stored = stored ?? []
+    this.storage = { sql: { exec: (query, ...args) => {
+      sql.push({ query, args })
+      if (/^\\s*SELECT[\\s\\S]*dsh_edge_quarantined_sessions/.test(query)) {
+        if (this.stored.some(r => r.format_target === undefined)) {
+          throw new Error('no such column: format_target')
+        }
+        return { toArray: () => this.stored.slice() }
+      }
+      if (/DROP TABLE/.test(query)) this.stored = []
+      if (/^\\s*INSERT/.test(query)) {
+        const [id, stored_version, format_target, reason, observed_at] = args
+        this.stored.push({ id, stored_version, format_target, reason, observed_at })
+      }
+      return { toArray: () => [] }
+    } } }
     this._sql = sql
   }
   prepareMigration(id, row) {
@@ -189,6 +214,7 @@ class Harness {
   }
 ${preflight}
 ${record}
+${known}
 }
 export { Harness }
 `
@@ -198,7 +224,7 @@ export { Harness }
 
   const realError = console.error
   console.error = (...args) => errors.push(args.join(' '))
-  const harness = new Harness(opts.sessions, sql)
+  const harness = new Harness(opts.sessions, sql, opts.stored)
   let result
   let thrown
   try {
@@ -236,4 +262,8 @@ function stripTypes(source) {
       'recordQuarantinedSessions(entries) {')
     .replace(/const quarantined: QuarantinedSession\[\] = \[\]/, 'const quarantined = []')
     .replace(/row\.id as SessionId/g, 'row.id')
+    // #1514: сигнатура памяти вердиктов — две строки generic'ов, снимаются
+    // так же построчно, как и две формы выше.
+    .replace(/private knownQuarantine\(\): Map<string, \{\n[\s\S]*?\n\s*\}> \{/, 'knownQuarantine() {')
+    .replace(/const known = new Map<string, \{\n[\s\S]*?\n\s*\}>\(\)/, 'const known = new Map()')
 }

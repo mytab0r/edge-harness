@@ -893,7 +893,7 @@ def stale_blocked_check(repo: str) -> list[str]:
                 lines.append(f"🔇 {violation_text(violation)} — метка НЕ снята "
                              f"автоматически ({error}); уже эскалировано в этом эпизоде")
             else:
-                delivered = escalate(repo, number, escalation_text(violation))
+                delivered = escalate(repo, number, escalation_text(violation), category="pipeline")
                 lines.append(f"🚨 {violation_text(violation)} — метка НЕ снята "
                              f"автоматически ({error}); эскалировано (сигнал: {delivered})")
             continue
@@ -919,7 +919,7 @@ def post_fact_comment(repo: str, number: int, text: str) -> tuple[bool, str]:
         print(f"::warning::stale_blocked_guard: комментарий не оставлен в #{number}: "
               f"{error} — доставляюсь тем же каналом, что помеченный путь "
               "(pulse_guard.escalate)", file=sys.stderr)
-        delivered = escalate(repo, number, text)
+        delivered = escalate(repo, number, text, category="pipeline")
         return False, f"{error}; эскалировано тем же каналом (сигнал: {delivered})"
 
 

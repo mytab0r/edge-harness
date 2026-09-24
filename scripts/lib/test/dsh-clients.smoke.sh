@@ -385,8 +385,23 @@ GITSTUB
 # npm pack: tarball'ы из реестра — пустые файлы нужных имён (целостность сверит
 # openssl-заглушка), локальный каталог — пустой tgz под glob клиента. Опции
 # (-g и пр.) глотаются: install -g у dsh_install не должен падать на basename.
+#
+# `npm root -g` (#1467): прод-код после установки проверяет ВЕРСИЮ НА ДИСКЕ —
+# `--before` это просьба к npm, а доказательство лежит в node_modules. Заглушка
+# обязана понимать эту форму вызова: иначе стенд краснеет на исправном коде
+# (AGENTS.md, «Заглушка внешнего инструмента — это пересказ»). Корень и манифест
+# ниже — настоящие файлы, версия читается из самого dsh-ci.sh, чтобы стенд не
+# завёл вторую копию пина.
+SMOKE_NPM_ROOT="$TMP/npmroot"
+mkdir -p "$SMOKE_NPM_ROOT/@deepseek-ai/cordis"
+printf '{"name":"@deepseek-ai/cordis","version":"%s"}\n' \
+  "$(sed -n 's/^DSH_EXPECTED_CORDIS="\(.*\)"$/\1/p' "$REPO/scripts/lib/dsh-ci.sh")" \
+  >"$SMOKE_NPM_ROOT/@deepseek-ai/cordis/package.json"
+export SMOKE_NPM_ROOT
+
 cat >"$TMP/bin/npm" <<'NPMSTUB'
 #!/usr/bin/env bash
+if [ "${1:-}" = "root" ]; then printf '%s\n' "${SMOKE_NPM_ROOT:?SMOKE_NPM_ROOT не задан}"; exit 0; fi
 [ "${1:-}" = "pack" ] && shift
 dest="."
 specs=()
@@ -1016,9 +1031,16 @@ SMOKE_DSH_STOP_ERROR="INVALID_API_KEY: unauthorized" \
 # ради которого сценарий существует: отказ провайдера отнесён не к агенту, и
 # причина названа разбором по классам, а не общей фразой. Это СТРОЖЕ прежней
 # проверки: прежняя прошла бы и на тексте без единого класса.
+# #1500: вторая правка ожидания. Синтетический текст INVALID_API_KEY не
+# матчится ни одним признаком классификатора (прод-форма AUTH распознаётся по
+# замеру, #1520), поэтому нераспознанный класс теперь cause_unknown, а НЕ
+# transient — «не распознан» и «повторяемый» разные утверждения, повтор НЕ
+# объявляется полезным (ради этого PR #1537 и написан). Чинится ожидание
+# сценария, не классификация: подгонка классификации вернула бы дефект.
 assert_log "Автономный воркер остановлен провайдером, не своей ошибкой" "worker-chain-refusal-green: отказ dsh обязан быть отнесён к провайдеру, а не к агенту"
-assert_log "транзиентных отказов: 1" "worker-chain-refusal-green: причина обязана прийти разбором по классам (#1307), а не общей фразой"
-assert_log "Повтор ИМЕЕТ смысл" "worker-chain-refusal-green: транзиентный класс обязан называть, что повтор осмыслен (#1307)"
+assert_log "транзиентных отказов: 0" "worker-chain-refusal-green: причина обязана прийти разбором по классам (#1307), а не общей фразой"
+assert_log "причина не установлена (класс отказа не распознан, #1500): 1" "worker-chain-refusal-green: нераспознанный класс обязан попасть в cause_unknown, а не в transient (#1500)"
+assert_log "НЕ объявлен полезным" "worker-chain-refusal-green: cause_unknown не даёт обещания повтора — текст потребителя не утверждает ни про квоту, ни про повтор (#1500)"
 assert_log "GH-API-LOCK-DELETE refs/locks/task-123" "worker-chain-refusal-green: задача возвращена в пул СРАЗУ (release-full), не ждёт TTL-сборщика (#422)"
 assert_not_log "Автономный воркер справился" "worker-chain-refusal-green: зелёный job — это исход «не сбой воркера» (#1286), а не ложное «справился» (живой класс #876)"
 echo "SMOKE: worker-chain-refusal-green — ок (#876/#1084/#1307/#1286)"
@@ -1038,8 +1060,14 @@ TELEGRAM_CHAT_ID="42" \
 GH_ISSUE_JSON='{"number":123,"title":"Smoke: цепочка реально без квоты","body":"## Цель\nпрогон\n\n## Критерий готовности\nсессия","state":"OPEN","assignees":[],"labels":[{"name":"task"}]}' \
 SMOKE_DSH_STOP_ERROR="RATE_LIMIT: Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-09-17 08:51:55" \
   run_client "worker-chain-quota-green" "$REPO/scripts/worker/task.sh"
-assert_log "исчерпана целиком" "worker-chain-quota-green: когда ВСЕ провайдеры реально без квоты, прежняя формулировка обязана остаться (#1307)"
-assert_log "повтор внутри этого прогона не поможет" "worker-chain-quota-green: при реальной квоте действие обязано остаться «ждать», а не «повторить»"
+# #1500: текст потребителя (task.sh) при RETRY_USEFUL=0 един для всех корзин —
+# он называет сводку, а не утверждает про квоту. Формулировка «исчерпана
+# целиком … повтор до сброса бессмысленен» остаётся у ИСТОЧНИКА (dsh-ci.sh,
+# единственный случай, где она верна буквально) и гвардится там:
+# scripts/lib/test/dsh-provider-chain.smoke.sh, сценарий 25. Здесь инвариант
+# потребителя: сводка названа, повтор не посоветован.
+assert_log "реально без квоты: 1 из 1" "worker-chain-quota-green: когда ВСЕ провайдеры реально без квоты, сводка обязана это назвать (#1307)"
+assert_log "НЕ объявлен полезным" "worker-chain-quota-green: при реальной квоте действие обязано остаться «ждать», а не «повторить»"
 assert_not_log "Повтор ИМЕЕТ смысл" "worker-chain-quota-green: при реальной квоте повтор смысла не имеет — сообщение не должно звать повторять"
 echo "SMOKE: worker-chain-quota-green — ок (#1307/#1286: job зелёный, задача в пуле)"
 

@@ -435,7 +435,7 @@ def dependabot_alert_watch(repo: str, now: datetime) -> tuple:
                 "Что дальше: посмотреть репозиторий Security → Dependabot, "
                 "завести задачу вручную (scripts/gh/issue-create) или поднять "
                 "DEPENDABOT_WATCH_DAILY_CAP, если объём временный."
-            )
+            , category="breakage")
 
     if not observations and not actions:
         observations.append("dependabot-alert-watch: открытых алертов нет")
