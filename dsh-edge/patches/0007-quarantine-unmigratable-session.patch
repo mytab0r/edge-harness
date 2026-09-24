@@ -51,7 +51,7 @@ index 1adbb33..6443b33 100644
          this.migrateSession(row.id as SessionId, row, true, target)
        }
        if (rebuild) {
-@@ -1035,6 +1049,76 @@ export class DurableObjectSessionPersistence extends SessionPersistence {
+@@ -1035,6 +1049,149 @@ export class DurableObjectSessionPersistence extends SessionPersistence {
        SESSION_FORMAT_VERSION,
        SESSION_FORMAT_VERSION,
      )
@@ -201,7 +201,7 @@ index 1adbb33..6443b33 100644
    }
  
    private isEventTableRebuildCheaper(legacy: number): boolean {
-@@ -1305,6 +1389,13 @@ export class DurableObjectSessionPersistence extends SessionPersistence {
+@@ -1305,6 +1462,24 @@ export class DurableObjectSessionPersistence extends SessionPersistence {
  
  type EventTable = 'dsh_session_events' | 'dsh_session_events_migrating'
  
