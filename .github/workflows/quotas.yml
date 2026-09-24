@@ -61,3 +61,17 @@ jobs:
           # настроен", хотя он задан в vars репозитория, просто не проброшен сюда.
           DEEPSEEK_BASE_URL: ${{ vars.DEEPSEEK_BASE_URL }}
         run: python scripts/measure/quotas.py
+
+      # Стектрейс исключения воркера (#1503). Секреты Cloudflare есть только в
+      # этом workflow, поэтому зонд живёт здесь же, а не заводит второй набор
+      # прав. `continue-on-error`: зонд диагностический — его отказ не имеет
+      # права ронять замер квот, ради которого workflow и существует.
+      - name: Стектрейс исключения воркера (Workers Logs, #1503)
+        continue-on-error: true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # Читает ТОЛЬКО /api/status (счётчики по статусам) — размеры таблиц,
+          # без которых «кто жрёт квоту» остаётся гаданием (#1503).
+          HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
+        run: python scripts/measure/worker_error_probe.py
