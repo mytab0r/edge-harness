@@ -20,6 +20,17 @@ on:
           и ничего не деплоит. Пусто — обычный ручной деплой.
         required: false
         default: ""
+      measure_objects_top:
+        description: >-
+          Задача #1513: сколько объектов (objectId) печатать в разбивке за
+          день. Пусто — разбивка не снимается. namespaceId отвечает «какой
+          воркер», objectId — «какой именно объект внутри него»: 2026-09-24
+          один namespace дал 4 047 032 строки, а известная цена транскрипта
+          объясняла восьмую часть — без objectId остальное не атрибутировать.
+          Не включено по умолчанию: измерение умножает число строк ответа на
+          число живых объектов, а у ответа есть потолок.
+        required: false
+        default: ""
 
 jobs:
   # Задача #320: разовый диагностический прогон в существующем workflow — здесь
@@ -42,10 +53,19 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           MEASURE_DAYS: ${{ github.event.inputs.measure_rows_read_days }}
+          MEASURE_OBJECTS_TOP: ${{ github.event.inputs.measure_objects_top }}
         # --hours (#1411): суточный итог отвечает «сколько», почасовая
         # раскладка — «что это было». Разовый диагностический прогон и
         # существует ради второго вопроса.
-        run: python scripts/measure/do_rows_read.py --days "$MEASURE_DAYS" --hours
+        # --objects (#1513) — только если владелец/агент явно попросил: см.
+        # описание входа выше, почему не всегда.
+        run: |
+          set -euo pipefail
+          args=(--days "$MEASURE_DAYS" --hours)
+          if [ -n "$MEASURE_OBJECTS_TOP" ]; then
+            args+=(--objects "$MEASURE_OBJECTS_TOP")
+          fi
+          python scripts/measure/do_rows_read.py "${args[@]}"
 
   deploy:
     if: github.event_name != 'workflow_dispatch' || github.event.inputs.measure_rows_read_days == ''
