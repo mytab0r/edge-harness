@@ -81,40 +81,65 @@ def main() -> int:
 
     # Формы пробуются по возрастанию специфичности. Первая, что вернёт 200,
     # и есть верная; при всех неудачах дословный вывод назовёт, чего не хватает.
-    # Что уже сказал сам API (две итерации, дословно в логах прогонов):
-    #   1) `queryId` ОБЯЗАТЕЛЕН и строка — без него ZodError на path ["queryId"];
-    #   2) произвольный `queryId: "probe"` не годится — «Query not found»;
-    #   3) лист фильтра обязан нести `type` из {string, number, boolean},
-    #      либо это группа (kind/filterCombination/filters).
-    # Значит `queryId` — не свободная метка, а ссылка. Перебираем известные
-    # значения и заодно зовём соседние эндпоинты как КОНТРОЛЬ: если `keys`
-    # отвечает 200, то токен и аккаунт исправны, и неверна только форма
-    # запроса — это различение дороже любой догадки.
-    leaf = lambda key, value: {
-        "key": key, "operation": "eq", "value": value, "type": "string",
+    # Форма установлена итерациями 1-3 (ответы API в логах прогонов):
+    # queryId — любая строка, он заводит запрос на лету; лист фильтра обязан
+    # нести `type`; datasets обязателен. Контроль telemetry/keys дал 200, то
+    # есть токен и права исправны.
+    #
+    # ГЛАВНОЕ, что показала итерация 3: `POST /api/heartbeat` отвечает 200,
+    # outcome "ok". Значит воркер НЕ мёртв целиком, и «падает на каждом
+    # маршруте» было неверно. Поэтому здесь спрашиваем ровно события с
+    # ошибкой — они и назовут, что именно падает.
+    leaf = lambda key, op, value: {
+        "key": key, "operation": op, "value": value, "type": "string",
     }
-    base = {
-        "timeframe": {"from": since_ms, "to": now_ms},
-        "limit": 20,
-        "parameters": {"datasets": ["cloudflare-workers"],
-                       "filters": [leaf("$metadata.service", WORKER)]},
-        "view": "events",
-    }
+    def q(filters):
+        return {
+            "queryId": "probe", "timeframe": {"from": since_ms, "to": now_ms},
+            "limit": 20, "view": "events",
+            "parameters": {"datasets": ["cloudflare-workers"], "filters": filters},
+        }
     attempts = [
-        ("КОНТРОЛЬ: telemetry/keys", {"timeframe": {"from": since_ms, "to": now_ms},
-                                      "datasets": ["cloudflare-workers"], "limit": 20},
-         f"{API}/accounts/{account}/workers/observability/telemetry/keys"),
-        ("queryId=workers-logs", {**base, "queryId": "workers-logs"}, url),
-        ("queryId=custom", {**base, "queryId": "custom"}, url),
-        ("queryId=UUID", {**base, "queryId": "00000000-0000-4000-8000-000000000000"}, url),
-        ("queryId пустой строкой", {**base, "queryId": ""}, url),
+        ("события с ошибкой", q([
+            leaf("$metadata.service", "eq", WORKER),
+            leaf("$metadata.error", "exists", ""),
+        ]), url),
+        ("уровень error", q([
+            leaf("$metadata.service", "eq", WORKER),
+            leaf("$metadata.level", "eq", "error"),
+        ]), url),
+        ("исход не ok", q([
+            leaf("$metadata.service", "eq", WORKER),
+            leaf("$workers.outcome", "neq", "ok"),
+        ]), url),
     ]
 
     ok = False
     for name, payload, endpoint in attempts:
         status, text = _post(token, endpoint, payload)
         print(f"── форма «{name}»: HTTP {status}")
-        print(text[:BODY_PREVIEW])
+        try:
+            payload_json = json.loads(text)
+        except ValueError:
+            print(text[:BODY_PREVIEW]); print(); continue
+        events = (((payload_json.get("result") or {}).get("events") or {}).get("events") or [])
+        if not events:
+            print(json.dumps(payload_json, ensure_ascii=False)[:BODY_PREVIEW])
+        for event in events:
+            meta = event.get("$metadata", {})
+            workers = event.get("$workers", {})
+            # Печатаются ТОЛЬКО поля разбора: сообщение, ошибка, что вызвало,
+            # исход. Тело запроса и заголовки не печатаются вовсе — там куски
+            # запросов владельца, а репозиторий публичный (AGENTS.md).
+            print(json.dumps({
+                "ts": event.get("timestamp"),
+                "level": meta.get("level"),
+                "trigger": meta.get("trigger"),
+                "message": str(meta.get("message"))[:300],
+                "error": str(meta.get("error"))[:900],
+                "outcome": workers.get("outcome"),
+                "cpuMs": workers.get("cpuTimeMs"),
+            }, ensure_ascii=False))
         print()
         if status == 200:
             ok = True
