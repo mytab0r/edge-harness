@@ -1,38 +1,24 @@
-#!/usr/bin/env python3
-"""Чем именно провайдер не устраивает запрос `dsh` — спросить у провайдера.
+"""Чем провайдер отвергает запрос dsh (#1520).
 
-Класс одной фразой: **`dsh` ходит формой Anthropic Messages API, записи нашей
-цепочки — OpenAI-совместимые эндпоинты, и почему конкретно провайдер отвергает
-запрос, никто не спрашивал.**
+Вопрос задачи один: почему цепочка провайдеров не даёт ответа, хотя ключи на
+месте. Ответ на него — код и ТЕЛО ответа на том же URL, с тем же ключом,
+которым ходит прод; всё остальное (какой провайдер «обычно работает»,
+какой id «должен быть живым») — правдоподобие, а не замер.
 
-Живой замер (#1494, `docs/research/28-provider-chain-truth-table.md`): пять
-записей цепочки из восьми отвечают HTTP 200 на прямой вызов
-`<base_url>/chat/completions` и те же пять не отвечают через `dsh`. Почему —
-неизвестно, потому что тело ответа провайдера в логи не попадает ни у одной из
-сторон (`EMPTY_RESPONSE` у цепочки, «тело не печатается» у bench).
+Зонд спрашивает тремя телами, и различие между ними и есть диагноз:
+ - чистый Anthropic Messages, `max_tokens: 16` — работает ли МАРШРУТ и КЛЮЧ;
+ - он же с манифестным `max_output_tokens` — не упёрлись ли в потолок модели;
+ - он же плюс ОДНО поле, которое dsh кладёт сверх протокола — какое именно
+   поле провайдер не принимает.
 
-Что уже установлено и не переспрашивается (#1502):
+Состав полей сверх протокола снят записью живого исходящего запроса dsh
+0.1.7-alpha.2 на локальный `http.server` (не пересказом документации):
+заголовки `anthropic-version: 2023-06-01`, `accept: text/event-stream`,
+тело `{"model","stream","messages","max_tokens","thinking","system",
+"dsh_plugin_packages","dsh_session_log"}`.
 
-* правило URL взято из исходника плагина, не угадано —
-  `messagesApiRoot(baseURL)` дописывает `/v1` только если путь им ещё не
-  заканчивается, дальше `POST …/messages`;
-* у NVIDIA NIM этого маршрута НЕТ — живой 404 без ключа;
-* у OpenRouter он ЕСТЬ — 401 без ключа, а с ключом через цепочку приходит
-  `INVALID_REQUEST: Invalid Anthropic Messages API request`, то есть претензия
-  к ТЕЛУ, а не к маршруту.
-
-Этот скрипт закрывает ровно тот пробел: шлёт минимальный корректный запрос в
-форме Anthropic Messages по правилу `messagesApiRoot` и печатает ответ
-провайдера — код и тело. Тело здесь печатать НУЖНО (в отличие от
-`provider_latency.py`, где оно намеренно скрыто): именно в нём лежит причина,
-ради которой скрипт существует. Секреты при этом не печатаются никогда: в
-запрос уходит только значение из `secret_env`, в вывод — только имя
-переменной, а тело ответа проходит через маскирование известных значений.
-
-Запуск (ключи нужны настоящие, поэтому место запуска — CI):
-    python scripts/measure/anthropic_route_probe.py
-Тесты (без сети, прод-формы ответов):
-    python -m pytest scripts/measure/test_anthropic_route_probe.py -q
+Запуск: шаг «Чем провайдер отвергает запрос dsh (#1520)» в
+`.github/workflows/quotas.yml` — секреты цепочки есть только там.
 """
 
 from __future__ import annotations
@@ -141,7 +127,25 @@ def redact(text: str, secrets: list[str]) -> str:
     return text
 
 
+#: Поля, которые dsh 0.1.7-alpha.2 кладёт в тело Anthropic Messages-запроса
+#: СВЕРХ протокола. Не догадка: снято записью живого исходящего запроса dsh на
+#: локальный http.server (см. докстринг модуля) — заголовки
+#: `anthropic-version: 2023-06-01`, `accept: text/event-stream`, тело
+#: `{"model","stream","messages","max_tokens","thinking","system",
+#: "dsh_plugin_packages","dsh_session_log"}`.
+#:
+#: Значения здесь — минимальные формы тех же ключей: проверяется, отвергает ли
+#: провайдер САМ КЛЮЧ, а не его размер (живое `dsh_session_log` весит ~160 КБ,
+#: и на нём «отвергли» не отличить от «не приняли такой объём»).
+DSH_EXTRA_FIELDS = {
+    "thinking": {"type": "disabled"},
+    "dsh_plugin_packages": {"version": 1, "packages": []},
+    "dsh_session_log": {"version": 1, "sessionFormatVersion": 4},
+}
+
+
 def probe(entry: dict, model: str, max_tokens: int = 16,
+          extra: dict | None = None, label: str = "протокол",
           timeout: float = 30.0) -> dict:
     """Один провайдер, одна модель, один потолок вывода.
 
@@ -161,6 +165,7 @@ def probe(entry: dict, model: str, max_tokens: int = 16,
         "max_tokens": max_tokens,
         "messages": [{"role": "user", "content": "ping"}],
     }
+    payload.update(extra or {})
     request = urllib.request.Request(
         url, data=json.dumps(payload).encode("utf-8"), method="POST",
         headers={
@@ -170,8 +175,8 @@ def probe(entry: dict, model: str, max_tokens: int = 16,
             "accept": "application/json",
         })
     result = {"name": entry["name"], "url": url, "model": model,
-              "max_tokens": max_tokens, "secret_env": entry["secret_env"],
-              "secret_present": bool(secret)}
+              "max_tokens": max_tokens, "label": label,
+              "secret_env": entry["secret_env"], "secret_present": bool(secret)}
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             body = response.read().decode("utf-8", "replace")
@@ -190,10 +195,10 @@ def format_report(results: list[dict]) -> str:
     # Имя переменной секрета — в таблице, значение — нигде. Читателю отчёта
     # чинить конфигурацию, и «секрета нет» без имени переменной не говорит,
     # ЧТО именно положить (AGENTS.md: утверждение обязано нести адрес).
-    lines = ["запись | модель | max_tokens | HTTP | секрет | переменная | URL",
+    lines = ["запись | тело | max_tokens | HTTP | секрет | переменная | URL",
              "---|---|---|---|---|---|---"]
     for r in results:
-        lines.append(f"{r['name']} | `{r['model']}` | {r['max_tokens']} | "
+        lines.append(f"{r['name']} | {r.get('label', 'протокол')} | {r['max_tokens']} | "
                      f"{r['status']} | "
                      f"{'есть' if r['secret_present'] else 'НЕТ'} | "
                      f"`{r['secret_env']}` | `{r['url']}`")
@@ -202,7 +207,7 @@ def format_report(results: list[dict]) -> str:
     for r in results:
         lines.append("")
         lines.append(f"── {r['name']} (HTTP {r['status']}, модель `{r['model']}`, "
-                     f"max_tokens={r['max_tokens']})")
+                     f"max_tokens={r['max_tokens']}, тело: {r.get('label', 'протокол')})")
         lines.append(r["body"] or "(пустое тело)")
     return "\n".join(lines)
 
@@ -227,15 +232,32 @@ def main() -> int:
                 r = probe(entry, model, max_tokens=cap)
                 r["body"] = redact(r["body"], secrets)
                 results.append(r)
+            # Поля сверх протокола — по ОДНОМУ. Скопом «отвергли» не называет,
+            # что именно отвергли, а чинить надо конкретное поле; разбор по
+            # одному даёт адрес (AGENTS.md: алерт не гадает).
+            if results[-1]["status"] != 200:
+                continue
+            for field, value in DSH_EXTRA_FIELDS.items():
+                r = probe(entry, model, max_tokens=caps[-1],
+                          extra={field: value}, label=f"+{field}")
+                r["body"] = redact(r["body"], secrets)
+                results.append(r)
     print(format_report(results))
     answered = [r for r in results if r["status"] == 200]
     print("")
     print(f"Ответили 200 на Anthropic-маршруте: {len(answered)} из {len(results)}")
     for r in results:
-        if r["max_tokens"] == 16 and r["status"] == 200:
+        if r.get("label", "").startswith("+") and r["status"] != 200:
+            print(f"ПОЛЕ ОТВЕРГНУТО: {r['name']}/{r['model']} — та же запись "
+                  f"отвечает 200 на чистом протоколе, а с полем "
+                  f"`{r['label'][1:]}` даёт {r['status']}. Это поле шлёт dsh "
+                  f"сверх Anthropic Messages, и отказ приходит из-за него.")
+    for r in results:
+        if r["max_tokens"] == 16 and r["status"] == 200 and not r.get("label", "").startswith("+"):
             prod = [o for o in results
                     if o["name"] == r["name"] and o["model"] == r["model"]
-                    and o["max_tokens"] != 16]
+                    and o["max_tokens"] != 16
+                    and not o.get("label", "").startswith("+")]
             for o in prod:
                 if o["status"] != 200:
                     print(f"РАЗЛИЧИЕ: {r['name']}/{r['model']} — маршрут исправен "

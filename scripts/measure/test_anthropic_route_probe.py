@@ -186,3 +186,61 @@ def test_missing_manifest_gives_empty_chain_not_a_default(tmp_path):
     фоллбэк-список означал бы, что зонд меряет не то, что реально зовёт
     конвейер."""
     assert mod.load_chain("ai-review", tmp_path / "нет-такого.json") == []
+
+
+def test_probe_really_sends_the_extra_field_and_a_server_can_reject_it(tmp_path):
+    """Настоящий сервер, настоящий запрос: заглушка тут бесполезна.
+
+    Проверяется то, ради чего поле вообще добавлено — что `probe` кладёт его в
+    ТЕЛО, а не в заголовок и не в URL. Сервер отвечает 400 ровно тем текстом,
+    которым OpenRouter отвечает dsh, и принимает чистый протокол — то есть
+    воспроизводит наблюдаемое различие целиком (AGENTS.md: стенд поднимает
+    настоящий сервер, «недоступность» — закрытым портом, а не `return 7`)."""
+    import http.server
+    import threading
+
+    seen = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["content-length"])))
+            seen.append(body)
+            reject = "dsh_session_log" in body
+            payload = (b'{"error":{"message":"Invalid Anthropic Messages API request"}}'
+                       if reject else b'{"type":"message"}')
+            self.send_response(400 if reject else 200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    entry = {"name": "стенд", "secret_env": "НЕТ_ТАКОЙ",
+             "base_url": f"http://127.0.0.1:{server.server_port}/v1"}
+    try:
+        clean = mod.probe(entry, "m", max_tokens=16)
+        dirty = mod.probe(entry, "m", max_tokens=16,
+                          extra={"dsh_session_log": mod.DSH_EXTRA_FIELDS["dsh_session_log"]},
+                          label="+dsh_session_log")
+    finally:
+        server.shutdown()
+
+    assert clean["status"] == 200, "чистый протокол обязан проходить"
+    assert dirty["status"] == 400
+    assert "Invalid Anthropic Messages API request" in dirty["body"]
+    assert "dsh_session_log" in seen[1] and "dsh_session_log" not in seen[0], (
+        "поле обязано уходить именно в теле — иначе замер меряет не то")
+
+
+def test_extra_fields_are_the_ones_dsh_actually_sends():
+    """Список полей — снимок живого запроса dsh 0.1.7-alpha.2, не догадка.
+
+    Если он разойдётся с тем, что шлёт плагин, зонд будет проверять поля,
+    которых нет, и молчать о тех, что есть. Поэтому состав зафиксирован здесь
+    и меняется тем же коммитом, что поднимает пин плагина."""
+    assert set(mod.DSH_EXTRA_FIELDS) == {
+        "thinking", "dsh_plugin_packages", "dsh_session_log"}
