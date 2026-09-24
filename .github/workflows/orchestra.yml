@@ -222,6 +222,12 @@ jobs:
           # pulse_guard.escalate всегда вернёт «НЕ доставлен» (нет токена/чата).
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Адрес морды — чтобы зонд перед отправкой кнопок мог узнать, дойдёт
+          # ли нажатие вообще (#1471): callback идёт Telegram → вебхук → морда
+          # → repository_dispatch, и лежащая морда делает кнопку немой. Не
+          # задан — поведение прежнее (кнопки уходят), состояние честно
+          # называется «unknown», а не выдаётся за «путь жив».
+          HARNESS_URL: ${{ vars.HARNESS_URL }}
         run: python scripts/orchestra/waiting_owner_guard.py
 
       # Само-аудит здоровья конвейера (openspec/changes/pipeline-health-
