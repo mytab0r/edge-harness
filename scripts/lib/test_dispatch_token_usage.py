@@ -102,6 +102,13 @@ EXPECTED_WORKFLOWS = frozenset({
     "deploy-dsh-edge.yml",
     "deploy-worker.yml",
     "dispatch-latency-probe.yml",
+    # #1525: перехват отвергнутого запроса dsh пересылающим рекордером,
+    # только ручной запуск. Из репо-секретов читает ТОЛЬКО ключи провайдера
+    # (OPENROUTER_*) — ни GH_DISPATCH_TOKEN, ни GH_PIPELINE_PAT: рекордер
+    # разговаривает с LLM, а не с GitHub (permissions: contents: read),
+    # поэтому не входит ни в DISPATCH_CONSUMER, ни в PIPELINE_CONSUMERS —
+    # тот же класс, что seed-provider-registry.yml.
+    "dsh-capture.yml",
     # #600: e2e-смоук морды dsh-edge на PR, до мержа. Репо-секретов не читает
     # вовсе (ADR 0017) — сборка и локальный unstable_dev не обращаются к
     # Cloudflare/GitHub ни с одним репо-секретом, `gh release download` идёт

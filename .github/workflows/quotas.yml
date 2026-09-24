@@ -99,3 +99,4 @@ jobs:
           NVIDIA_NIM_1_API_KEY: ${{ secrets.NVIDIA_NIM_1_API_KEY }}
           NVIDIA_NIM_2_API_KEY: ${{ secrets.NVIDIA_NIM_2_API_KEY }}
         run: python scripts/measure/anthropic_route_probe.py
+
