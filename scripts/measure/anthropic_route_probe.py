@@ -319,6 +319,32 @@ def blames_our_request(result: dict) -> bool:
     return answer_error_type(result) not in TRANSIENT_ERROR_TYPES
 
 
+def base_candidates(base_url: str) -> list[str]:
+    """Кандидаты в базу для записи, чей Anthropic-маршрут мёртв.
+
+    Порождаются МЕХАНИЧЕСКИ из текущей базы, а не берутся из головы: путь
+    укорачивается посегментно, и к каждому уровню добавляется `/anthropic` —
+    та форма, которой чужие OpenAI-совместимые шлюзы обычно отделяют
+    Anthropic-протокол. Угадывать адрес нельзя, а перебрать десяток
+    и посмотреть, кто ответит МОДЕЛЬЮ, — это замер.
+
+    Кандидат `…/v1` не порождается отдельно: правило плагина само допишет
+    `/v1` там, где его нет (`messages_api_root`), и лишняя пара была бы тем
+    же запросом дважды."""
+    from urllib.parse import urlsplit, urlunsplit
+    parts = urlsplit(base_url.rstrip("/"))
+    segments = [s for s in parts.path.split("/") if s]
+    seen, out = set(), []
+    for cut in range(len(segments), -1, -1):
+        prefix = "/" + "/".join(segments[:cut]) if cut else ""
+        for tail in ("", "/anthropic"):
+            url = urlunsplit((parts.scheme, parts.netloc, prefix + tail, "", ""))
+            if url not in seen:
+                seen.add(url)
+                out.append(url)
+    return out
+
+
 def format_report(results: list[dict]) -> str:
     # Имя переменной секрета — в таблице, значение — нигде. Читателю отчёта
     # чинить конфигурацию, и «секрета нет» без имени переменной не говорит,
@@ -340,7 +366,49 @@ def format_report(results: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def cmd_candidates(entry_name: str) -> int:
+    """Перебрать кандидатов в базу для ОДНОЙ записи и назвать ту, что отвечает.
+
+    Отдельная команда, а не часть обычного замера: каждый кандидат — реальный
+    вызов чужого API, и тратить их на каждом прогоне квот незачем."""
+    chain = load_chain()
+    entry = next((e for e in chain if e["name"] == entry_name), None)
+    if entry is None:
+        names = ", ".join(e["name"] for e in chain) or "цепочка пуста"
+        print(f"::error::записи «{entry_name}» нет в манифесте (есть: {names})",
+              file=sys.stderr)
+        return 1
+    secret = os.environ.get(entry["secret_env"], "")
+    if not secret:
+        print(f"::error::секрета {entry['secret_env']} нет в окружении — перебор "
+              "поймал бы отказ по ключу, а не по маршруту", file=sys.stderr)
+        return 1
+    model = entry_models(entry)[0]
+    results = []
+    for candidate in base_candidates(entry["base_url"]):
+        probe_entry = dict(entry, base_url=candidate)
+        result = probe(probe_entry, model, label=f"база {candidate}")
+        result["body"] = redact(result["body"], [secret])
+        results.append(result)
+        if answered(result):
+            # Нашли — дальше тратить чужие вызовы не на что.
+            break
+    print(format_report(results))
+    ok = [r for r in results if answered(r)]
+    print("")
+    if ok:
+        print(f"ОТВЕТИЛА МОДЕЛЬЮ: {entry_name} на базе {ok[-1]['url']} — эту и "
+              "ставить в манифест")
+    else:
+        print(f"Ни один из {len(results)} кандидатов не ответил моделью. Это "
+              "факт замера, а не вывод «Anthropic-маршрута у провайдера нет»: "
+              "база может лежать вне механически порождаемого набора.")
+    return 0
+
+
 def main() -> int:
+    if len(sys.argv) > 2 and sys.argv[1] == "--candidates":
+        return cmd_candidates(sys.argv[2])
     chain = load_chain()
     if not chain:
         print("::error::боевая цепочка не прочитана из config/provider-usage.json — "
