@@ -75,3 +75,27 @@ jobs:
           # без которых «кто жрёт квоту» остаётся гаданием (#1503).
           HANDS_TOKEN: ${{ secrets.HANDS_TOKEN }}
         run: python scripts/measure/worker_error_probe.py
+
+      # Чем провайдер отвергает тело запроса dsh (#1520). Цепочка мертва
+      # (#1502), конвейер не делает работы вовсе: воркер девятый раз за сутки
+      # берёт одну задачу, падает за секунду и возвращает её в пул. Что именно
+      # не устраивает провайдера, никто не спрашивал — тело ответа в логи не
+      # попадает ни у одной из сторон. Зонд спрашивает и печатает ответ
+      # дословно.
+      #
+      # Живёт здесь, а не в отдельном workflow: ключи цепочки уже проброшены в
+      # соседние замеры, и второй набор прав ради одного вопроса — лишняя
+      # поверхность. `continue-on-error` по той же причине, что у зонда выше:
+      # диагностика не имеет права ронять замер квот.
+      - name: Чем провайдер отвергает запрос dsh (#1520)
+        continue-on-error: true
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          OPENROUTER_1_API_KEY: ${{ secrets.OPENROUTER_1_API_KEY }}
+          OPENROUTER_2_API_KEY: ${{ secrets.OPENROUTER_2_API_KEY }}
+          OLLAMA_CLOUD_1_API_KEY: ${{ secrets.OLLAMA_CLOUD_1_API_KEY }}
+          OLLAMA_CLOUD_2_API_KEY: ${{ secrets.OLLAMA_CLOUD_2_API_KEY }}
+          OLLAMA_CLOUD_3_API_KEY: ${{ secrets.OLLAMA_CLOUD_3_API_KEY }}
+          NVIDIA_NIM_1_API_KEY: ${{ secrets.NVIDIA_NIM_1_API_KEY }}
+          NVIDIA_NIM_2_API_KEY: ${{ secrets.NVIDIA_NIM_2_API_KEY }}
+        run: python scripts/measure/anthropic_route_probe.py
