@@ -81,34 +81,38 @@ def main() -> int:
 
     # Формы пробуются по возрастанию специфичности. Первая, что вернёт 200,
     # и есть верная; при всех неудачах дословный вывод назовёт, чего не хватает.
-    # Форма взята НЕ из доки, а из ответа самого API: ZodError первой попытки
-    # назвал оба варианта фильтра — либо группа
-    # (`kind: "group"`, `filterCombination`, `filters`), либо лист, у которого
-    # ОБЯЗАТЕЛЕН `type` из {string, number, boolean}. Первая попытка отдельно
-    # показала, что произвольный `queryId` не годится: «Query not found» —
-    # значит это ссылка на сохранённый запрос, а не свободная метка.
+    # Что уже сказал сам API (две итерации, дословно в логах прогонов):
+    #   1) `queryId` ОБЯЗАТЕЛЕН и строка — без него ZodError на path ["queryId"];
+    #   2) произвольный `queryId: "probe"` не годится — «Query not found»;
+    #   3) лист фильтра обязан нести `type` из {string, number, boolean},
+    #      либо это группа (kind/filterCombination/filters).
+    # Значит `queryId` — не свободная метка, а ссылка. Перебираем известные
+    # значения и заодно зовём соседние эндпоинты как КОНТРОЛЬ: если `keys`
+    # отвечает 200, то токен и аккаунт исправны, и неверна только форма
+    # запроса — это различение дороже любой догадки.
     leaf = lambda key, value: {
         "key": key, "operation": "eq", "value": value, "type": "string",
     }
-    base = {"timeframe": {"from": since_ms, "to": now_ms}, "limit": 20}
+    base = {
+        "timeframe": {"from": since_ms, "to": now_ms},
+        "limit": 20,
+        "parameters": {"datasets": ["cloudflare-workers"],
+                       "filters": [leaf("$metadata.service", WORKER)]},
+        "view": "events",
+    }
     attempts = [
-        ("лист с type, без queryId", {
-            **base,
-            "parameters": {"filters": [leaf("$metadata.service", WORKER)]},
-        }),
-        ("группа and", {
-            **base,
-            "parameters": {"filters": [{
-                "kind": "group", "filterCombination": "and",
-                "filters": [leaf("$metadata.service", WORKER)],
-            }]},
-        }),
-        ("без фильтров вовсе", {**base, "parameters": {}}),
+        ("КОНТРОЛЬ: telemetry/keys", {"timeframe": {"from": since_ms, "to": now_ms},
+                                      "datasets": ["cloudflare-workers"], "limit": 20},
+         f"{API}/accounts/{account}/workers/observability/telemetry/keys"),
+        ("queryId=workers-logs", {**base, "queryId": "workers-logs"}, url),
+        ("queryId=custom", {**base, "queryId": "custom"}, url),
+        ("queryId=UUID", {**base, "queryId": "00000000-0000-4000-8000-000000000000"}, url),
+        ("queryId пустой строкой", {**base, "queryId": ""}, url),
     ]
 
     ok = False
-    for name, payload in attempts:
-        status, text = _post(token, url, payload)
+    for name, payload, endpoint in attempts:
+        status, text = _post(token, endpoint, payload)
         print(f"── форма «{name}»: HTTP {status}")
         print(text[:BODY_PREVIEW])
         print()
