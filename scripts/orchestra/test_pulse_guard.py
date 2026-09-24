@@ -238,8 +238,8 @@ def test_send_telegram_always_sends_parse_mode_and_escapes_plain(monkeypatch):
     calls = []
     monkeypatch.setattr(pg, "subprocess",
                         SimpleNamespace(run=lambda *a, **k: calls.append(a) or SimpleNamespace(
-                            returncode=0, stderr="")))
-    assert pg.send_telegram('причина: <упало> & "вышло"') is True
+                            returncode=0, stderr="", stdout='{"ok": true}')))
+    assert pg.send_telegram('причина: <упало> & "вышло"', category="pipeline") is True
     assert len(calls) == 1
     argv = calls[0][0]
     joined = " ".join(argv)
@@ -260,9 +260,9 @@ def test_send_telegram_as_html_passes_markup_verbatim(monkeypatch):
     calls = []
     monkeypatch.setattr(pg, "subprocess",
                         SimpleNamespace(run=lambda *a, **k: calls.append(a) or SimpleNamespace(
-                            returncode=0, stderr="")))
+                            returncode=0, stderr="", stdout='{"ok": true}')))
     markup = '<a href="https://github.com/o/r/issues/7">#7</a>'
-    assert pg.send_telegram(markup, as_html=True) is True
+    assert pg.send_telegram(markup, as_html=True, category="pipeline") is True
     assert f"text={markup}" in " ".join(calls[0][0])  # повторное экранирование убило бы ссылку
 
 
@@ -277,9 +277,9 @@ def test_send_telegram_with_reply_markup_passes_json_keyboard(monkeypatch):
     calls = []
     monkeypatch.setattr(pg, "subprocess",
                         SimpleNamespace(run=lambda *a, **k: calls.append(a) or SimpleNamespace(
-                            returncode=0, stderr="")))
+                            returncode=0, stderr="", stdout='{"ok": true}')))
     keyboard = pg.build_decision_keyboard(471, ["Вариант А", "Вариант Б"])
-    assert pg.send_telegram("Нужно решение", reply_markup=keyboard) is True
+    assert pg.send_telegram("Нужно решение", reply_markup=keyboard, category="pipeline") is True
     joined = " ".join(calls[0][0])
     assert f"reply_markup={json.dumps(keyboard)}" in joined
 
@@ -294,8 +294,8 @@ def test_send_telegram_without_reply_markup_does_not_add_the_flag(monkeypatch):
     calls = []
     monkeypatch.setattr(pg, "subprocess",
                         SimpleNamespace(run=lambda *a, **k: calls.append(a) or SimpleNamespace(
-                            returncode=0, stderr="")))
-    assert pg.send_telegram("обычный алерт") is True
+                            returncode=0, stderr="", stdout='{"ok": true}')))
+    assert pg.send_telegram("обычный алерт", category="pipeline") is True
     assert "reply_markup" not in " ".join(calls[0][0])
 
 
@@ -518,8 +518,8 @@ def test_escalate_without_options_keeps_old_signature_behaviour(monkeypatch):
     posted = []
     sent = []
     monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
-    monkeypatch.setattr(pg, "send_telegram", lambda text, reply_markup=None: sent.append(reply_markup) or True)
-    result = pg.escalate("o/r", 120, "обычная эскалация")
+    monkeypatch.setattr(pg, "send_telegram", lambda text, reply_markup=None, **_kw: sent.append(reply_markup) or True)
+    result = pg.escalate("o/r", 120, "обычная эскалация", category="breakage")
     assert sent == [None]  # старые вызовы (без options) не порождают клавиатуру
     assert "доставлен" in result
 
@@ -527,8 +527,9 @@ def test_escalate_without_options_keeps_old_signature_behaviour(monkeypatch):
 def test_escalate_with_options_sends_decision_keyboard(monkeypatch):
     monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: None)
     sent = []
-    monkeypatch.setattr(pg, "send_telegram", lambda text, reply_markup=None: sent.append(reply_markup) or True)
-    pg.escalate("o/r", 471, "Нужно решение владельца", options=["Вариант А", "Вариант Б"])
+    monkeypatch.setattr(pg, "send_telegram", lambda text, reply_markup=None, **_kw: sent.append(reply_markup) or True)
+    pg.escalate("o/r", 471, "Нужно решение владельца", options=["Вариант А", "Вариант Б"],
+                category="decision")
     assert sent[0] == pg.build_decision_keyboard(471, ["Вариант А", "Вариант Б"])
 
 
@@ -543,7 +544,7 @@ def test_escalate_reports_comment_skipped_not_left_when_write_gated(monkeypatch)
     monkeypatch.setattr(pg, "subprocess", SimpleNamespace(
         run=lambda *a, **k: (_ for _ in ()).throw(AssertionError("subprocess.run не должен вызываться"))))
     monkeypatch.setattr(pg, "send_telegram", lambda *a, **k: False)
-    result = pg.escalate("o/r", 120, "текст эскалации")
+    result = pg.escalate("o/r", 120, "текст эскалации", category="breakage")
     assert result == "Telegram: НЕ доставлен; след в #120: пропущен (DRY-RUN)"
 
 
@@ -763,7 +764,7 @@ def test_gate_blocks_dispatch_after_streak_and_notifies_once(monkeypatch):
     sent = []
     monkeypatch.setattr(pg, "gh", fake)
     monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
-    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
+    monkeypatch.setattr(pg, "send_telegram", lambda text, **_kw: sent.append(text) or True)
 
     observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed is False                # диспатч остановлен
@@ -776,7 +777,7 @@ def test_gate_blocks_dispatch_after_streak_and_notifies_once(monkeypatch):
     fake.routes["issues/120/comments"] = [
         job_comment("2026-08-31T11:59:00Z", f"x {pg.PAUSE_MARKER}")]
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: posted.append("spam"))
-    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append("spam") or True)
+    monkeypatch.setattr(pg, "send_telegram", lambda text, **_kw: sent.append("spam") or True)
     _, _, allowed2 = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed2 is False
     assert posted == [posted[0]] and sent == [sent[0]]
@@ -793,7 +794,7 @@ def test_gate_allows_dispatch_when_series_reset_by_success(monkeypatch):
     })
     monkeypatch.setattr(pg, "gh", fake)
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
-    monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать"))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a, **_kw: pytest.fail("не должен слать"))
     observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed is True
     # closed-состояние ничего не меняет — это наблюдение (#456), не действие
@@ -881,7 +882,7 @@ def test_heartbeat_ok_is_quiet_and_stale_cries(monkeypatch):
     fake = FakeGh({"workflows/orchestra.yml/runs": ok_runs, "issues/120/comments": []})
     monkeypatch.setattr(pg, "gh", fake)
     sent = []
-    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
+    monkeypatch.setattr(pg, "send_telegram", lambda text, **_kw: sent.append(text) or True)
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: None)
     lines = pg.heartbeat_check("mytab0r/edge-harness", utc(2026, 8, 31, 12, 0))
     assert sent == [] and any("в норме" in line for line in lines)
@@ -907,7 +908,7 @@ def test_heartbeat_check_carries_live_cadence_observation(monkeypatch):
         fake = FakeGh({"workflows/orchestra.yml/runs": {"workflow_runs": runs},
                        "issues/120/comments": []})
         monkeypatch.setattr(pg, "gh", fake)
-        monkeypatch.setattr(pg, "send_telegram", lambda text: True)
+        monkeypatch.setattr(pg, "send_telegram", lambda text, **_kw: True)
         monkeypatch.setattr(pg, "post_issue_comment", lambda *a: None)
         return pg.heartbeat_check("mytab0r/edge-harness", now)
 
@@ -951,7 +952,7 @@ def test_heartbeat_check_blind_to_pull_request_contract_runs_mutation_guard(monk
     fake = FakeGh({"workflows/orchestra.yml/runs": runs, "issues/120/comments": []})
     monkeypatch.setattr(pg, "gh", fake)
     sent = []
-    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
+    monkeypatch.setattr(pg, "send_telegram", lambda text, **_kw: sent.append(text) or True)
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: None)
 
     now = utc(2026, 9, 5, 14, 24, 0)
@@ -1012,7 +1013,7 @@ def test_heartbeat_check_finds_real_tick_past_page_full_of_contract_runs(monkeyp
     })
     monkeypatch.setattr(pg, "gh", fake)
     sent = []
-    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
+    monkeypatch.setattr(pg, "send_telegram", lambda text, **_kw: sent.append(text) or True)
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: None)
 
     now = utc(2026, 9, 5, 14, 24, 0)
@@ -1033,7 +1034,7 @@ def test_heartbeat_check_loud_when_zero_ticks_found_after_server_filter(monkeypa
     })
     monkeypatch.setattr(pg, "gh", fake)
     sent, posted = [], []
-    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
+    monkeypatch.setattr(pg, "send_telegram", lambda text, **_kw: sent.append(text) or True)
     monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
 
     lines = pg.heartbeat_check("mytab0r/edge-harness", utc(2026, 9, 5, 14, 24))
@@ -1055,7 +1056,7 @@ def test_heartbeat_check_no_ticks_report_honest_when_comment_post_fails(monkeypa
         "issues/120/comments": [],
     })
     monkeypatch.setattr(pg, "gh", fake)
-    monkeypatch.setattr(pg, "send_telegram", lambda text: True)
+    monkeypatch.setattr(pg, "send_telegram", lambda text, **_kw: True)
 
     def failing_post(repo, n, text):
         raise RuntimeError("HTTP 500: transient")
@@ -1079,7 +1080,7 @@ def test_heartbeat_check_no_ticks_marker_suppresses_repeat_comment_not_telegram(
     })
     monkeypatch.setattr(pg, "gh", fake)
     sent, posted = [], []
-    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
+    monkeypatch.setattr(pg, "send_telegram", lambda text, **_kw: sent.append(text) or True)
     monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
 
     lines = pg.heartbeat_check("mytab0r/edge-harness", utc(2026, 9, 5, 14, 24))
@@ -1104,7 +1105,7 @@ def test_heartbeat_check_no_ticks_episode_reopens_after_close_marker(monkeypatch
     })
     monkeypatch.setattr(pg, "gh", fake)
     posted = []
-    monkeypatch.setattr(pg, "send_telegram", lambda text: True)
+    monkeypatch.setattr(pg, "send_telegram", lambda text, **_kw: True)
     monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
 
     lines = pg.heartbeat_check("mytab0r/edge-harness", utc(2026, 9, 5, 14, 24))
@@ -1127,7 +1128,7 @@ def test_heartbeat_check_closes_no_ticks_episode_when_ticks_return(monkeypatch):
     })
     monkeypatch.setattr(pg, "gh", fake)
     posted = []
-    monkeypatch.setattr(pg, "send_telegram", lambda text: True)
+    monkeypatch.setattr(pg, "send_telegram", lambda text, **_kw: True)
     monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
 
     pg.heartbeat_check("mytab0r/edge-harness", utc(2026, 9, 5, 14, 10))
@@ -1150,7 +1151,7 @@ def test_heartbeat_check_does_not_reclose_already_closed_no_ticks_episode(monkey
     })
     monkeypatch.setattr(pg, "gh", fake)
     posted = []
-    monkeypatch.setattr(pg, "send_telegram", lambda text: True)
+    monkeypatch.setattr(pg, "send_telegram", lambda text, **_kw: True)
     monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
 
     pg.heartbeat_check("mytab0r/edge-harness", utc(2026, 9, 5, 14, 10))
@@ -1260,7 +1261,7 @@ def test_independent_pulse_check_quiet_when_independent_tick_recent(monkeypatch)
         "issues/120/comments": [],
     })
     monkeypatch.setattr(pg, "gh", fake)
-    monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать"))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a, **_kw: pytest.fail("не должен слать"))
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: None)  # закрытие эпизода (нет открытого — не пишет)
     lines = pg.independent_pulse_check("mytab0r/edge-harness", utc(2026, 9, 7, 4, 55, 0))
     assert any("в норме" in line for line in lines)
@@ -1272,7 +1273,7 @@ def test_independent_pulse_check_escalates_on_real_incident_and_names_hours(monk
     fake = _fake_gh_for_morning_gap()
     monkeypatch.setattr(pg, "gh", fake)
     sent, posted = [], []
-    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
+    monkeypatch.setattr(pg, "send_telegram", lambda text, **_kw: sent.append(text) or True)
     monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
 
     lines = pg.independent_pulse_check("mytab0r/edge-harness", utc(2026, 9, 7, 9, 0, 0))
@@ -1290,7 +1291,7 @@ def test_independent_pulse_check_dedups_same_episode(monkeypatch):
         {"created_at": "2026-09-07T08:55:00Z",
          "body": f"🚨 edge-harness: {pg.DO_PULSE_MARKER}\nранее"}])
     monkeypatch.setattr(pg, "gh", fake)
-    monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать повторно"))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a, **_kw: pytest.fail("не должен слать повторно"))
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать повторно"))
 
     lines = pg.independent_pulse_check("mytab0r/edge-harness", utc(2026, 9, 7, 9, 0, 0))
@@ -1313,7 +1314,7 @@ def test_independent_pulse_check_closes_episode_when_ticks_resume(monkeypatch):
     })
     monkeypatch.setattr(pg, "gh", fake)
     posted = []
-    monkeypatch.setattr(pg, "send_telegram", lambda *a: True)
+    monkeypatch.setattr(pg, "send_telegram", lambda *a, **_kw: True)
     monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
 
     lines = pg.independent_pulse_check("mytab0r/edge-harness", utc(2026, 9, 7, 20, 30, 0))
@@ -1330,7 +1331,7 @@ def test_independent_pulse_check_no_calls_beyond_recent_runs_when_not_applicable
             "workflow_runs": [run("success", "2026-09-05T10:00:00Z", 1, actor="github-actions[bot]")]},
     })
     monkeypatch.setattr(pg, "gh", fake)
-    monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать"))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a, **_kw: pytest.fail("не должен слать"))
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
     lines = pg.independent_pulse_check("mytab0r/edge-harness", utc(2026, 9, 7, 9, 0, 0))
     assert lines == []
@@ -1351,7 +1352,7 @@ def test_gate_first_entry_posts_pause_marker_and_blocks(monkeypatch):
     posted, sent = [], []
     monkeypatch.setattr(pg, "gh", fake)
     monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
-    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
+    monkeypatch.setattr(pg, "send_telegram", lambda text, **_kw: sent.append(text) or True)
 
     observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed is False
@@ -1370,7 +1371,7 @@ def test_gate_stays_open_before_backoff_then_probes_after(monkeypatch):
     })
     monkeypatch.setattr(pg, "gh", fake)
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
-    monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать"))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a, **_kw: pytest.fail("не должен слать"))
     observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed is False
     # state=="open" (выдержка не истекла, уже оповещено) ничего не меняет — наблюдение
@@ -1382,7 +1383,7 @@ def test_gate_stays_open_before_backoff_then_probes_after(monkeypatch):
         job_comment("2026-08-31T11:45:00Z", pg.PAUSE_MARKER)]
     posted, sent = [], []
     monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
-    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
+    monkeypatch.setattr(pg, "send_telegram", lambda text, **_kw: sent.append(text) or True)
     observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed is True
     assert len(posted) == 1 and f"{pg.PROBE_MARKER} 1]" in posted[0]
@@ -1407,7 +1408,7 @@ def test_gate_probe_success_closes_breaker_via_reset_streak(monkeypatch):
     })
     monkeypatch.setattr(pg, "gh", fake)
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
-    monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать"))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a, **_kw: pytest.fail("не должен слать"))
     observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed is True
     assert any("разрешён" in line for line in observations)
@@ -1427,7 +1428,7 @@ def test_gate_probe_failure_grows_backoff_and_blocks_next_probe(monkeypatch):
     monkeypatch.setattr(pg, "gh", fake)
     # 14 минут с последней пробы (11:46 -> 12:00) — меньше выдержки попытки 2 (30 мин)
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
-    monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать"))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a, **_kw: pytest.fail("не должен слать"))
     observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed is False
     # state=="open" (уже оповещено) — наблюдение, не действие
@@ -1467,7 +1468,7 @@ def test_gate_in_progress_probe_does_not_falsely_reopen_dispatch(monkeypatch):
     })
     monkeypatch.setattr(pg, "gh", fake)
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
-    monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать"))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a, **_kw: pytest.fail("не должен слать"))
 
     # доказательство мутацией: без фикса (не читая маркеры до decide_dispatch)
     # count_consecutive_failures([None, "failure", "failure"]) == 0 и
@@ -1499,7 +1500,7 @@ def test_gate_probe_rate_is_bounded_by_backoff_within_an_hour(monkeypatch):
     })
     monkeypatch.setattr(pg, "gh", fake)
     monkeypatch.setattr(pg, "post_issue_comment", fake_issue_comments)
-    monkeypatch.setattr(pg, "send_telegram", lambda text: True)
+    monkeypatch.setattr(pg, "send_telegram", lambda text, **_kw: True)
 
     start = utc(2026, 8, 31, 12, 0)
     current_now = [start]
@@ -1653,7 +1654,7 @@ def test_gate_open_text_names_effective_failures_not_raw_zero(monkeypatch):
     })
     monkeypatch.setattr(pg, "gh", fake)
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать — throttle не истёк"))
-    monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать — throttle не истёк"))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a, **_kw: pytest.fail("не должен слать — throttle не истёк"))
 
     # 10 минут с маркера паузы — меньше выдержки первой попытки (15 мин): open
     now = utc(2026, 8, 31, 12, 0)
@@ -1713,7 +1714,7 @@ def test_gate_open_state_posts_throttled_reminder_after_interval(monkeypatch):
     monkeypatch.setattr(pg, "gh", fake)
     posted, sent = [], []
     monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
-    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
+    monkeypatch.setattr(pg, "send_telegram", lambda text, **_kw: sent.append(text) or True)
 
     # +30 минут с последнего маркера — меньше и throttle (60), и backoff (240): тихо
     _, actions1, allowed1 = pg.conveyor_gate("mytab0r/edge-harness", utc(2026, 8, 31, 10, 31))
@@ -1764,7 +1765,7 @@ def test_gate_fake_pause_reminder_marker_cannot_suppress_alert(monkeypatch):
     monkeypatch.setattr(pg, "gh", fake)
     posted, sent = [], []
     monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
-    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
+    monkeypatch.setattr(pg, "send_telegram", lambda text, **_kw: sent.append(text) or True)
 
     # Фаза А: 90 минут с последнего ЧЕСТНОГО сигнала — throttle истёк,
     # напоминание обязано уйти (подделка 11:00 фильтром не считается)
@@ -1826,7 +1827,7 @@ def test_gate_resume_marker_reopens_dispatch_without_probe(monkeypatch):
     })
     monkeypatch.setattr(pg, "gh", fake)
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("серия сброшена мержем — новых сигналов быть не должно"))
-    monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("серия сброшена мержем — новых сигналов быть не должно"))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a, **_kw: pytest.fail("серия сброшена мержем — новых сигналов быть не должно"))
 
     observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed is True
@@ -1851,7 +1852,7 @@ def test_gate_resume_resets_probe_attempt_numbering(monkeypatch):
     })
     monkeypatch.setattr(pg, "gh", fake)
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
-    monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать"))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a, **_kw: pytest.fail("не должен слать"))
 
     observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed is True
@@ -1877,7 +1878,7 @@ def test_gate_reds_after_resume_form_a_fresh_series(monkeypatch):
     })
     monkeypatch.setattr(pg, "gh", fake)
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
-    monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать"))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a, **_kw: pytest.fail("не должен слать"))
     observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed is True
 
@@ -1893,7 +1894,7 @@ def test_gate_reds_after_resume_form_a_fresh_series(monkeypatch):
     fake.routes["runs/5/jobs"] = JOBS_PAYLOAD
     posted, sent = [], []
     monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
-    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
+    monkeypatch.setattr(pg, "send_telegram", lambda text, **_kw: sent.append(text) or True)
     observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed is False
     assert len(posted) == 1 and pg.PAUSE_MARKER in posted[0]
@@ -1911,7 +1912,7 @@ def test_stale_resume_marker_does_not_shadow_real_success(monkeypatch):
     })
     monkeypatch.setattr(pg, "gh", fake)
     monkeypatch.setattr(pg, "post_issue_comment", lambda *a: pytest.fail("не должен писать"))
-    monkeypatch.setattr(pg, "send_telegram", lambda *a: pytest.fail("не должен слать"))
+    monkeypatch.setattr(pg, "send_telegram", lambda *a, **_kw: pytest.fail("не должен слать"))
     observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed is True
     assert not any("мержем" in line for line in observations)
@@ -2062,7 +2063,7 @@ def test_conveyor_gate_ignores_fake_resume_marker_with_live_impersonation_envelo
     monkeypatch.setattr(pg, "gh", fake)
     posted, sent = [], []
     monkeypatch.setattr(pg, "post_issue_comment", lambda repo, n, text: posted.append(text))
-    monkeypatch.setattr(pg, "send_telegram", lambda text: sent.append(text) or True)
+    monkeypatch.setattr(pg, "send_telegram", lambda text, **_kw: sent.append(text) or True)
 
     observations, actions, allowed = pg.conveyor_gate("mytab0r/edge-harness", NOW)
     assert allowed is False, (
@@ -3421,7 +3422,7 @@ def test_escalate_keeps_buttons_while_the_path_is_alive(morda, monkeypatch):
     monkeypatch.setattr(pg, "send_telegram",
                         lambda text, *a, **kw: sent.update(text=text, markup=kw.get("reply_markup")) or True)
 
-    pg.escalate("o/r", 7, "вопрос", options=["раз", "два"])
+    pg.escalate("o/r", 7, "вопрос", options=["раз", "два"], category="decision")
 
     assert sent["markup"] is not None, "живой путь — кнопки на месте"
     assert "РЕШЕНИЕ" not in sent["text"], "текстовый путь не подмешивается к рабочим кнопкам"
@@ -3437,7 +3438,7 @@ def test_escalate_replaces_dead_buttons_with_a_working_reply_path(morda, monkeyp
     monkeypatch.setattr(pg, "send_telegram",
                         lambda text, *a, **kw: sent.update(text=text, markup=kw.get("reply_markup")) or True)
 
-    pg.escalate("o/r", 1443, "что делаем с квотой", options=["поднять интервал", "отключить приём"])
+    pg.escalate("o/r", 1443, "что делаем с квотой", options=["поднять интервал", "отключить приём"], category="decision")
 
     assert sent["markup"] is None, "кнопка, которая не может сработать, не отправляется"
     assert f"{pg.DECISION_COMMENT_PREFIX}: 1" in sent["text"]
@@ -3452,3 +3453,157 @@ def test_fallback_says_out_loud_that_the_comment_is_not_authenticated():
     text = pg.decision_fallback_text("o/r", 5, ["а", "б"], "почему")
 
     assert "не подписан" in text or "ничем не подписан" in text
+
+
+# ── Кэш читающих вызовов на прогон (#1483) ──────────────────────────────────
+#
+# Класс одной фразой: один и тот же GET к GitHub API выполняется несколько раз
+# за один прогон — бюджет installation-токена тратится на ответы, которые уже
+# получены. Замер инспектора состояния: 204 вызова, 55 повторов, один URL —
+# 23 раза подряд; после фикса 149 вызовов и ни одного повтора.
+#
+# Стенд считает РЕАЛЬНЫЕ обращения к транспорту (подменён subprocess.run —
+# единственная граница с сетью), а не факт наличия кэша в исходнике: вырезанное
+# тело проверки прошло бы структурный тест молча.
+
+def _counting_transport(monkeypatch, answers=None):
+    """Подменяет границу с сетью и считает обращения. Возвращает список
+    аргументов каждого реального вызова."""
+    seen = []
+    answers = answers or {}
+
+    def fake_run(args, **kwargs):
+        seen.append(tuple(args))
+        key = tuple(args)
+        body = answers.get(key, '{"n": 1}')
+        return SimpleNamespace(returncode=0, stdout=body, stderr="")
+
+    monkeypatch.setattr(pg, "subprocess", SimpleNamespace(run=fake_run))
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_RUN_ID", "1")
+    return seen
+
+
+def test_read_cache_is_off_by_default(monkeypatch):
+    """Мутирующие потоки (scheduler) обязаны читать настоящее состояние —
+    умолчание «кэша нет» и есть та гарантия."""
+    seen = _counting_transport(monkeypatch)
+    pg.gh("repos/o/r/issues/1")
+    pg.gh("repos/o/r/issues/1")
+    assert len(seen) == 2, "кэш оказался включён по умолчанию"
+
+
+def test_enabled_cache_pays_for_the_same_read_once(monkeypatch):
+    """Ровно то, ради чего всё: 23 одинаковых запроса превращаются в один."""
+    with pg.read_cache():
+        seen = _counting_transport(monkeypatch)
+        for _ in range(23):
+            pg.gh("repos/o/r/actions/workflows/ai-review.yml/runs?per_page=100")
+        assert len(seen) == 1, f"реальных обращений {len(seen)}, а должно быть одно"
+        assert pg.read_cache_size() == 1
+
+
+def test_a_write_invalidates_everything_so_reads_after_it_are_real(monkeypatch):
+    """Вторая защита: если кэш включит мутирующий поток, «прочитал устаревшее
+    после собственной записи» обязано быть невозможно конструктивно."""
+    with pg.read_cache():
+        seen = _counting_transport(monkeypatch)
+        pg.gh("repos/o/r/issues/1")
+        pg.gh("-X", "POST", "repos/o/r/issues/1/comments", "-f", "body=x")
+        pg.gh("repos/o/r/issues/1")
+        reads = [call for call in seen if "-X" not in call]
+        assert len(reads) == 2, "чтение после записи отдано из кэша — это silent-wrong"
+
+
+def test_a_write_is_never_served_from_cache(monkeypatch):
+    """Повтор изменяющего вызова обязан уйти в сеть: «уже делали» не значит
+    «сделано снова»."""
+    with pg.read_cache():
+        seen = _counting_transport(monkeypatch)
+        pg.gh("-X", "POST", "repos/o/r/issues/1/comments", "-f", "body=x")
+        pg.gh("-X", "POST", "repos/o/r/issues/1/comments", "-f", "body=x")
+        assert len(seen) == 2
+
+
+def test_empty_body_answer_is_cached_not_treated_as_a_miss(monkeypatch):
+    """204 без тела — валидный ответ None. Если считать его промахом, кэш
+    молча перестанет работать ровно на таких маршрутах."""
+    with pg.read_cache():
+        seen = _counting_transport(monkeypatch, {("gh", "api", "repos/o/r/quiet"): ""})
+        assert pg.gh("repos/o/r/quiet") is None
+        assert pg.gh("repos/o/r/quiet") is None
+        assert len(seen) == 1
+
+
+def test_a_failed_read_is_not_remembered(monkeypatch):
+    """Запомнить отказ на весь прогон — значит превратить одну сетевую
+    неудачу в неудачу всех инвариантов, читающих тот же URL."""
+    with pg.read_cache():
+        calls = []
+
+        def flaky(args, **kwargs):
+            calls.append(tuple(args))
+            if len(calls) == 1:
+                return SimpleNamespace(returncode=1, stdout="", stderr="HTTP 403")
+            return SimpleNamespace(returncode=0, stdout='{"n": 1}', stderr="")
+
+        monkeypatch.setattr(pg, "subprocess", SimpleNamespace(run=flaky))
+        monkeypatch.setenv("GITHUB_ACTIONS", "true")
+        monkeypatch.setenv("GITHUB_RUN_ID", "1")
+        with pytest.raises(RuntimeError):
+            pg.gh("repos/o/r/issues/1")
+        assert pg.gh("repos/o/r/issues/1") == {"n": 1}
+        assert len(calls) == 2
+
+
+def test_cache_scope_does_not_outlive_the_block(monkeypatch):
+    """Первая редакция была парной (enable/disable) и протекла в ДРУГОЙ файл
+    тестов: `repo_invariants.main()` включал кэш и не выключал. Область
+    видимости обязана быть конструкцией, а не дисциплиной вызывающего."""
+    seen = _counting_transport(monkeypatch)
+    with pg.read_cache():
+        pg.gh("repos/o/r/issues/1")
+        pg.gh("repos/o/r/issues/1")
+    assert len(seen) == 1
+    pg.gh("repos/o/r/issues/1")
+    pg.gh("repos/o/r/issues/1")
+    assert len(seen) == 3, "кэш пережил блок — чужой прогон получит наш снимок"
+
+
+# ── Тема решений содержит ТОЛЬКО сообщения с кнопками (#1490) ───────────────
+#
+# Живой случай: владелец открыл «🟣 Решения владельца» и увидел там алерт о
+# квоте DO и сообщение предохранителя конвейера — без единой кнопки. Причина:
+# категория была зашита ВНУТРЬ общего канала escalate(), а его зовут сорок
+# мест по любому поводу. Здесь эта ошибка становится невозможной.
+
+def test_decision_category_without_buttons_is_a_loud_refusal(monkeypatch):
+    """Без вариантов решения категория decision запрещена: это и есть то, что
+    владелец увидел в теме."""
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a, **k: None)
+    monkeypatch.setattr(pg, "send_telegram",
+                        lambda *a, **k: pytest.fail("сигнал не должен уйти вовсе"))
+    with pytest.raises(ValueError) as caught:
+        pg.escalate("o/r", 120, "алерт без кнопок", category="decision")
+    assert "кнопками" in str(caught.value)
+
+
+def test_buttons_without_the_decision_category_are_a_loud_refusal(monkeypatch):
+    """Обратная сторона: вопрос с кнопками, уехавший в тему шума, владелец не
+    найдёт. Инвариант двусторонний, иначе он закрывает половину класса."""
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a, **k: None)
+    monkeypatch.setattr(pg, "send_telegram",
+                        lambda *a, **k: pytest.fail("сигнал не должен уйти вовсе"))
+    with pytest.raises(ValueError):
+        pg.escalate("o/r", 471, "вопрос", options=["А", "Б"], category="pipeline")
+
+
+def test_matching_pairs_pass(monkeypatch):
+    """Положительная сторона обоих: правильные сочетания проходят."""
+    monkeypatch.setattr(pg, "post_issue_comment", lambda *a, **k: None)
+    sent = []
+    monkeypatch.setattr(pg, "send_telegram",
+                        lambda text, reply_markup=None, **kw: sent.append(kw.get("category")) or True)
+    pg.escalate("o/r", 120, "поломка", category="breakage")
+    pg.escalate("o/r", 471, "вопрос", options=["А"], category="decision")
+    assert sent == ["breakage", "decision"]

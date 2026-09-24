@@ -76,6 +76,13 @@ EXPECTED_WORKFLOWS = frozenset({
     # — в репозиторий не пишет вовсе (permissions: contents: read), поэтому не
     # входит ни в DISPATCH_CONSUMER, ни в PIPELINE_CONSUMERS.
     "seed-provider-registry.yml",
+    # #1463: живой замер тредов в личке. Читает TELEGRAM_BOT_TOKEN/
+    # TELEGRAM_CHAT_ID (иначе это не замер, а пересказ документации) и
+    # НИ GH_DISPATCH_TOKEN, НИ GH_PIPELINE_PAT — в репозиторий не пишет
+    # вовсе (permissions: contents: read), поэтому не входит ни в
+    # DISPATCH_CONSUMER, ни в PIPELINE_CONSUMERS; тот же класс, что
+    # branch-protection-watch.yml выше.
+    "telegram-thread-probe.yml",
     # Сирота A аудита 2026-09-11 (scripts/orchestra/checklist_tail_labels.py):
     # читает только github.token (issues: write, pull-requests: read) — тот
     # же класс, что dependabot-alert-watch.yml ниже, ни GH_DISPATCH_TOKEN, ни

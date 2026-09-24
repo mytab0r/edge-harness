@@ -53,6 +53,7 @@ PAUSE_MARKER ставится только сигнальным коммента
 импортирует их вместе с gh()/parse_time().
 """
 
+import contextlib
 import hashlib
 import html
 import importlib.util
@@ -61,9 +62,11 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta
+from typing import NamedTuple
 from pathlib import Path
 
 # Заведение issue пула — одно место правды (pool_issue.create_pool_issue,
@@ -753,6 +756,10 @@ def announce_write_mode() -> str:
 # добавленный в одну, молча не попал бы во вторую).
 _gh_call_is_write = review_labels.is_write_call
 
+#: Часовой «в кэше нет» — отличает отсутствие ключа от закэшированного None
+#: (ответ 204 без тела — это валидный None, а не промах).
+_MISS = object()
+
 
 class WriteGateSkipped(RuntimeError):
     """Гейт прод-записи (prod_writes_allowed) отказал: вызов НЕ ушёл в сеть
@@ -765,8 +772,79 @@ class WriteGateSkipped(RuntimeError):
     их нельзя терять за одним сообщением."""
 
 
+#: Кэш ответов на читающие вызовы, ВЫКЛЮЧЕННЫЙ по умолчанию (#1483). None —
+#: выключен, dict — включён на этот процесс.
+#:
+#: Класс одной фразой: один и тот же GET к GitHub API выполняется несколько
+#: раз за один прогон — бюджет installation-токена тратится на ответы, которые
+#: уже получены. Замер инспектора состояния (repo_invariants) на живом
+#: репозитории: 204 вызова за прогон, 55 из них повторы, один URL — 23 раза
+#: подряд. При лимите 5000/час и запуске инспектора каждые 15 минут ПЛЮС на
+#: каждый push/PR это выжигало бюджет, и 2026-09-23 обязательные `contract` и
+#: `mutation-claim` падали на 403 на PR #1480/#1464/#1482 подряд.
+#:
+#: Выключен по умолчанию сознательно: тот же помощник зовут МУТИРУЮЩИЕ потоки
+#: (scheduler), где чтение после записи обязано видеть новое состояние.
+#: Включает его вызывающий, который знает, что читает один согласованный
+#: снимок (repo_invariants.main). Вторая защита — на случай, если включит и
+#: мутирующий: ЛЮБОЙ изменяющий вызов сбрасывает кэш целиком (см. ниже), так
+#: что «прочитал устаревшее после собственной записи» невозможно
+#: конструктивно, а не по договорённости.
+_READ_CACHE: dict[tuple[str, ...], object] | None = None
+
+
+def enable_read_cache() -> None:
+    """Включить кэш читающих вызовов на этот процесс и очистить его."""
+    global _READ_CACHE
+    _READ_CACHE = {}
+
+
+def disable_read_cache() -> None:
+    """Вернуть поведение по умолчанию (кэша нет)."""
+    global _READ_CACHE
+    _READ_CACHE = None
+
+
+@contextlib.contextmanager
+def read_cache():
+    """Кэш на время блока — и ни секундой дольше.
+
+    Парные enable/disable были первой редакцией и протекли в первом же полном
+    прогоне тестов (#1483): `repo_invariants.main()` включал кэш и не выключал,
+    процесс pytest жил дальше, и два теста планировщика в ДРУГОМ файле получили
+    ответы из чужого снимка. В проде процесс завершается сразу и течь не видно —
+    ровно тот случай, когда область видимости обязана быть конструкцией, а не
+    дисциплиной. Вложенность допустима: внутренний блок восстанавливает
+    состояние внешнего, а не выключает кэш насовсем."""
+    global _READ_CACHE
+    previous = _READ_CACHE
+    _READ_CACHE = {}
+    try:
+        yield
+    finally:
+        _READ_CACHE = previous
+
+
+def read_cache_size() -> int:
+    """Сколько ответов лежит в кэше. Нужен гвардии и отчётам — иначе «кэш
+    работает» проверялось бы прозой."""
+    return 0 if _READ_CACHE is None else len(_READ_CACHE)
+
+
 def gh(*args: str) -> dict | list | None:
-    if _gh_call_is_write(args) and not prod_writes_allowed():
+    write = _gh_call_is_write(args)
+    if _READ_CACHE is not None:
+        if write:
+            # Состояние на сервере только что изменилось — всё, что мы о нём
+            # знали, устарело. Сбрасываем целиком: точечная инвалидация по
+            # URL требовала бы знать, какие чтения затронула запись, а это
+            # второе место правды про семантику маршрутов.
+            _READ_CACHE.clear()
+        else:
+            cached = _READ_CACHE.get(tuple(args), _MISS)
+            if cached is not _MISS:
+                return cached  # type: ignore[return-value]
+    if write and not prod_writes_allowed():
         print(
             f"::warning::DRY-RUN (вне GitHub Actions — {ALLOW_PROD_WRITES_ENV} больше не "
             f"снимает этот запрет, issue #1074) — изменяющий вызов пропущен: "
@@ -783,7 +861,12 @@ def gh(*args: str) -> dict | list | None:
         raise RuntimeError(f"gh api {' '.join(args[:2])}: {result.stderr.strip()}")
     # Часть успешных вызовов (например, POST .../dispatches) отвечает 204 без
     # тела — отсутствие JSON это успех, а не ошибка разбора.
-    return json.loads(result.stdout) if result.stdout.strip() else None
+    payload = json.loads(result.stdout) if result.stdout.strip() else None
+    # В кэш кладётся ТОЛЬКО удачное чтение: отказ (RuntimeError выше) сюда не
+    # доходит, и «запомнить ошибку на весь прогон» невозможно.
+    if _READ_CACHE is not None and not write:
+        _READ_CACHE[tuple(args)] = payload
+    return payload
 
 
 def parse_time(raw: str) -> datetime:
@@ -1722,7 +1805,80 @@ def edit_issue_comment(repo: str, comment_id: int, text: str) -> None:
     gh("-X", "PATCH", f"repos/{repo}/issues/comments/{comment_id}", "-f", "body=" + text)
 
 
-def send_telegram(text: str, as_html: bool = False, reply_markup: dict | None = None) -> bool:
+_telegram_topics_spec = importlib.util.spec_from_file_location(
+    "telegram_topics", Path(__file__).resolve().parent.parent / "lib" / "telegram_topics.py")
+telegram_topics = importlib.util.module_from_spec(_telegram_topics_spec)
+_telegram_topics_spec.loader.exec_module(telegram_topics)
+
+
+class TelegramSendResult(NamedTuple):
+    """Исход ОДНОЙ попытки sendMessage. `description` — то, что сказал сам
+    Telegram: по нему отличают «темы больше нет» от «сломалась отправка», и
+    лечатся эти два случая по-разному."""
+    ok: bool
+    description: str
+
+
+def _telegram_send_message(token: str, chat: str, payload_text: str,
+                           reply_markup: dict | None, thread_id: int | None) -> TelegramSendResult:
+    """Один вызов sendMessage.
+
+    `-sS` без `-f` намеренно (#1465): с `-f` curl отдаёт только код возврата, а
+    ТЕЛО ответа — единственное место, где Telegram называет причину
+    (`description`). Без причины «тему удалили» неотличимо от «сломалась сеть»,
+    и мы заводили бы тему заново на каждом таймауте."""
+    args = ["curl", "-sS", "--max-time", "30", "-X", "POST",
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            "--data-urlencode", f"chat_id={chat}",
+            "--data-urlencode", "parse_mode=HTML",
+            "--data-urlencode", f"text={payload_text}"]
+    if thread_id is not None:
+        args += ["--data-urlencode", f"message_thread_id={thread_id}"]
+    if reply_markup is not None:
+        args += ["--data-urlencode", f"reply_markup={json.dumps(reply_markup)}"]
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, encoding="utf-8")
+    except OSError as error:
+        return TelegramSendResult(False, f"curl недоступен: {error}")
+    if result.returncode != 0:
+        return TelegramSendResult(False, f"curl rc={result.returncode}: {result.stderr.strip()}")
+    try:
+        answer = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return TelegramSendResult(False, f"ответ Telegram не разобран: {result.stdout.strip()[:200]}")
+    if answer.get("ok"):
+        return TelegramSendResult(True, "")
+    return TelegramSendResult(False, str(answer.get("description") or "<без описания>"))
+
+
+def resolve_signal_topic(category: str, repo: str, token: str,
+                         chat: str) -> tuple[int | None, str]:
+    """`(message_thread_id, пометка)`. Пометка непустая ровно тогда, когда темы
+    не будет: она уходит В ТЕКСТ сигнала, чтобы владелец видел причину, а не
+    гадал, почему всё опять в одном потоке."""
+    if not repo:
+        # Вне CI (локальный прогон) репозиторий не задан — это НАШЕ состояние,
+        # не владельца: громко в лог job'а, но без строки в его сообщении.
+        print("::warning::GITHUB_REPOSITORY не задан — тему определить нечем, "
+              "сигнал в общем потоке", file=sys.stderr)
+        return None, ""
+    try:
+        return telegram_topics.resolve_thread_id(category, repo, token, chat, int(time.time())), ""
+    except telegram_topics.TopicUnavailable as error:
+        # Чат не форум, у бота нет прав — это СЛОМАННАЯ настройка, которую
+        # чинит владелец. Строка повторится на каждом сигнале, и это правильно:
+        # молчаливый общий поток и есть то состояние, из которого уходим.
+        print(f"::warning::тема не получена: {error}", file=sys.stderr)
+        return None, f"⚠️ сигнал в общем потоке: {error}"
+    except KeyError as error:
+        # Неизвестная категория — дефект кода отправителя, а не среды.
+        # Сигнал всё равно уходит: потерять его хуже, чем показать не там.
+        print(f"::warning::{error}", file=sys.stderr)
+        return None, f"⚠️ сигнал в общем потоке: {error}"
+
+
+def send_telegram(text: str, as_html: bool = False, reply_markup: dict | None = None,
+                  *, category: str) -> bool:
     """Best-effort: место правды — комментарий в задаче #120, Telegram — активный
     канал. Промах кричит warning'ом в лог, не молчит (см. WORKER-PLAYBOOK).
 
@@ -1737,8 +1893,19 @@ def send_telegram(text: str, as_html: bool = False, reply_markup: dict | None = 
     у сборщика, повторное экранирование убило бы ссылки.
 
     reply_markup (#254) — инлайн-клавиатура решения владельца (см.
-    build_decision_keyboard); необязательна, обычные алерты её не передают —
-    сигнатура обратно совместима, поведение существующих вызовов не меняется."""
+    build_decision_keyboard); необязательна, обычные алерты её не передают.
+
+    category (#1461/#1465) — ОБЯЗАТЕЛЬНА и только по имени. Умолчания нет
+    сознательно: умолчание «всё остальное» и есть то состояние, из которого
+    уходим — решение владельца вперемешку с шумом конвейера в одном потоке.
+    Значение обязано быть ключом telegram_topics.CATEGORIES; неизвестное —
+    громкий отказ (и гвардия по исходнику ловит его ещё до прогона, см.
+    scripts/lib/test_telegram_topics.py::test_every_sender_names_a_known_category).
+
+    Тема — не обязательство: если её не удалось получить (чат не форум, нет
+    прав, сеть, исчерпан бюджет), сигнал уходит В ОБЩИЙ ПОТОК с явной
+    пометкой, ПОЧЕМУ он не в теме. Потерять сигнал дороже, чем показать его
+    не там (AGENTS.md, fail loud вместо silent-wrong)."""
     if not prod_writes_allowed():
         # Тот же класс, что gh() -X POST/PUT/PATCH/DELETE (2026-09-11, закрыт
         # безусловно issue #1074): вне GitHub Actions реальный алерт владельцу
@@ -1753,23 +1920,33 @@ def send_telegram(text: str, as_html: bool = False, reply_markup: dict | None = 
         print("::warning::TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID не заданы — сигнал не отправлен",
               file=sys.stderr)
         return False
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    thread_id, topic_note = resolve_signal_topic(category, repo, token, chat)
     payload_text = text if as_html else tg_html(text)
-    args = ["curl", "-fsS", "--max-time", "30", "-X", "POST",
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            "--data-urlencode", f"chat_id={chat}",
-            "--data-urlencode", "parse_mode=HTML",
-            "--data-urlencode", f"text={payload_text}"]
-    if reply_markup is not None:
-        args += ["--data-urlencode", f"reply_markup={json.dumps(reply_markup)}"]
-    try:
-        result = subprocess.run(args, capture_output=True, text=True, encoding="utf-8")
-    except OSError as error:
-        print(f"::warning::curl недоступен, сигнал не отправлен: {error}", file=sys.stderr)
-        return False
-    if result.returncode != 0:
-        print(f"::warning::Telegram не принял сигнал: {result.stderr.strip()}", file=sys.stderr)
-        return False
-    return True
+    if topic_note:
+        payload_text = f"{payload_text}\n\n{tg_html(topic_note)}"
+
+    sent = _telegram_send_message(token, chat, payload_text, reply_markup, thread_id)
+    if sent.ok:
+        return True
+
+    # Тему удалили руками. Сигнал не теряем: забываем её (следующий прогон
+    # заведёт заново) и шлём в общий поток, назвав причину — иначе читатель
+    # решит, что тема просто не настроена.
+    if thread_id is not None and telegram_topics.topic_is_gone(sent.description):
+        telegram_topics.forget_topic(repo, category, int(time.time()))
+        fallback_note = (f"⚠️ тема «{telegram_topics.CATEGORIES[category]}» исчезла "
+                         f"({sent.description}) — сигнал в общем потоке, тема будет "
+                         "заведена заново")
+        print(f"::warning::{fallback_note}", file=sys.stderr)
+        retry = _telegram_send_message(
+            token, chat, f"{payload_text}\n\n{tg_html(fallback_note)}", reply_markup, None)
+        if retry.ok:
+            return True
+        sent = retry
+
+    print(f"::warning::Telegram не принял сигнал: {sent.description}", file=sys.stderr)
+    return False
 
 
 # Префикс комментария-решения — то же значение, что cf-worker/src/config.ts::
@@ -1890,7 +2067,8 @@ def build_decision_keyboard(issue_number: int, options: list[str]) -> dict:
     return {"inline_keyboard": keyboard}
 
 
-def escalate(repo: str, issue_number: int, text: str, options: list[str] | None = None) -> str:
+def escalate(repo: str, issue_number: int, text: str, options: list[str] | None = None,
+             *, category: str) -> str:
     """Канал эскалации поломок — общий с предохранителем конвейера: комментарий
     в задачу-статус + Telegram, best-effort по каждому (см. send_telegram).
     Переиспользуется вне пары «предохранитель/пульс» (scheduler.archive_runner_sessions,
@@ -1904,7 +2082,27 @@ def escalate(repo: str, issue_number: int, text: str, options: list[str] | None 
     вызывающий с `options` больше не передаёт пустой список: с #1413 вопрос
     без кнопочных вариантов владельцу не адресуется вовсе (гвардия оставляет
     пометку агенту), так что текстовый путь здесь — для будущих вызывающих
-    вне waiting:owner, не для задач без вариантов."""
+    вне waiting:owner, не для задач без вариантов.
+
+    category (#1490) — ОБЯЗАТЕЛЬНА и приходит ОТ ВЫЗЫВАЮЩЕГО. Зашитый здесь
+    литерал (первая редакция #1465) отправлял в тему решений владельца всё,
+    что вообще проходит через этот общий канал: алерт о квоте, предохранитель
+    конвейера, инварианты, откат деплоя. Владелец открыл тему «Решения
+    владельца» и увидел там сообщения без единой кнопки — тема, заведённая
+    ради одного вида сигналов, наполнилась всем подряд.
+
+    Инвариант ниже — механизм, а не договорённость: тема решений по
+    определению содержит только то, под чем есть кнопки. Несовпадение —
+    громкий отказ, а не тихая отправка не в ту тему."""
+    decision_asked = bool(options)
+    if decision_asked != (category == telegram_topics.DECISION_CATEGORY):
+        raise ValueError(
+            f"escalate: category={category!r} и "
+            f"{'есть' if decision_asked else 'нет'} вариантов решения — "
+            f"несовместимы. Тема «{telegram_topics.CATEGORIES[telegram_topics.DECISION_CATEGORY]}» "
+            "содержит ТОЛЬКО сообщения с кнопками (#1490): либо передай options, "
+            f"либо назови категорию по существу сигнала ({', '.join(sorted(telegram_topics.CATEGORIES))})."
+        )
     try:
         post_issue_comment(repo, issue_number, text)
         posted = True
@@ -1922,17 +2120,23 @@ def escalate(repo: str, issue_number: int, text: str, options: list[str] | None 
         # Зонд стоит ЗДЕСЬ, а не в build_decision_keyboard: клавиатура —
         # чистая сборка структуры, ей неоткуда ходить в сеть, и звать её из
         # тестов без стенда должно оставаться дёшево.
+        #
+        # `category` (#1461) едет по ОБЕИМ веткам: текстовый запасной путь —
+        # то же сообщение владельцу, что и кнопочное, и уходить мимо тем оно
+        # не имеет права. Слияние двух правок, а не выбор одной из них.
         status, why = owner_button_path_status()
         if status == BUTTON_PATH_DEAD:
             print(f"::warning::кнопки решения по #{issue_number} не отправлены: {why} — "
                   f"вопрос уходит с текстовым путём ответа (#1471)", file=sys.stderr)
             delivered = send_telegram(
-                text + decision_fallback_text(repo, issue_number, options, why))
+                text + decision_fallback_text(repo, issue_number, options, why),
+                category=category)
         else:
             delivered = send_telegram(
-                text, reply_markup=build_decision_keyboard(issue_number, options))
+                text, reply_markup=build_decision_keyboard(issue_number, options),
+                category=category)
     else:
-        delivered = send_telegram(text)
+        delivered = send_telegram(text, category=category)
     comment_note = "оставлен" if posted else ("пропущен (DRY-RUN)" if skipped else "НЕ оставлен")
     return (f"Telegram: {'доставлен' if delivered else 'НЕ доставлен'}; "
             f"след в #{issue_number}: {comment_note}")
@@ -2017,7 +2221,7 @@ def heartbeat_check(repo: str, now: datetime) -> list[str]:
                 f"Успешных прогонов {ORCHESTRA_WORKFLOW} (schedule/workflow_dispatch) "
                 "не найдено за последние 100 прогонов каждого события — пульс не "
                 "подтверждён, возможен отключённый workflow (docs/research/21).")
-        delivered = send_telegram(text)
+        delivered = send_telegram(text, category="breakage")
         # posted/attempted — находка AI-ревью PR #318, третий раунд: строка
         # отчёта раньше безусловно утверждала «след в #120», даже если
         # post_issue_comment упал (RuntimeError уходил только в warning) —
@@ -2064,7 +2268,7 @@ def heartbeat_check(repo: str, now: datetime) -> list[str]:
                    f"(порог {HEARTBEAT_MAX_AGE_MINUTES})"]
         return healthy + ([cadence_line] if cadence_line else [])
     text = heartbeat_alert_text(age, last_ok)
-    delivered = send_telegram(text)
+    delivered = send_telegram(text, category="breakage")
     # posted/attempted — тот же класс, что и в ветке HEARTBEAT_NO_TICKS выше
     # (находка AI-ревью PR #318, третий раунд): безусловное «след в #120» в
     # тексте отчёта было неверно, если post_issue_comment упал.
@@ -2190,7 +2394,7 @@ def independent_pulse_check(repo: str, now: datetime) -> list[str]:
     if not episode_reopened(open_times, close_times):
         return [f"🚨 независимый DO-пульс не приходил ({int(age)} мин назад, эпизод уже оповещён)"]
     text = independent_pulse_alert_text(age, exact)
-    result = escalate(repo, WATCHDOG_ISSUE, text)
+    result = escalate(repo, WATCHDOG_ISSUE, text, category="breakage")
     return [f"🚨 независимый DO-пульс не приходил {age / 60:.1f} ч ({result})"]
 
 
@@ -2363,7 +2567,7 @@ def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], list[str], bool]
                 post_issue_comment(repo, WATCHDOG_ISSUE, text)
             except RuntimeError as err:
                 print(f"::warning::напоминание в #{WATCHDOG_ISSUE} не доставлено: {err}", file=sys.stderr)
-            delivered = send_telegram(text)
+            delivered = send_telegram(text, category="pipeline")
             return ([line], [f"⏳ напоминание о длящейся паузе: следующая проба через "
                      f"{int(remaining)} мин (Telegram: "
                      f"{'доставлен' if delivered else 'НЕ доставлен'}; след в #{WATCHDOG_ISSUE})"],
@@ -2379,7 +2583,7 @@ def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], list[str], bool]
             post_issue_comment(repo, WATCHDOG_ISSUE, text)
         except RuntimeError as err:
             print(f"::warning::сигнал в #{WATCHDOG_ISSUE} не доставлен: {err}", file=sys.stderr)
-        delivered = send_telegram(text)
+        delivered = send_telegram(text, category="pipeline")
         return ([], [f"🔎 пробный диспатч после паузы {int(backoff)} мин (попытка {attempt}) — "
                  f"{failures} красных {WORKER_WORKFLOW} подряд (Telegram: "
                  f"{'доставлен' if delivered else 'НЕ доставлен'}; сигнал в #{WATCHDOG_ISSUE})"],
@@ -2393,7 +2597,7 @@ def conveyor_gate(repo: str, now: datetime) -> tuple[list[str], list[str], bool]
         post_issue_comment(repo, WATCHDOG_ISSUE, text)
     except RuntimeError as err:
         print(f"::warning::сигнал в #{WATCHDOG_ISSUE} не доставлен: {err}", file=sys.stderr)
-    delivered = send_telegram(text)
+    delivered = send_telegram(text, category="breakage")
     return ([], [f"🚨 конвейер на паузе: {failures} красных прогонов {WORKER_WORKFLOW} "
              f"подряд — диспатч остановлен (Telegram: "
              f"{'доставлен' if delivered else 'НЕ доставлен'}; сигнал в #{WATCHDOG_ISSUE})"],
@@ -2886,7 +3090,7 @@ def failure_watch(repo: str, now: datetime) -> tuple[list[str], list[str]]:
             already_escalated_today = True  # не гадаем повторно на этом же пульсе
         if not already_escalated_today:
             text = failure_watch_cap_alert_text(cap_marker, ci_created_today, cap_skipped_this_pulse)
-            result = escalate(repo, WATCHDOG_ISSUE, text)
+            result = escalate(repo, WATCHDOG_ISSUE, text, category="breakage")
             actions.append(
                 f"🚨 failure-watch: эскалация потолка автозаведения {FAILURE_WATCH_LABEL} ({result})")
 

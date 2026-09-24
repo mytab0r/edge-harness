@@ -14,35 +14,43 @@
 # 0.0.1-rc.1 намеренно НЕ используется: тянет @deepseek-ai/dsh-code-runtime-worker,
 # который в публичном npm отсутствует (tarball 404); с 0.0.1-rc.3 зависимость —
 # dsh-code-runtime-worker-thread, она опубликована (проверено установкой, 475 пакетов).
-DSH_VERSION="0.1.1-rc.2"
-DSH_INTEGRITY="sha512-UP1UIh6q3Gme/yXRn/QL2P8IsVlv8Shpg22TRJIZPsCRWLm4CBiA1MUvXmJAfsOEETBMLAl+xWPtFw6ICsN3wg=="
-DSH_HEADLESS_VERSION="0.1.1-rc.2"
-DSH_HEADLESS_INTEGRITY="sha512-Pk50xwmUUehOxNe8DJ2/tThj7Aw1MmJQeUkfAQh9miF7Tm+WOOxiOOei/H4wjH9cf+FuqtbLDw6jrHmGotfhjw=="
+DSH_VERSION="0.1.7-alpha.2"
+DSH_INTEGRITY="sha512-uXuWobwmpNzqFOTFP61kgf0aH8IzU9LWPF9QWCUfv5DOtgtlm+6+zHvQMboEe0bCaitul61ySvUqd4mMNRedzw=="
+DSH_HEADLESS_VERSION="0.1.7-alpha.2"
+DSH_HEADLESS_INTEGRITY="sha512-kRaYTJ+U5z0IywMMpI77O0w8P+FDFepltMTaJKb+ZhIFtCdWwFcb/f1Ah156qOiRLvhJy+Y2OU+lEdnZq5/Riw=="
 
 # Пин ТРАНЗИТИВНЫХ зависимостей по дате (#1467). Пины выше держат только два
 # верхних пакета; их собственные зависимости объявлены ДИАПАЗОНАМИ, и каждый
 # прогон резолвит их заново — то есть публикация в чужом реестре меняет то,
 # что стоит в нашем job'е, без единого коммита у нас.
 #
-# Это не гипотеза, а инцидент 2026-09-22, установленный по датам:
-#   @deepseek-ai/cordis 4.0.4 опубликован 15:36:40Z;
-#   dsh@0.1.1-rc.2 зависит от cordis диапазоном "^4.0.1" — 4.0.4 подходит;
-#   последний зелёный прогон ai-review — 15:16 (шаг dsh ~15:20, cordis 4.0.3);
-#   все прогоны после падают на `dsh: user patch-layer watching requires the
-#   Cordis HMR service` — dsh выходит rc=1 за секунду, ДО любого вызова к
-#   провайдеру, и восемь провайдеров цепочки подряд «отказывают» одинаково.
-#   Конвейер слияний встал: ни один PR не может получить ai:ok.
+# ОПРОВЕРГНУТО (#1481). Первая редакция этого комментария называла виновником
+# `@deepseek-ai/cordis 4.0.4` по совпадению дат публикации. Пин реально
+# закрепил 4.0.3 — и dsh продолжил падать тем же «user patch-layer watching
+# requires the Cordis HMR service». Причина оказалась другой и установлена
+# локальным воспроизведением с инструментовкой, а не по датам:
+# `dsh-app-boot@0.1.1-rc.2` зовёт `hmr.registerConfig(...)`, которого нет НИ В
+# ОДНОЙ опубликованной версии `@deepseek-ai/cordis-plugin-hmr` (1.0.16…1.0.19),
+# то есть путь `watchUserPatches` не мог отработать ни при каком выборе
+# транзитивных версий. Лечится переходом на 0.1.7-alpha.2, где апстрим этот
+# путь выкинул, а строка hmr переехала на свой пакет `@deepseek-ai/dsh-hmr`.
+# Разбор целиком — закрытая #1467 и #1481.
+#
+# Сам механизм пина при этом остаётся нужным и ниже не отменяется: чужая
+# публикация по-прежнему меняет содержимое нашего job'а без коммита у нас.
 #
 # `npm --before` резолвит ВСЕ версии так, как реестр выглядел на указанный
 # момент, — это лечит класс (любая транзитивная зависимость), а не случай
 # (cordis). Дату двигают руками вместе с пинами версий выше: обновление
 # перестаёт быть событием чужого реестра и становится нашим коммитом.
-DSH_RESOLVE_BEFORE="2026-09-22T15:00:00Z"
+DSH_RESOLVE_BEFORE="2026-09-23T00:00:00Z"
 
 # Видимый результат установки, а не факт «шаг прошёл» (AGENTS.md). Ровно та
-# версия, что стояла в последнем зелёном прогоне; расхождение — громкий отказ,
-# потому что молча уехавшая транзитивная зависимость и есть #1467.
-DSH_EXPECTED_CORDIS="4.0.3"
+# версия, что реально встаёт с пинами выше — замерено установкой
+# dsh@0.1.7-alpha.2 + dsh-headless@0.1.7-alpha.2 (#1481), а не взято из
+# диапазона. Расхождение — громкий отказ: молча уехавшая транзитивная
+# зависимость меняет наш job без коммита у нас.
+DSH_EXPECTED_CORDIS="4.0.4"
 
 # Ротация учёток — плагины владельца combo-router + anthropic-oauth-pool
 # (#215). Публикуются релизными ассетами ЭТОГО репозитория (как forge-плагины
@@ -276,10 +284,40 @@ dsh_verify_resolved_deps() {
   fi
   got=$(node -e "process.stdout.write(require('$manifest').version)")
   if [ "$got" != "$DSH_EXPECTED_CORDIS" ]; then
-    echo "::error::dsh_install: @deepseek-ai/cordis $got вместо $DSH_EXPECTED_CORDIS — транзитивная зависимость уехала, несмотря на --before=$DSH_RESOLVE_BEFORE (#1467). Именно так конвейер встал 2026-09-22: dsh падает с «user patch-layer watching requires the Cordis HMR service» ДО обращения к провайдеру. Газ: сверить дату пина и ожидаемую версию здесь же, в scripts/lib/dsh-ci.sh" >&2
+    echo "::error::dsh_install: @deepseek-ai/cordis $got вместо $DSH_EXPECTED_CORDIS — транзитивная зависимость уехала, несмотря на --before=$DSH_RESOLVE_BEFORE (#1467/#1481). Что именно сломается от этого расхождения — заранее не известно, поэтому отказ громкий, а не предсказание. Газ: сверить дату пина и ожидаемую версию здесь же, в scripts/lib/dsh-ci.sh" >&2
     return 1
   fi
   echo "dsh_install: транзитивный пин держит — @deepseek-ai/cordis $got (--before=$DSH_RESOLVE_BEFORE)"
+  # Что РЕАЛЬНО встало, а не что мы просили (#1467, второй заход). Первый
+  # диагноз назвал виновником cordis по совпадению дат — пин его закрепил,
+  # а dsh продолжил падать тем же «user patch-layer watching requires the
+  # Cordis HMR service». Значит уехал кто-то другой, и гадать, кто именно,
+  # нельзя: список версий печатается целиком, один раз, и следующий разбор
+  # начинается с факта, а не с гипотезы.
+  local root_dir
+  root_dir=$(npm root -g 2>/dev/null || true)
+  if [ -n "$root_dir" ]; then
+    echo "dsh_install: что установилось (@deepseek-ai/*):"
+    node -e '
+      const fs = require("fs"), path = require("path");
+      const roots = [process.argv[1] + "/@deepseek-ai",
+                     process.argv[1] + "/@deepseek-ai/dsh/node_modules/@deepseek-ai"];
+      const seen = new Map();
+      for (const dir of roots) {
+        let names = [];
+        try { names = fs.readdirSync(dir); } catch { continue; }
+        for (const name of names) {
+          const manifest = path.join(dir, name, "package.json");
+          try {
+            const version = JSON.parse(fs.readFileSync(manifest, "utf8")).version;
+            if (!seen.has(name)) seen.set(name, version);
+          } catch {}
+        }
+      }
+      for (const name of [...seen.keys()].sort())
+        console.log("  @deepseek-ai/" + name + " " + seen.get(name));
+    ' "$root_dir" || echo "  (перечислить не удалось)"
+  fi
 }
 
 # Скачивание и проверка целостности suite ротации учёток (#215). Единственное
@@ -1672,24 +1710,47 @@ dsh_chain_head_max_tokens() { # chain_json -> потолок ответа для
 # Отказ привязан к ID МОДЕЛИ, а не к аккаунту (#1309). Разделение осей: пока
 # провайдер отвечает «такой модели нет / она снята / её параметры не те» —
 # аккаунт жив, и правильный следующий шаг это ДРУГАЯ МОДЕЛЬ того же
-# аккаунта, а не следующий аккаунт. Прод-формы (все четыре — дословно из
-# живых прогонов, не пересказ):
+# аккаунта, а не следующий аккаунт. Прод-формы (все три — дословно из живых
+# прогонов, не пересказ):
 #   dsh: HTTP_410: DeepSeek API error (HTTP 410)      — id снят провайдером
 #                                                       (worker.yml 35010410097)
-#   dsh: HTTP_404: modelCode does not exist           — id не существует
-#                                                       (прогон 33572445063, PR #190)
 #   dsh: INVALID_REQUEST: max_tokens (131072) exceeds model's maximum output
 #     tokens (65536) for model nemotron-3-ultra       — потолок ЭТОЙ модели
 #                                                       (worker.yml 34730173870)
 #   UNKNOWN_MODEL                                     — id не принят каталогом
 #                                                       (worker.yml 34753001158, #1130)
 #
+# ЧЕТВЁРТАЯ форма, `dsh: HTTP_404: …`, отсюда УБРАНА (#1494): она попала в
+# список как «id не существует» по прогону 33572445063, но 404 этого не
+# доказывает — см. _dsh_failure_is_model_ambiguous ниже и замер
+# docs/research/28-provider-chain-truth-table.md. Список правится здесь, а не
+# только у функции, ровно потому, что две копии одного правила расходятся и
+# правят не ту (CLAUDE.md).
+#
 # Функция НЕ решает, переключаться ли на следующего ПРОВАЙДЕРА — это
 # по-прежнему dsh_chain_should_advance, и её решение не меняется ни для
 # одного класса: при единственном кандидате (форма `model`, вся цепочка до
 # #1309) поведение побайтно прежнее — модельного шага просто нет.
+# Отказ ДОКАЗАННО привязан к id модели: 410 Gone — терминальный ответ именно
+# про ресурс (#1289), UNKNOWN_MODEL называет модель прямым текстом,
+# `INVALID_REQUEST: max_tokens` — наш конфиг против предела ЭТОЙ модели
+# (#1062). Каждый из трёх различает «эта модель» от «этот аккаунт» сам.
 _dsh_failure_is_model_scoped() { # err_file
-  grep -qE 'HTTP_410:|HTTP_404:|UNKNOWN_MODEL|INVALID_REQUEST: max_tokens' "$1" 2>/dev/null
+  grep -qE 'HTTP_410:|UNKNOWN_MODEL|INVALID_REQUEST: max_tokens' "$1" 2>/dev/null
+}
+
+# 404 сюда НЕ входит (#1494): он не различает «такой модели нет» и «такого
+# маршрута нет». Замер 2026-09-23 (docs/research/28-provider-chain-truth-table.md):
+# GLM отдал `HTTP_404/EMPTY_RESPONSE` через цепочку и HTTP 200 прямым вызовом
+# `<base_url>/chat/completions` — тот же id, тот же секрет, тот же день (03:51
+# UTC против 13:03 UTC, раннеры разные). Вердикт `dead_model` отправлял следующего агента «узнать
+# точный id модели», то есть чинить то, что не сломано.
+#
+# Поведение не меняется — следующая модель ТОГО ЖЕ провайдера пробуется, это
+# дёшево и аккаунт не расходует. Меняется ЗАЯВЛЕНИЕ: причина не установлена, и
+# так и сказано. AGENTS.md, «Алерт не гадает».
+_dsh_failure_is_model_ambiguous() { # err_file
+  grep -qE 'HTTP_404:' "$1" 2>/dev/null
 }
 
 # Исход ОДНОГО провайдера — машиночитаемая запись для итоговой сводки
@@ -1794,7 +1855,7 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
   local count i=0 stop=0 entry name base_url secret_env key reset_hint cap_note
   local quota_state_json
   local candidates cand_count ci cand model max_tokens
-  local confirmed_any model_scoped_last provider_outcome provider_rl_used
+  local confirmed_any model_scoped_last model_ambiguous_last provider_outcome provider_rl_used
   count=$(jq 'length' <<<"$DSH_PROVIDER_CHAIN")
   DSH_CHAIN_PROVIDER=""
   DSH_CHAIN_MODEL=""
@@ -1866,6 +1927,7 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
     cand_count=$(jq 'length' <<<"$candidates")
     confirmed_any=0
     model_scoped_last=0
+    model_ambiguous_last=0
     provider_outcome=""
     # #1309 + #1121: потолок доли считается на ПРОВАЙДЕРА, а не на кандидата
     # модели — иначе запись с тремя моделями получила бы три потолка подряд
@@ -1884,6 +1946,7 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
       fi
       confirmed_any=1
       model_scoped_last=0
+      model_ambiguous_last=0
       DSH_CHAIN_MODELS_TRIED="${DSH_CHAIN_MODELS_TRIED:+$DSH_CHAIN_MODELS_TRIED, }$name/$model"
       rl_true_remaining=$((chain_rl_budget - chain_rl_used))
       [ "$rl_true_remaining" -lt 0 ] && rl_true_remaining=0
@@ -1922,6 +1985,12 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
           echo "::warning::цепочка провайдеров: $name — модель '$model' отвергнута самим провайдером (rc=$DSH_RUN_RC, отказ привязан к id модели, не к аккаунту): пробую следующую модель ЭТОГО же провайдера, аккаунт не расходуется (#1309)" >&2
           continue
         fi
+      elif _dsh_failure_is_model_ambiguous "$err_file"; then
+        model_ambiguous_last=1
+        if [ "$ci" -lt "$cand_count" ]; then
+          echo "::warning::цепочка провайдеров: $name — модель '$model' дала 404 (rc=$DSH_RUN_RC). Причина НЕ установлена: 404 не различает «такой модели нет» и «такого маршрута нет» (#1494). Пробую следующую модель ЭТОГО же провайдера — это дёшево и аккаунт не расходует, но выводом о мёртвом id это не является" >&2
+          continue
+        fi
       fi
       if dsh_chain_should_advance "$err_file" "$DSH_RUN_FAILURE_REASON" "$DSH_RUN_RC"; then
         echo "::warning::цепочка провайдеров: $name — rc=$DSH_RUN_RC, класс отказа: $DSH_CHAIN_CLASS_NOTE — пробую следующего" >&2
@@ -1938,6 +2007,14 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
         provider_outcome="unconfirmed_model"
       elif [ "$model_scoped_last" = 1 ]; then
         provider_outcome="dead_model"
+      elif [ "$model_ambiguous_last" = 1 ]; then
+        # Отдельный класс, а не «dead_model» и не «transient»: первый утверждал
+        # бы недоказанное («id мёртв»), второй — что повтор поможет. Поможет ли
+        # повтор, этим замером НЕ установлено (#1494): 404 у NVIDIA NIM уже
+        # наблюдался перемежающимся, то есть повторяемым, а у GLM тот же 404
+        # держался при живом 200 прямым вызовом. Поэтому повтор не объявляется
+        # ни полезным, ни бесполезным — называется неустановленным.
+        provider_outcome="model_unclear"
       else
         case "$DSH_RUN_FAILURE_REASON" in
           quota_exhausted) provider_outcome="quota" ;;
@@ -1973,8 +2050,8 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
 # лежат в DSH_CHAIN_OUTCOMES — сообщение обязано их назвать, а не предлагать
 # читателю догадаться.
 _dsh_chain_report_exhausted() { # count
-  local total=$1 quota=0 budget=0 config=0 transient=0 other=0
-  local names_quota="" names_budget="" names_config="" names_transient=""
+  local total=$1 quota=0 budget=0 config=0 transient=0 unclear=0 other=0
+  local names_quota="" names_budget="" names_config="" names_transient="" names_unclear=""
   local cls nm
   while IFS=$'\t' read -r nm cls _; do
     [ -n "$nm" ] || continue
@@ -1985,13 +2062,15 @@ _dsh_chain_report_exhausted() { # count
         budget=$((budget + 1)); names_budget="${names_budget:+$names_budget, }$nm" ;;
       no_secret|unconfirmed_model|dead_model)
         config=$((config + 1)); names_config="${names_config:+$names_config, }$nm ($cls)" ;;
+      model_unclear)
+        unclear=$((unclear + 1)); names_unclear="${names_unclear:+$names_unclear, }$nm" ;;
       transient)
         transient=$((transient + 1)); names_transient="${names_transient:+$names_transient, }$nm" ;;
       *)
         other=$((other + 1)) ;;
     esac
   done <<<"$DSH_CHAIN_OUTCOMES"
-  DSH_CHAIN_OUTCOME_SUMMARY="реально без квоты: $quota из $total; не пробованы по-настоящему (наш бюджет ожидания исчерпан): $budget; мёртвая конфигурация (нет секрета/неподтверждённый id/снятая моделью): $config; транзиентных отказов: $transient"
+  DSH_CHAIN_OUTCOME_SUMMARY="реально без квоты: $quota из $total; не пробованы по-настоящему (наш бюджет ожидания исчерпан): $budget; мёртвая конфигурация (нет секрета/неподтверждённый id/снятая моделью): $config; причина не установлена (404 — модель или маршрут, #1494): $unclear; транзиентных отказов: $transient"
   if [ "$((budget + transient))" -gt 0 ]; then
     DSH_CHAIN_RETRY_USEFUL=1
   else
@@ -2005,6 +2084,7 @@ _dsh_chain_report_exhausted() { # count
   local action=""
   [ "$budget" -gt 0 ] && action="${action:+$action; }освободить бюджет ожидания RATE_LIMIT (DSH_RATE_LIMIT_MAX_WAIT_SECS/DSH_RATE_LIMIT_PROVIDER_CAP_SECS) — у $budget провайдер(а/ов) ($names_budget) лимит не снялся в отведённой им доле бюджета: это НАШ тормоз, а не их квота"
   [ "$config" -gt 0 ] && action="${action:+$action; }починить конфигурацию: $names_config (docs/runbooks/switch-llm-provider.md, «Узнать точный id модели»)"
+  [ "$unclear" -gt 0 ] && action="${action:+$action; }установить причину у: $names_unclear — провайдер ответил 404, а 404 не различает «такой модели нет» и «такого маршрута нет» (#1494). Дешёвая проверка: scripts/measure/provider_latency.py зовёт ТУ ЖЕ запись цепочки (тот же base_url, id и секрет) прямым вызовом <base_url>/chat/completions — HTTP 200 там означает, что запись цепочки исправна и чинить надо путь вызова, а не id модели (живой случай: docs/research/28-provider-chain-truth-table.md)"
   [ "$transient" -gt 0 ] && action="${action:+$action; }повторить прогон — $transient транзиентный(х) отказ(ов) ($names_transient)"
   [ "$quota" -gt 0 ] && action="${action:+$action; }дождаться сброса квоты у: $names_quota${DSH_CHAIN_RESET_HINT:+ ($DSH_CHAIN_RESET_HINT)}"
   echo "::error::цепочка провайдеров не дала ответа, но НЕ «исчерпана целиком»: $DSH_CHAIN_OUTCOME_SUMMARY. Опробованы: $DSH_CHAIN_TRIED. Действие: ${action:-причину установить не удалось — ни один класс исхода не распознан, см. лог выше}" >&2

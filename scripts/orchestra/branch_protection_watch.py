@@ -223,7 +223,7 @@ def branch_protection_check(repo: str, event: dict) -> list[str]:
         return [f"✅ branch_protection_rule: {action} — состояние {WATCHED_BRANCH} соответствует EXPECTED_*"]
 
     text = build_alert_text(action, violations, repo, sender)
-    delivered = escalate(repo, WATCHDOG_ISSUE, text)
+    delivered = escalate(repo, WATCHDOG_ISSUE, text, category="breakage")
     fields = ", ".join(v["field"] for v in violations)
     return [f"🚨 branch_protection_rule: {action} — нарушено ({fields}) — сигнал в #{WATCHDOG_ISSUE} ({delivered})"]
 
