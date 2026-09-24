@@ -802,12 +802,38 @@ jobs:
       # в воркспейсе edge-harness → батч событий → архив. Неудача — красный
       # деплой: сломанный шов невидим владельцу иначе, чем по красному job'у.
       - name: Канарейка ingest-шва (#119)
+        id: canary_ingest
         if: success()
         env:
           DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
         run: |
           set -euo pipefail
           source "$GITHUB_WORKSPACE/scripts/lib/canary_http.sh"
+          # Вердикт отката (#1426). Канарейка обязана различать «деплой плохой»
+          # и «бэкенд лежит по причине, к деплою не относящейся»: у второго
+          # откат не просто бесполезен, он ВРЕДЕН — возвращает прод на версию
+          # без фикса ровно тогда, когда фикс нужнее всего. Живой случай —
+          # прогон 35989178639 (2026-09-24): исчерпана суточная квота rows_read,
+          # workspace.create отвечает 500 «Exceeded allowed rows read in Durable
+          # Objects free tier», автооткат снимает деплой, который НЁС фикс этого
+          # самого расхода. Кольцо разрывается здесь.
+          #
+          # trap на EXIT, а не запись после каждого шага: ниже с десяток мест с
+          # `exit 1`, и вердикт, написанный руками у каждого, разошёлся бы на
+          # первом же новом шаге (тот же класс «три копии одной проверки»).
+          export CANARY_LAST_CODE_FILE="$RUNNER_TEMP/dsh-edge-canary-last-code"
+          : >"$CANARY_LAST_CODE_FILE"
+          _emit_verdict() {
+            local rc=$?
+            local verdict
+            verdict=$(canary_rollback_verdict)
+            echo "verdict=$verdict" >>"$GITHUB_OUTPUT"
+            if [ "$rc" -ne 0 ] && [ "$verdict" = "backend-down" ]; then
+              echo "::warning::Канарейка красная, но бэкенд отвечает 5xx по посторонней причине (код выше) — автооткат ОТМЕНЁН: прежняя версия упрётся в то же самое, а фикс, если он в этом деплое, откат похоронит (#1426)"
+            fi
+            return $rc
+          }
+          trap _emit_verdict EXIT
           base="https://dsh-edge.mytab0r.workers.dev"
           jar="$RUNNER_TEMP/dsh-edge-canary.cookies"
           code=$(canary_probe "Логин канарейки #119" 303 -c "$jar" \
@@ -1114,7 +1140,14 @@ jobs:
       # сигнал остаётся видимым, а не маскируется вторичным).
       - name: Автооткат прода при красной канарейке/смоуке
         id: auto_rollback
-        if: failure() && steps.deploy.outcome == 'success'
+        # Третье условие (#1426): вердикт канарейки. `backend-down` означает
+        # «бэкенд лежит по посторонней причине» — прежняя версия упрётся в то
+        # же самое, а фикс, если он в этом деплое, откат похоронит. Пустой
+        # вердикт (канарейка не дошла до шага вовсе) сюда НЕ попадает:
+        # сравнение с 'backend-down' его не исключает, и откат остаётся
+        # поведением по умолчанию — «не знаю» лечится откатом, «знаю, что
+        # посторонняя» не лечится.
+        if: failure() && steps.deploy.outcome == 'success' && steps.canary_ingest.outputs.verdict != 'backend-down'
         continue-on-error: true
         # confirm()/prompt() апстрима — best-effort неинтерактивны на не-TTY
         # раннере (дефолты возвращаются без ожидания ввода, тот же паттерн,
