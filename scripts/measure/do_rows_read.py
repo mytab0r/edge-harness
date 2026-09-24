@@ -215,9 +215,27 @@ def daily_totals_from_rows(rows: list[dict], sum_has: set[str], dim_has: set[str
             entry["rows_read"] += r["sum"].get("rowsRead", 0) or 0
             if has_written:
                 entry["rows_written"] += r["sum"].get("rowsWritten", 0) or 0
+    # by_object (#1513): namespaceId отвечает «какой воркер», objectId — «какой
+    # именно объект внутри него». Замер 2026-09-24 показал, зачем это нужно:
+    # namespace dsh-edge прочитал 4 047 032 строки за 2,5 часа, а известная
+    # цена транскрипта (427 строк/событие, замер #678) объясняла только ~54 000
+    # на прогон — 92% расхода не было атрибутировано НИЧЕМУ, и следующая
+    # починка снова была бы гаданием. Одна сессия dsh-edge — один объект,
+    # поэтому эта разбивка отвечает прямо: расход размазан по многим сессиям
+    # или сидит в одной-двух.
+    by_object: dict[str, dict[str, int]] = {}
+    if "objectId" in dim_has:
+        for r in rows:
+            ns = r["dimensions"].get("namespaceId") or "?"
+            obj = r["dimensions"].get("objectId") or "?"
+            entry = by_object.setdefault(f"{ns}/{obj}", {"rows_read": 0, "rows_written": 0})
+            entry["rows_read"] += r["sum"].get("rowsRead", 0) or 0
+            if has_written:
+                entry["rows_written"] += r["sum"].get("rowsWritten", 0) or 0
     return {
         "rows_read": total_read,
         "rows_written": total_written,
+        "by_object": by_object,
         "peak_label": peak_label,
         "peak_rows_read": (peak["sum"].get("rowsRead", 0) or 0) if peak is not None else 0,
         "by_namespace": by_namespace,
@@ -266,6 +284,46 @@ def format_hourly_breakdown(days_summary: list[tuple[date, dict]]) -> str:
     if not printed:
         return ("почасовая раскладка: ни одного часа с ненулевым rows_read за снятые сутки "
                 "(это не «данных нет» — данные пришли, чтения в них нулевые)")
+    return "\n".join(lines)
+
+
+def format_object_breakdown(days_summary: list[tuple[date, dict]], top: int) -> str:
+    """Разбивка по конкретным объектам (#1513): `namespaceId/objectId`.
+
+    Печатается только по флагу `--objects`, и это не вкусовщина: добавление
+    `objectId` в измерения умножает число строк ответа на число живых
+    объектов, а у ответа есть потолок GRAPHQL_ROW_LIMIT. Молча делать такой
+    запрос всегда значило бы рисковать обрезкой там, где сегодня обрезки нет.
+
+    Печатается ТОП-N, а не всё: объектов могут быть тысячи. Ниже таблицы —
+    сколько объектов осталось за кадром и сколько строк на них приходится,
+    иначе «топ-10 дал 30%» нельзя отличить от «остальное — длинный хвост».
+    """
+    if not any(day_summary.get("by_object") for _, day_summary in days_summary):
+        return ("разбивка по objectId не снята: запусти с `--objects` "
+                "(или измерения objectId нет в этом датасете) — это «не спрашивали», "
+                "а не «расход ничему не принадлежит»")
+    lines = [
+        f"день | namespaceId/objectId | rows_read | % суток | rows_written",
+        "---|---|---|---|---",
+    ]
+    for day, day_summary in days_summary:
+        objects = day_summary.get("by_object") or {}
+        if not objects:
+            continue
+        day_read = day_summary["rows_read"]
+        ranked = sorted(objects.items(), key=lambda kv: (-kv[1]["rows_read"], kv[0]))
+        for key, val in ranked[:top]:
+            share = val["rows_read"] / day_read * 100 if day_read else 0.0
+            lines.append(f"{day.isoformat()} | {key} | {val['rows_read']:,} | "
+                         f"{share:.1f}% | {val['rows_written']:,}")
+        rest = ranked[top:]
+        if rest:
+            rest_read = sum(v["rows_read"] for _, v in rest)
+            rest_share = rest_read / day_read * 100 if day_read else 0.0
+            lines.append(f"{day.isoformat()} | …ещё {len(rest)} объект(ов) | "
+                         f"{rest_read:,} | {rest_share:.1f}% | "
+                         f"{sum(v['rows_written'] for _, v in rest):,}")
     return "\n".join(lines)
 
 
@@ -483,11 +541,25 @@ def today_rows_read(token: str, account_id: str) -> int:
     return summary["rows_read"]
 
 
-def run(token: str, account_id: str, days: int, *, hours: bool = False) -> str:
+def run(token: str, account_id: str, days: int, *, hours: bool = False,
+        objects: int = 0) -> str:
     info = discover_dataset(token)
     dataset = info["dataset"]
     sum_fields = sorted({"rowsRead", "rowsWritten"} & info["sum_field_names"])
-    dim_fields = sorted({"date", "datetimeHour", "namespaceId"} & info["dim_field_names"])
+    # objectId — только по явному запросу (#1513): измерение умножает число
+    # строк ответа на число живых объектов, а у ответа есть потолок
+    # GRAPHQL_ROW_LIMIT. Просить его всегда значило бы рисковать обрезкой
+    # там, где сегодня её нет.
+    wanted_dims = {"date", "datetimeHour", "namespaceId"}
+    if objects:
+        wanted_dims.add("objectId")
+    dim_fields = sorted(wanted_dims & info["dim_field_names"])
+    if objects and "objectId" not in info["dim_field_names"]:
+        # fail loud: «спросили, но схема не даёт» — это не то же самое, что
+        # «расход ничему не принадлежит», и лечится по-другому.
+        print("::warning::измерения objectId нет в живой схеме датасета "
+              f"{dataset!r} — разбивка по объектам не снята (возможности нет, "
+              "а не «объектов нет»)", file=sys.stderr)
     shape = choose_query_shape(info["filter_field_names"], info["dim_field_names"])
     query = build_data_query(dataset, shape, sum_fields, dim_fields)
 
@@ -516,6 +588,8 @@ def run(token: str, account_id: str, days: int, *, hours: bool = False) -> str:
         "",
         format_namespace_breakdown(per_day),
     ]
+    if objects:
+        lines += ["", format_object_breakdown(per_day, objects)]
     if hours:
         lines += ["", format_hourly_breakdown(per_day)]
     return "\n".join(lines)
@@ -533,6 +607,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hours", action="store_true",
                         help="добавить почасовую раскладку (#1411): суточный итог отвечает "
                              "«сколько», форма суток — «что это было»")
+    parser.add_argument("--objects", type=int, nargs="?", const=10, default=0,
+                        metavar="TOP",
+                        help="добавить разбивку по objectId (#1513): namespaceId отвечает "
+                             "«какой воркер», objectId — «какой именно объект». Печатает "
+                             "TOP объектов за день (по умолчанию 10) и хвост одной строкой")
     return parser
 
 
@@ -551,7 +630,7 @@ def main() -> int:
         return 1
 
     try:
-        report = run(token, account_id, args.days, hours=args.hours)
+        report = run(token, account_id, args.days, hours=args.hours, objects=args.objects)
     except RuntimeError as error:
         msg = str(error)
         low = msg.lower()
