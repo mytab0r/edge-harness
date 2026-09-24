@@ -84,6 +84,7 @@ def test_report_carries_code_and_body_but_not_the_secret_value():
     тело — «чем именно не устроило», и второе тут главное."""
     results = [{
         "name": "OpenRouter-1", "status": 400, "model": "nvidia/nemotron",
+        "max_tokens": 131072,
         "url": "https://openrouter.ai/api/v1/messages",
         "secret_env": "OPENROUTER_API_KEY", "secret_present": True,
         "body": '{"error":{"message":"Invalid Anthropic Messages API request"}}',
@@ -115,6 +116,69 @@ def test_chain_is_read_from_the_manifest_not_hardcoded(tmp_path):
     assert [e["name"] for e in chain] == ["A"], (
         "запись без обязательных полей обязана отбрасываться, а не ехать "
         "дальше полупустой")
+
+
+def test_models_plural_entry_is_probed_not_silently_dropped(tmp_path):
+    """Запись с `models` (фолбэк по моделям внутри провайдера) обязана попасть
+    в замер.
+
+    Живой случай: первый прогон зонда (run 35996106905) напечатал шесть строк
+    из восьми — NVIDIA-NIM-1/2 задают модели ключом `models`, и фильтр по
+    `model` выбросил их молча. Отчёт при этом выглядел полным: читатель не
+    отличил бы «не спрашивали» от «ответили»."""
+    manifest = tmp_path / "usage.json"
+    manifest.write_text(json.dumps({
+        "usage": {"ai-review": "main"},
+        "chains": {"main": [
+            {"name": "NIM", "base_url": "https://nim/v1", "secret_env": "K",
+             "models": ["a", "b"]},
+        ]},
+    }), encoding="utf-8")
+
+    chain = mod.load_chain("ai-review", manifest)
+
+    assert [e["name"] for e in chain] == ["NIM"]
+    assert mod.entry_models(chain[0]) == ["a", "b"], (
+        "обе модели записи обязаны быть опрошены — прод перебирает их так же")
+
+
+def test_entry_without_any_model_is_dropped_loudly(tmp_path, capsys):
+    """Выброс записи обязан быть слышен (AGENTS.md, fail loud): молча
+    пропущенная запись читается в отчёте как «эту не спрашивали» только тем,
+    кто помнит состав цепочки наизусть."""
+    manifest = tmp_path / "usage.json"
+    manifest.write_text(json.dumps({
+        "usage": {"ai-review": "main"},
+        "chains": {"main": [
+            {"name": "пустая", "base_url": "https://x/v1", "secret_env": "K",
+             "models": []},
+        ]},
+    }), encoding="utf-8")
+
+    assert mod.load_chain("ai-review", manifest) == []
+    assert "пустая" in capsys.readouterr().err
+
+
+def test_report_distinguishes_route_from_payload_by_max_tokens():
+    """Главный вопрос задачи: «маршрут не тот» или «тело запроса не то».
+
+    Различает их ровно одно — тот же URL и тот же ключ, разный `max_tokens`.
+    Поэтому запись обязана нести его в отчёте: строка «200» без потолка не
+    говорит, что именно проверено."""
+    results = [
+        {"name": "OpenRouter-1", "status": 200, "model": "m", "max_tokens": 16,
+         "url": "https://openrouter.ai/api/v1/messages", "secret_env": "K",
+         "secret_present": True, "body": "{}"},
+        {"name": "OpenRouter-1", "status": 400, "model": "m", "max_tokens": 131072,
+         "url": "https://openrouter.ai/api/v1/messages", "secret_env": "K",
+         "secret_present": True, "body": "Invalid Anthropic Messages API request"},
+    ]
+    report = mod.format_report(results)
+
+    assert "131072" in report and "16" in report
+    assert report.count("https://openrouter.ai/api/v1/messages") >= 2, (
+        "обе попытки — по одному и тому же URL; если бы отчёт печатал его "
+        "один раз, различие потолка перестало бы читаться как причина")
 
 
 def test_missing_manifest_gives_empty_chain_not_a_default(tmp_path):

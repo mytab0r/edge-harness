@@ -94,8 +94,39 @@ def load_chain(consumer: str = "ai-review",
     chain = manifest.get("chains", {}).get(chain_name) if chain_name else None
     if not isinstance(chain, list):
         return []
-    return [e for e in chain if isinstance(e, dict)
-            and {"name", "base_url", "model", "secret_env"} <= e.keys()]
+    usable, dropped = [], []
+    for entry in chain:
+        if not isinstance(entry, dict) or not {"name", "base_url", "secret_env"} <= entry.keys():
+            dropped.append(repr(entry)[:80])
+            continue
+        if not entry_models(entry):
+            dropped.append(f"{entry.get('name')}: ни model, ни непустой models")
+            continue
+        usable.append(entry)
+    if dropped:
+        # Молча выброшенная запись — silent-wrong (AGENTS.md): читатель отчёта
+        # решит, что она отвечает 200, тогда как её просто не спрашивали.
+        # Живой случай: первый прогон зонда (run 35996106905) напечатал шесть
+        # строк из восьми — NVIDIA-NIM-1/2 задают модели ключом `models`
+        # (фолбэк по моделям внутри провайдера), и фильтр по `model` их съел.
+        print("::warning::записи цепочки пропущены зондом: " + "; ".join(dropped),
+              file=sys.stderr)
+    return usable
+
+
+def entry_models(entry: dict) -> list[str]:
+    """Модели записи: `model` (одна) или `models` (фолбэк внутри провайдера).
+
+    Обе формы живые и обе лежат в одном манифесте — `dsh-ci.sh` читает их
+    вместе, и зонд обязан спрашивать ровно то же, иначе он меряет не ту
+    цепочку, которой ходит прод."""
+    single = entry.get("model")
+    if isinstance(single, str) and single:
+        return [single]
+    many = entry.get("models")
+    if isinstance(many, list):
+        return [m for m in many if isinstance(m, str) and m]
+    return []
 
 
 def redact(text: str, secrets: list[str]) -> str:
@@ -110,17 +141,24 @@ def redact(text: str, secrets: list[str]) -> str:
     return text
 
 
-def probe(entry: dict, timeout: float = 30.0) -> dict:
-    """Один провайдер: минимальный корректный Anthropic Messages запрос.
+def probe(entry: dict, model: str, max_tokens: int = 16,
+          timeout: float = 30.0) -> dict:
+    """Один провайдер, одна модель, один потолок вывода.
 
     Возвращает факт, а не вердикт: код и тело. Классификацию делает читатель —
     у скрипта нет данных, чтобы отличить «маршрута нет» от «ключ не тот» лучше,
-    чем это сделает сам текст провайдера."""
+    чем это сделает сам текст провайдера.
+
+    `max_tokens` вынесен в параметр, потому что он и есть подозреваемый: прод
+    шлёт `max_output_tokens` из манифеста (до 131072), зонд по умолчанию — 16.
+    Одна и та же запись, отвечающая 200 на 16 и отказом на манифестном
+    значении, называет причину точно, а двумя прогонами с разными телами её
+    не различить."""
     secret = os.environ.get(entry["secret_env"], "")
     url = f"{messages_api_root(entry['base_url'])}/messages"
     payload = {
-        "model": entry["model"],
-        "max_tokens": 16,
+        "model": model,
+        "max_tokens": max_tokens,
         "messages": [{"role": "user", "content": "ping"}],
     }
     request = urllib.request.Request(
@@ -131,8 +169,9 @@ def probe(entry: dict, timeout: float = 30.0) -> dict:
             "x-api-key": secret,
             "accept": "application/json",
         })
-    result = {"name": entry["name"], "url": url, "model": entry["model"],
-              "secret_env": entry["secret_env"], "secret_present": bool(secret)}
+    result = {"name": entry["name"], "url": url, "model": model,
+              "max_tokens": max_tokens, "secret_env": entry["secret_env"],
+              "secret_present": bool(secret)}
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             body = response.read().decode("utf-8", "replace")
@@ -151,17 +190,19 @@ def format_report(results: list[dict]) -> str:
     # Имя переменной секрета — в таблице, значение — нигде. Читателю отчёта
     # чинить конфигурацию, и «секрета нет» без имени переменной не говорит,
     # ЧТО именно положить (AGENTS.md: утверждение обязано нести адрес).
-    lines = ["запись | HTTP | секрет | переменная | URL",
-             "---|---|---|---|---"]
+    lines = ["запись | модель | max_tokens | HTTP | секрет | переменная | URL",
+             "---|---|---|---|---|---|---"]
     for r in results:
-        lines.append(f"{r['name']} | {r['status']} | "
+        lines.append(f"{r['name']} | `{r['model']}` | {r['max_tokens']} | "
+                     f"{r['status']} | "
                      f"{'есть' if r['secret_present'] else 'НЕТ'} | "
                      f"`{r['secret_env']}` | `{r['url']}`")
     lines.append("")
     lines.append("Ответы провайдеров дословно (обрезаны, секреты замаскированы):")
     for r in results:
         lines.append("")
-        lines.append(f"── {r['name']} (HTTP {r['status']}, модель `{r['model']}`)")
+        lines.append(f"── {r['name']} (HTTP {r['status']}, модель `{r['model']}`, "
+                     f"max_tokens={r['max_tokens']})")
         lines.append(r["body"] or "(пустое тело)")
     return "\n".join(lines)
 
@@ -176,13 +217,31 @@ def main() -> int:
     secrets = [os.environ.get(e["secret_env"], "") for e in chain]
     results = []
     for entry in chain:
-        r = probe(entry)
-        r["body"] = redact(r["body"], secrets)
-        results.append(r)
+        # Манифестный потолок — ровно то, что подставляет прод; 16 — заведомо
+        # безобидный минимум. Разница между двумя ответами и есть ответ на
+        # вопрос задачи: «маршрут не тот» или «тело запроса не то».
+        prod_cap = entry.get("max_output_tokens")
+        caps = [16] if not isinstance(prod_cap, int) else [16, prod_cap]
+        for model in entry_models(entry):
+            for cap in caps:
+                r = probe(entry, model, max_tokens=cap)
+                r["body"] = redact(r["body"], secrets)
+                results.append(r)
     print(format_report(results))
     answered = [r for r in results if r["status"] == 200]
     print("")
     print(f"Ответили 200 на Anthropic-маршруте: {len(answered)} из {len(results)}")
+    for r in results:
+        if r["max_tokens"] == 16 and r["status"] == 200:
+            prod = [o for o in results
+                    if o["name"] == r["name"] and o["model"] == r["model"]
+                    and o["max_tokens"] != 16]
+            for o in prod:
+                if o["status"] != 200:
+                    print(f"РАЗЛИЧИЕ: {r['name']}/{r['model']} — маршрут исправен "
+                          f"(200 при max_tokens=16), отказ {o['status']} приходит "
+                          f"на манифестном max_tokens={o['max_tokens']}: чинить "
+                          f"надо потолок в манифесте, а не base_url")
     if not answered:
         print("Ни одна запись цепочки не обслуживает форму, которой ходит dsh — "
               "это факт замера, а не вердикт о причине: текст каждого отказа выше.")
