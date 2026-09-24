@@ -135,3 +135,95 @@ describe("цена чтения журнала по задаче (#1411)", () =>
     expect(long).toBeLessThanOrEqual(Math.max(short, 5));
   });
 });
+
+// Гвардия цены ватчдога застрявших сообщений (#1503).
+//
+// Четвёртая дверь того же класса, и самая дорогая: запрос жил не на пути
+// запроса, а на ПЕРИОДИЧЕСКОМ тике, то есть платился сам по себе, без
+// единого обращения владельца.
+//
+// Живой инцидент 2026-09-23/24: DO вычитывал 1 837 397 строк за 85 минут при
+// 277 запросах воркера, суточный лимит rows_read (5 000 000) выжигался за
+// несколько часов. Морда отвечала «Exceeded allowed rows read in Durable
+// Objects free tier» — дословно из Workers Logs, — и кнопки владельца в
+// Telegram умирали вместе с ней: нажатие идёт тем же путём, через DO.
+//
+// Причина: `#reclaimStuckMessages` выбирал ВСЕ сообщения в processing
+// (`WHERE status='processing' AND processing_ts IS NOT NULL`, без LIMIT), а
+// порог застревания проверялся уже в JS. Свежие сообщения, которым до порога
+// ещё минуты, читались каждый тик наравне с застрявшими. Отказ шёл по кругу:
+// чем больше в очереди, тем дороже тик, тем вероятнее следующий отказ.
+//
+// Мерим ту же величину, что кончилась, тем же способом, что выше: rowsRead
+// настоящего SqlStorage, не план запроса и не время.
+
+const FRESH = 800;          // сообщений в processing, которым ещё далеко до порога
+const RECLAIM_BUDGET = 200; // потолок: батч 50 + накладные индекса, втрое с запасом
+
+describe("цена ватчдога застрявших сообщений (#1503)", () => {
+  it("свежие processing не читаются: порог в SQL, а не в JS", async () => {
+    const stub = env.HARNESS.get(env.HARNESS.idFromName("owner"));
+
+    const rowsRead = await runInDurableObject(stub, async (_instance, state) => {
+      const sql = state.storage.sql;
+      const now = Date.now();
+      for (let i = 0; i < FRESH; i++) {
+        // processing_ts = сейчас: до порога messageStuckProcessingMs (10 мин)
+        // этим сообщениям ещё далеко, разбирать их нечего.
+        sql.exec(
+          "INSERT INTO messages (source, source_msg_id, ts, text, status, attempts, processing_ts) " +
+            "VALUES ('test', ?, ?, 'x', 'processing', 0, ?)",
+          `stuck-guard-${now}-${i}`, now, now,
+        );
+      }
+      // Тот же SQL, что исполняет ватчдог.
+      const cursor = sql.exec(
+        `SELECT id, attempts, processing_ts FROM messages
+         WHERE status = 'processing' AND processing_ts IS NOT NULL AND processing_ts < ?
+         ORDER BY processing_ts ASC LIMIT ?`,
+        now - 10 * 60_000, 50,
+      );
+      const rows = cursor.toArray();
+      // Ни одно свежее сообщение не отобрано — это и есть суть фикса.
+      expect(rows.length).toBe(0);
+      return cursor.rowsRead;
+    });
+
+    expect(rowsRead).toBeLessThanOrEqual(RECLAIM_BUDGET);
+  });
+
+  it("цена не растёт вместе с очередью processing", async () => {
+    // Отличает «сейчас дёшево» от «дёшево навсегда»: инцидент случился не
+    // потому, что тик был дорог изначально, а потому, что он дорожал с каждым
+    // новым сообщением в очереди.
+    const stub = env.HARNESS.get(env.HARNESS.idFromName("owner"));
+
+    const measure = async (count: number): Promise<number> => {
+      return await runInDurableObject(stub, async (_instance, state) => {
+        const sql = state.storage.sql;
+        const now = Date.now();
+        const tag = `stuck-growth-${count}-${now}`;
+        for (let i = 0; i < count; i++) {
+          sql.exec(
+            "INSERT INTO messages (source, source_msg_id, ts, text, status, attempts, processing_ts) " +
+              "VALUES ('test', ?, ?, 'x', 'processing', 0, ?)",
+            `${tag}-${i}`, now, now,
+          );
+        }
+        const cursor = sql.exec(
+          `SELECT id, attempts, processing_ts FROM messages
+           WHERE status = 'processing' AND processing_ts IS NOT NULL AND processing_ts < ?
+           ORDER BY processing_ts ASC LIMIT ?`,
+          now - 10 * 60_000, 50,
+        );
+        cursor.toArray();
+        return cursor.rowsRead;
+      });
+    };
+
+    const small = await measure(200);
+    const large = await measure(2000);
+    // Десятикратный рост очереди не имеет права удорожать тик даже вдвое.
+    expect(large).toBeLessThanOrEqual(Math.max(small * 2, RECLAIM_BUDGET));
+  });
+});

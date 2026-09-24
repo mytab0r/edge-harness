@@ -158,6 +158,14 @@ const SCHEMA = [
   // фильтрует по (status, processed_ts) — без индекса это была бы полная
   // история инбокса на каждый тик, тот же класс, что подпалил квоту здесь.
   `CREATE INDEX IF NOT EXISTS messages_status_processed ON messages(status, processed_ts)`,
+  // Ватчдог застрявших сообщений (#1503) ищет `status='processing' AND
+  // processing_ts < порог`. Без ведущей пары (status, processing_ts) SQLite
+  // отбирает по одному status и проверяет порог уже построчно — то есть
+  // читает ВСЮ очередь processing каждый тик. Это не догадка: гвардия
+  // `цена ватчдога застрявших сообщений` в journal-rows-read.spec.ts
+  // покраснела ровно на этом — 801 прочитанная строка на 800 свежих
+  // сообщений, при батче 50.
+  `CREATE INDEX IF NOT EXISTS messages_status_processing ON messages(status, processing_ts)`,
   // Готовность хранилища (#575, вторая половина «зелёный health при мёртвой
   // морде»): одна строка (id=1) — исход ПОСЛЕДНЕГО живого SQL-раундтрипа,
   // сделанного пульсом (см. #checkStorageReady/#tickStorageReadyAlert), и
@@ -2673,8 +2681,26 @@ export class Harness extends DurableObject<Env> {
    *  сквозным тестом alarm ниже). */
   #reclaimStuckMessages(): number {
     const now = Date.now();
+    // Порог — В ЗАПРОСЕ, батч — тоже (#1503). Раньше выборка была безлимитной,
+    // а messageStuck() отсеивал уже в JS: каждый тик читал ВСЕ сообщения в
+    // processing, включая свежие, которым до порога ещё минуты. Живой замер
+    // 2026-09-24: 1 837 397 строк за 85 минут, лимит rows_read (5 млн/сутки)
+    // выжигался за несколько часов — морда падала с «Exceeded allowed rows
+    // read in Durable Objects free tier», кнопки владельца умирали. Отказ шёл
+    // по кругу: чем больше застряло, тем дороже тик.
+    //
+    // `now - messageStuckProcessingMs` — та же граница, что у messageStuck;
+    // одно место правды сохранено тем, что ниже КАЖДЫЙ отобранный ряд всё
+    // равно проходит через messageStuck(): SQL сужает выборку, решает по
+    // прежнему она. Разойтись они не могут — это проверяет тест.
     const candidates = this.#rows(
-      this.#sql.exec("SELECT id, attempts, processing_ts FROM messages WHERE status = 'processing' AND processing_ts IS NOT NULL"),
+      this.#sql.exec(
+        `SELECT id, attempts, processing_ts FROM messages
+         WHERE status = 'processing' AND processing_ts IS NOT NULL AND processing_ts < ?
+         ORDER BY processing_ts ASC LIMIT ?`,
+        now - LIMITS.messageStuckProcessingMs,
+        LIMITS.messageReclaimBatch,
+      ),
     );
     let reclaimed = 0;
     for (const row of candidates) {
