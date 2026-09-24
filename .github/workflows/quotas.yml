@@ -99,3 +99,21 @@ jobs:
           NVIDIA_NIM_1_API_KEY: ${{ secrets.NVIDIA_NIM_1_API_KEY }}
           NVIDIA_NIM_2_API_KEY: ${{ secrets.NVIDIA_NIM_2_API_KEY }}
         run: python scripts/measure/anthropic_route_probe.py
+
+      # Перехват отвергнутого запроса dsh (#1525). Зонд выше исчерпал перебор:
+      # OpenRouter отвечает МОДЕЛЬЮ на том же URL и с тем же ключом, на
+      # котором dsh получает `INVALID_REQUEST`. Ни потолок вывода, ни
+      # внепротокольные поля, ни форма целиком, ни объём до 2 МБ отказа не
+      # воспроизвели — дальше гадать нечего, надо смотреть на сам запрос.
+      #
+      # Рекордер встаёт МЕЖДУ dsh и провайдером и пишет обе стороны. Секреты
+      # цепочки есть только здесь, поэтому шаг живёт рядом с зондом, а не в
+      # своём workflow. `continue-on-error` по той же причине, что у соседей:
+      # диагностика не имеет права ронять замер квот.
+      - name: Перехват запроса dsh (#1525)
+        continue-on-error: true
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          OPENROUTER_1_API_KEY: ${{ secrets.OPENROUTER_1_API_KEY }}
+          OPENROUTER_2_API_KEY: ${{ secrets.OPENROUTER_2_API_KEY }}
+        run: python scripts/measure/dsh_request_capture.py --entry OpenRouter-1
