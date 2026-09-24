@@ -201,20 +201,10 @@ index 1adbb33..6443b33 100644
    }
  
    private isEventTableRebuildCheaper(legacy: number): boolean {
-@@ -1305,6 +1462,24 @@ export class DurableObjectSessionPersistence extends SessionPersistence {
+@@ -1305,6 +1462,27 @@ export class DurableObjectSessionPersistence extends SessionPersistence {
  
  type EventTable = 'dsh_session_events' | 'dsh_session_events_migrating'
  
-+/** HARNESS (#1376): one session this build refused to migrate, and why.
-+ *  `observedAt` (#1514) — когда вердикт вынесен ВПЕРВЫЕ: по нему он протухает
-+ *  и перепроверяется, и он же не даёт отметке обновляться на каждом пропуске. */
-+interface QuarantinedSession {
-+  readonly id: string
-+  readonly storedVersion: number
-+  readonly reason: string
-+  readonly observedAt?: number
-+}
-+
 +/** HARNESS (#1514): как часто вердикт по изолированной сессии перевыносится
 + *  заново. Час, а не «каждый старт»: старт случается десятки раз за прогон
 + *  (Durable Object выгружается через ~10 с простоя), и перевынос стоит полного
@@ -222,6 +212,19 @@ index 1adbb33..6443b33 100644
 + *  прямо: сборка с починенным мигратором подхватит сессию не мгновенно, а в
 + *  пределах часа. */
 +const QUARANTINE_RECHECK_MS = 60 * 60 * 1000
++
++/** HARNESS (#1376): one session this build refused to migrate, and why.
++ *  `observedAt` (#1514) — когда вердикт вынесен ВПЕРВЫЕ: по нему он протухает
++ *  и перепроверяется, и он же не даёт отметке обновляться на каждом пропуске.
++ *  Поле объявлено ПЕРВЫМ намеренно: патч 0008 цепляется контекстом за хвост
++ *  этого интерфейса (`readonly reason: string` + `}`), и дописывание в конец
++ *  ломало бы наложение соседнего патча серии. */
++interface QuarantinedSession {
++  readonly observedAt?: number
++  readonly id: string
++  readonly storedVersion: number
++  readonly reason: string
++}
 +
  function revisionOf(storeIdentity: string, row: HeaderRow): PersistenceRevision {
    return SessionPersistenceRevision(
