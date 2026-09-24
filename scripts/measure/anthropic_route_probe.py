@@ -216,18 +216,33 @@ def probe(entry: dict, model: str, max_tokens: int = 16,
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             body = response.read().decode("utf-8", "replace")
-            result.update(status=response.status, body=body[:BODY_PREVIEW])
+            result.update(status=response.status, body=body[:BODY_PREVIEW],
+                          body_is_answer=classify_answer(response.status, body))
     except urllib.error.HTTPError as error:
         body = error.read().decode("utf-8", "replace")
-        result.update(status=error.code, body=body[:BODY_PREVIEW])
+        result.update(status=error.code, body=body[:BODY_PREVIEW],
+                      body_is_answer=classify_answer(error.code, body))
     except OSError as error:
         # «Возможности нет» отделено от «возможность есть, но отказала»
         # (AGENTS.md, fail loud): сеть — не ответ провайдера.
-        result.update(status=0, body=f"сеть недоступна: {error}")
+        result.update(status=0, body=f"сеть недоступна: {error}",
+                      body_is_answer=False)
     return result
 
 
 def answered(result: dict) -> bool:
+    """См. `classify_answer`. Если вердикт уже снят с ПОЛНОГО тела при запросе
+    (`probe` кладёт его в `body_is_answer`), берём его: в отчёт тело попадает
+    обрезанным до `BODY_PREVIEW`, и разбирать обрезок как JSON — это тот же
+    silent-wrong, только наоборот. Живой случай (прогон 35998173221): запись
+    вернула настоящий `"type":"message"`, обрезок не распарсился, и зонд
+    напечатал «0 из 24 ответили» при живом ответе модели."""
+    if "body_is_answer" in result:
+        return bool(result["body_is_answer"])
+    return classify_answer(result.get("status"), result.get("body") or "")
+
+
+def classify_answer(status: int | None, body: str) -> bool:
     """Ответ провайдера — это `{"type":"message"}` в ТЕЛЕ, а не код 200.
 
     Не педантизм: живой случай (прогон 35996106905) — OpenRouter вернул
@@ -240,9 +255,8 @@ def answered(result: dict) -> bool:
 
     Стриминговый ответ (`accept: text/event-stream`) приходит кадрами SSE —
     там признак тот же, но внутри строк `data:`."""
-    if result.get("status") != 200:
+    if status != 200:
         return False
-    body = result.get("body") or ""
     for chunk in ([body] if not body.startswith("event:") and not body.startswith("data:")
                   else [line[5:].strip() for line in body.splitlines()
                         if line.startswith("data:")]):

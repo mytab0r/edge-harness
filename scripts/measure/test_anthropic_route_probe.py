@@ -285,3 +285,18 @@ def test_streaming_answer_is_read_from_sse_frames():
 
     err = 'event: error\ndata: {"type":"error","error":{"type":"overloaded_error"}}\n\n'
     assert mod.answered({"status": 200, "body": err}) is False
+
+
+def test_verdict_is_taken_from_the_full_body_not_from_the_printed_preview():
+    """Тело в отчёте обрезано — судить по обрезку нельзя.
+
+    Живой случай (прогон 35998173221): запись вернула настоящий Anthropic-ответ,
+    но превью оборвалось посреди JSON, разбор упал, и зонд напечатал «0 из 24
+    ответили» при живом ответе модели. Вердикт снимается с полного тела при
+    запросе и дальше не пересчитывается."""
+    truncated = '{"id":"gen-1","type":"message","role":"assistant","content":[{"type":"te'
+
+    assert mod.classify_answer(200, truncated) is False, (
+        "обрезок и правда не разбирается — это и есть ловушка")
+    assert mod.answered({"status": 200, "body": truncated,
+                         "body_is_answer": True}) is True
