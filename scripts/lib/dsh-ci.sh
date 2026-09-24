@@ -1325,6 +1325,9 @@ dsh_load_provider_chain_from_manifest() { # consumer_id
   # provider_latency.py (зовёт /chat/completions, где та же запись отвечает
   # 200) и seed_provider_registry.py — удаление унесло бы живые данные
   # заодно. Флаг ставится ТОЛЬКО по замеру, и в записи рядом стоит его номер.
+  # Имена берутся из самой цепочки, а не из списка рядом: переименуют
+  # запись в манифесте — сообщение доедет само, а вторая копия имён
+  # разошлась бы молча (AGENTS.md, «одно место правды»).
   local skipped
   skipped=$(jq -r '[.[] | select(.anthropic_route == false) | .name] | join(", ")' <<<"$chain")
   if [ -n "$skipped" ]; then
