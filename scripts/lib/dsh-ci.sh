@@ -1320,6 +1320,18 @@ dsh_load_provider_chain_from_manifest() { # consumer_id
     echo "::error::манифест $manifest: usage[\"$consumer\"] ссылается на несуществующую цепочку '$chain_name' в .chains" >&2
     return 1
   fi
+  # Записи, у которых Anthropic-маршрут ЗАМЕРЕН мёртвым (#1524), из цепочки
+  # выбрасываются здесь, а не удаляются из манифеста: манифест читают ещё и
+  # provider_latency.py (зовёт /chat/completions, где та же запись отвечает
+  # 200) и seed_provider_registry.py — удаление унесло бы живые данные
+  # заодно. Флаг ставится ТОЛЬКО по замеру, и в записи рядом стоит его номер.
+  local skipped
+  skipped=$(jq -r '[.[] | select(.anthropic_route == false) | .name] | join(", ")' <<<"$chain")
+  if [ -n "$skipped" ]; then
+    # Газ назван: снять флаг, когда перебор кандидатов найдёт живую базу.
+    echo "манифест использования провайдеров: пропущены записи без Anthropic-маршрута (#1524): $skipped — каждая тратила бы попытку прогона на заведомый 404. Вернуть: python scripts/measure/anthropic_route_probe.py --candidates <имя> нашёл живую базу — поставь её и сними anthropic_route: false"
+    chain=$(jq -c '[.[] | select(.anthropic_route != false)]' <<<"$chain")
+  fi
   count=$(jq 'length' <<<"$chain" 2>/dev/null) || count=0
   if [ -z "$count" ] || [ "$count" -lt 1 ]; then
     echo "::error::манифест $manifest: цепочка '$chain_name' (потребитель '$consumer') пуста" >&2
