@@ -126,6 +126,7 @@ class Recorder(BaseHTTPRequestHandler):
         record["response_body"] = text
         record["is_answer"] = probe.classify_answer(record["status"], text)
         record["error_type"] = probe.answer_error_type({"body": text})
+        record["attempt"] = len(self.captures) + 1
         self.captures.append(record)
 
         self.send_response(record["status"] or 502)
@@ -174,7 +175,8 @@ def run_dsh(prompt: str, port: int, model: str, timeout: int) -> tuple[int, str]
 
 
 def format_capture(record: dict, secrets: list[str]) -> str:
-    lines = [f"── запрос на {record['path']} → переслан на {record['forwarded_to']}"]
+    lines = [f"── попытка {record.get('attempt', 1)}: запрос на {record['path']} "
+             f"→ переслан на {record['forwarded_to']}"]
     for key, value in sorted(record["request_headers"].items()):
         lines.append(f"    {key}: {value}")
     lines.append("")
