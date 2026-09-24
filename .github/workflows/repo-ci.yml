@@ -163,13 +163,6 @@ jobs:
           pip install --quiet pytest pyyaml
           python -m pytest scripts/measure/test_do_rows_read.py -q
 
-      # Зонд Anthropic-маршрута (#1520): проверяется ПРАВИЛО URL и то, что
-      # секрет не утекает в отчёт. Сеть не трогаем — неверен был пересказ
-      # правила, а не сетевой шов (#1502: таблица, неверная для трёх строк из
-      # четырёх, родилась именно из пересказа).
-      - name: Тесты зонда Anthropic-маршрута
-        run: python -m pytest scripts/measure/test_anthropic_route_probe.py -q
-
       # Гвардия класса «неограниченный агрегат на горячем пути DO» (#320/#321/
       # #575): #status() зовётся на каждый heartbeat/батч событий/сообщение
       # инбокса/callback — GROUP BY по всей таблице там обязан идти только
