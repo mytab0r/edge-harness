@@ -32,6 +32,7 @@ _console_utf8_spec.loader.exec_module(importlib.util.module_from_spec(_console_u
 # --- конец console_utf8 bootstrap ---
 
 import json
+import re
 import os
 import sys
 import urllib.error
@@ -272,6 +273,52 @@ def classify_answer(status: int | None, body: str) -> bool:
     return False
 
 
+#: Типы ошибок, при которых отказ НИЧЕГО не говорит о нашем запросе: провайдер
+#: или его апстрим временно не в состоянии ответить. Списать такой отказ на
+#: поле или на объём — атрибуция по правдоподобию (AGENTS.md: аккаунтный
+#: ресурс атрибутируй измерением; алерт не гадает). Живой случай: прогон
+#: 35998369851 назвал причиной поле `system` и порог 162 КБ, тогда как тело в
+#: обоих случаях говорило `overloaded_error: Upstream error from Nvidia`.
+TRANSIENT_ERROR_TYPES = frozenset({
+    "overloaded_error", "api_error", "rate_limit_error", "timeout_error",
+})
+
+
+def answer_error_type(result: dict) -> str:
+    """Тип ошибки из тела (`error.type`), или пусто, если тело им не является.
+
+    Нужен именно тип, а не код: у этих провайдеров код 200 стоит и под
+    ответом, и под ошибкой, а различает их только тело."""
+    body = result.get("body") or ""
+    chunks = ([body] if not body.lstrip().startswith(("event:", "data:"))
+              else [line[5:].strip() for line in body.splitlines()
+                    if line.startswith("data:")])
+    for chunk in chunks:
+        try:
+            parsed = json.loads(chunk)
+        except ValueError:
+            match = re.search(r'"type"\s*:\s*"([a-z_]+_error)"', chunk)
+            if match:
+                return match.group(1)
+            continue
+        if isinstance(parsed, dict) and parsed.get("type") == "error":
+            error = parsed.get("error")
+            if isinstance(error, dict) and isinstance(error.get("type"), str):
+                return error["type"]
+            return "error"
+    return ""
+
+
+def blames_our_request(result: dict) -> bool:
+    """Можно ли вменить этот отказ НАШЕМУ запросу.
+
+    Нельзя, если провайдер назвал причиной себя (перегрузка, лимит, таймаут) —
+    тогда единственное честное утверждение «в этом прогоне ответа не было», а
+    не «отвергнуто из-за поля X». Различие не косметическое: по первому
+    читатель полезет править манифест, которого дефект не касается."""
+    return answer_error_type(result) not in TRANSIENT_ERROR_TYPES
+
+
 def format_report(results: list[dict]) -> str:
     # Имя переменной секрета — в таблице, значение — нигде. Читателю отчёта
     # чинить конфигурацию, и «секрета нет» без имени переменной не говорит,
@@ -347,6 +394,7 @@ def main() -> int:
               "нельзя (живой случай: прогон 35996106905, overloaded_error в 200)")
     for r in results:
         if (r.get("label", "") == "форма dsh целиком" and not answered(r)
+                and blames_our_request(r)
                 and all(answered(o) for o in results
                         if o["name"] == r["name"] and o["model"] == r["model"]
                         and o.get("label") != "форма dsh целиком")):
@@ -354,20 +402,24 @@ def main() -> int:
                   f"отдельности принято (200), а снятая с dsh форма целиком "
                   f"даёт {r['status']}: отвергает не одно поле, а их сочетание.")
     for r in results:
-        if r.get("label", "").startswith("объём ") and not answered(r):
+        if (r.get("label", "").startswith("объём ") and not answered(r)
+                and blames_our_request(r)):
             ok = [o for o in results if o["name"] == r["name"]
                   and o.get("label", "").startswith("объём ")
                   and answered(o)]
             last_ok = ok[-1]["label"] if ok else "ни одного"
             print(f"ПОРОГ ОБЪЁМА: {r['name']}/{r['model']} — принят {last_ok}, "
-                  f"отвергнут «{r['label']}» с кодом {r['status']}. Форма тела "
-                  f"та же, различается только размер.")
+                  f"отвергнут «{r['label']}» с отказом "
+                  f"`{answer_error_type(r) or r['status']}`. Форма тела та же, "
+                  f"различается только размер.")
     for r in results:
-        if r.get("label", "").startswith("+") and not answered(r):
+        if (r.get("label", "").startswith("+") and not answered(r)
+                and blames_our_request(r)):
             print(f"ПОЛЕ ОТВЕРГНУТО: {r['name']}/{r['model']} — та же запись "
-                  f"отвечает 200 на чистом протоколе, а с полем "
-                  f"`{r['label'][1:]}` даёт {r['status']}. Это поле шлёт dsh "
-                  f"сверх Anthropic Messages, и отказ приходит из-за него.")
+                  f"ответила моделью на чистом протоколе, а с полем "
+                  f"`{r['label'][1:]}` дала отказ "
+                  f"`{answer_error_type(r) or r['status']}`. Это поле шлёт dsh "
+                  f"сверх Anthropic Messages.")
     for r in results:
         if r["max_tokens"] == 16 and answered(r) and not r.get("label", "").startswith("+"):
             prod = [o for o in results
@@ -380,6 +432,14 @@ def main() -> int:
                           f"(200 при max_tokens=16), отказ {o['status']} приходит "
                           f"на манифестном max_tokens={o['max_tokens']}: чинить "
                           f"надо потолок в манифесте, а не base_url")
+    transient = [r for r in results if not answered(r)
+                 and not blames_our_request(r)]
+    if transient:
+        names = sorted({f"{r['name']}/{answer_error_type(r)}" for r in transient})
+        print(f"Отказов, которые провайдер объяснил собой (перегрузка/лимит), "
+              f"а не нашим запросом: {len(transient)} — {', '.join(names)}. "
+              "Вменять их полю или объёму нельзя: в этом прогоне ответа "
+              "просто не было.")
     if not ok:
         print("Ни одна запись цепочки не обслуживает форму, которой ходит dsh — "
               "это факт замера, а не вердикт о причине: текст каждого отказа выше.")

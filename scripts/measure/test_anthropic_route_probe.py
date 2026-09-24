@@ -300,3 +300,44 @@ def test_verdict_is_taken_from_the_full_body_not_from_the_printed_preview():
         "обрезок и правда не разбирается — это и есть ловушка")
     assert mod.answered({"status": 200, "body": truncated,
                          "body_is_answer": True}) is True
+
+
+#: Дословные тела отказов из прогонов — для проверки, кого зонд винит.
+BLAME_CASES = [
+    ('{"type":"error","error":{"type":"overloaded_error","message":"Upstream error'
+     ' from Nvidia: Service temporarily overloaded","error_type":"provider_overloaded"}}',
+     "overloaded_error", False,
+     "перегрузка апстрима — провайдер назвал причиной себя"),
+    ('{"type":"error","error":{"type":"invalid_request_error","message":"Invalid'
+     ' Anthropic Messages API request"}}', "invalid_request_error", True,
+     "отвергнут запрос — вот это про нас"),
+    ('{"type":"error","error":{"type":"authentication_error","message":"Unauthorized"}}',
+     "authentication_error", True, "мёртвый ключ — наша конфигурация"),
+]
+
+
+@pytest.mark.parametrize("body,expected_type,ours,why", BLAME_CASES,
+                         ids=[c[3] for c in BLAME_CASES])
+def test_transient_provider_failure_is_never_blamed_on_our_request(
+        body, expected_type, ours, why):
+    """Отказ, причиной которого провайдер назвал себя, нельзя вменять полю или
+    объёму нашего запроса.
+
+    Живой случай (прогон 35998369851): зонд напечатал «ПОЛЕ ОТВЕРГНУТО …
+    `system`» и «ПОРОГ ОБЪЁМА … 162 КБ», тогда как тело в обоих случаях
+    говорило `overloaded_error: Upstream error from Nvidia`. Читатель такого
+    алерта пошёл бы править манифест, которого дефект не касается — ровно та
+    атрибуция по правдоподобию, что описана в AGENTS.md."""
+    result = {"status": 200, "body": body, "body_is_answer": False}
+
+    assert mod.answer_error_type(result) == expected_type
+    assert mod.blames_our_request(result) is ours, why
+
+
+def test_blame_survives_a_truncated_error_body():
+    """Тело в отчёте обрезано; тип ошибки обязан читаться и из обрезка, иначе
+    перегрузку снова вменят нашему запросу — тот же дефект, только тише."""
+    truncated = '{"type":"error","error":{"type":"overloaded_error","message":"Upstr'
+
+    assert mod.answer_error_type({"body": truncated}) == "overloaded_error"
+    assert mod.blames_our_request({"body": truncated}) is False
