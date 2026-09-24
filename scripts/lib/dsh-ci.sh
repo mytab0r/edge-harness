@@ -1516,10 +1516,43 @@ dsh_require_provider_chain() { # [consumer_id]
 # читают уже замаскированную переменную, второй копии redact на каждую
 # точку вывода не нужно (то же место правды, что redact() выше в этом
 # файле).
+# Исход провайдера по классу отказа (#1500). Отдельной функцией, а не веткой
+# внутри цикла, по двум причинам. Первая — проверяемость: отображение «класс ->
+# исход» и есть то, что чинится этой задачей, и гвардия обязана исполнять
+# именно его; ветка внутри `dsh_run_with_provider_chain` исполняется только
+# полным прогоном цепочки, и тест, кормящий готовые исходы, покрасился бы
+# зелёным при любой правке отображения (живой случай: первая версия гвардии
+# #1500 пережила мутацию «вернуть transient» не заметив). Вторая — одно место
+# правды: класс устанавливает dsh_chain_should_advance, трактует его этот
+# список, и второго разбора stderr больше нет.
+#
+# Прежнее умолчание было `transient`, то есть УТВЕРЖДАЛО повторяемость для
+# любого текста, которого нет в списке признаков. «Класс не распознан» и
+# «повтор поможет» — разные утверждения; живой случай: три ключа Ollama
+# отвечали 401, а сводка прогон за прогоном советовала «повторить прогон».
+dsh_chain_outcome_for_class() { # class_id
+  case "$1" in
+    dead_credential) printf 'dead_credential\n' ;;
+    bad_request) printf 'bad_request\n' ;;
+    # Эти три названы транзиентными ЗАМЕРОМ, а не умолчанием: обрыв SSE
+    # наблюдался у разных провайдеров (#1084), таймаут — наш нож (#880),
+    # превышение потолка модели лечится другой записью цепочки (#1062).
+    stream_closed|our_timeout|max_tokens_over_model) printf 'transient\n' ;;
+    *) printf 'cause_unknown\n' ;;
+  esac
+}
+
 dsh_chain_should_advance() { # err_file failure_reason rc
   local err_file=$1 reason=$2 rc=$3
+  # Класс отказа объявляется здесь ОДИН раз и в двух видах: машиночитаемый
+  # DSH_CHAIN_CLASS_ID для решений и человекочитаемая DSH_CHAIN_CLASS_NOTE для
+  # лога. Раньше решение об исходе перегрепывало stderr второй раз — две копии
+  # одного разбора, и они уже расходились: «класс не распознан» в ноте против
+  # «transient» в исходе (#1500).
+  DSH_CHAIN_CLASS_ID=""
   case "$reason" in
     quota_exhausted|rate_limit_retry_budget_exceeded)
+      DSH_CHAIN_CLASS_ID="$reason"
       DSH_CHAIN_CLASS_NOTE="$reason"
       return 0 ;;
     prompt_too_long)
@@ -1530,6 +1563,7 @@ dsh_chain_should_advance() { # err_file failure_reason rc
       # не дошла до сети). Единственная в этой функции ветка «стоп»: она про
       # НАС, не про провайдера, — именно то различие, которого #1084 не
       # находил среди провайдерских классов.
+      DSH_CHAIN_CLASS_ID="prompt_too_long"
       DSH_CHAIN_CLASS_NOTE="промпт не помещается в аргумент командной строки — отказ наш, одинаковый у всех провайдеров (#1315)"
       return 1 ;;
   esac
@@ -1537,6 +1571,7 @@ dsh_chain_should_advance() { # err_file failure_reason rc
   # сработала (промпт собран иначе, предел ядра другой), живая прод-форма
   # отказа execve видна в stderr дословно — не считаем её транзиентом.
   if grep -qE 'Argument list too long' "$err_file"; then
+    DSH_CHAIN_CLASS_ID="prompt_too_long"
     DSH_CHAIN_CLASS_NOTE="execve отверг аргументы (Argument list too long) — отказ наш, одинаковый у всех провайдеров (#1315)"
     return 1
   fi
@@ -1549,10 +1584,12 @@ dsh_chain_should_advance() { # err_file failure_reason rc
   # заданного ей таймаута, иначе rc=124 идёт в общую недиагностируемую
   # ветку ниже (не гадаем, AGENTS.md «Алерт не гадает»).
   if [ "$rc" = "124" ] && [ "${DSH_RUN_LAST_ATTEMPT_ELAPSED_SECS:-0}" -ge "${DSH_RUN_LAST_ATTEMPT_TIMEOUT_SECS:-999999999}" ]; then
+    DSH_CHAIN_CLASS_ID="our_timeout"
     DSH_CHAIN_CLASS_NOTE="наш таймаут (${DSH_RUN_LAST_ATTEMPT_TIMEOUT_SECS}с истекли, попытка длилась ${DSH_RUN_LAST_ATTEMPT_ELAPSED_SECS}с) — НЕ отказ провайдера, убит по времени (#877/#880)"
     return 0
   fi
   if grep -qE 'HTTP_404:|EMPTY_RESPONSE:' "$err_file"; then
+    DSH_CHAIN_CLASS_ID="http_404"
     DSH_CHAIN_CLASS_NOTE="HTTP_404/EMPTY_RESPONSE в stderr"
     return 0
   fi
@@ -1565,6 +1602,7 @@ dsh_chain_should_advance() { # err_file failure_reason rc
   # следующего, не повторяем у того же — см. развёрнутый довод в комментарии
   # над функцией.
   if grep -qE 'STREAM_CLOSED:' "$err_file"; then
+    DSH_CHAIN_CLASS_ID="stream_closed"
     DSH_CHAIN_CLASS_NOTE="STREAM_CLOSED (SSE-поток оборвался без [DONE]) в stderr — transient-обрыв соединения, не привязан к конкретному провайдеру (#1084)"
     return 0
   fi
@@ -1576,10 +1614,12 @@ dsh_chain_should_advance() { # err_file failure_reason rc
   # Cloud, прогон 34730173870): «dsh: INVALID_REQUEST: max_tokens (131072)
   # exceeds model's maximum output tokens (65536) for model nemotron-3-ultra».
   if grep -qE "INVALID_REQUEST:.*max_tokens \([0-9]+\) exceeds model.s maximum output tokens \([0-9]+\)" "$err_file"; then
+    DSH_CHAIN_CLASS_ID="max_tokens_over_model"
     DSH_CHAIN_CLASS_NOTE="конфиг ЭТОГО провайдера неверен — max_output_tokens в config/provider-usage.json превышает реальный потолок модели ($(tr '\n' ' ' <"$err_file" | cut -c1-200 | redact)); возможность у следующего провайдера не исключена (свой лимит) — пробую дальше, но эту запись стоит поправить (#1062)"
     return 0
   fi
   if [ ! -s "$err_file" ] || ! grep -qE '[^[:space:]]' "$err_file"; then
+    DSH_CHAIN_CLASS_ID="empty_stderr"
     DSH_CHAIN_CLASS_NOTE="stderr пуст — диагностику дать не может, класс не установить, консервативно пробую следующего"
     return 0
   fi
@@ -1596,6 +1636,32 @@ dsh_chain_should_advance() { # err_file failure_reason rc
   # ветки с `return 1`: quota/rate_limit в начале функции решены иначе
   # намеренно (advance, не stop), а не потому что стоп-класс существует и
   # просто не сработал здесь.
+  # #1500: отказ по УЧЁТНЫМ ДАННЫМ. Прод-форма снята замером, не пересказана:
+  # зонд #1520 (прогон 35998654827) получил от всех трёх записей Ollama
+  # HTTP 401 с телом
+  # {"type":"error","error":{"type":"authentication_error","message":"Unauthorized"}}
+  # — одинаково на всех опробованных телах запроса и потолках вывода. Ключ
+  # либо принят, либо нет; повтор того же ключа даст тот же ответ. Переход к
+  # следующему провайдеру осмыслен (у него свой ключ), но «повторить прогон»
+  # — нет.
+  if grep -qE '(^|[^A-Za-z_])AUTH:' "$err_file"; then
+    DSH_CHAIN_CLASS_ID="dead_credential"
+    DSH_CHAIN_CLASS_NOTE="учётные данные отвергнуты провайдером ($(tr '\n' ' ' <"$err_file" | cut -c1-200 | redact)) — ключ мёртв, повтор с тем же ключом даст то же; лечится ротацией, не повтором (#1500)"
+    return 0
+  fi
+  # #1500: наш запрос не принят провайдером по ФОРМЕ. Прод-форма снята
+  # перехватом (#1525, прогон 36010507733): провайдер назвал поле дословно —
+  # {"path":["thinking","budget_tokens"],
+  #  "message":"Invalid input: expected number, received undefined"}.
+  # Отказ детерминирован: тот же запрос даст тот же ответ, и повтор его не
+  # меняет. Ветка идёт ПОСЛЕ частного случая max_tokens выше — тот про конфиг
+  # ОДНОЙ записи, этот про форму запроса, общую для всех.
+  if grep -qE '(^|[^A-Za-z_])INVALID_REQUEST:' "$err_file"; then
+    DSH_CHAIN_CLASS_ID="bad_request"
+    DSH_CHAIN_CLASS_NOTE="провайдер отверг форму нашего запроса ($(tr '\n' ' ' <"$err_file" | cut -c1-200 | redact)) — отказ детерминирован, повтор того же запроса даст то же (#1500)"
+    return 0
+  fi
+  DSH_CHAIN_CLASS_ID="unrecognised"
   DSH_CHAIN_CLASS_NOTE="класс не распознан ($(tr '\n' ' ' <"$err_file" | cut -c1-200 | redact)) — консервативно пробую следующего (#1084)"
   return 0
 }
@@ -2067,7 +2133,7 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
         case "$DSH_RUN_FAILURE_REASON" in
           quota_exhausted) provider_outcome="quota" ;;
           rate_limit_retry_budget_exceeded) provider_outcome="our_budget" ;;
-          *) provider_outcome="transient" ;;
+          *) provider_outcome=$(dsh_chain_outcome_for_class "${DSH_CHAIN_CLASS_ID:-}") ;;
         esac
       fi
     fi
@@ -2099,7 +2165,9 @@ dsh_run_with_provider_chain() { # answer_file err_file prompt_text [initial_rl_u
 # читателю догадаться.
 _dsh_chain_report_exhausted() { # count
   local total=$1 quota=0 budget=0 config=0 transient=0 unclear=0 other=0
+  local creds=0 badreq=0 unknown=0
   local names_quota="" names_budget="" names_config="" names_transient="" names_unclear=""
+  local names_creds="" names_badreq="" names_unknown=""
   local cls nm
   while IFS=$'\t' read -r nm cls _; do
     [ -n "$nm" ] || continue
@@ -2112,13 +2180,19 @@ _dsh_chain_report_exhausted() { # count
         config=$((config + 1)); names_config="${names_config:+$names_config, }$nm ($cls)" ;;
       model_unclear)
         unclear=$((unclear + 1)); names_unclear="${names_unclear:+$names_unclear, }$nm" ;;
+      dead_credential)
+        creds=$((creds + 1)); names_creds="${names_creds:+$names_creds, }$nm" ;;
+      bad_request)
+        badreq=$((badreq + 1)); names_badreq="${names_badreq:+$names_badreq, }$nm" ;;
+      cause_unknown)
+        unknown=$((unknown + 1)); names_unknown="${names_unknown:+$names_unknown, }$nm" ;;
       transient)
         transient=$((transient + 1)); names_transient="${names_transient:+$names_transient, }$nm" ;;
       *)
         other=$((other + 1)) ;;
     esac
   done <<<"$DSH_CHAIN_OUTCOMES"
-  DSH_CHAIN_OUTCOME_SUMMARY="реально без квоты: $quota из $total; не пробованы по-настоящему (наш бюджет ожидания исчерпан): $budget; мёртвая конфигурация (нет секрета/неподтверждённый id/снятая моделью): $config; причина не установлена (404 — модель или маршрут, #1494): $unclear; транзиентных отказов: $transient"
+  DSH_CHAIN_OUTCOME_SUMMARY="реально без квоты: $quota из $total; не пробованы по-настоящему (наш бюджет ожидания исчерпан): $budget; мёртвая конфигурация (нет секрета/неподтверждённый id/снятая моделью): $config; ключ отвергнут провайдером: $creds; форма запроса отвергнута: $badreq; причина не установлена (404 — модель или маршрут, #1494): $unclear; причина не установлена (класс отказа не распознан, #1500): $unknown; транзиентных отказов: $transient"
   if [ "$((budget + transient))" -gt 0 ]; then
     DSH_CHAIN_RETRY_USEFUL=1
   else
@@ -2133,6 +2207,9 @@ _dsh_chain_report_exhausted() { # count
   [ "$budget" -gt 0 ] && action="${action:+$action; }освободить бюджет ожидания RATE_LIMIT (DSH_RATE_LIMIT_MAX_WAIT_SECS/DSH_RATE_LIMIT_PROVIDER_CAP_SECS) — у $budget провайдер(а/ов) ($names_budget) лимит не снялся в отведённой им доле бюджета: это НАШ тормоз, а не их квота"
   [ "$config" -gt 0 ] && action="${action:+$action; }починить конфигурацию: $names_config (docs/runbooks/switch-llm-provider.md, «Узнать точный id модели»)"
   [ "$unclear" -gt 0 ] && action="${action:+$action; }установить причину у: $names_unclear — провайдер ответил 404, а 404 не различает «такой модели нет» и «такого маршрута нет» (#1494). Дешёвая проверка: scripts/measure/provider_latency.py зовёт ТУ ЖЕ запись цепочки (тот же base_url, id и секрет) прямым вызовом <base_url>/chat/completions — HTTP 200 там означает, что запись цепочки исправна и чинить надо путь вызова, а не id модели (живой случай: docs/research/28-provider-chain-truth-table.md)"
+  [ "$creds" -gt 0 ] && action="${action:+$action; }ротировать ключи: $names_creds — провайдер отверг учётные данные (AUTH), повтор с тем же ключом даст тот же отказ; кодом не лечится (#1500)"
+  [ "$badreq" -gt 0 ] && action="${action:+$action; }починить форму запроса: $names_badreq — провайдер отверг НАШ запрос (INVALID_REQUEST), отказ детерминирован, повтор его не меняет; текст провайдера в логе выше называет поле (#1500)"
+  [ "$unknown" -gt 0 ] && action="${action:+$action; }установить причину у: $names_unknown — класс отказа не распознан ни одним признаком. Повтор НЕ объявляется ни полезным, ни бесполезным: это честный пробел, а не транзиент (#1500). Дословный stderr — в логе выше; перехват запроса и ответа — python scripts/measure/dsh_request_capture.py --entry <имя> (#1525)"
   [ "$transient" -gt 0 ] && action="${action:+$action; }повторить прогон — $transient транзиентный(х) отказ(ов) ($names_transient)"
   [ "$quota" -gt 0 ] && action="${action:+$action; }дождаться сброса квоты у: $names_quota${DSH_CHAIN_RESET_HINT:+ ($DSH_CHAIN_RESET_HINT)}"
   echo "::error::цепочка провайдеров не дала ответа, но НЕ «исчерпана целиком»: $DSH_CHAIN_OUTCOME_SUMMARY. Опробованы: $DSH_CHAIN_TRIED. Действие: ${action:-причину установить не удалось — ни один класс исхода не распознан, см. лог выше}" >&2
