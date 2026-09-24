@@ -79,12 +79,30 @@ def status_counts() -> None:
         print("HANDS_TOKEN не задан — счётчики таблиц не прочитаны; это «возможности нет», "
               "а не «таблицы пусты»")
         return
+    # User-Agent обязателен (#1508). Дефолтный `Python-urllib/3.x` Cloudflare
+    # режет на краю: зонд получал 403 ДО воркера и печатал «не прочитано» —
+    # то есть отсутствие числа выглядело как свойство морды, хотя было
+    # свойством нашего заголовка. Проверено живым вызовом 2026-09-24: тот же
+    # URL с браузерным UA отвечает 401 JSON («нужна авторизация»), то есть
+    # доходит до воркера. Это не обход защиты, а честное представление
+    # собственного клиента.
     req = urllib.request.Request(
         "https://edge-harness.mytab0r.workers.dev/api/status",
-        headers={"Authorization": f"Bearer {token}"})
+        headers={
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "edge-harness-worker-error-probe (scripts/measure/worker_error_probe.py)",
+        })
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             body = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as error:
+        # Код возврата — часть факта: 401 значит «токен не тот», 403 —
+        # «до воркера не дошло», 500 — «воркер упал». Три разные починки,
+        # и печатать их одним «не прочитан» — то самое гадание, которое
+        # AGENTS.md запрещает алертам.
+        print(f"::warning::/api/status не прочитан: HTTP {error.code} — "
+              f"счётчики таблиц не получены; это «возможности нет», а не «таблицы пусты»")
+        return
     except (OSError, ValueError) as error:
         print(f"::warning::/api/status не прочитан: {error}")
         return
