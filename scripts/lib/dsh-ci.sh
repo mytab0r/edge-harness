@@ -1329,7 +1329,7 @@ dsh_load_provider_chain_from_manifest() { # consumer_id
   skipped=$(jq -r '[.[] | select(.anthropic_route == false) | .name] | join(", ")' <<<"$chain")
   if [ -n "$skipped" ]; then
     # Газ назван: снять флаг, когда перебор кандидатов найдёт живую базу.
-    echo "манифест использования провайдеров: пропущены записи без Anthropic-маршрута (#1524): $skipped — каждая тратила бы попытку прогона на заведомый 404. Вернуть: python scripts/measure/anthropic_route_probe.py --candidates <имя> нашёл живую базу — поставь её и сними anthropic_route: false"
+    echo "манифест использования провайдеров: пропущены записи без Anthropic-маршрута (#1524): $skipped — каждая тратила бы попытку прогона на заведомый 404. Вернуть в строй: запусти python scripts/measure/anthropic_route_probe.py --candidates <имя>; если перебор найдёт живую базу — поставь её в config/provider-usage.json и сними там anthropic_route: false"
     chain=$(jq -c '[.[] | select(.anthropic_route != false)]' <<<"$chain")
   fi
   count=$(jq 'length' <<<"$chain" 2>/dev/null) || count=0
