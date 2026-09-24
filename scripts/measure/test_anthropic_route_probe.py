@@ -244,3 +244,44 @@ def test_extra_fields_are_the_ones_dsh_actually_sends():
     и меняется тем же коммитом, что поднимает пин плагина."""
     assert set(mod.DSH_EXTRA_FIELDS) == {
         "thinking", "dsh_plugin_packages", "dsh_session_log", "stream", "system"}
+
+
+#: Тела, СКОПИРОВАННЫЕ из прогонов зонда, а не сочинённые по форме протокола.
+#: Прогон 35996106905 — `overloaded_error` под кодом 200; он и есть причина,
+#: по которой `answered()` вообще существует.
+LIVE_BODIES = [
+    (200, '{"type":"error","error":{"type":"overloaded_error","message":"Upstream error'
+          ' from Nvidia: Service temporarily overloaded","error_type":"provider_overloaded"},'
+          '"request_id":"gen-1790251307-Oi92177EXMMWyFD3uqcu"}', False,
+     "200 с телом-ошибкой (прогон 35996106905) — не ответ"),
+    (200, '{"id":"gen-1790251091-wsEV4eq2c6yG9vVr2udc","type":"message","role":"assistant",'
+          '"content":[{"type":"text","text":"Pong"}],"model":"nvidia/nemotron"}', True,
+     "настоящий Anthropic-ответ"),
+    (401, '{"type":"error","error":{"type":"authentication_error","message":"Unauthorized"},'
+          '"request_id":"req_c38351f1159607606d42d01d"}', False, "мёртвый ключ Ollama"),
+    (404, '{"timestamp":"2026-09-24T12:01:47.075+00:00","status":404,"error":"Not Found",'
+          '"path":"/v4/v1/messages"}', False, "удвоение пути у GLM"),
+    (404, "404 page not found\n", False, "у NVIDIA-NIM нет Anthropic-маршрута"),
+]
+
+
+@pytest.mark.parametrize("status,body,expected,why", LIVE_BODIES,
+                         ids=[c[3] for c in LIVE_BODIES])
+def test_answer_is_judged_by_body_not_by_status(status, body, expected, why):
+    """Код 200 не доказательство (AGENTS.md прямо называет его таковым не
+    являющимся). Живой случай: OpenRouter отдал 200 и ошибку в теле — зонд,
+    считающий по коду, назвал бы запись рабочей, и следующий читатель искал бы
+    поломку везде, кроме места, где она есть."""
+    assert mod.answered({"status": status, "body": body}) is expected, why
+
+
+def test_streaming_answer_is_read_from_sse_frames():
+    """Прод ходит со `stream: true`, и там признак ответа лежит в кадрах
+    `data:`. Читать такое тело как один JSON — значит не распознать ни успех,
+    ни ошибку и молча записать провайдера в неотвечающие."""
+    sse = ('event: message_start\n'
+           'data: {"type":"message_start","message":{"id":"x"}}\n\n')
+    assert mod.answered({"status": 200, "body": sse}) is True
+
+    err = 'event: error\ndata: {"type":"error","error":{"type":"overloaded_error"}}\n\n'
+    assert mod.answered({"status": 200, "body": err}) is False

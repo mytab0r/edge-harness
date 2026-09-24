@@ -227,6 +227,37 @@ def probe(entry: dict, model: str, max_tokens: int = 16,
     return result
 
 
+def answered(result: dict) -> bool:
+    """Ответ провайдера — это `{"type":"message"}` в ТЕЛЕ, а не код 200.
+
+    Не педантизм: живой случай (прогон 35996106905) — OpenRouter вернул
+    HTTP 200 с телом
+    `{"type":"error","error":{"type":"overloaded_error","message":"Upstream
+    error from Nvidia: Service temporarily overloaded"}}`. Зонд, считающий
+    ответом код, назвал бы такую запись рабочей — и следующий читатель искал
+    бы поломку где угодно, кроме места, где она есть (AGENTS.md: «проверяй
+    видимый результат, а не шаг»; «HTTP 200» прямо назван не доказательством).
+
+    Стриминговый ответ (`accept: text/event-stream`) приходит кадрами SSE —
+    там признак тот же, но внутри строк `data:`."""
+    if result.get("status") != 200:
+        return False
+    body = result.get("body") or ""
+    for chunk in ([body] if not body.startswith("event:") and not body.startswith("data:")
+                  else [line[5:].strip() for line in body.splitlines()
+                        if line.startswith("data:")]):
+        try:
+            parsed = json.loads(chunk)
+        except ValueError:
+            continue
+        if isinstance(parsed, dict):
+            if parsed.get("type") == "error":
+                return False
+            if parsed.get("type") in ("message", "message_start"):
+                return True
+    return False
+
+
 def format_report(results: list[dict]) -> str:
     # Имя переменной секрета — в таблице, значение — нигде. Читателю отчёта
     # чинить конфигурацию, и «секрета нет» без имени переменной не говорит,
@@ -235,7 +266,7 @@ def format_report(results: list[dict]) -> str:
              "---|---|---|---|---|---|---"]
     for r in results:
         lines.append(f"{r['name']} | {r.get('label', 'протокол')} | {r['max_tokens']} | "
-                     f"{r['status']} | "
+                     f"{r['status']}{'' if answered(r) else ' (тело НЕ ответ)'} | "
                      f"{'есть' if r['secret_present'] else 'НЕТ'} | "
                      f"`{r['secret_env']}` | `{r['url']}`")
     lines.append("")
@@ -271,7 +302,7 @@ def main() -> int:
             # Поля сверх протокола — по ОДНОМУ. Скопом «отвергли» не называет,
             # что именно отвергли, а чинить надо конкретное поле; разбор по
             # одному даёт адрес (AGENTS.md: алерт не гадает).
-            if results[-1]["status"] != 200:
+            if not answered(results[-1]):
                 continue
             for field, value in DSH_EXTRA_FIELDS.items():
                 r = probe(entry, model, max_tokens=caps[-1],
@@ -287,50 +318,55 @@ def main() -> int:
                           extra=padded_body(size), label=f"объём {size // 1024} КБ")
                 r["body"] = redact(r["body"], secrets)
                 results.append(r)
-                if r["status"] != 200:
+                if not answered(r):
                     # Дальше по развёртке смысла нет: порог найден, а каждый
                     # следующий вызов — реальный расход чужой квоты.
                     break
     print(format_report(results))
-    answered = [r for r in results if r["status"] == 200]
+    ok = [r for r in results if answered(r)]
+    code_200 = [r for r in results if r["status"] == 200]
     print("")
-    print(f"Ответили 200 на Anthropic-маршруте: {len(answered)} из {len(results)}")
+    print(f"Ответили моделью на Anthropic-маршруте: {len(ok)} из {len(results)}")
+    if len(code_200) != len(ok):
+        print(f"Из них отдали код 200 с телом-ошибкой: {len(code_200) - len(ok)} — "
+              "код 200 у этих провайдеров не означает ответа, и считать по нему "
+              "нельзя (живой случай: прогон 35996106905, overloaded_error в 200)")
     for r in results:
-        if (r.get("label", "") == "форма dsh целиком" and r["status"] != 200
-                and all(o["status"] == 200 for o in results
+        if (r.get("label", "") == "форма dsh целиком" and not answered(r)
+                and all(answered(o) for o in results
                         if o["name"] == r["name"] and o["model"] == r["model"]
                         and o.get("label") != "форма dsh целиком")):
             print(f"СОЧЕТАНИЕ: {r['name']}/{r['model']} — каждое поле по "
                   f"отдельности принято (200), а снятая с dsh форма целиком "
                   f"даёт {r['status']}: отвергает не одно поле, а их сочетание.")
     for r in results:
-        if r.get("label", "").startswith("объём ") and r["status"] != 200:
+        if r.get("label", "").startswith("объём ") and not answered(r):
             ok = [o for o in results if o["name"] == r["name"]
                   and o.get("label", "").startswith("объём ")
-                  and o["status"] == 200]
+                  and answered(o)]
             last_ok = ok[-1]["label"] if ok else "ни одного"
             print(f"ПОРОГ ОБЪЁМА: {r['name']}/{r['model']} — принят {last_ok}, "
                   f"отвергнут «{r['label']}» с кодом {r['status']}. Форма тела "
                   f"та же, различается только размер.")
     for r in results:
-        if r.get("label", "").startswith("+") and r["status"] != 200:
+        if r.get("label", "").startswith("+") and not answered(r):
             print(f"ПОЛЕ ОТВЕРГНУТО: {r['name']}/{r['model']} — та же запись "
                   f"отвечает 200 на чистом протоколе, а с полем "
                   f"`{r['label'][1:]}` даёт {r['status']}. Это поле шлёт dsh "
                   f"сверх Anthropic Messages, и отказ приходит из-за него.")
     for r in results:
-        if r["max_tokens"] == 16 and r["status"] == 200 and not r.get("label", "").startswith("+"):
+        if r["max_tokens"] == 16 and answered(r) and not r.get("label", "").startswith("+"):
             prod = [o for o in results
                     if o["name"] == r["name"] and o["model"] == r["model"]
                     and o["max_tokens"] != 16
                     and not o.get("label", "").startswith("+")]
             for o in prod:
-                if o["status"] != 200:
+                if not answered(o):
                     print(f"РАЗЛИЧИЕ: {r['name']}/{r['model']} — маршрут исправен "
                           f"(200 при max_tokens=16), отказ {o['status']} приходит "
                           f"на манифестном max_tokens={o['max_tokens']}: чинить "
                           f"надо потолок в манифесте, а не base_url")
-    if not answered:
+    if not ok:
         print("Ни одна запись цепочки не обслуживает форму, которой ходит dsh — "
               "это факт замера, а не вердикт о причине: текст каждого отказа выше.")
     return 0
