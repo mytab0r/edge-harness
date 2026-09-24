@@ -341,3 +341,47 @@ def test_blame_survives_a_truncated_error_body():
 
     assert mod.answer_error_type({"body": truncated}) == "overloaded_error"
     assert mod.blames_our_request({"body": truncated}) is False
+
+
+#: Живые базы из манифеста и то, что обязано оказаться среди кандидатов.
+#: Не выдумано: именно эти две записи отвечают 404 по Anthropic-маршруту
+#: (замер #1520), и именно для них перебор написан.
+CANDIDATE_CASES = [
+    ("https://api.z.ai/api/coding/paas/v4", "https://api.z.ai/api/anthropic"),
+    ("https://integrate.api.nvidia.com/v1", "https://integrate.api.nvidia.com/anthropic"),
+]
+
+
+@pytest.mark.parametrize("base,expected", CANDIDATE_CASES, ids=[c[0] for c in CANDIDATE_CASES])
+def test_candidates_are_derived_mechanically_from_the_live_base(base, expected):
+    """Кандидаты порождаются из текущей базы, а не берутся из головы.
+
+    Угаданный адрес — это догадка, выданная за факт; механический перебор с
+    проверкой «кто ответил МОДЕЛЬЮ» — замер. Проверяется, что форма, которой
+    чужие шлюзы обычно отделяют Anthropic-протокол, в наборе есть."""
+    assert expected in mod.base_candidates(base)
+
+
+def test_candidates_shorten_the_path_and_do_not_repeat_themselves():
+    """Путь укорачивается посегментно, и каждый кандидат встречается один раз.
+
+    Повтор — это лишний реальный вызов чужого API на каждом прогоне; их и так
+    тратится по одному на кандидата."""
+    candidates = mod.base_candidates("https://api.z.ai/api/coding/paas/v4")
+
+    assert len(candidates) == len(set(candidates)), "кандидат задвоился"
+    assert candidates[0] == "https://api.z.ai/api/coding/paas/v4", (
+        "первой обязана идти текущая база — если отвечает она, перебор "
+        "вообще не нужен, и это надо увидеть сразу")
+    assert "https://api.z.ai" in candidates
+
+
+def test_no_bare_v1_candidate_is_generated():
+    """Отдельный кандидат `…/v1` не порождается: правило плагина само допишет
+    `/v1` там, где его нет, и пара «база» + «база/v1» стала бы одним и тем же
+    запросом дважды."""
+    candidates = mod.base_candidates("https://api.z.ai/api/coding/paas")
+
+    roots = [mod.messages_api_root(c) for c in candidates]
+    assert len(roots) == len(set(roots)), (
+        f"два кандидата дают один и тот же маршрут: {roots}")
