@@ -43,7 +43,18 @@ DSH_CI = REPO / "scripts" / "lib" / "dsh-ci.sh"
 EFFORTS_THAT_ENABLE_THINKING = ("low", "high", "max")
 
 
-def build_profile(tmp_path: Path) -> dict:
+#: Оба писателя профиля. `dsh_patch_profile` ветвится по активности suite, и
+#: каждая ветка пишет свой YAML: первая правка #1533 легла только в плоскую, а
+#: вызовы через combo-router остались бы невалидными. Значит проверять надо обе
+#: — не «функцию», а каждый путь, по которому профиль реально рождается.
+PROFILE_BRANCHES = {
+    "плоский (цепочка провайдеров)": {"DSH_PLUGINS_SUITE_ACTIVE": "0"},
+    "combo-router (suite активен)": {"DSH_PLUGINS_SUITE_ACTIVE": "1",
+                                     "DSH_CHAIN_ACTIVE": "0"},
+}
+
+
+def build_profile(tmp_path: Path, branch_env: dict | None = None) -> dict:
     """Собрать профиль НАСТОЯЩИМ `dsh_patch_profile` и прочитать его как YAML.
 
     Через настоящий bash и настоящую функцию: перепечатать её логику в тесте —
@@ -51,6 +62,7 @@ def build_profile(tmp_path: Path) -> dict:
     env = dict(os.environ)
     env.update(HOME=str(tmp_path), DEEPSEEK_BASE_URL="https://example.invalid/v1",
                DEEPSEEK_MODEL="проверочная-модель", DEEPSEEK_API_KEY="k")
+    env.update(branch_env or {})
     result = subprocess.run(
         ["bash", "-c",
          f'source "{DSH_CI}" >/dev/null 2>&1; dsh_patch_profile headless'],
@@ -62,13 +74,28 @@ def build_profile(tmp_path: Path) -> dict:
             for entry in yaml.safe_load(patches[0].read_text(encoding="utf-8"))}
 
 
-def test_built_profile_turns_reasoning_effort_off(tmp_path):
-    """Собранный профиль обязан нести `reasoningEffort: "off"` СТРОКОЙ.
+@pytest.mark.parametrize("branch", list(PROFILE_BRANCHES), ids=list(PROFILE_BRANCHES))
+def test_built_profile_turns_reasoning_effort_off(branch, tmp_path):
+    """Собранный профиль обязан нести `reasoningEffort: "off"` СТРОКОЙ — в
+    КАЖДОЙ ветке `dsh_patch_profile`.
 
     Строкой — не придирка: YAML 1.1 читает голый `off` как булево `False`,
     схема плагина ждёт значение из набора `off/low/high/max`, и неверное
-    значение вернуло бы `thinking: enabled` тем же путём, который чинится."""
-    config = build_profile(tmp_path)["llm-deepseek"]
+    значение вернуло бы `thinking: enabled` тем же путём, который чинится.
+
+    По ветке на параметр — потому что первая правка #1533 легла ровно в одну
+    из двух, и однопутевой тест это бы пропустил."""
+    profile = build_profile(tmp_path, PROFILE_BRANCHES[branch])
+    # Ветка обязана быть РАЗНОЙ, иначе «покрыты обе» — заявление, а не факт:
+    # combo-router пишет свои плагины, плоская — нет. Без этой проверки оба
+    # параметра могли бы молча собирать один и тот же YAML.
+    if branch.startswith("combo"):
+        assert "combo-router" in profile, (
+            "ожидалась ветка combo-router, собралась плоская — тест проверяет "
+            "не тот путь")
+    else:
+        assert "combo-router" not in profile
+    config = profile["llm-deepseek"]
 
     assert "reasoningEffort" in config, (
         "усилие рассуждения не задано — плагин возьмёт умолчание `high` и "

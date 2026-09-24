@@ -754,15 +754,14 @@ dsh_mount_anthropic_pool() { # $1 — профиль (headless)
 # suite смонтирован, но dump-config не подтвердил активацию (мягкий откат,
 # dsh_mount_plugins_suite). Не публичная функция первого выбора — дергать
 # напрямую нет смысла вне этих двух мест, но и не re-declare внутри каждого.
-_dsh_patch_profile_plain() { # $1 — профиль
-  local profile=$1
-  local patch="$HOME/.dsh/profiles/$profile/cordis.patch.yml"
-  mkdir -p "$(dirname "$patch")"
-  cat >"$patch" <<PATCH
-- id: agent-default-model
-  config:
-    provider: deepseek-official
-    model: $DSH_MODEL
+# Конфиг плагина llm-deepseek — ОДНО место правды на оба писателя профиля
+# (_dsh_patch_profile_plain и ветка combo-router в dsh_patch_profile). Две
+# копии разошлись бы молча: первая правка #1533 легла только в плоскую ветку,
+# и вызовы через combo-router остались бы невалидными — ровно тот рецидив,
+# про который AGENTS.md говорит «три одинаковые копии проверки — отложенный
+# рецидив, а не осторожность».
+_dsh_llm_deepseek_config() {
+  cat <<CONFIG
 - id: llm-deepseek
   config:
     maxTokens: $DSH_MAX_TOKENS
@@ -789,6 +788,19 @@ _dsh_patch_profile_plain() { # $1 — профиль
     # значение здесь не упало бы, а вернуло бы thinking enabled тем же путём,
     # который и чинится.
     reasoningEffort: "off"
+CONFIG
+}
+
+_dsh_patch_profile_plain() { # $1 — профиль
+  local profile=$1
+  local patch="$HOME/.dsh/profiles/$profile/cordis.patch.yml"
+  mkdir -p "$(dirname "$patch")"
+  cat >"$patch" <<PATCH
+- id: agent-default-model
+  config:
+    provider: deepseek-official
+    model: $DSH_MODEL
+$(_dsh_llm_deepseek_config)
 PATCH
 }
 
@@ -1018,9 +1030,7 @@ dsh_patch_profile() { # $1 — имя профиля (обычно headless); в
   config:
     provider: combo
     model: auto
-- id: llm-deepseek
-  config:
-    maxTokens: $DSH_MAX_TOKENS
+$(_dsh_llm_deepseek_config)
 - id: llm-pi-ai
   config:
     providers:
