@@ -1,9 +1,9 @@
 diff --git a/apps/dsh-edge/src/index.ts b/apps/dsh-edge/src/index.ts
-index bf1b380..a11fad8 100644
+index 3bd48d2..ebfb213 100644
 --- a/apps/dsh-edge/src/index.ts
 +++ b/apps/dsh-edge/src/index.ts
-@@ -70,6 +70,28 @@ export default {
-
+@@ -92,6 +92,28 @@ export default {
+ 
        rejectCrossOriginAuthenticatedRequest(request, url)
        rejectLegacyInstanceSelector(request, url)
 +
@@ -31,10 +31,10 @@ index bf1b380..a11fad8 100644
        const instanceStub = env.DSH_EDGE_INSTANCE.getByName(OWNER_INSTANCE)
        if (isInstanceApiPath(url.pathname)) {
          const response = await instanceStub.fetch(
-@@ -143,6 +165,71 @@ export default {
+@@ -175,6 +197,71 @@ export default {
    },
  } satisfies ExportedHandler<Env>
-
+ 
 +// The proxy validates the query shape itself but does not redefine the journal
 +// contract: the journal defaults `after` to 0 and clamps `limit` to its replayMax
 +// (cf-worker/src/harness.ts), so the proxy always forwards `after` (0 when the
@@ -104,10 +104,10 @@ index bf1b380..a11fad8 100644
    if (request.headers.has('x-dsh-edge-instance') || url.searchParams.has('instance')) {
      throw new EdgeHttpError(400, 'This deployment has one owner workspace; instance selectors are not supported.')
 diff --git a/apps/dsh-edge/src/instance.ts b/apps/dsh-edge/src/instance.ts
-index 43f172f..5171db0 100644
+index aadf715..3b28a49 100644
 --- a/apps/dsh-edge/src/instance.ts
 +++ b/apps/dsh-edge/src/instance.ts
-@@ -156,6 +156,13 @@ export interface EdgeEnv {
+@@ -215,6 +215,13 @@ export interface EdgeEnv {
    DEEPSEEK_STREAM_IDLE_TIMEOUT_MS?: string
    DSH_EDGE_DEFAULT_COMMAND_TIMEOUT_MS?: string
    DSH_EDGE_MAX_COMMAND_TIMEOUT_MS?: string
@@ -119,5 +119,5 @@ index 43f172f..5171db0 100644
 +  HARNESS_SERVICE?: Fetcher
 +  HANDS_TOKEN?: string
  }
-
- class DshEdgeObjectBase extends DurableObject<EdgeEnv> {
+ 
+ // Every build carries the Container mixin; it touches `ctx.container` only

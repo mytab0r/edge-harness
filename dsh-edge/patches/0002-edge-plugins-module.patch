@@ -1,8 +1,8 @@
 diff --git a/apps/dsh-edge/src/session-store.ts b/apps/dsh-edge/src/session-store.ts
-index e1bb2e8..e5e0f88 100644
+index dc7515e..b9760e5 100644
 --- a/apps/dsh-edge/src/session-store.ts
 +++ b/apps/dsh-edge/src/session-store.ts
-@@ -5,6 +5,7 @@ import Storage from '@deepseek-ai/dsh-storage'
+@@ -7,6 +7,7 @@ import Storage from '@deepseek-ai/dsh-storage'
  import * as StorageDomain from '@deepseek-ai/dsh-storage-domain'
  import WorkspaceRegistry from '@deepseek-ai/dsh-workspace'
  import { DurableObjectStorageBackend } from './do-storage-backend.ts'
@@ -10,7 +10,7 @@ index e1bb2e8..e5e0f88 100644
  import AgentRegistry, {
    installModelSelection,
    type Agent,
-@@ -659,6 +660,36 @@ export class EdgeSessionStore {
+@@ -751,6 +752,36 @@ export class EdgeSessionStore {
          projectionCallback(session.id, key, value, seq)
        })
      }

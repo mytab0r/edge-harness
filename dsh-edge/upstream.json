@@ -1,5 +1,5 @@
 {
   "repo": "pawaca/dsh-edge",
-  "sha": "8ae722deab06582bd46ca18befa1d0c284674167",
-  "note": "Пин апстрима для source-build морды. Автоматический бамп (#1518, scripts/orchestra/upstream_drift.py::attempt_auto_bump): sha — тег dsh-edge-v0.17.0 (repos/pawaca/dsh-edge/tags). Патч-серия dsh-edge/patches НЕ перебазирована этим коммитом — применимость доказывает шаг «Патч-серия» deploy-dsh-edge.yml после мержа (dsh-edge/PATCHES.md); красный деплой — честный сигнал, не тихий пропуск версии, дальше заводит задачу пульс отказов деплоя (#477)."
+  "sha": "c4edb2cc789d26f4c372b9766ff0ad4a78f55408",
+  "note": "Пин апстрима для source-build морды. Автоматический бамп (#1548, scripts/orchestra/upstream_drift.py::attempt_auto_bump): sha — тег dsh-edge-v0.18.0 (repos/pawaca/dsh-edge/tags). Патч-серия dsh-edge/patches перебазирована на этот пин тем же PR (#1549): вся серия из семи патчей накладывается подряд `git apply` на чистый клон `pawaca/dsh-edge@c4edb2cc` без единого хунка мимо (конфликт — `EdgeSessionStoreError.code` в session-store.ts, апстрим переформатировал union; разрешение сохраняет наш код `AGENT_UNAVAILABLE` в апстримном формате)."
 }
