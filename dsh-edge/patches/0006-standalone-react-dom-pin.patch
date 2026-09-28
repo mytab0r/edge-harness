@@ -1,5 +1,5 @@
 diff --git a/apps/dsh-edge/standalone/pnpm-workspace.yaml b/apps/dsh-edge/standalone/pnpm-workspace.yaml
-index 0c9151a..3f2ccf4 100644
+index 5cf8967..4cf7623 100644
 --- a/apps/dsh-edge/standalone/pnpm-workspace.yaml
 +++ b/apps/dsh-edge/standalone/pnpm-workspace.yaml
 @@ -1,5 +1,19 @@
