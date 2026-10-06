@@ -109,7 +109,7 @@ export function extractPatchMethod(patch, marker) {
  * @param {string} patch - полный текст unified diff.
  */
 export function assertQuarantineWiring(patch) {
-  if (!patch.includes('+      const rebuild = refused.size === 0 && this.isEventTableRebuildCheaper(legacy)')) {
+  if (!patch.includes('+      const rebuild = refused.size === 0 && this.isEventTableRebuildCheaper(rewriteWrites, migratedRows)')) {
     throw new Error(
       'патч 0007: путь rebuild больше не выключается при непустом карантине — '
       + 'он копирует в новую таблицу только строки текущей версии и дропает старую, '
@@ -150,7 +150,7 @@ export const CORRUPTION = 'corruption'
  *   строки dsh_sessions: `throws` — вид отказа prepareMigration на этой сессии
  *   (UNSUPPORTED_MIGRATION или CORRUPTION), отсутствует — сессия мигрирует.
  * @param {string} [opts.patch] - текст диффа (по умолчанию настоящий, с диска).
- * @returns {{legacy: number, quarantined: Array, sql: Array<{query: string, args: Array}>,
+ * @returns {{rewriteWrites: number, quarantined: Array, sql: Array<{query: string, args: Array}>,
  *            errors: Array<string>, thrown: Error|undefined}}
  */
 export async function runQuarantineScenario(opts) {
@@ -210,7 +210,11 @@ class Harness {
       error.name = 'SessionPersistenceCorruptionError'
       throw error
     }
-    return { physicalRows: entry.rows }
+    // Апстрим 0.19.0: prepareMigration больше не считает physicalRows —
+    // возвращает дельта-миграцию. Счётчик «история декодирована» здесь —
+    // rewriteWrites (он > 0 только для сессии, чью историю prepareMigration
+    // читал), migratedRows сценарий не проверяет.
+    return { rewriteWrites: entry.rows, packed: new Array(entry.rows).fill({}) }
   }
 ${preflight}
 ${record}
@@ -238,7 +242,7 @@ export { Harness }
     console.error = realError
   }
   return {
-    legacy: result?.legacy,
+    rewriteWrites: result?.rewriteWrites,
     quarantined: result?.quarantined ?? [],
     sql,
     errors,
@@ -256,12 +260,15 @@ export { Harness }
  */
 function stripTypes(source) {
   return source
-    .replace(/private preflightOutdatedSessions\(outdated: readonly HeaderRow\[\]\): \{\n\s*legacy: number\n\s*quarantined: readonly QuarantinedSession\[\]\n\s*\} \{/,
-      'preflightOutdatedSessions(outdated) {')
+    .replace(/private preflightOutdatedSessions\(outdated: readonly HeaderRow\[\],\n\s*childFacts: ReadonlyMap<string, SessionFormatJsonObject\[\]>\): \{\n\s*rewriteWrites: number\n\s*migratedRows: number\n\s*quarantined: readonly QuarantinedSession\[\]\n\s*\} \{/,
+      'preflightOutdatedSessions(outdated, childFacts = new Map()) {')
     .replace(/private recordQuarantinedSessions\(entries: readonly QuarantinedSession\[\]\): void \{/,
       'recordQuarantinedSessions(entries) {')
     .replace(/const quarantined: QuarantinedSession\[\] = \[\]/, 'const quarantined = []')
     .replace(/row\.id as SessionId/g, 'row.id')
+    // 0.19.0: prepareMigration зовётся с childFacts.get(row.id)! — non-null
+    // assertion снимается тем же построчным способом, что и `as`.
+    .replace(/childFacts\.get\(row\.id\)!/g, 'childFacts.get(row.id)')
     // #1514: сигнатура памяти вердиктов — две строки generic'ов, снимаются
     // так же построчно, как и две формы выше.
     .replace(/private knownQuarantine\(\): Map<string, \{\n[\s\S]*?\n\s*\}> \{/, 'knownQuarantine() {')
