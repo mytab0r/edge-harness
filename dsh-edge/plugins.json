@@ -49,9 +49,9 @@
       "id": "provider-registry",
       "package": "@edge-harness/dsh-plugin-provider-registry",
       "source": {
-        "release": "plugins-provider-registry-v0.1.4",
-        "asset": "provider-registry-0.1.4.tgz",
-        "sha256": "c9248b604987b4d4f4a28bc8da658dafb47d7cc32dc8360e4a4eeb0d3f2e6d09"
+        "release": "plugins-provider-registry-v0.1.5",
+        "asset": "provider-registry-0.1.5.tgz",
+        "sha256": "bf8499bcd33406a8bc7dc9e24c970b29fdf69b4b598538f071044b1afe398593"
       },
       "server": true,
       "client": false
