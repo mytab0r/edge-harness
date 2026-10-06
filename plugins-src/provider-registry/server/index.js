@@ -26,13 +26,12 @@
  * #505) она снята из экспортов пакета целиком (сверено скачанным npm-тарболлом
  * @deepseek-ai/dsh-settings@0.1.2-rc.1, lib/index.js — экспортирует только
  * SettingsConflictError/SettingsProvider/redactSecrets), а её тело переехало
- * методом на сам сервис — `ctx.settings.installSection(owner, ns, schema,
- * entry, hooks)` (тот же README, раздел «Registering a namespace»: «ctx.
- * settings.installSection(owner, ns, schema, entry, hooks) packages the
- * optional-service wiring for a consumer plugin»). Сигнатура и порядок
- * аргументов не изменились — только вызов через `ctx.inject(['settings'],
- * sctx => sctx.settings.installSection(...))` вместо свободной функции,
- * которая раньше делала этот `ctx.inject` сама. `settingsNamespace()` был
+ * методом на сам сервис — до 0.1.5-rc.2: `ctx.settings.installSection(…)` через
+ * `ctx.inject(['settings'], …)`. На пине 0.19.0 (@deepseek-ai/dsh-settings
+ * 0.2.0-rc.1) этот метод снят ЦЕЛИКОМ (SettingsForms + launcher-профиль);
+ * актуальный шов — Edge settings (`dsh-edge/src/edge-settings.ts`):
+ * `settings.register(ns, schema, {base, validate})` → scope {get, watch,
+ * update, replace} — см. apply() ниже и комментарий у вызова. `settingsNamespace()` был
  * идентити-валидатором формы (throw при несовпадении с шаблоном, иначе
  * возврат значения как есть, lib/index.js@0.1.1-rc.2) — README 0.1.2-rc.1
  * подтверждает ту же валидацию строкового namespace внутри register/
@@ -45,7 +44,7 @@ import { DeepSeekAdapter, resolveAdapterOptions } from '@deepseek-ai/dsh-llm-dee
 import { LlmError, assertUsableApiKey } from '@deepseek-ai/dsh-llm'
 import { getOrCreateAnonymousUserId } from '@deepseek-ai/dsh-anonymous-user-id'
 
-const PLUGIN_VERSION = '0.1.2'
+const PLUGIN_VERSION = '0.1.5'
 const NS = 'llm-pi-ai'
 /** Маршрут штатного провайдера морды (session-store.ts): в реестре запрещён. */
 const EDGE_PROVIDER = 'deepseek-official'
@@ -169,7 +168,11 @@ function routeMaxTokens() {
  * записи без него (находка ревью #453: без независимого вывода имени ref'а
  * не тратим догадку, которая могла бы разойтись с клиентской формулой). */
 function connectionOf(route, profileValue) {
-  return resolveAdapterOptions({
+  // 0.2.0-rc.1: resolveAdapterOptions больше не пропускает apiKeyEnv в
+  // возвращаемое соединение (аутентификация переехала в dependencies.resolveAuth),
+  // а resolveAuth получает ЭТО соединение аргументом — имя ref'а ключа
+  // дописывается наружу здесь, иначе resolveAuth зовётся без него.
+  const connection = resolveAdapterOptions({
     apiKeyEnv: profileValue.apiKeyEnv,
     baseURL: profileValue.baseURL,
     models: (profileValue.models ?? []).map(model => ({
@@ -181,6 +184,7 @@ function connectionOf(route, profileValue) {
     maxTokens: routeMaxTokens(),
     defaultContextWindow: DEFAULT_CONTEXT_WINDOW,
   })
+  return { ...connection, apiKeyEnv: profileValue.apiKeyEnv }
 }
 
 /**
@@ -248,7 +252,21 @@ export default {
       }
       const adapter = new RegistryAdapter({
         options,
-        resolveApiKey: async (connection) => {
+        // 0.2.0-rc.1: listModels апстримного адаптера больше не выводит каталог
+        // из options().models — он зовёт dependencies.discoverModels (без него
+        // пикер моделей маршрута пуст: «1 моделей» зарегистрировано, список
+        // пуст). Реклама каталога — из живого раздела, форма элемента —
+        // {provider, id, name} (валидация listModels в dsh-llm).
+        discoverModels: (provider) => (options().models ?? []).map((model) => ({
+          provider,
+          id: model.id,
+          name: model.name ?? model.id,
+        })),
+        // 0.2.0-rc.1: dependencies.resolveApiKey переименован в resolveAuth —
+        // адаптер зовёт this.dependencies.resolveAuth(connection) на пути
+        // generate (старое имя молча не вызывался бы: ход уходил в сеть без
+        // ключа).
+        resolveAuth: async (connection) => {
           // ctx.get() — ленивый доступ к опциональному сервису, в отличие от
           // свойства ctx.<service>, которому нужен inject (гейт apply-time).
           // Тот же паттерн у апстримного dsh-llm-deepseek (inject: ['llm'],
@@ -339,18 +357,24 @@ export default {
       }
     }
 
-    // ctx.inject(['settings'], …) — тот же optional-inject, что раньше делала
-    // сама свободная функция installSettingsSection (0.1.1-rc.2); в 0.1.2-rc.1
-    // вызывающий обязан сделать его сам, вызывая installSection методом
-    // сервиса (см. комментарий в начале файла, issue #806/#507).
+    // ctx.inject(['settings'], …) — шов настроек пина 0.19.0 (dsh-edge 0.19.0,
+    // src/edge-settings.ts): апстримный @deepseek-ai/dsh-settings@0.2.0-rc.1
+    // сменил модель (SettingsForms + launcher-профиль), метод installSection
+    // снят ЦЕЛИКОМ (lib/index.js экспортирует только
+    // SettingsConflictError/SettingsForms/redactSecrets) — вызов старым путём
+    // падал тихо внутри optional-inject, namespace не монтировался и красил
+    // деплой на шаге реестра (run 37497300822: «namespace llm-pi-ai смонтирован
+    // реестром»). Edge serve'ит шов сам: settings.register(ns, schema,
+    // {base, validate}) → scope {get, watch, update, replace}; живое значение —
+    // scope.get(), коммит — watch.
     ctx.inject(['settings'], (sctx) => {
-      sctx.settings.installSection(ctx, NS, Config, { providers: {} }, {
+      const scope = sctx.settings.register(NS, Config, {
+        base: { providers: {} },
         validate: assertServiceable,
-        setSource: (source) => {
-          section = source
-        },
-        onChange: sync,
       })
+      section = () => scope.get()
+      sync()
+      scope.watch(sync)
     })
 
     console.info(`edge-plugin:provider-registry installed v${PLUGIN_VERSION} (namespace ${NS})`)
