@@ -82,20 +82,21 @@ def test_real_repo_has_zero_drift_after_the_fix():
     который апстрим объявляет на верхнем уровне. Список версий — снят живым
     запросом к raw.githubusercontent.com (изначально при разработке гвардии,
     обновлён бампом пина #1294: 0.1.2-rc.1 → 0.1.5-rc.2, затем бампом пина
-    #1580: 0.1.5-rc.2 → 0.2.0-rc.1, schemastery 3.18.2 → 3.18.4, сверено с
-    apps/dsh-edge/standalone/package.json на теге dsh-edge-v0.19.0),
+    #1580: 0.1.5-rc.2 → 0.2.0-rc.1, schemastery 3.18.2 → 3.18.4, затем бампом
+    пина #1590: 0.2.0-rc.1 → 0.2.0-rc.2, сверено с
+    apps/dsh-edge/standalone/package.json на теге dsh-edge-v0.19.1),
     не сеть в pytest: живую сверку с ТЕКУЩИМ пином делает сам
     scripts/lib/plugin_upstream_version_drift.py при запуске гвардии в CI.
     Снимок обязан идти следом за бампом пина, поднимающим версии
     @deepseek-ai/*: расхождение с Pin в upstream.json красит этот тест,
     хотя живая гвардия зелёная."""
     upstream_deps_snapshot = {
-        "@deepseek-ai/dsh-anonymous-user-id": "0.2.0-rc.1",
-        "@deepseek-ai/dsh-credentials": "0.2.0-rc.1",
-        "@deepseek-ai/dsh-llm": "0.2.0-rc.1",
-        "@deepseek-ai/dsh-llm-deepseek": "0.2.0-rc.1",
-        "@deepseek-ai/dsh-settings": "0.2.0-rc.1",
-        "@deepseek-ai/dsh-tools": "0.2.0-rc.1",
+        "@deepseek-ai/dsh-anonymous-user-id": "0.2.0-rc.2",
+        "@deepseek-ai/dsh-credentials": "0.2.0-rc.2",
+        "@deepseek-ai/dsh-llm": "0.2.0-rc.2",
+        "@deepseek-ai/dsh-llm-deepseek": "0.2.0-rc.2",
+        "@deepseek-ai/dsh-settings": "0.2.0-rc.2",
+        "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
         "@deepseek-ai/schemastery": "3.18.4",
     }
     plugin_deps = drift.collect_plugin_deepseek_deps(drift.PLUGINS_SRC_DIR)
