@@ -39,31 +39,34 @@ import assert from 'node:assert/strict';
 // по-прежнему только не-@deepseek транзитивки (zod, eventsource-parser) —
 // их диапазоны ведут к чужим стабильным версиям, не к волне rc.
 const FIXTURES = [
-  ['@deepseek-ai/cordis', '4.0.2', 'sha512-asOnXP1TzFSFQlHb1iegDZp0z/8WD1c7YNrwJR/Tx2bzNuMXfcekE/I67Iv6SQXeLB4csxqCngzQKANP7gdw0g=='],
-  ['@deepseek-ai/dsh-anonymous-user-id', '0.1.5-rc.2', 'sha512-YIpZoi8mY/d+BjnPOryDYR7lkwr2uWh5KJWjIqm2sGN+C6imc66lDiSi5wy91JMRzefFWJf26fCiYXAF7ErQAw=='],
-  ['@deepseek-ai/dsh-atomic-write', '0.1.5-rc.2', 'sha512-9bCOLkug83IGuoEBPHUxgfJ/IxsHg/UigGi8Oj0agibcGVq2WdL/fbU8KA3KU5H49KDOxq2/AA3XUI3RiAEtYA=='],
-  ['@deepseek-ai/dsh-attachment', '0.1.5-rc.2', 'sha512-S6b8/WjqzGw+dMDLRXnq+tbijDGkQh38yE+zpQytX2/w/mPR3VzGj5r6McS01WwD76vXR8WFoheSCLyCAro8WQ=='],
-  ['@deepseek-ai/dsh-brand', '0.1.5-rc.2', 'sha512-/+3TzQRYT4M8NINZ9OrsL5VWNyQSXof8mFLx3txiosWA7Bt0H6UcxUdKGXVwj6gCXhsQ74mzEHm2ucsflG0mYA=='],
-  ['@deepseek-ai/dsh-credentials', '0.1.5-rc.2', 'sha512-TfX5MYLlyw0BFERj3dGxVfP9QGcKZUE5eXDSaY7ZfJbfQgK51VfxV5tP899OxIDRD3Bw94K5Rzx+dbUTSWJBtA=='],
-  ['@deepseek-ai/dsh-deepseek-llm-api-extensions', '0.1.5-rc.2', 'sha512-zue4FWkj7Srg8mAwA6XNqT560NkraILiYtAwIcpT4mmt1Nlim+m55x7ACNkwA5Es0uCkEFAU1H6wHSnR7l2EfQ=='],
-  ['@deepseek-ai/dsh-fs', '0.1.5-rc.2', 'sha512-6DHTquXPbpYdykGayqYaXSI9t668tDCoswH/bDezV+nwj4LxjrfY/smEtgp7nC4ubyoKf1hmjpNfUonGC9e7aA=='],
-  ['@deepseek-ai/dsh-home-paths', '0.1.5-rc.2', 'sha512-Ek+DH9+MTiulfWDMKo5r335k4I9XIItk+jq8YaPihpK3klSeiKLW/SpKJhFodRnW1CwEyjIlt2XriycRvceIiw=='],
-  ['@deepseek-ai/dsh-invariants', '0.1.5-rc.2', 'sha512-oUxttB2yjAgkk47AiXOCxk9GwnfGvIEGsQfnMD7fukwIdD3KLJObU7+nz63tbFN80rjwMI8rg+p9QBQ10KU5+g=='],
-  ['@deepseek-ai/dsh-launch-environment', '0.1.5-rc.2', 'sha512-Cr35kPA3W7skJsPLJhUExLDAjVKCmvJgkog0m8EZ+XdK8RlBDsWiH2peRWFtFOjt8QOOeEkupPs1VDpWORIRyw=='],
-  ['@deepseek-ai/dsh-llm', '0.1.5-rc.2', 'sha512-Z7BVsBkK24SE4EItQeow8PHms/9GP0DSTi337vTAa/RY7tNg2Snz3INcXUj6CPZfvntQr1in9op9wLI+rfNsqA=='],
-  ['@deepseek-ai/dsh-llm-deepseek', '0.1.5-rc.2', 'sha512-qNRbLsE2ro+AfD7NgJwTukQLG82gIkbAISjDHgv0au7TocfPkNkUWSu20mTaBcuLGXzfSgBVn4oYx5N3ws6KVg=='],
-  ['@deepseek-ai/dsh-sandbox', '0.1.5-rc.2', 'sha512-OTOR6Jj9cey5YkhALG0TBwZ/Z3t986aczH6fLbzoIIegix+gwNaEBOqCWs+exVJ0Z2QuN/ItXzn+xHxW8Y0dcA=='],
-  ['@deepseek-ai/dsh-scope', '0.1.5-rc.2', 'sha512-JwItISje52iVIjlGMNayRVMZrvZU/0i3Gr0s+coND5nBp5lS+pOj9Zf1RQzA5cWjHYCWKmDuQc+m6zGlwmtAeQ=='],
-  ['@deepseek-ai/dsh-session', '0.1.5-rc.2', 'sha512-y+klWiGAWR4m4cc4ylurA0cW63673B4N8cr2ANMimweDZAfxL4XVBC7WiD/5DT2DtIhYmVZhz/niyS/WbniUTA=='],
-  ['@deepseek-ai/dsh-settings', '0.1.5-rc.2', 'sha512-LI2Y6GkEs9ALMW+7S9jHPeEZDXHtG5X6cix1HdJ1rRxTEO5427QlYhMiz45rk7hqZ8ca2O4XFMW8IWXFZQLxmw=='],
-  ['@deepseek-ai/dsh-timeout', '0.1.5-rc.2', 'sha512-FgfaAw8Zt5X4Y6Ljh833B8Hy7h96FeR+yjNKI3iSyZSqREqOBgvDGXFfQlSu6V3Buvw/cbI/CJUQJvfRBKXOiA=='],
-  ['@deepseek-ai/dsh-typert-protocol', '0.1.5-rc.2', 'sha512-zP8J20rBXa1AFjKL2i83JBeQcePZx8yal3pNojj4t7CCokMcoFMUbr50woa6fY1tRJ7qHxgypO3rH8Q6YWgmiA=='],
-  ['@deepseek-ai/dsh-util-crypto', '0.1.5-rc.2', 'sha512-JR0aJEUL35RE8FVT89wMZMbPwMrbkjNcy+gE9pq70d/m2Zxw3a0iNer+BAxPAKYPbmy0xDDXReTwXiecKVy4sQ=='],
-  ['@deepseek-ai/dsh-util-values', '0.1.5-rc.2', 'sha512-Cr0TkM6dFAD+Iy4sNXH/afJVMHwJXoOztivj+RflkYoACsOq+Ix0vdHn36hwW7mayU8OK3ZKIZUQ6BPo1fHvUg=='],
-  ['@deepseek-ai/schemastery', '3.18.2', 'sha512-njDtZsznjYxok7KLLlHOPyuv2efdWVbSflAHgztSfbMsg+CVraEoRe2DjOCgClYv3ZCSm7WXoaUkbB/+RY7tWQ=='],
-];
-
-const fixtureRoot = join(
+  // Пины 0.2.0-rc.1 — closure deps+peers по версии package.json плагина (пин
+  // dsh-edge/upstream.json 0.19.0). dsh-settings оставлен в фикстуре только
+  // ради redactSecrets для describe(); сам шов настроек здесь — MemoryEdgeSettings
+  // ниже, зеркало контракта dsh-edge/src/edge-settings.ts (installSection в
+  // 0.2.0-rc.1 снят целиком, красный деплой run 37497300822).
+  ['@deepseek-ai/cordis', '4.0.4', 'sha512-obgyxqWAmFn3Re8kvsuUnyW+ihrz6eJCnJO4fh1cQzDtmPYz/zzVeUkH9R94I0OwSVOocK67Kgakm04j/oQXzg=='],
+  ['@deepseek-ai/dsh-anonymous-user-id', '0.2.0-rc.1', 'sha512-FMR2+JfTLM4/xMREZeqXuKxSyegVBPjVuJPCumj0ZR9ZI+3R1lVQTM9cuz+Z3WnE1jtiryqnZ7KswldE45El0w=='],
+  ['@deepseek-ai/dsh-atomic-write', '0.2.0-rc.1', 'sha512-xfqotH4A560oEQl+EzvyAJFjhiFF68ywiM/LuSuMQ2xvqLnaX50tJV/WCCBfVguM+4x/hObI0jz4oLDBs0d2Kg=='],
+  ['@deepseek-ai/dsh-attachment', '0.2.0-rc.1', 'sha512-aKKFE9fGYYn1BCzDtun7IYkpiMANYt7s51vwPukkCnobNiLfxHrIyANLWNmMTSpq0iENfqREXPR805K/um8Hfw=='],
+  ['@deepseek-ai/dsh-brand', '0.2.0-rc.1', 'sha512-TPeMaUt/Xev0X2TfIf6pSVVGiWAbFHy+VWCIW+w8UkC0yH1ep9302JQOBqhUgefAM4s/3W1R8lra/PMbFhjx2w=='],
+  ['@deepseek-ai/dsh-credentials', '0.2.0-rc.1', 'sha512-XcAy6bK1lHLW3XWxxwKtrFdDurEvEvpBoqNhfR6PHTetd8wV/f9l06uNg0DO7xg1GUzkY8t88j2EXhg2z2nFrw=='],
+  ['@deepseek-ai/dsh-deepseek-llm-api-extensions', '0.2.0-rc.1', 'sha512-IlXvOxcKeE1MWKGTEs/jOyMxcEF/bbJsX3FvSeRWx8d8iRSTis5iWvkJktyf6bX5aQ2zNEOfbZbZKXkWkaZMmw=='],
+  ['@deepseek-ai/dsh-fs', '0.2.0-rc.1', 'sha512-IWjXn/BsoWwT5dti/Jfkrx49GDGi1H7B3cuTgwRvxIQl6o86eb7ns+3mQiBpFyrCrVOMV+1t8FC1ipiIxol+gA=='],
+  ['@deepseek-ai/dsh-home-paths', '0.2.0-rc.1', 'sha512-QWHegbfNY4J7qZgBdiWshhhcF6fgybua6XKUaMIhxj4J+mqR9KEQOJ7hRjOOg8Yub3nGbBTyqpH10C44EGGroA=='],
+  ['@deepseek-ai/dsh-invariants', '0.2.0-rc.1', 'sha512-sEeO6sRPGxgHChQsiU/V3LvelbVaLt7kb4WHVQqljZGgoAv3VZK0rzSlQaGfTCYJrThcoJ/a9mCT9pcZEZ3aDg=='],
+  ['@deepseek-ai/dsh-launch-environment', '0.2.0-rc.1', 'sha512-ADTbIFhcVnFSYmycI4Ln4q9GGv5YS+MRg0ahCbn0+rDLcYyx4TT9B9Xyiz856YRRPpYRbYwQqZ+o14kCDpicQA=='],
+  ['@deepseek-ai/dsh-llm', '0.2.0-rc.1', 'sha512-F5ZlBG8z8o5PfEWeEF/PN9t/A1N/oEErvqmpqE4J8f9mJR85DvBdV+rjDs7OjAbMJsJ8INjkbroruG5NNKDg5A=='],
+  ['@deepseek-ai/dsh-llm-deepseek', '0.2.0-rc.1', 'sha512-ENUE7f58O3neU2G72IpZP5t/0GBoKr748KEcNIrccmO+kIENjAwuOM87QY2Uw1GPcSBfVUx/TELolgcyAPpCTg=='],
+  ['@deepseek-ai/dsh-sandbox', '0.2.0-rc.1', 'sha512-NnEHqSf4SKoM5cIqtHg+utLUZYJX4r9u2PwQbEpYwiOYSvOW5G4DRtLRpIX7J6V2HOC6CXo2Xcm3DJBOsbKYOA=='],
+  ['@deepseek-ai/dsh-scope', '0.2.0-rc.1', 'sha512-D1JeWIz40A62/nJIi7HwLsddmuDwdcxV9Lbx5IgBveWDZHGqPIP0/CPJ4o6XWr+C1qI/GBtdMkN2Z3F20Rlt7w=='],
+  ['@deepseek-ai/dsh-session', '0.2.0-rc.1', 'sha512-KUDCUk8kmiJCwvV3gDbkUSpkyoGHdg36nIhKsEh6iBoYDuIQCuvX2htiVRXCm099XZO6rCBVInmm1193UoPYcA=='],
+  ['@deepseek-ai/dsh-settings', '0.2.0-rc.1', 'sha512-kC7Cq6Ls6of8J9qY0/8oehLbf9AV62QVA9dL0YPOnvdvgaNJaRbLtXxwr+I36rjDVmOfUkqvW4nxBIjJmPSY/g=='],
+  ['@deepseek-ai/dsh-timeout', '0.2.0-rc.1', 'sha512-SQpvDLIPU0EJP1lbphfuEkLrvnX+CE9u9ym1+L5z/8dYe9BCPbhgjQoRvDnyzKZqFyoXVvZFdqdAADlc6DX7Ig=='],
+  ['@deepseek-ai/dsh-typert-protocol', '0.2.0-rc.1', 'sha512-MhpeimGP6E3MqSESLm32OmPgx5aNUG7yCJCgcIFw7XBWhQmKB9fU3CWuUxxbWZeC7eWkdJ93AG2ww/Qu6QWW9A=='],
+  ['@deepseek-ai/dsh-util-crypto', '0.2.0-rc.1', 'sha512-BLBQVRGBlzhNprSpREiMDi1JwX0X8jKdEPWiVRKBnttlG9d33j1pLsaiH9HHLY/D10lXX/NagGia/Zz9mW4FBA=='],
+  ['@deepseek-ai/dsh-util-values', '0.2.0-rc.1', 'sha512-Eh1HH0LFvztBwU2xotdfW5oCwLlWGjK2ygCC5+PnC3tkSDh9gvVQpEf0ezK+Kk6vpLz117V7VPehhR1+gs90+Q=='],
+  ['@deepseek-ai/schemastery', '3.18.4', 'sha512-SSXO6tYuyrIqKVbmOnIq0s+riUywYzouFMcnBluHF9n4KMo2G8HvEzhCYj6pj2617/glOjbJuVInJ9hfONsjkg=='],
+];const fixtureRoot = join(
   tmpdir(),
   `provider-registry-fixture-${createHash('sha256').update(FIXTURES.map((f) => f[2]).join('|')).digest('hex').slice(0, 8)}`,
 );
@@ -110,26 +113,138 @@ const hooksPath = join(fixtureRoot, 'provider-registry-hooks.mjs');
 writeFileSync(hooksPath, hooksSource);
 register(pathToFileURL(hooksPath).href, import.meta.url);
 
-const { Context } = await import('@deepseek-ai/cordis');
+const { Context, Service } = await import('@deepseek-ai/cordis');
 const { LlmRuntime } = await import('@deepseek-ai/dsh-llm');
-const { default: SettingsProvider } = await import('@deepseek-ai/dsh-settings');
+const { redactSecrets } = await import('@deepseek-ai/dsh-settings');
 const { default: z } = await import('@deepseek-ai/schemastery');
 const plugin = (await import('../server/index.js')).default;
 const DIRECTORY = (await import('../directory.json', { with: { type: 'json' } })).default;
 
-// In-memory провайдер настроек: persist — no-op, write() сам кладёт раздел
-// в this.document после persist; load() возвращает текущий документ.
-class MemorySettingsProvider extends SettingsProvider {
+// In-memory стенд настроек — зеркало контракта dsh-edge/src/edge-settings.ts
+// (шов, который Edge serve'ит на пине 0.19.0: installSection в
+// @deepseek-ai/dsh-settings@0.2.0-rc.1 снят целиком — красный деплой
+// run 37497300822). Поверхность: register(ns, schema, {base, validate}) →
+// scope {get, watch, update, replace}; describe({redactSecrets}); mutate
+// set|unset с отказом через validate. Хранение — this.document (load/persist —
+// точки подмены, как DO KV в проде). Поведенческий гейт шва в проде —
+// dsh-edge/registry-integration/check.mjs против собранного воркера.
+class MemoryEdgeSettings extends Service {
   writable = true
+  document = {}
+  registrations = new Map()
+
+  static inject = []
+  constructor(ctx) { super(ctx, 'settings') }
+
+  async* [Service.init]() {
+    yield () => Promise.resolve()
+    const stored = await this.load()
+    this.document = stored ?? {}
+  }
+
   async load() { return this.document }
-  async persist() {}
+  async persist(document) { this.document = document }
+
+  register(name, schema, options = {}) {
+    const registration = { ns: name, schema, base: options.base, validate: options.validate, resolved: undefined, revision: 0, watchers: new Set() }
+    if (this.registrations.has(registration.ns)) throw new Error(`settings namespace "${registration.ns}" is already registered`)
+    registration.resolved = this.resolveInternal(registration)
+    this.registrations.set(registration.ns, registration)
+    return {
+      get: () => registration.resolved,
+      watch: (callback) => {
+        registration.watchers.add(callback)
+        return () => registration.watchers.delete(callback)
+      },
+      update: (patch) => this.update(registration.ns, patch),
+      replace: (section) => this.replace(registration.ns, section),
+    }
+  }
+
+  describe(options) {
+    return [...this.registrations.values()].map((registration) => {
+      const user = this.document[registration.ns]
+      const descriptor = {
+        ns: registration.ns,
+        autoGenerate: true,
+        schema: registration.schema.toJSON(),
+        value: registration.resolved,
+        revision: registration.revision,
+        ...(registration.base === undefined ? {} : { base: registration.base }),
+        ...(user === undefined ? {} : { user }),
+        applies: 'live',
+      }
+      if (options?.redactSecrets !== true) return descriptor
+      const redacted = redactSecrets(registration.schema, registration.resolved)
+      return { ...descriptor, value: redacted.value, secrets: redacted.secrets }
+    })
+  }
+
+  async update(ns, patch, expectedRevision) { return this.writeInternal(ns, 'merge', patch, expectedRevision) }
+  async replace(ns, section, expectedRevision) { return this.writeInternal(ns, 'replace', section, expectedRevision) }
+  async mutate(ns, ops, expectedRevision) {
+    if (!Array.isArray(ops) || !ops.every((op) => op !== null && typeof op === 'object'
+      && (op.op === 'set' || op.op === 'unset') && Array.isArray(op.path))) {
+      return Promise.reject(new TypeError(`settings mutate for "${ns}" ops must be {op:'set'|'unset', path: string[]}`))
+    }
+    return this.writeInternal(ns, 'mutate', { ops }, expectedRevision)
+  }
+
+  async writeInternal(ns, mode, input, expectedRevision) {
+    const registration = this.registrations.get(ns)
+    if (registration === undefined) throw new Error(`settings namespace "${ns}" is not registered`)
+    if (expectedRevision !== undefined && expectedRevision !== registration.revision) {
+      throw new Error(`settings namespace "${ns}" was changed concurrently`)
+    }
+    const current = this.document[ns] ?? {}
+    let section
+    if (mode === 'replace') {
+      section = structuredClone(input)
+    } else {
+      section = structuredClone(current)
+      if (mode === 'merge') for (const [key, value] of Object.entries(input)) section[key] = value
+      else for (const op of input.ops) {
+        if (op.op === 'unset') {
+          let node = section
+          for (const key of op.path.slice(0, -1)) { node = node?.[key]; if (node === undefined) break }
+          if (node !== undefined) delete node[op.path.at(-1)]
+        } else {
+          let node = section
+          for (const key of op.path.slice(0, -1)) {
+            if (node[key] === undefined || node[key] === null) node[key] = {}
+            node = node[key]
+          }
+          node[op.path.at(-1)] = structuredClone(op.value)
+        }
+      }
+    }
+    const next = this.resolveInternal(registration, section)
+    if (JSON.stringify(current) !== JSON.stringify(section)) {
+      registration.revision += 1
+      await this.persist({ ...this.document, [ns]: section })
+    }
+    this.commitInternal(registration, next)
+  }
+
+  resolveInternal(registration, sectionOverride) {
+    const section = sectionOverride ?? this.document[registration.ns]
+    const candidate = { ...(registration.base ?? {}), ...(section ?? {}) }
+    const value = registration.schema(candidate)
+    registration.validate?.(value)
+    return value
+  }
+
+  commitInternal(registration, next) {
+    registration.resolved = next
+    for (const callback of [...registration.watchers]) void callback(next, next)
+  }
 }
 
 /** Морда в миниатюре: LlmRuntime + Settings + реестр. */
 async function mountMordre() {
   const ctx = new Context();
   await ctx.plugin(LlmRuntime);
-  await ctx.plugin(MemorySettingsProvider);
+  await ctx.plugin(MemoryEdgeSettings);
   await ctx.plugin(plugin);
   return ctx;
 }
@@ -248,7 +363,7 @@ describe('provider-registry: добавление провайдера (как C
 
     const restarted = new Context();
     await restarted.plugin(LlmRuntime);
-    await restarted.plugin(class extends MemorySettingsProvider {
+    await restarted.plugin(class extends MemoryEdgeSettings {
       async load() { return persisted }
     });
     await restarted.plugin(plugin);
@@ -328,7 +443,7 @@ describe('provider-registry: негатив — мусор не проходит
     // MISSING_CREDENTIAL — значит ключ из хранилища разрешился до fetch.
     const ctx = new Context();
     await ctx.plugin(LlmRuntime);
-    await ctx.plugin(MemorySettingsProvider);
+    await ctx.plugin(MemoryEdgeSettings);
     // Стаб запоминает аргумент: контракт формата ссылки обязан быть закреплён
     // тестом (находка ревью PR #453) — сервер зовёт resolve РОВНО с apiKeyEnv
     // из профиля, никакой деривации имени ссылки на сервере нет.

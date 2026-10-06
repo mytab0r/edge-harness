@@ -1,7 +1,7 @@
 {
   "name": "@edge-harness/dsh-plugin-provider-registry",
-  "version": "0.1.4",
-  "description": "dsh-edge edge plugin: the provider registry of the morde served through the native Settings -> Models UI (settings namespace llm-pi-ai, directory of ready OpenAI-compatible routes, one reused DeepSeekAdapter per configured route) Версия поднята бампом пина #1294 (0.1.5-rc.2): депы @deepseek-ai/* согласованы с пином dsh-edge/upstream.json, релиз пересобран форжем (#80/#507).",
+  "version": "0.1.5",
+  "description": "dsh-edge edge plugin: the provider registry of the morde served through the native Settings -> Models UI (settings namespace llm-pi-ai, directory of ready OpenAI-compatible routes, one reused DeepSeekAdapter per configured route) 0.1.5: порт на шов настроек пина dsh-edge 0.19.0 (@deepseek-ai/dsh-settings 0.2.0-rc.1 снял installSection; settings.register + discoverModels + resolveAuth), депы согласованы с пином, релиз пересобран форжем (#80/#507).",
   "type": "module",
   "main": "server/index.js",
   "exports": {
