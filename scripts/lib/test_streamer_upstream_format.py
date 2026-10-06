@@ -133,6 +133,13 @@ def tool_call(arguments: str) -> dict:
 
 
 def tool_result(text: str) -> dict:
+    # Форма V0 (вход миграции v0-to-v1): message — ровно
+    # {id, role: "user", content, source}, БЕЗ top-level toolCallId. Текущая
+    # рантайм-форма (пин 0.19.0: role "tool" + top-level toolCallId) здесь
+    # НЕ проходит — и не должна: эта гвардия проверяет, что харнес пишет
+    # данные, которые принимает МИГРАТОР хранимых сессий
+    # (@deepseek-ai/dsh-session-format-v0-to-v1), а не живой ingest
+    # (его каноническую форму несёт dsh-edge/ingest-integration/check.mjs).
     return {"turn": 1, "step": 1, "message": {
         "id": "msg-t", "role": "user",
         "content": [{"type": "tool-result", "toolCallId": "call-1",
