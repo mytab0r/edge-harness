@@ -133,8 +133,11 @@ def tool_call(arguments: str) -> dict:
 
 
 def tool_result(text: str) -> dict:
+    # Каноническая форма пина 0.19.0: role "tool" + top-level toolCallId
+    # (createToolResultMessage, @deepseek-ai/dsh-llm 0.2.0-rc.1) — роль "user"
+    # больше не проходит валидатор холодной загрузки сессии.
     return {"turn": 1, "step": 1, "message": {
-        "id": "msg-t", "role": "user",
+        "id": "msg-t", "role": "tool", "toolCallId": "call-1",
         "content": [{"type": "tool-result", "toolCallId": "call-1",
                      "content": [{"type": "text", "text": text}]}],
         "source": {"kind": "tool", "callId": "call-1"}}}

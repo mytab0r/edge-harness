@@ -64,7 +64,7 @@ index 316fbbf..1238321 100644
  
  function llmHttpStatus(code: string): number {
 diff --git a/apps/dsh-edge/src/instance.ts b/apps/dsh-edge/src/instance.ts
-index 1c82274..aadf715 100644
+index 20a1ad2..3474588 100644
 --- a/apps/dsh-edge/src/instance.ts
 +++ b/apps/dsh-edge/src/instance.ts
 @@ -60,6 +60,8 @@ import {
@@ -76,7 +76,7 @@ index 1c82274..aadf715 100644
    MAX_SESSION_CREATE_BODY_BYTES,
    MAX_TURN_BODY_BYTES,
    corsHeaders,
-@@ -634,6 +636,8 @@ export class DshEdgeInstance extends DshEdgeWorkspace {
+@@ -633,6 +635,8 @@ export class DshEdgeInstance extends DshEdgeWorkspace {
          return await this.startTurn(request, route.sessionId)
        } else if (route.action === 'cancel' && request.method === 'POST') {
          return this.cancelTurn(route.sessionId, request)
@@ -85,7 +85,7 @@ index 1c82274..aadf715 100644
        }
  
        throw new EdgeHttpError(404, 'Session route not found.')
-@@ -1636,6 +1640,35 @@ export class DshEdgeInstance extends DshEdgeWorkspace {
+@@ -1640,6 +1644,35 @@ export class DshEdgeInstance extends DshEdgeWorkspace {
      })
    }
  
@@ -121,7 +121,7 @@ index 1c82274..aadf715 100644
    private async startTurn(request: Request, sessionId: SessionId): Promise<Response> {
      const body = await readJsonObject(request, MAX_TURN_BODY_BYTES)
      const message = requireBoundedUtf8String(body.message, 'message', MAX_MESSAGE_TEXT_BYTES)
-@@ -2015,7 +2048,7 @@ function activeTurnSignals(): Pick<ActiveTurn,
+@@ -1996,7 +2029,7 @@ function activeTurnSignals(): Pick<ActiveTurn,
  
  interface ParsedSessionRoute {
    sessionId?: SessionId
@@ -130,7 +130,7 @@ index 1c82274..aadf715 100644
  }
  
  function parseSessionRoute(pathname: string): ParsedSessionRoute {
-@@ -2036,7 +2069,7 @@ function parseSessionRoute(pathname: string): ParsedSessionRoute {
+@@ -2017,7 +2050,7 @@ function parseSessionRoute(pathname: string): ParsedSessionRoute {
    const id = SessionId(sessionId)
    if (parts.length === 3) return { sessionId: id }
    const action = parts[3]
@@ -140,7 +140,7 @@ index 1c82274..aadf715 100644
    }
    return { sessionId: id, action }
 diff --git a/apps/dsh-edge/src/session-store.ts b/apps/dsh-edge/src/session-store.ts
-index b9760e5..5c8d471 100644
+index 704a465..6f8b9b1 100644
 --- a/apps/dsh-edge/src/session-store.ts
 +++ b/apps/dsh-edge/src/session-store.ts
 @@ -22,7 +22,7 @@ import type {
@@ -167,7 +167,7 @@ index b9760e5..5c8d471 100644
      message: string,
    ) {
      super(message)
-@@ -1875,6 +1881,180 @@ export class EdgeSessionStore {
+@@ -1890,6 +1896,180 @@ export class EdgeSessionStore {
      }
    }
  
@@ -348,7 +348,7 @@ index b9760e5..5c8d471 100644
    /** Count live Agent owners for host.describe. */
    async attachedSessionCount(): Promise<number> {
      const { agents } = await this.services()
-@@ -2189,6 +2369,116 @@ export class EdgeSessionStore {
+@@ -2193,6 +2373,140 @@ export class EdgeSessionStore {
    }
  }
  
@@ -428,17 +428,41 @@ index b9760e5..5c8d471 100644
 +    if (typeof record.id !== 'string' || record.id === '') {
 +      throw fail(`"${type}" requires a non-empty string message.id`)
 +    }
++    if (type === 'tool/result') {
++      // dsh-session 0.19.0 (пин 0.2.0-rc.1) валидирует tool/result на
++      // ХОЛОДНОЙ ЗАГРУЗКЕ сессии (assertMessageEventShape): message.role
++      // обязан быть "tool", source — {kind: "tool", callId}, а top-level
++      // message.toolCallId — совпадать с source.callId. Раньше форма
++      // tool/result здесь сознательно не проверялась («nothing in this
++      // deployment produces a tool/result ingest event yet») — живой канал
++      // появился (стенд ingest-интеграции и спул раннера), и событие
++      // неверной формы принималось на записи (append не валидирует), а валило
++      // сессию задним числом на следующей загрузке:
++      // SessionPersistenceCorruptionError «session event at seq N message
++      // must have role "tool"» — красный деплой dsh-edge 0.19.0 (run
++      // 37465243370). Форма сверяется ЗДЕСЬ, до записи: те же инварианты,
++      // что проверяет загрузчик, — громкий 400 на ingest вместо тихой порчи
++      // сессии.
++      if (record.role !== 'tool') {
++        throw fail('"tool/result" requires message.role "tool"')
++      }
++      const toolSource = record.source
++      const toolSourceRecord = toolSource !== null && typeof toolSource === 'object' && !Array.isArray(toolSource)
++        ? (toolSource as Record<string, unknown>)
++        : undefined
++      if (toolSourceRecord === undefined || toolSourceRecord.kind !== 'tool'
++        || typeof toolSourceRecord.callId !== 'string' || toolSourceRecord.callId === '') {
++        throw fail('"tool/result" requires a tool source with a non-empty callId')
++      }
++      if (record.toolCallId !== toolSourceRecord.callId) {
++        throw fail('"tool/result" message.toolCallId must match source.callId')
++      }
++    }
 +    if (type === 'assistant/message') {
 +      // assertMessageEventShape also requires role "assistant" and a model
 +      // source with provider+model (dsh-session/lib/index.js::hasProviderModel)
 +      // for this type specifically — an id alone is not sufficient to pass
 +      // validation on the next cold load, only to move which field trips it.
-+      // tool/result's own extra shape (source.kind "tool"/callId, single
-+      // tool-result content block) is deliberately NOT mirrored here: nothing
-+      // in this deployment produces a tool/result ingest event yet, and a
-+      // check with no real producer to feed it prod-form data is exactly the
-+      // "тест кормит прод-форму данных, а не пересказ" trap — left for
-+      // whoever adds that writer next.
 +      const sourceField = record.source
 +      const sourceRecord = sourceField !== null && typeof sourceField === 'object' && !Array.isArray(sourceField)
 +        ? (sourceField as Record<string, unknown>)
