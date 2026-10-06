@@ -1,5 +1,5 @@
 diff --git a/apps/dsh-edge/src/do-session-persistence.ts b/apps/dsh-edge/src/do-session-persistence.ts
-index 89e35d6..f8e6d1c 100644
+index 5f34e5a..5c6be9e 100644
 --- a/apps/dsh-edge/src/do-session-persistence.ts
 +++ b/apps/dsh-edge/src/do-session-persistence.ts
 @@ -1278,6 +1278,36 @@ export class DurableObjectSessionPersistence extends SessionPersistence {

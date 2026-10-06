@@ -1,5 +1,5 @@
 diff --git a/apps/dsh-edge/src/do-session-persistence.ts b/apps/dsh-edge/src/do-session-persistence.ts
-index 5ffc47c..89e35d6 100644
+index 5ffc47c..5f34e5a 100644
 --- a/apps/dsh-edge/src/do-session-persistence.ts
 +++ b/apps/dsh-edge/src/do-session-persistence.ts
 @@ -42,6 +42,7 @@ import {
@@ -10,7 +10,17 @@ index 5ffc47c..89e35d6 100644
  } from '@deepseek-ai/dsh-session-format-catalog'
  import type { SessionFormatJsonObject, SessionFormatRestore } from '@deepseek-ai/dsh-session-format'
  import { historicalChildCatalogSource } from '@deepseek-ai/dsh-session-format-v3-to-v4'
-@@ -1090,14 +1091,21 @@ export class DurableObjectSessionPersistence extends SessionPersistence {
+@@ -1084,20 +1085,27 @@ export class DurableObjectSessionPersistence extends SessionPersistence {
+        FROM dsh_sessions WHERE version != ?`,
+       SESSION_FORMAT_VERSION,
+     ).toArray()
++    // HARNESS (#1376): declared out here so the quarantine write below runs on
++    // EVERY startup, including the empty case — a session that became readable
++    // again must stop being listed without anyone clearing a latch.
++    let quarantined: readonly QuarantinedSession[] = []
+     if (outdated.length > 0) {
+       // Validate every old log before the first migration write. Discard each
+       // artifact after preflight to avoid retaining all decoded histories at once.
        // The second decode runs synchronously in the same transaction/snapshot.
        // Child evidence is read from the pre-migration state once and reused by both passes.
        const childFacts = this.collectChildFactsFor(new Set(outdated.map(row => row.id)))
@@ -22,10 +32,6 @@ index 5ffc47c..89e35d6 100644
 -        migratedRows += prepared?.packed.length ?? 0
 -      }
 -      const rebuild = this.isEventTableRebuildCheaper(rewriteWrites, migratedRows)
-+      // HARNESS (#1376): declared out here so the quarantine write below runs on
-+      // EVERY startup, including the empty case — a session that became readable
-+      // again must stop being listed without anyone clearing a latch.
-+      let quarantined: readonly QuarantinedSession[] = []
 +      const preflight = this.preflightOutdatedSessions(outdated, childFacts)
 +      const rewriteWrites = preflight.rewriteWrites
 +      const migratedRows = preflight.migratedRows
