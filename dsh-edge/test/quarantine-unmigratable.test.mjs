@@ -39,8 +39,9 @@ test('отказ одной сессии не мешает мигрироват�
   assert.equal(result.thrown, undefined,
     'отказ формата обязан быть изолирован, а не вынесен наружу: он валит старт всего DO')
   assert.deepEqual(result.quarantined.map(e => e.id), ['harness-22'])
-  assert.equal(result.legacy, 100,
-    'строки карантинной сессии не должны попадать в счётчик legacy — по нему выбирается путь rebuild')
+  assert.equal(result.rewriteWrites, 100,
+    'строки карантинной сессии не должны попадать в счётчик rewriteWrites — '
+    + 'по нему (вместе с migratedRows) выбирается путь rebuild')
 })
 
 test('карантинная сессия названа поимённо, с версией и причиной', async () => {
@@ -139,8 +140,8 @@ test('#1514: сохранённый вердикт переиспользует�
   })
 
   assert.equal(result.quarantined.length, 1, 'сессия обязана остаться в карантине')
-  assert.equal(result.legacy, 0,
-    'legacy > 0 означает, что prepareMigration всё-таки читал историю — '
+  assert.equal(result.rewriteWrites, 0,
+    'rewriteWrites > 0 означает, что prepareMigration всё-таки читал историю — '
     + 'именно это и выжигало аккаунтную квоту rows_read на каждом старте (#1514)')
   assert.deepEqual(result.errors, [],
     'повторный вердикт не должен писаться в лог заново: console.error на каждом '
@@ -156,8 +157,8 @@ test('#1514: вердикт протухает и перевыносится —
   })
 
   assert.equal(result.quarantined.length, 1)
-  assert.equal(result.legacy, 0,
-    'сессия по-прежнему немигрируема, поэтому legacy остаётся нулём')
+  assert.equal(result.rewriteWrites, 0,
+    'сессия по-прежнему немигрируема, поэтому rewriteWrites остаётся нулём')
   assert.equal(result.errors.length, 1,
     'протухший вердикт обязан быть вынесен ЗАНОВО (console.error снова) — иначе '
     + 'сборка с починенным мигратором никогда бы не подхватила сессию: '
