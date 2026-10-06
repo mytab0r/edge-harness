@@ -1,5 +1,5 @@
 {
   "repo": "pawaca/dsh-edge",
   "sha": "5a8e1c73ce1e4f93044081fc291cc35e3403db57",
-  "note": "Пин апстрима для source-build морды. Автоматический бамп (#1590, scripts/orchestra/upstream_drift.py::attempt_auto_bump): sha — тег dsh-edge-v0.19.1 (repos/pawaca/dsh-edge/tags). Патч-серия dsh-edge/patches НЕ перебазирована этим коммитом — применимость доказывает шаг «Патч-серия» deploy-dsh-edge.yml после мержа (dsh-edge/PATCHES.md); красный деплой — честный сигнал, не тихий пропуск версии, дальше заводит задачу пульс отказов деплоя (#477)."
+  "note": "Пин апстрима для source-build морды. Автоматический бамп (#1590, scripts/orchestra/upstream_drift.py::attempt_auto_bump): sha — тег dsh-edge-v0.19.1 (repos/pawaca/dsh-edge/tags). Патч-серия dsh-edge/patches не перебазировалась — серия 0002–0008 проверена наложением подряд git apply на чистом клоне pawaca/dsh-edge@5a8e1c73 (порядок шага «Патч-серия» deploy-dsh-edge.yml): все семь патчей легли без хунков мимо, карантинные файлы (do-session-persistence, http, session-store) на месте. Живой контроль применимости — тот же шаг деплоя (dsh-edge/PATCHES.md); красный деплой — честный сигнал, не тихий пропуск версии, дальше заводит задачу пульс отказов деплоя (#477)."
 }
