@@ -188,7 +188,13 @@ try {
     { type: 'user/message', data: { id: 'm1', role: 'user', content: [{ type: 'text', text: 'задача раннера' }], source: { kind: 'user' } } },
     { type: 'assistant/message', data: { turn: 1, step: 1, message: { id: 'a1', role: 'assistant', content: [{ type: 'reasoning', text: 'размышляю' }, { type: 'text', text: 'делаю' }], source: { kind: 'model', provider: 'edge-harness', model: 'runner-model' } } } },
     { type: 'tool/call', data: { turn: 1, step: 1, callId: 'c1', name: 'bash', arguments: '{"command":"echo hi"}' } },
-    { type: 'tool/result', data: { turn: 1, step: 1, message: { id: 't1', role: 'user', content: [{ type: 'tool-result', toolCallId: 'c1', isError: false, content: [{ type: 'text', text: 'hi' }] }], source: { kind: 'tool', callId: 'c1' } } } },
+    // Каноническая форма tool/result (пин 0.19.0): createToolResultMessage
+    // (@deepseek-ai/dsh-llm) строит message {role: "tool", toolCallId, source:
+    // {kind: "tool", callId}} — роль "user" здесь валидатор холодной загрузки
+    // (assertMessageEventShape) больше не принимает: «session event at seq N
+    // message must have role "tool"», SessionPersistenceCorruptionError на
+    // replay, красный деплой (run 37465243370).
+    { type: 'tool/result', data: { turn: 1, step: 1, message: { id: 't1', role: 'tool', toolCallId: 'c1', content: [{ type: 'tool-result', toolCallId: 'c1', isError: false, content: [{ type: 'text', text: 'hi' }] }], source: { kind: 'tool', callId: 'c1' } } } },
     { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
   ] }
   const ing1 = await jsonRequest(`/api/sessions/${sid}/ingest`, {

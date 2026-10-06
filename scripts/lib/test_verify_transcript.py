@@ -46,6 +46,11 @@ def tool_call(turn, step, call_id, name="bash", arguments='{"command":"echo hi"}
 
 
 def tool_result(turn, step, call_id, text="hi"):
+    # Каноническая форма tool/result пина 0.19.0 (dsh-edge/ingest-integration/
+    # check.mjs): message.role "tool" + top-level toolCallId — иначе валидатор
+    # холодной загрузки (assertMessageEventShape) валит сессию задним числом
+    # («session event at seq N message must have role "tool"», красный деплой
+    # run 37465243370).
     return {
         "type": "tool/result",
         "data": {
@@ -53,7 +58,8 @@ def tool_result(turn, step, call_id, text="hi"):
             "step": step,
             "message": {
                 "id": f"t-{call_id}",
-                "role": "user",
+                "role": "tool",
+                "toolCallId": call_id,
                 "content": [{"type": "tool-result", "toolCallId": call_id, "isError": False,
                              "content": [{"type": "text", "text": text}]}],
                 "source": {"kind": "tool", "callId": call_id},
