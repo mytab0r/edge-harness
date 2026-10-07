@@ -261,7 +261,9 @@ ai_dsh.sh` не получают секреты `ANTHROPIC_OAUTH_1`/`ANTHROPIC_O
 **Не элемент `DSH_PROVIDER_CHAIN`.** Пул регистрирует себя в
 `llm-pi-ai.providers` с `api: anthropic-messages` — другим протокольным
 диалектом, чем `openai-completions`, на котором держится вся цепочка
-(`llm-deepseek`-адаптер шлёт OpenAI-формат на любой `DEEPSEEK_BASE_URL`).
+(`llm-deepseek`-адаптер раннерского DSH шлёт OpenAI-формат на любой
+`DEEPSEEK_BASE_URL`; у морды dsh-edge с пина dsh-edge-v0.19.0 адаптер
+`dsh-llm-deepseek` 0.2.0 другой — только Anthropic Messages, см. ниже).
 Подстановка пула элементом цепочки отправила бы OpenAI-запрос на
 Anthropic-эндпоинт — не сработает структурно. Вместо этого
 `dsh_run_with_pool_then_chain` (`scripts/lib/dsh-ci.sh`) пробует пул ПЕРВЫМ
@@ -319,6 +321,21 @@ Exhausted») — переживается автоматически всеми 
 | Что | Где живёт | Кто читает |
 |---|---|---|
 | Базовый URL | `vars.DEEPSEEK_BASE_URL` | раннеры + морда (при деплое) |
+
+**Протокольная развилка одной переменной (с пина dsh-edge-v0.19.0, задача
+#1590).** Раннеры и морда читают одну и ту же `vars.DEEPSEEK_BASE_URL`, но
+говорят на разных протоколах: раннерский `llm-deepseek` — OpenAI-completions
+(ему нужен OpenAI-рут провайдера, у GLM это `…/api/coding/paas/v4`), морда
+dsh-edge 0.19.x (адаптер `dsh-llm-deepseek` 0.2.0) — только Anthropic
+Messages (у GLM это `https://api.z.ai/api/anthropic`; подтверждено живым
+деплоем 2026-10-07 — на OpenAI-руте канарейка морды не получала ни одного
+хода модели, прогоны 37556921801/37557338171/37557672354, зелёный —
+37558188054 уже на Messages-руте). Штатный путь раннеров не задет: цепочка
+несёт свой OpenAI-баз URL в записях `DSH_PROVIDER_CHAIN`
+(`dsh-ci.sh::dsh_run_with_provider_chain` экспортирует `base_url` записи),
+`vars.DEEPSEEK_BASE_URL` для морды настроен на Messages-рут. Одно значение —
+два протокола: пока переменная одна, менять её под раннеры нельзя, не сломав
+морду, и наоборот (узкая задача на разводку переменных — нужно завести; на 2026-10-07 в пуле не заведена).
 | Модель | `vars.DEEPSEEK_MODEL` | раннеры + морда (при деплое) |
 | Ключ | `secrets.DEEPSEEK_API_KEY` | раннеры + морда (при деплое) |
 | Имя группы в пикере | `vars.DSH_EDGE_PROVIDER_NAME` | только морда |
@@ -387,7 +404,11 @@ curl -s https://dsh-edge.mytab0r.workers.dev/api/health
 
 ```bash
 gh secret set DEEPSEEK_API_KEY   # ключ z.ai
-gh variable set DEEPSEEK_BASE_URL --body 'https://api.z.ai/api/coding/paas/v4'
+# ВНИМАНИЕ (протокольная развилка, см. «Что где объявлено»): с пина
+# dsh-edge-v0.19.0 морда говорит Anthropic Messages — базовый URL морды
+# https://api.z.ai/api/anthropic, НЕ OpenAI-рут paas/v4 (на нём канарейка
+# деплоя красная: «модель не сделала ни одного хода», #1590).
+gh variable set DEEPSEEK_BASE_URL --body 'https://api.z.ai/api/anthropic'
 gh variable set DEEPSEEK_MODEL --body 'glm-5.3-flash'
 gh variable set DSH_EDGE_PROVIDER_NAME --body 'GLM'
 gh variable set DSH_EDGE_MODEL_CATALOG --body '[{"id":"glm-5","name":"GLM-5","contextWindow":200000},{"id":"glm-5.3","name":"GLM-5.3","contextWindow":1000000},{"id":"glm-5.3-flash","name":"GLM-5.3-Flash","contextWindow":1000000},{"id":"glm-4.7","name":"GLM-4.7","contextWindow":200000}]'
