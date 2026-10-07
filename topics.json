@@ -2,8 +2,8 @@
   "schema": 1,
   "topics": {
     "breakage": {
-      "created_ts": 1791335368,
-      "message_thread_id": 0,
+      "created_ts": 1791339014,
+      "message_thread_id": 1687792,
       "title": "🔴 Поломки"
     },
     "decision": {
