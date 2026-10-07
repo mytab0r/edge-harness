@@ -14,7 +14,7 @@
 Тест кормится ПРОД-ФОРМОЙ, а не пересказом (AGENTS.md, «тест кормит прод-форму
 данных»). Фикстура ниже получена воспроизводимо:
 
-    npm pack @deepseek-ai/dsh-llm-deepseek@0.1.5-rc.2
+    npm pack @deepseek-ai/dsh-llm-deepseek@0.2.0-rc.1
     # массив DEFAULT_MODELS взят ДОСЛОВНО из package/lib/index.js,
     # константы (DEFAULT_CONTEXT_WINDOW и т.п.) подставлены значениями
     npx esbuild@0.25.0 models-src.mjs --bundle --minify --format=esm
@@ -41,11 +41,12 @@ import pytest
 
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "deploy-dsh-edge.yml"
 
-# Прод-форма (см. докстринг): дословный DEFAULT_MODELS апстрима 0.1.5-rc.2
-# после esbuild --minify. Первым элементом стоит deepseek-flash — ровно то,
-# на чём сломался прежний якорь.
+# Прод-форма (см. докстринг): дословный DEFAULT_MODELS апстрима 0.2.0-rc.1
+# (пин dsh-edge-v0.19.0, #1580) после esbuild --minify. deepseek-v4-flash
+# из каталога УШЁЛ — ровно то, на чём сломался якорь 2026-10-06 (маркер
+# `{id:"deepseek-v4-flash"` стал встречаться 0 раз).
 UPSTREAM_MINIFIED_CATALOG = (
-    '[{id:"deepseek-flash",name:"DeepSeek-V41-Flash",contextWindow:131072,inputModalities:["text","image"],imagePixelBudget:1e6,imageMaxBytes:5e6,systemPromptUpdate:"in-history"},{id:"deepseek-v4-flash",name:"DeepSeek-V4-Flash",description:"Fast, efficient, and economical; suited to focused, routine, or parallel tasks.",contextWindow:131072},{id:"deepseek-v4-pro",name:"DeepSeek-V4-Pro",description:"Stronger agentic coding, knowledge, and difficult reasoning; suited to complex or quality-critical tasks at higher cost.",contextWindow:131072},{id:"deepseek-v4-flash-vision-exp",name:"DeepSeek-V4-Flash-Vision-Exp",contextWindow:131072,inputModalities:["text","image"],imagePixelBudget:1e6,imageMaxBytes:5e6}]'
+    '[{id:"deepseek-flash",name:"DeepSeek-V41-Flash",contextWindow:131072,inputModalities:["text","image"],systemPromptUpdate:"in-history",toolUpdate:"addition-only"},{id:"deepseek-v4-pro",name:"DeepSeek-V4-Pro",description:"Stronger agentic coding, knowledge, and difficult reasoning; suited to complex or quality-critical tasks at higher cost.",contextWindow:131072}]'
 )
 
 # Прежний якорь — хранится здесь НЕ как рабочий код, а как носитель класса:
@@ -54,9 +55,7 @@ ANCHORED_TO_FIRST_ELEMENT = r'\[\{id:"deepseek-v4-flash"(?:[^\[\]]|\[[^\[\]]*\])
 
 MODEL_IDS_IN_FIXTURE = (
     "deepseek-flash",
-    "deepseek-v4-flash",
     "deepseek-v4-pro",
-    "deepseek-v4-flash-vision-exp",
 )
 
 
@@ -113,9 +112,14 @@ def test_marker_is_unique_in_live_upstream_form():
     убедиться, что маркер один. На живой форме он один — но проверка нужна не
     ради сегодняшнего бандла, а ради завтрашнего."""
     assert UPSTREAM_MINIFIED_CATALOG.count(_marker()) == 1
-    # Префиксная ловушка: deepseek-v4-flash-vision-exp начинается с того же id.
-    # Закрывающая кавычка в маркере — единственное, что их различает.
-    assert 'id:"deepseek-v4-flash-vision-exp"' in UPSTREAM_MINIFIED_CATALOG
+    # Префиксная ловушка (класс 0.1.5-rc.2: deepseek-v4-flash-vision-exp
+    # начинался с того же текста): закрывающая кавычка маркера — единственное,
+    # что отличает его от более длинного id. Живого длинного соседа в каталоге
+    # 0.2.0-rc.1 больше нет, поэтому ловушка держится синтетическим входом:
+    # маркер не имеет права совпасть внутри более длинного id.
+    longer_id = '{id:"deepseek-flash-exp"'
+    assert _marker() not in longer_id
+    assert longer_id.startswith(_marker()[:-1])
 
 
 def test_step_refuses_loudly_when_marker_is_not_unique():

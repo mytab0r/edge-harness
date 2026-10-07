@@ -408,7 +408,12 @@ jobs:
           # наш. Скобочно-сбалансированный матч нужен потому, что массив
           # содержит вложенные скобки (inputModalities:["text","image"]) —
           # наивный [^\]]* рвёт бандл.
-          marker = '{id:"deepseek-v4-flash"'
+          # 2026-10-06 (пин dsh-edge-v0.19.0, #1580): dsh-llm-deepseek
+          # 0.2.0-rc.1 вывел deepseek-v4-flash из DEFAULT_MODELS — первый
+          # элемент теперь deepseek-flash (V41-Flash). Форма перепроверена
+          # на собранном артефакте пина (worker/direct/index.js): маркер
+          # встречается ровно 1 раз, массив по-прежнему одноуровнево вложенный.
+          marker = '{id:"deepseek-flash"'
           markers = src.count(marker)
           if markers != 1:
               # subn(count=1) молча взял бы ПЕРВЫЙ матч: при двух вхождениях
@@ -418,18 +423,26 @@ jobs:
               # шаг существует, поэтому падаем громко и называем число.
               sys.exit(f"::error::Маркер каталога {marker} встречается {markers} раз(а), ожидалось ровно 1 — "
                        "upstream сменил форму; какой массив патчить, определить нельзя")
-          pattern = re.compile(r'\[(?:[^\[\]]|\[[^\[\]]*\])*\{id:"deepseek-v4-flash"(?:[^\[\]]|\[[^\[\]]*\])*\}(?:[^\[\]]|\[[^\[\]]*\])*\]')
+          pattern = re.compile(r'\[(?:[^\[\]]|\[[^\[\]]*\])*\{id:"deepseek-flash"(?:[^\[\]]|\[[^\[\]]*\])*\}(?:[^\[\]]|\[[^\[\]]*\])*\]')
           patched, n = pattern.subn(lambda _: new_array, src, count=1)
           if n != 1:
               sys.exit("::error::Каталог моделей в бандле не найден — upstream сменил форму; патч применять некуда")
           old = 'displayName:"DeepSeek"'
           if old in patched:
               patched = patched.replace(old, f'displayName:"{provider_name}"', 1)
-          # имя группы моделей в каталоге (providerInfo) — второй литерал
-          group_pat = re.compile(r'\{id:([A-Za-z_$][\w$]*),name:"DeepSeek"\}')
-          patched, n2 = group_pat.subn(lambda m: '{id:' + m.group(1) + f',name:"{provider_name}"}}', patched, count=1)
+          # имя группы моделей в каталоге (providerInfo) — второй литерал.
+          # 0.19.0: providerInfo.name больше не литерал объекта, а фолбэк
+          # зависимости — `name:this.dependencies.providerName??"DeepSeek"`
+          # (dsh-llm-deepseek 0.2.0-rc.1, providerInfo()). Якоримся на этот
+          # фолбэк и заменяем только его: получится
+          # `name:this.dependencies.providerName??"<провайдер>"` — зависимость,
+          # если её зададут, по-прежнему выигрывает.
+          group_anchor = 'providerName??"DeepSeek"'
+          n2 = patched.count(group_anchor)
           if n2 != 1:
-              sys.exit("::error::Имя группы провайдера (providerInfo) не найдено — upstream сменил форму")
+              sys.exit(f"::error::Фолбэк имени группы провайдера (providerInfo) {group_anchor} встречается {n2} раз(а), "
+                       "ожидался ровно 1 — upstream сменил форму")
+          patched = patched.replace(group_anchor, f'providerName??"{provider_name}"', 1)
           open("worker.js", "w", encoding="utf-8").write(patched)
           first_id = catalog[0]["id"]
           if f'id:"{first_id}"' not in patched:
