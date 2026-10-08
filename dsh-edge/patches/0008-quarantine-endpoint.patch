@@ -60,10 +60,10 @@ index 5f34e5a..5c6be9e 100644
    return SessionPersistenceRevision(
      `${storeIdentity}:incarnation:${row.incarnation}:revision:${row.revision}`,
 diff --git a/apps/dsh-edge/src/instance.ts b/apps/dsh-edge/src/instance.ts
-index c21bdb9..aa5be54 100644
+index 21c0013..2709998 100644
 --- a/apps/dsh-edge/src/instance.ts
 +++ b/apps/dsh-edge/src/instance.ts
-@@ -463,6 +463,24 @@ export class DshEdgeInstance extends DshEdgeWorkspace {
+@@ -468,6 +468,24 @@ export class DshEdgeInstance extends DshEdgeWorkspace {
        if (url.pathname === '/api/remote.mux') {
          return this.openRemoteMux(request)
        }
@@ -85,14 +85,14 @@ index c21bdb9..aa5be54 100644
 +      if (url.pathname === '/api/quarantine' && request.method === 'GET') {
 +        return jsonResponse({ ok: true, quarantined: await this.sessions.quarantinedSessions() })
 +      }
-       if (url.pathname === '/api/skills') {
-         return await this.handleSkillsCrud(request)
-       }
+       // Deliverable cards (upstream dsh-client-ui-deliverables) ask the Host for
+       // a desktop that can open presented files in native apps. The Edge has
+       // none: answer as upstream does for such a Host, so the cards offer the
 diff --git a/apps/dsh-edge/src/session-store.ts b/apps/dsh-edge/src/session-store.ts
-index 7daa94f..4741b15 100644
+index 1852184..3b1349c 100644
 --- a/apps/dsh-edge/src/session-store.ts
 +++ b/apps/dsh-edge/src/session-store.ts
-@@ -118,6 +118,7 @@ import EdgeCredentialProvider from './edge-credentials.ts'
+@@ -128,6 +128,7 @@ import EdgeCredentialProvider from './edge-credentials.ts'
  import DurableObjectSessionPersistence, {
    EDGE_HISTORY_PAGE_LIMITS,
    type EdgeEventPage,
@@ -100,7 +100,7 @@ index 7daa94f..4741b15 100644
  } from './do-session-persistence.ts'
  import EdgeModelSelectionBridge from './model-selection-bridge.ts'
  import EdgeSessionQuery, { edgeSearchDocuments } from './edge-session-query.ts'
-@@ -902,6 +903,23 @@ export class EdgeSessionStore {
+@@ -967,6 +968,23 @@ export class EdgeSessionStore {
      return info.inputModalities === undefined || info.inputModalities.includes('image')
    }
  

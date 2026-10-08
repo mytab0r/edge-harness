@@ -1,5 +1,5 @@
 {
   "repo": "pawaca/dsh-edge",
   "sha": "5b32ccde7ae67b71646dd001a69d5c88aafa0776",
-  "note": "Пин апстрима для source-build морды. Автоматический бамп (#1623, scripts/orchestra/upstream_drift.py::attempt_auto_bump): sha — тег dsh-edge-v0.22.0 (repos/pawaca/dsh-edge/tags). Патч-серия dsh-edge/patches НЕ перебазирована этим коммитом — применимость доказывает шаг «Патч-серия» deploy-dsh-edge.yml после мержа (dsh-edge/PATCHES.md); красный деплой — честный сигнал, не тихий пропуск версии, дальше заводит задачу пульс отказов деплоя (#477)."
+  "note": "Пин апстрима для source-build морды. Автоматический бамп (#1623, scripts/orchestra/upstream_drift.py::attempt_auto_bump): sha — тег dsh-edge-v0.22.0 (repos/pawaca/dsh-edge/tags). Патч-серия dsh-edge/patches перебазирована вручную (#1623, находка AI-ревью PR #1624): 0008-quarantine-endpoint.patch наложен на instance.ts без прежнего /api/skills-контекста — маршрут /api/quarantine встал перед upstream-блоком deliverable-карточек /api/present.host; 0002–0007 легли без правок. Применимость серии подряд git apply проверена локально на этом sha (0002→0008, git apply --check чисто)."
 }
