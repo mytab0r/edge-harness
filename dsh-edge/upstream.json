@@ -1,5 +1,5 @@
 {
   "repo": "pawaca/dsh-edge",
-  "sha": "6dcd8cb76470319841d7ba5e928b3d38c695964c",
-  "note": "Пин апстрима для source-build морды. Автоматический бамп (#1625, scripts/orchestra/upstream_drift.py::attempt_auto_bump): sha — тег dsh-edge-v0.23.0 (repos/pawaca/dsh-edge/tags). Патч-серия dsh-edge/patches НЕ перебазирована этим коммитом — применимость доказывает шаг «Патч-серия» deploy-dsh-edge.yml после мержа (dsh-edge/PATCHES.md); красный деплой — честный сигнал, не тихий пропуск версии, дальше заводит задачу пульс отказов деплоя (#477)."
+  "sha": "4d7c7d21e08f34b426a5d6edbe5e8c64b848414f",
+  "note": "Пин апстрима для source-build морды. Автоматический бамп (#1633, scripts/orchestra/upstream_drift.py::attempt_auto_bump): sha — тег dsh-edge-v0.24.0 (repos/pawaca/dsh-edge/tags). Патч-серия dsh-edge/patches НЕ перебазирована этим коммитом — применимость доказывает шаг «Патч-серия» deploy-dsh-edge.yml после мержа (dsh-edge/PATCHES.md); красный деплой — честный сигнал, не тихий пропуск версии, дальше заводит задачу пульс отказов деплоя (#477)."
 }
