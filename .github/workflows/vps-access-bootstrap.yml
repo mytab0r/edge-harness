@@ -6,12 +6,16 @@
 # (форс-командный ключ деплоя) и легитимно ходит на VPS по SSH.
 #
 # Что делает (идемпотентно):
-#   1. appends PUBKEY (из input workflow_dispatch) в /root/.ssh/authorized_keys
-#   2. выполняет контрольную команду и печатает её вывод в лог
+#   1. добавляет PUBKEY (из input workflow_dispatch) в /root/.ssh/authorized_keys
+#      — данные через stdin, удалённая команда статична: input'ы НЕ
+#      интерполируются в root-shell (находка AI-ревью этого PR);
+#   2. выполняет контрольную команду и печатает её вывод в лог.
+#      check_cmd произволен ПО ЗАМЫСЛУ (диагностический канал для admin'ов
+#      репо: github write-access и так даёт root через SSH_DEPLOY_KEY).
 #
-# Безопасность: ключ одноразовый по назначению (доступ агента), приватная
-# часть никогда не покидает машину агента; pubkey не секрет. Job можно
-# удалить после прогона — доступ отзывается удалением строки authorized_keys.
+# Отзыв доступа: удалить строку с "kanban t_fafa14e5" из
+# /root/.ssh/authorized_keys на VPS, или удалить этот workflow.
+# Приватный ключ на VPS не попадает и в логи не печатается.
 name: vps-access-bootstrap
 
 on:
@@ -44,21 +48,19 @@ jobs:
           CHECK_CMD: ${{ inputs.check_cmd }}
         run: |
           set -euo pipefail
-          install -m 600 -T /dev/stdin ~/.ssh/id_deploy <<< "$SSH_KEY" 2>/dev/null || {
-            mkdir -p ~/.ssh && chmod 700 ~/.ssh
-            printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy
-            chmod 600 ~/.ssh/id_deploy
-          }
-          cat >> ~/.ssh/ssh_config <<CFG
-          Host vps
-            HostName 167.99.134.201
-            User root
-            IdentityFile ~/.ssh/id_deploy
-            IdentitiesOnly yes
-            StrictHostKeyChecking accept-new
-          CFG
-          # 1) идемпотентно добавить pubkey в authorized_keys
-          ssh -F ~/.ssh/ssh_config vps "mkdir -p /root/.ssh && chmod 700 /root/.ssh && touch /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys && grep -qxF '$PUBKEY' /root/.ssh/authorized_keys || echo '$PUBKEY' >> /root/.ssh/authorized_keys"
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          {
+            echo 'Host vps'
+            echo '  HostName 167.99.134.201'
+            echo '  User root'
+            echo '  IdentityFile ~/.ssh/id_deploy'
+            echo '  IdentitiesOnly yes'
+            echo '  StrictHostKeyChecking accept-new'
+          } > ~/.ssh/config
+          chmod 600 ~/.ssh/config
+          printf '%s\n' "$PUBKEY" | ssh -F ~/.ssh/config vps 'mkdir -p /root/.ssh && chmod 700 /root/.ssh && touch /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys && { grep -qxF -f - /root/.ssh/authorized_keys || cat >> /root/.ssh/authorized_keys; }'
           echo "== pubkey installed =="
-          # 2) контрольный вывод
-          ssh -F ~/.ssh/ssh_config vps "$CHECK_CMD"
+          ssh -F ~/.ssh/config vps "$CHECK_CMD"
