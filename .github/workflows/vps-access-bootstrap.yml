@@ -61,6 +61,11 @@ jobs:
             echo '  StrictHostKeyChecking accept-new'
           } > ~/.ssh/config
           chmod 600 ~/.ssh/config
-          printf '%s\n' "$PUBKEY" | ssh -F ~/.ssh/config vps 'mkdir -p /root/.ssh && chmod 700 /root/.ssh && touch /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys && { grep -qxF -f - /root/.ssh/authorized_keys || cat >> /root/.ssh/authorized_keys; }'
-          echo "== pubkey installed =="
+          # stdin у трубы один: pubkey кладём отдельным вызовом во временный
+          # файл; идемпотентность и верификацию делаем уже по файлу
+          # (grep -f - съел бы stdin до cat — находка AI-ревью round 2).
+          printf '%s\n' "$PUBKEY" | ssh -F ~/.ssh/config vps 'cat > /tmp/agent_pubkey && wc -c /tmp/agent_pubkey'
+          ssh -F ~/.ssh/config vps 'mkdir -p /root/.ssh && chmod 700 /root/.ssh && touch /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys && { grep -qxF -f /tmp/agent_pubkey /root/.ssh/authorized_keys || cat /tmp/agent_pubkey >> /root/.ssh/authorized_keys; }'
+          # верификация установки: без ключа job красный, не надеемся на check_cmd
+          ssh -F ~/.ssh/config vps 'grep -qxF -f /tmp/agent_pubkey /root/.ssh/authorized_keys && rm -f /tmp/agent_pubkey && echo KEY-INSTALLED'
           ssh -F ~/.ssh/config vps "$CHECK_CMD"
