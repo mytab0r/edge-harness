@@ -1,0 +1,64 @@
+# Одноразовый бутстрап SSH-доступа агента к VPS (167.99.134.201).
+#
+# Зачем: воркеры Hermes (контейнер hermes на сервере UroBorOS / домашний ПК)
+# не имеют ключа к VPS — проверить образ в проде (`docker inspect autopilot`)
+# без SSH нельзя. Канал доставки pubkey: этот job уже имеет SSH_DEPLOY_KEY
+# (форс-командный ключ деплоя) и легитимно ходит на VPS по SSH.
+#
+# Что делает (идемпотентно):
+#   1. appends PUBKEY (из input workflow_dispatch) в /root/.ssh/authorized_keys
+#   2. выполняет контрольную команду и печатает её вывод в лог
+#
+# Безопасность: ключ одноразовый по назначению (доступ агента), приватная
+# часть никогда не покидает машину агента; pubkey не секрет. Job можно
+# удалить после прогона — доступ отзывается удалением строки authorized_keys.
+name: vps-access-bootstrap
+
+on:
+  workflow_dispatch:
+    inputs:
+      pubkey:
+        description: "Открытый SSH-ключ агента (одна строка, ssh-ed25519 AAAA... comment)"
+        required: true
+        type: string
+      check_cmd:
+        description: "Контрольная команда на VPS после добавления ключа"
+        required: false
+        default: "docker ps --format '{{.Names}}' | head -20"
+
+permissions: {}
+
+concurrency:
+  group: vps-access-bootstrap
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Append pubkey + run check
+        env:
+          SSH_KEY: ${{ secrets.SSH_DEPLOY_KEY }}
+          PUBKEY: ${{ inputs.pubkey }}
+          CHECK_CMD: ${{ inputs.check_cmd }}
+        run: |
+          set -euo pipefail
+          install -m 600 -T /dev/stdin ~/.ssh/id_deploy <<< "$SSH_KEY" 2>/dev/null || {
+            mkdir -p ~/.ssh && chmod 700 ~/.ssh
+            printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy
+            chmod 600 ~/.ssh/id_deploy
+          }
+          cat >> ~/.ssh/ssh_config <<CFG
+          Host vps
+            HostName 167.99.134.201
+            User root
+            IdentityFile ~/.ssh/id_deploy
+            IdentitiesOnly yes
+            StrictHostKeyChecking accept-new
+          CFG
+          # 1) идемпотентно добавить pubkey в authorized_keys
+          ssh -F ~/.ssh/ssh_config vps "mkdir -p /root/.ssh && chmod 700 /root/.ssh && touch /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys && grep -qxF '$PUBKEY' /root/.ssh/authorized_keys || echo '$PUBKEY' >> /root/.ssh/authorized_keys"
+          echo "== pubkey installed =="
+          # 2) контрольный вывод
+          ssh -F ~/.ssh/ssh_config vps "$CHECK_CMD"
