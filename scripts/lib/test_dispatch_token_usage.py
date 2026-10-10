@@ -163,6 +163,12 @@ EXPECTED_WORKFLOWS = frozenset({
     # dev, поэтому не входит ни в DISPATCH_CONSUMER, ни в PIPELINE_CONSUMERS.
     "worker-ci.yml",
     "worker.yml",
+    # Одноразовый бутстрап SSH-доступа агента к VPS (kanban t_fafa14e5):
+    # workflow_dispatch вручную, читает секрет SSH_DEPLOY_KEY (форс-командный
+    # ключ деплоя на VPS) — ни GH_DISPATCH_TOKEN, ни GH_PIPELINE_PAT не
+    # использует, в репозиторий не пишет (pubkey уходит на VPS по ssh),
+    # поэтому не входит ни в DISPATCH_CONSUMER, ни в PIPELINE_CONSUMERS.
+    "vps-access-bootstrap.yml",
 })
 
 ALL_WORKFLOWS = sorted(
