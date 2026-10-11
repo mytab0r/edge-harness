@@ -205,12 +205,20 @@ const ZHIPU_PROFILE = {
     // Негатив при записи: занятие маршрута штатного провайдера — отказ
     // (валидация апстримного mountPiAiProvider: маршрут, который уже обслуживает
     // другой адаптер, отказан целиком). Текст отказа апстримный — подстроку не
-    // фиксируем, фиксируем сам факт отказа записи.
+    // фиксируем; вместо неё различаем отказ НАСТОЯЩЕЙ проверкой исхода: профиль
+    // несёт apiKeyEnv (иначе отказ мог бы прийти от отсутствия ключа — чужая
+    // причина, находка ревью PR #453 п.3 в новой форме), и после отказанной
+    // записи llm.providers показывает ровно одного deepseek-official — тени
+    // маршрута нет.
     const reserved = await rpc('settings.mutate', {
       ns: 'llm-pi-ai',
-      ops: [{ op: 'set', path: ['providers', 'deepseek-official'], value: { baseURL: 'https://x.example/v1', models: [{ id: 'm' }] } }],
+      ops: [{ op: 'set', path: ['providers', 'deepseek-official'], value: { baseURL: 'https://x.example/v1', apiKeyEnv: 'RESERVED_API_KEY', models: [{ id: 'm' }] } }],
     })
     assert.equal(reserved.result.ok, false, 'маршрут deepseek-official занят — запись отказана')
+    const afterReserved = await rpc('llm.providers', {})
+    const officialRows = afterReserved.result.value.providers.filter((row) => row.provider === 'deepseek-official')
+    assert.equal(officialRows.length, 1, 'после отказанной записи ровно один deepseek-official')
+    assert.equal(officialRows[0].active, true, 'отказанная запись не затенила штатный маршрут')
 
     // Негатив при записи: кривой baseURL отказан, морда жива.
     const bad = await rpc('settings.mutate', {

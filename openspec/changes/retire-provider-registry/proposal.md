@@ -19,7 +19,7 @@ register`): плагин уходит в карантин, и весь путь 
    `plugins-src/provider-registry` удалены; юнит-тест шага в `repo-ci.yml` снят.
 2. Релизы-ростеры `plugin-manager` и `agents-tasks` (единственные, кто вшивает
    `manifest.json`) перевыпущены с составом из 5 плагинов:
-   `plugins-plugin-manager-v0.1.11`, `plugins-agents-tasks-v0.1.4`;
+   `plugins-plugin-manager-v0.1.13`, `plugins-agents-tasks-v0.1.4`;
    `dsh-edge/plugins.json` ссылается на них с новыми sha256.
 3. `dsh-edge/registry-integration/check.mjs` переведён на родной механизм:
    namespace смонтирован апстримом, protocolChoices = три протокола, directory
