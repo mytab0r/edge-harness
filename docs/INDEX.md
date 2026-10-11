@@ -107,8 +107,9 @@
 
 - [Переключение LLM-провайдера](runbooks/switch-llm-provider.md) — раннеры и штатный
   `deepseek-official` сидят на одном слоте деплоя, смена там = замена. В морде (Settings →
-  Models) второй провайдер добавляется без передеплоя через плагин `provider-registry`
-  (#378). Шаги, проверка видимого результата, откат, и почему потолок ответа зашит под GLM.
+  Models) второй провайдер добавляется без передеплоя через штатный Settings → Models
+  (#378; с пина dsh-edge-v0.26.0 namespace монтирует сам апстрим, плагин `provider-registry`
+  снят — #1640). Шаги, проверка видимого результата, откат, и почему потолок ответа зашит под GLM.
 - [Обновить учётки пула Claude из krouter-экспорта](runbooks/refresh-anthropic-pool.md) —
   `dsh-anthropic-oauth-pool` (#838), секреты `ANTHROPIC_OAUTH_1/2`, импорт из
   krouter-бэкапа или одиночного credentials.json (`scripts/lib/anthropic_oauth_import.py`),

@@ -200,19 +200,30 @@ const MAX_REPLAY_RESPONSE_BYTES = 1_048_576
 - В direct-бэкенде **sync отключён полностью** — методы кидают `ENOSYS` (`direct-shell.ts:324`, `:336`); `getExec` всегда `ENOENT` (`direct-shell.ts:114-115`), то есть **переподключиться к запущенной команде нельзя**.
 - **Кнопки добавления/редактирования провайдера в Settings → Models неактивны.** UI-компоненты `CustomProviderCard` и `ProviderEditor` из upstream пакета `@deepseek-ai/dsh-client-ui-settings-models` исправны. Дело **не** в запрете записи: морда объявляет себя пишущим провайдером настроек явно — `do-settings-provider.ts:21`, `override readonly writable = true`. Корневая причина раздвоена и различается по типам кнопок. (1) **"Add"** (добавить провайдера из directory) отключена условием `disabled: addable.length === 0 || !state.writable` (`@deepseek-ai/dsh-client-ui-settings-models@0.0.1-rc.3`, `lib/client.js:2015`), где `addable = rows.filter(r => !r.configured && r.entry.settingsNs !== "")` (строка 1844). Единственный провайдер морды (`deepseek-official`) уже отмечен `configured=true`, поэтому список `addable` всегда пуст. (2) **"Add custom provider"** (`CustomProviderCard`) отключена условием `disabled: protocols.length === 0 || !state.writable` (строка 2029), где `protocols = protocolChoices(state.namespaces.get("llm-pi-ai"))` (строка 1847). Namespace `llm-pi-ai` не смонтирован в морде → `protocolChoices(undefined)` возвращает `[]` (`lib/client.js:488`) → кнопка недоступна независимо от `writable`. Практический вывод: `writable = true` — необходимое, но не достаточное условие для ни одной из двух кнопок. Когда компоненты всё же активны, пути записи разделяются: правка существующего провайдера (`ProviderEditor`) берёт settings-namespace **динамически** из ответа сервера (`const ns = namespace.ns` → `api.settings.mutate({ ns, ops })`, строки 1424, 1442-1446), namespace приходит из поля `settingsNs` directory-записи. Создание нового провайдера (`CustomProviderCard`) пишет в **жёстко зашитый** литерал `"llm-pi-ai"` (строка 1054). Практическое следствие: собственный settings-namespace работает с UI для правки существующего провайдера; чтобы ожила кнопка создания, серверу нужно смонтировать namespace ровно с именем `llm-pi-ai`, который можно реализовать без пакета `dsh-llm-pi-ai`.
 
-  **Реакция (#378, 2026-09-03): обе причины закрыты серверным плагином `provider-registry`** (change
-  `openspec/changes/dsh-edge-provider-registry`, релиз `plugins-registry-v0.1.1`, запись в
-  `dsh-edge/plugins.json`), без пакета `dsh-llm-pi-ai`: (1) плагин монтирует settings-namespace
-  `llm-pi-ai` со своей схемой (форма апстримного `Config`: `providers`-словарь; `api` — union с
-  единственным протоколом транспорта `openai-completions`) — `protocolChoices` оживают; (2) плагин
-  публикует directory-записи готовых OpenAI-compat маршрутов (`zhipu`, `nvidia-nim`, `openrouter`,
-  `deepseek`) — они видны кнопке «Add», пока не настроены. Каждая настроенная запись
-  `providers.<route-id>` становится живым маршрутом пикера (один `DeepSeekAdapter` на маршрут,
-  ключи — штатный credential-механизм морды). На пине 0.8.0 (клиент 0.1.1-rc.2) контракты
-  перепроверены по бандлу: `NS$1 = "llm-pi-ai"` (строка 1077), гейты кнопок (2056/2070),
-  `layoutOf` (1377-1379), `protocolChoices` читает union по пути `providers.<probe>.api` из
-  `settings.describe`. Гвардия литерала в деплое (`dsh-edge/verify-provider-namespace.mjs`,
-  мутационно проверена) роняет деплой, если апстрим переименует `NS$1`. Дым инсталла
+  **Реакция (#378, 2026-09-03): обе причины были закрыты серверным плагином `provider-registry`**
+  (change `openspec/changes/dsh-edge-provider-registry`, релизы `plugins-provider-registry-v0.1.x`),
+  без пакета `dsh-llm-pi-ai`: плагин монтировал settings-namespace `llm-pi-ai` со своей схемой и
+  публиковал directory-записи готовых OpenAI-compat маршрутов (`zhipu`, `nvidia-nim`, `openrouter`,
+  `deepseek`).
+
+  **Снятие плагина (#1640, пин dsh-edge-v0.26.0): затычка выведена — её окно закрыл сам апстрим.**
+  На 0.26.0 апстрим монтирует namespace `llm-pi-ai` сам — `apps/dsh-edge/src/edge-llm-settings.ts::
+  mountPiAiProvider` (пакет `@deepseek-ai/dsh-llm-pi-ai@0.2.0-rc.2`): (1) union-протокол
+  `protocolChoices` несёт три значения (`openai-completions`, `openai-responses`, `anthropic-messages`)
+  — «Add custom provider» жива; (2) каждая настроенная запись `providers.<route-id>` становится
+  живым маршрутом пикера средствами апстримного провайдера (форма профиля: `api`, `baseURL`,
+  `displayName`, `models`, `apiKeyEnv` — сверено с `lib/types/config.d.ts` тарболла), ключи —
+  штатный credential-механизм морды. Повторная регистрация namespace плагином падала бы
+  (`settings namespace "llm-pi-ai" is already registered` от `edge-settings.ts::register`), поэтому
+  плагин снят с пина: запись убрана из `dsh-edge/plugins.json`, исходники `plugins-src/
+  provider-registry` удалены, релизы-ростеры `plugin-manager`/`agents-tasks` перевыпущены с
+  составом из 5 (`plugins-plugin-manager-v0.1.11`, `plugins-agents-tasks-v0.1.4`). Регресс против
+  затычки один: directory готовых маршрутов («Add» с пречищенными строками каталога) апстрим не
+  публикует — провайдер добавляется вручную через «Add custom provider», засев прод-маршрутов
+  остаётся за `seed-provider-registry.yml` (#1330). Гвардия литерала в деплое
+  (`dsh-edge/verify-provider-namespace.mjs`, мутационно проверена) остаётся: имя namespace
+  `llm-pi-ai` по-прежнему зашито в клиентском бандле литералом, переименование апстримом должно
+  ронять деплой громко. Дым инсталла
   (`smoke-edge-plugins.mjs`) и интеграция на собранном артефакте
   (`dsh-edge/registry-integration/check.mjs`: namespace, directory, негатив при записи,
   добавление, пикер, рестарт DO, удаление) закрывают класс «зелёная сборка с мёртвыми кнопками».
@@ -284,7 +295,7 @@ Workers Paid нужен **только** для режима `isolated` (Worker 
 - **точная схема Config, которую ожидают `protocolChoices`/`ModelListEditor`** побайтово — сверялась по типам, не по `lib/index.js` пакета `dsh-llm-pi-ai`.
 - **поведение дефолтных (не-abstract) методов `LlmAdapter`** (`providerInfo`/`listModels`/`resolveModel`) без переопределения — смотрелись только `.d.ts`.
 - **`node:`-импорты в `dsh-llm-deepseek`**: не измерено прогоном, полифиллятся ли они `nodejs_compat` при реальном вызове, или путь действительно мёртв благодаря `resolveFiles`.
-- **Кнопки добавления/редактирования провайдера** — гейт вскрыт по клиентскому бандлу и закрыт серверным плагином `provider-registry` (#378, см. «Что НЕ работает»); живой ход через добавленный в морде маршрут на проде не снят (нужна кука владельца и настоящий ключ нового провайдера). Раннерский замер прироста gzip-бандла при монтировании namespace `llm-pi-ai` своим кодом не делался: пакет `llm-pi-ai` не монтируется, цифра 900 KiB и вывод о превышении бюджета относятся к нему и взяты из апстримной заметки.
+- **Кнопки добавления/редактирования провайдера** — гейт вскрыт по клиентскому бандлу (#378, см. «Что НЕ работает»); на пинах до 0.25.x закрывался плагином `provider-registry`, с пина dsh-edge-v0.26.0 namespace `llm-pi-ai` монтирует сам апстрим (`mountPiAiProvider`), плагин снят (#1640). Живой ход через добавленный в морде маршрут на проде не снят (нужна кука владельца и настоящий ключ нового провайдера). Замер прироста gzip-бандла от монтирования апстримного пакета `llm-pi-ai` (теперь он в сборке морды) не делался; цифра 900 KiB и вывод о превышении бюджета — из апстримной заметки про самостоятельное монтирование, не замер этого деплоя.
 - **Доступность самих `@deepseek-ai/dsh-*` в публичном npm и их лицензия.** Вывод косвенный — из того, что `npx dsh-edge install` работает у сторонних пользователей. Но именно эта установка ничего не доказывает: она ставит предсобранный воркер и upstream-пакеты не резолвит вовсе (см. раздел про дистрибуцию). Прямой проверки `npm view @deepseek-ai/dsh-agent` не делалось.
 - Точное содержимое `.patch`-файлов (сейчас семь) не читалось — читался только `audit.json` с причинами и условиями снятия.
 - Заявления README о поведении (лимиты, отказ вместо усечения, 30-дневная кука) сверялись с текстом README и с константами в коде, но не прогоном живого деплоя.
