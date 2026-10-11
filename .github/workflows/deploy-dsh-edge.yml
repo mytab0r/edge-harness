@@ -278,15 +278,17 @@ jobs:
         working-directory: ${{ github.workspace }}/clone/apps/dsh-edge/standalone
         run: node "$GITHUB_WORKSPACE/dsh-edge/proxy-integration/check.mjs" "$GITHUB_WORKSPACE/clone/apps/dsh-edge"
 
-      # Реестр провайдеров (#378) обязан работать на СОБРАННОМ артефакте до
-      # деплоя: unstable_dev поднимает direct-воркер с настоящим DO SQLite и
-      # прогоняет путь владельца Settings → Models теми же RPC, что шлёт UI
-      # (namespace llm-pi-ai, directory, негатив при записи, добавление,
-      # пикер, рестарт DO, удаление). Красный шаг — деплой не начинается.
-      - name: Интеграция реестра провайдеров на собранном артефакте (#378)
+      # Settings → Models обязан работать на СОБРАННОМ артефакте до деплоя:
+      # unstable_dev поднимает direct-воркер с настоящим DO SQLite и прогоняет
+      # путь владельца теми же RPC, что шлёт UI (namespace llm-pi-ai, негатив
+      # при записи, добавление, пикер, рестарт DO, удаление). С пина
+      # dsh-edge-v0.26.0 namespace монтирует сам апстрим (mountPiAiProvider) —
+      # плагин provider-registry снят (#1640), directory готовых маршрутов
+      # больше нет. Красный шаг — деплой не начинается.
+      - name: Интеграция Settings → Models на собранном артефакте (#378)
         if: steps.route.outputs.plugins != '0'
         working-directory: ${{ github.workspace }}/clone/apps/dsh-edge/standalone
-        run: node "$GITHUB_WORKSPACE/dsh-edge/registry-integration/check.mjs" "$GITHUB_WORKSPACE/clone/apps/dsh-edge" "$GITHUB_WORKSPACE/plugins-src/provider-registry/directory.json"
+        run: node "$GITHUB_WORKSPACE/dsh-edge/registry-integration/check.mjs" "$GITHUB_WORKSPACE/clone/apps/dsh-edge"
 
       - name: Деплой-каталог (source-build)
         if: steps.route.outputs.plugins != '0'
@@ -930,16 +932,15 @@ jobs:
         run: |
           echo "::notice::Состав карантина НЕ читался: деплоился npm-префаб, патч-серия не накладывалась, маршрута /api/quarantine в этой сборке нет — смотреть нечем на этом пути (отсутствие чтения, а не отсутствие карантина)"
 
-      # Канарейка реестра провайдеров (#378), только чтение: деплой обязан не
-      # просто поднять морду, а смонтировать namespace llm-pi-ai и directory
-      # готовых маршрутов — без них кнопки Settings → Models мертвы, и это
-      # видно только живым RPC. Мутаций в проде канарейка не делает
-      # (добавление/удаление доказано интеграцией на собранном артефакте).
-      # Состав directory-маршрутов ниже генерируется из
-      # plugins-src/provider-registry/directory.json — единственного места
-      # правды о каталоге (плюс штатный deepseek-official); списки руками
-      # не ведутся.
-      - name: Канарейка реестра провайдеров (#378)
+      # Канарейка Settings → Models (#378), только чтение: деплой обязан не
+      # просто поднять морду, а смонтировать namespace llm-pi-ai — без него
+      # кнопки Settings → Models мертвы, и это видно только живым RPC.
+      # Мутаций в проде канарейка не делает (добавление/удаление доказано
+      # интеграцией на собранном артефакте). С пина dsh-edge-v0.26.0 namespace
+      # монтирует сам апстрим; directory готовых маршрутов больше нет
+      # (плагин provider-registry снят, #1640) — проверяем штатного
+      # deepseek-official.
+      - name: Канарейка Settings → Models (#378)
         if: success() && steps.route.outputs.plugins != '0'
         env:
           DSH_EDGE_ACCESS_KEY: ${{ secrets.DSH_EDGE_ACCESS_KEY }}
@@ -962,19 +963,10 @@ jobs:
             || { echo "::error::Namespace llm-pi-ai не смонтирован на проде — кнопки Settings → Models мертвы (#378)"; exit 1; }
           rpc llm.providers '{"type":"client-request","rpcId":"canary114","method":"llm.providers","payload":{}}' \
             > "$RUNNER_TEMP/registry-providers.json"
-          routes="deepseek-official $(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).map((x) => x.route).join(" "))' plugins-src/provider-registry/directory.json)"
-          for route in $routes; do
-            jq -e --arg route "$route" '.result.value.providers[] | select(.provider == $route)' \
-              "$RUNNER_TEMP/registry-providers.json" >/dev/null \
-              || { echo "::error::Маршрута $route нет в llm.providers на проде (#378)"; exit 1; }
-          done
           official_active=$(jq -r '.result.value.providers[] | select(.provider == "deepseek-official") | .active' \
             "$RUNNER_TEMP/registry-providers.json")
           [ "$official_active" = "true" ] || { echo "::error::Штатный провайдер deepseek-official не активен на проде — селектор моделей сломан"; exit 1; }
-          # Число маршрутов считается из той же переменной routes (штатный +
-          # каталог directory.json), не захардкожено: расширение каталога не
-          # должно заставить канарейку соврать в итоговой строке.
-          echo "✅ реестр #378 жив на проде: namespace llm-pi-ai смонтирован, directory содержит $(( $(wc -w <<<"$routes") )) маршрутов (штатный + готовые)"
+          echo "✅ Settings → Models живы на проде: namespace llm-pi-ai смонтирован (апстрим 0.26.0), штатный провайдер активен"
 
       # Канарейка runner-bridge (#390/#945): предыдущие две канарейки выше
       # доказывают, что RPC-поверхность dsh-edge жива («морда жива»), но НЕ
