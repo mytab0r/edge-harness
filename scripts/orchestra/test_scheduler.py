@@ -1162,6 +1162,21 @@ def patch_gh(monkeypatch, fake):
     monkeypatch.setattr(sch, "gh", fake)
     monkeypatch.setattr(pg, "gh", fake)
     monkeypatch.setattr(sd, "gh", fake)
+    # #1438: в одном прогоне живут ДВА экземпляра pulse_guard, и
+    # upstream_drift держит НЕ тот, что лежит в sys.modules. Замер на полном
+    # прогоне каталога:
+    #     sys.modules['pulse_guard']          id= 139625455672416
+    #     pulse_guard у upstream_drift        id= 139625481296192
+    #     тот же объект?  False
+    # Из-за этого upstream_drift_lines звал НЕПАТЧЕНЫЙ gh и уходил в живую
+    # сеть (`repos/pawaca/dsh-edge/tags`), а отказ превращался в ⚠️-строку
+    # отчёта, которую детектор простоя читал как симптом. Патчим именно тот
+    # объект, который зовёт прод-код, — узко, по имени модуля-держателя, а не
+    # обходом всех модулей (обход исполнен и отвергнут: 277 failed).
+    upstream_drift = sys.modules.get("upstream_drift")
+    pg_of_drift = getattr(upstream_drift, "pulse_guard", None)
+    if pg_of_drift is not None and pg_of_drift is not pg:
+        monkeypatch.setattr(pg_of_drift, "gh", fake)
 
 
 def patch_post_issue_comment(monkeypatch, fn):
