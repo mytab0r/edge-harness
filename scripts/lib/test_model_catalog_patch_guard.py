@@ -74,10 +74,27 @@ def _catalog_pattern() -> re.Pattern:
 
 def _marker() -> str:
     text = _workflow_text()
-    match = re.search(r"""marker = '(\{id:"[^"]+"\})?'""", text) or re.search(
-        r"""marker = '(.+?)'\n""", text)
+    match = re.search(r"marker = '(.+?)'\n", text)
     assert match, "в deploy-dsh-edge.yml не найден `marker = '...'` — проверка уникальности снята"
     return match.group(1)
+
+
+# Прод-форма второго вхождения литерала на пине dsh-edge-v0.26.1 (задача
+# #1636): карта шаблонов провайдера pi-ai в собранном
+# apps/dsh-edge/standalone/worker/direct/index.js — дословный фрагмент
+# собранного артефакта пина (замер 2026-10-11), не пересказ. Это НЕ массив
+# DEFAULT_MODELS: перед `{id:"deepseek-flash"` стоит ключ объекта
+# `"deepseek-flash":`, а не `[`.
+UPSTREAM_0261_TEMPLATE_MAP_SNIPPET = (
+    'qj=Ht("cloudflare-workers-ai",het);var fet={"openai-completions":'
+    '{"deepseek-flash":{id:"deepseek-flash",name:"DeepSeek V4.1 Flash",'
+    'api:"openai-completions",baseUrl:"https://api.deepseek.com",'
+    'provider:"deepseek",reasoning:!0,thinkingLevelMap:{minimal:null,low:"low",'
+    'medium:null,high:"high",max:"max"},input:["text","image"],'
+    'cost:{input:.3,output:1.2,cacheRead:.006,cacheWrite:0},contextWindow:1e6,'
+    'maxTokens:384e3,compat:{supportsStore:!1,supportsDeveloperRole:!1,'
+    'maxTokensField:"max_tokens"}'
+)
 
 
 def test_previous_anchor_really_fails_on_live_upstream_form():
@@ -113,13 +130,14 @@ def test_marker_is_unique_in_live_upstream_form():
     ради сегодняшнего бандла, а ради завтрашнего."""
     assert UPSTREAM_MINIFIED_CATALOG.count(_marker()) == 1
     # Префиксная ловушка (класс 0.1.5-rc.2: deepseek-v4-flash-vision-exp
-    # начинался с того же текста): закрывающая кавычка маркера — единственное,
-    # что отличает его от более длинного id. Живого длинного соседа в каталоге
-    # 0.2.0-rc.1 больше нет, поэтому ловушка держится синтетическим входом:
-    # маркер не имеет права совпасть внутри более длинного id.
-    longer_id = '{id:"deepseek-flash-exp"'
-    assert _marker() not in longer_id
-    assert longer_id.startswith(_marker()[:-1])
+    # начинался с того же текста). Маркер несёт закрывающую кавычку после id,
+    # поэтому более длинный id (`deepseek-flash-exp`) маркер совпасть не может —
+    # проверяем это на синтетическом входе, живого длинного соседа в каталоге
+    # нет: массивная форма маркера не матчится в массиве, начинающемся
+    # более длинным id.
+    longer_first_id = '[{id:"deepseek-flash-exp",name:"x",contextWindow:1}]'
+    assert _marker() not in longer_first_id
+    assert longer_first_id.startswith("[{id:"), "фикстура ловушки обязана быть массивной формой"
 
 
 def test_step_refuses_loudly_when_marker_is_not_unique():
@@ -150,6 +168,32 @@ def test_pattern_does_not_swallow_the_rest_of_the_bundle():
     bundle = "var e=" + UPSTREAM_MINIFIED_CATALOG + ';var t=["text","image"];var n=[1,2,3];'
     captured = pattern.search(bundle).group(0)
     assert captured == UPSTREAM_MINIFIED_CATALOG
+
+
+def test_marker_disambiguates_template_map_added_in_0261():
+    """Пин dsh-edge-v0.26.1 (#1636): голый литерал `{id:"deepseek-flash"`
+    встречается в собранном бандле ДВАЖДЫ — второе вхождение из карты шаблонов
+    провайдера pi-ai (фикстура ниже), не из DEFAULT_MODELS. Различает якорь
+    массивной формы (`[{id:"deepseek-flash"`): голый литерал — 2, массивная
+    форма — 1, регекс патчит ровно массив каталога и не трогает карту.
+
+    Снятие этого теста вернуло бы красный деплой на пине 0.26.1: шаг падал
+    громко на «маркер встречается 2 раз(а)» (живой прогон deploy-dsh-edge
+    38130473060, 2026-10-11)."""
+    bundle = (
+        "var pre=1;" + UPSTREAM_MINIFIED_CATALOG
+        + ";var post=" + UPSTREAM_0261_TEMPLATE_MAP_SNIPPET + ";"
+    )
+    assert bundle.count('{id:"deepseek-flash"') == 2, (
+        "фикстура перестала быть прод-формой: голых литералов должно быть 2, "
+        "как на собранном артефакте пина dsh-edge-v0.26.1")
+    assert bundle.count(_marker()) == 1, (
+        "массивная форма маркера обязана встречаться 1 раз — иначе якорь "
+        "не различает каталог от карты шаблонов")
+    found = _catalog_pattern().findall(bundle)
+    assert len(found) == 1
+    assert found[0] == UPSTREAM_MINIFIED_CATALOG, (
+        "регекс обязан захватить массив DEFAULT_MODELS, а не карту шаблонов")
 
 
 if __name__ == "__main__":
