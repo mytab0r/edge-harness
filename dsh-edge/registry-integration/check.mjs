@@ -189,7 +189,11 @@ const ZHIPU_PROFILE = {
     const view = described.result.value.namespaces.find((d) => d.ns === 'llm-pi-ai')
     assert.ok(view !== undefined, 'namespace llm-pi-ai смонтирован реестром — иначе кнопка создания мертва')
     assert.equal(described.result.value.writable, true, 'настройки морды writable')
-    assert.deepEqual(protocolChoices(view.schema), ['openai-completions'],
+    // Апстрим dsh-edge-v0.26.0 расширил union-протокол клиента (schema.namespace):
+    // к openai-completions добавились openai-responses и anthropic-messages —
+    // фиксируем новую прод-форму целиком (сорт, чтобы порядок union не ломал чек);
+    // следующий бамп пина с изменением набора снова уронит чек громко.
+    assert.deepEqual([...protocolChoices(view.schema)].sort(), ['anthropic-messages', 'openai-completions', 'openai-responses'].sort(),
       'schema.namespace должен нести union-протокол (protocolChoices клиента)')
 
     const providers = await rpc('llm.providers', {})
