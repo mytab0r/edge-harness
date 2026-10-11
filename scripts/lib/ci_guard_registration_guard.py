@@ -360,7 +360,6 @@ ALLOWLIST = frozenset({
     'Юнит-тесты плагина runner-bridge',
     'Юнит-тесты логики инструментов интеграций',
     'Юнит-тесты клиентского бандла интеграций',
-    'Юнит-тесты плагина provider-registry',
     'Smoke task-branch — проверка на входе и рабочее дерево',
     'Smoke pr-create — Closes/Fixes/Resolves отклоняется до вызова gh (#496)',
     'Тесты паритета scripts/git/pr-create ↔ contract_check.py',

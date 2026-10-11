@@ -541,8 +541,6 @@ jobs:
       # cordis с LlmRuntime + SettingsProvider (фикстура — tarball'ы
       # @deepseek-ai с пином целостности): namespace, directory, добавление,
       # рестарт DO, негатив при записи, MISSING_CREDENTIAL без сети.
-      - name: Юнит-тесты плагина provider-registry
-        run: node --test plugins-src/provider-registry/test/registry.test.mjs
 
       # Преграда бренд-замены морды (#109): замещающий бандл brand-official
       # обязан быть валидным JS до деплоя — деплой-шаг перезаписывает им

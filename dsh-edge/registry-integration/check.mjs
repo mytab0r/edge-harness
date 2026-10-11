@@ -1,14 +1,20 @@
 #!/usr/bin/env node
-// Интеграционная проверка реестра провайдеров (#378) на СОБРАННОМ воркере
-// dsh-edge. Вызывается deploy-dsh-edge.yml после сборки (рядом с
-// ingest-integration): поднимает standalone-артефакт (direct) через
-// unstable_dev на реальном workerd + DO SQLite и прогоняет путь владельца
-// штатного Settings → Models через те же RPC, что шлёт клиентский UI:
+// Интеграционная проверка Settings → Models на СОБРАННОМ воркере dsh-edge.
+// Вызывается deploy-dsh-edge.yml после сборки (рядом с ingest-integration):
+// поднимает standalone-артефакт (direct) через unstable_dev на реальном
+// workerd + DO SQLite и прогоняет путь владельца штатного Settings → Models
+// через те же RPC, что шлёт клиентский UI. С бампа пина до dsh-edge-v0.26.0
+// (#1637/#1640) namespace llm-pi-ai монтирует сам апстрим
+// (apps/dsh-edge/src/edge-llm-settings.ts::mountPiAiProvider, пакет
+// @deepseek-ai/dsh-llm-pi-ai) — плагин provider-registry снят как затычка,
+// чьё окно закрылось (исходный дефект #378 закрыт апстримом); directory
+// готовых маршрутов больше НЕ публикуется (кнопка «Add» — пустой список,
+// создание кастомного провайдера работает без него):
 //
 //   settings.describe → namespace llm-pi-ai смонтирован (кнопка «Add custom
-//     provider» жива: схема содержит union-протокол);
-//   llm.providers → directory содержит штатного deepseek-official (активен)
-//     и готовые маршруты реестра (дормантные → кнопка «Add» активна);
+//     provider» жива: схема содержит union-протокол из трёх значений
+//     openai-completions / openai-responses / anthropic-messages);
+//   llm.providers → штатный deepseek-official на месте и активен;
 //   негатив: маршрут deepseek-official и кривой baseURL отказаны ПРИ ЗАПИСИ
 //     (settings-rejected — ошибка видна в Settings, морда жива);
 //   добавление провайдера (settings.mutate + credentials.set, как
@@ -17,7 +23,7 @@
 //   рестарт DO (второй unstable_dev над тем же persistTo) → настройка
 //     пережила рестарт без передеплоя;
 //   удаление (unset + credentials.unset, как removeProviderProfile) →
-//     маршрут снова дормантный, ключа больше нет.
+//     маршрут и ключ исчезли полностью.
 //
 // Использование: node check.mjs <APP_DIR>
 //   APP_DIR — apps/dsh-edge клона апстрима на пине с применённой серией патчей
@@ -28,13 +34,11 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { pathToFileURL } from 'node:url'
 import { createRequire } from 'node:module'
 
 const appDir = process.argv[2]
-const directoryJson = process.argv[3]
-if (!appDir || !directoryJson) {
-  console.error('Использование: node check.mjs <APP_DIR> <plugins-src/provider-registry/directory.json>')
+if (!appDir) {
+  console.error('Использование: node check.mjs <APP_DIR>')
   process.exit(1)
 }
 const standaloneDir = join(appDir, 'standalone')
@@ -164,11 +168,6 @@ function protocolChoices(schemaJson) {
     .filter((value) => typeof value === 'string')
 }
 
-// Состав directory-каталога читается из directory.json плагина — единственного
-// места правды (не дублируется списком здесь).
-const DIRECTORY_ROUTES = (await import(pathToFileURL(directoryJson).href, { with: { type: 'json' } })).default
-  .map((item) => item.route)
-
 const ZHIPU_PROFILE = {
   displayName: 'Z.ai (GLM)',
   api: 'openai-completions',
@@ -189,7 +188,12 @@ const ZHIPU_PROFILE = {
     const view = described.result.value.namespaces.find((d) => d.ns === 'llm-pi-ai')
     assert.ok(view !== undefined, 'namespace llm-pi-ai смонтирован реестром — иначе кнопка создания мертва')
     assert.equal(described.result.value.writable, true, 'настройки морды writable')
-    assert.deepEqual(protocolChoices(view.schema), ['openai-completions'],
+    // Апстрим dsh-edge-v0.26.0 расширил union-протокол клиента (schema.namespace):
+    // к openai-completions добавились openai-responses и anthropic-messages —
+    // фиксируем новую прод-форму целиком (сорт, чтобы порядок union не ломал чек);
+    // следующий бамп пина с изменением набора снова уронит чек громко.
+    assert.deepEqual([...protocolChoices(view.schema)].sort(),
+      ['anthropic-messages', 'openai-completions', 'openai-responses'],
       'schema.namespace должен нести union-протокол (protocolChoices клиента)')
 
     const providers = await rpc('llm.providers', {})
@@ -198,25 +202,23 @@ const ZHIPU_PROFILE = {
     const official = rows.find((row) => row.provider === 'deepseek-official')
     assert.ok(official !== undefined, 'штатный провайдер морды на месте')
     assert.equal(official.active, true, 'штатный провайдер активен — селектор моделей жив')
-    for (const route of DIRECTORY_ROUTES) {
-      const row = rows.find((candidate) => candidate.provider === route)
-      assert.ok(row !== undefined, `directory содержит ${route} (кнопка Add)`)
-      assert.equal(row.active, false, `${route} пока не настроен — не активен`)
-      assert.equal(row.settingsNs, 'llm-pi-ai')
-    }
-
-    // Негатив при записи: занятие маршрута штатного провайдера — отказ.
+    // Негатив при записи: занятие маршрута штатного провайдера — отказ
+    // (валидация апстримного mountPiAiProvider: маршрут, который уже обслуживает
+    // другой адаптер, отказан целиком). Текст отказа апстримный — подстроку не
+    // фиксируем; вместо неё различаем отказ НАСТОЯЩЕЙ проверкой исхода: профиль
+    // несёт apiKeyEnv (иначе отказ мог бы прийти от отсутствия ключа — чужая
+    // причина, находка ревью PR #453 п.3 в новой форме), и после отказанной
+    // записи llm.providers показывает ровно одного deepseek-official — тени
+    // маршрута нет.
     const reserved = await rpc('settings.mutate', {
       ns: 'llm-pi-ai',
-      ops: [{ op: 'set', path: ['providers', 'deepseek-official'], value: { baseURL: 'https://x.example/v1', models: [{ id: 'm' }] } }],
+      ops: [{ op: 'set', path: ['providers', 'deepseek-official'], value: { baseURL: 'https://x.example/v1', apiKeyEnv: 'RESERVED_API_KEY', models: [{ id: 'm' }] } }],
     })
     assert.equal(reserved.result.ok, false, 'маршрут deepseek-official занят — запись отказана')
-    // Находка ревью PR #453, п.3: тестовый профиль без apiKeyEnv — общая
-    // проверка `/provider-registry/` пройдёт зелёной и на СОВСЕМ ДРУГОМ отказе
-    // (отсутствие apiKeyEnv, тоже throw с этим префиксом), если гвардию
-    // коллизии с deepseek-official вообще убрать — точная подстрока доказывает,
-    // что отказала именно она.
-    assert.match(String(reserved.result.error?.message ?? ''), /занят штатным/)
+    const afterReserved = await rpc('llm.providers', {})
+    const officialRows = afterReserved.result.value.providers.filter((row) => row.provider === 'deepseek-official')
+    assert.equal(officialRows.length, 1, 'после отказанной записи ровно один deepseek-official')
+    assert.equal(officialRows[0].active, true, 'отказанная запись не затенила штатный маршрут')
 
     // Негатив при записи: кривой baseURL отказан, морда жива.
     const bad = await rpc('settings.mutate', {
@@ -239,7 +241,7 @@ const ZHIPU_PROFILE = {
 
     const afterAdd = await rpc('llm.providers', {})
     const zhipu = afterAdd.result.value.providers.find((row) => row.provider === 'zhipu')
-    assert.ok(zhipu !== undefined, 'zhipu виден в directory после добавления')
+    assert.ok(zhipu !== undefined, 'zhipu виден в llm.providers после добавления')
     assert.equal(zhipu.active, true, 'zhipu стал активным маршрутом')
 
     // Пикер моделей: группа zhipu с её каталогом (без сети — каталог локальный).
@@ -251,7 +253,7 @@ const ZHIPU_PROFILE = {
     const officialGroup = catalog.result.value.groups.find((entry) => entry.id === 'deepseek-official')
     assert.ok(officialGroup !== undefined, 'группа штатного провайдера в пикере не пострадала')
 
-    console.log('registry-check: фаза 1 пройдена (namespace, directory, негатив, добавление, пикер)')
+    console.log('registry-check: фаза 1 пройдена (namespace, негатив, добавление, пикер)')
   } finally {
     await worker.stop()
   }
@@ -284,8 +286,7 @@ const ZHIPU_PROFILE = {
 
     const afterRemove = await rpc('llm.providers', {})
     const dormant = afterRemove.result.value.providers.find((row) => row.provider === 'zhipu')
-    assert.ok(dormant !== undefined, 'zhipu остаётся в directory (кнопка Add может вернуть его)')
-    assert.equal(dormant.active, false, 'zhipu больше не активен после удаления')
+    assert.equal(dormant, undefined, 'zhipu исчез из llm.providers после удаления (directory у апстрима нет)')
     const gone = await rpc('settings.describe', {})
     assert.equal(gone.result.value.namespaces.find((d) => d.ns === 'llm-pi-ai')?.value?.providers?.zhipu, undefined,
       'профиль zhipu в namespace больше нет')

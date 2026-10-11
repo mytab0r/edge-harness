@@ -65,7 +65,7 @@ CONSUMER_MECHANISM: dict[str, str] = {
 }
 
 MORDA_VISIBILITY_NOTE = (
-    "1 слот адаптера через Settings -> Models (plugins-src/provider-registry, #378) — "
+    "1 слот адаптера через Settings -> Models (#378; с пина dsh-edge-v0.26.0 namespace монтирует сам апстрим, provider-registry снят — #1640) — "
     "failover туда не помещается, вне манифеста принципиально "
     "(docs/runbooks/switch-llm-provider.md, «Морда — вне цепочки принципиально»)"
 )
